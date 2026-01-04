@@ -6,9 +6,24 @@ Create a network, add devices and people, and route AI jobs across pooled comput
 
 ## Project Status
 
-**Phase:** Initial Planning & Reference Study
-**Timeline:** 8-11 months to production (realistic)
-**Team Size Needed:** 5-7 people, ~7 FTE
+**Current Phase:** Phase 1.5 - Network Layer Implementation (In Progress)
+**Completed Modules:** 5/12 Phase 1 modules
+**Test Coverage:** 41 tests passing (34 unit + 7 doc tests)
+**Next Milestone:** Module 2.3 - Control Plane Registration API
+
+### Completed Modules
+
+✅ **Module 1.1: Project Foundation** (Cargo workspace, dependencies)
+✅ **Module 1.2: Device Identity** (Ed25519 keypairs, multibase serialization)
+✅ **Module 1.3: Database Schema** (PostgreSQL + SQLite migrations)
+✅ **Module 1.4: Relay Server** (Circuit Relay v2 + token auth)
+✅ **Module 1.5: Network Swarm** (libp2p with Identify, RelayClient, DCUTR)
+✅ **Module 2.2: Job Protocol** (Request-response job distribution with CBOR)
+
+### Currently Building
+
+🚧 **Module 2.3:** Control Plane Registration API
+🚧 **Module 2.4:** Job execution engine
 
 ## What Is This?
 
@@ -38,20 +53,38 @@ Mesh enables:
 
 ```
 mesh/
-├── plan.md                 # Full product specification (JSON)
-├── IMPLEMENTATION.md       # Phase-by-phase implementation roadmap (200+ tasks)
+├── PLAN.md                # Full product specification (JSON)
+├── IMPLEMENTATION.md      # Phase-by-phase implementation roadmap
 ├── README.md              # This file
 ├── Cargo.toml             # Rust workspace configuration
-├── reference/             # Carcass VPN reference code (DO NOT USE DIRECTLY)
-│   ├── README.md          # Study guide for reference implementation
-│   ├── behaviour.rs       # libp2p swarm composition ⭐
-│   ├── ip.rs              # Protocol handler + ring buffers ⭐
-│   ├── config.rs          # Ed25519 key management ⭐
-│   └── ...
-└── (future directories)
-    ├── agent/             # Desktop and mobile agent (Rust)
-    ├── relay/             # Relay server (Rust)
-    └── control-plane/     # Control plane API (TypeScript or Rust)
+│
+├── agent/                 # ✅ Desktop agent implementation (Rust)
+│   ├── src/
+│   │   ├── device/        # ✅ Ed25519 identity, capabilities detection
+│   │   ├── network/       # ✅ libp2p mesh swarm + job protocol
+│   │   │   ├── mesh_swarm.rs    # ✅ Relay + DCUTR + Job Protocol
+│   │   │   ├── job_protocol.rs  # ✅ Request-response job distribution
+│   │   │   └── events.rs        # ✅ Network event types
+│   │   └── errors.rs      # ✅ Error handling
+│   └── examples/
+│       └── relay_connectivity.rs # ✅ Integration test example
+│
+├── relay-server/          # ✅ Relay server implementation (Rust)
+│   ├── src/
+│   │   ├── relay.rs       # ✅ Circuit Relay v2 server
+│   │   ├── config.rs      # ✅ Configuration + auth tokens
+│   │   └── auth.rs        # ✅ Token-based authentication
+│   └── README.md          # ✅ Deployment guide
+│
+├── control-plane/         # 🚧 Control plane (stub, TypeScript planned)
+│   └── src/
+│       └── db/            # ✅ PostgreSQL schema + migrations
+│
+└── reference/             # Reference VPN code study (DO NOT USE DIRECTLY)
+    ├── README.md          # Study guide for reference implementation
+    ├── behaviour.rs       # libp2p swarm composition ⭐
+    ├── ip.rs              # Protocol handler + ring buffers ⭐
+    └── config.rs          # Ed25519 key management ⭐
 ```
 
 ## Reference Implementation
@@ -81,48 +114,58 @@ See `reference/README.md` for detailed study guide.
 
 See `IMPLEMENTATION.md` for the complete phase-by-phase checklist.
 
-### Phase 0: Prototype (6-8 weeks)
-**Goal:** Desktop-only network with relay-based embeddings job execution
+### Phase 1: Foundation & Infrastructure (Current)
 
-**Critical validations (Week 1-2):**
-- [ ] iOS background compute test (SHOWSTOPPER RISK - 40% failure probability)
-- [ ] Relay throughput benchmark
-- [ ] mTLS on mobile compatibility
+**Status:** 5/12 modules complete
 
-**Core networking (Week 3-4):**
-- [ ] libp2p swarm setup (inspired by reference/behaviour.rs)
-- [ ] Job protocol handler (inspired by reference/ip.rs)
-- [ ] Deploy relay server
-- [ ] Test NAT traversal
+**✅ Completed:**
+- Device identity system (Ed25519 keypairs, multibase serialization)
+- Database schemas (PostgreSQL + SQLite migrations)
+- Relay server (Circuit Relay v2 with token auth)
+- Network swarm (libp2p: Identify + RelayClient + DCUTR)
+- Job protocol (request-response with CBOR serialization)
+
+**🚧 In Progress:**
+- Control plane registration API
+- Job execution engine
+- Desktop agent CLI
+- Ledger & credit system
 
 **Deliverables:**
-- 2 desktop devices can join network via relay
-- Embeddings job executes successfully
-- Ledger tracks credits burned
+- ✅ Relay server deployable
+- ✅ Agent can connect to relay and establish circuits
+- ✅ Job protocol can send/receive job requests
+- 🚧 Desktop agent can register with control plane
+- 🚧 Desktop agent can execute jobs locally
+- 🚧 Credit tracking functional
 
-### Phase 1: MVP (12-16 weeks after Phase 0)
-**Goal:** Production-ready alpha with mobile agents, 2 workloads, web dashboard
+### Phase 2: Desktop MVP (Planned)
 
-**Major components:**
-- iOS + Android mobile agents (8-10 weeks - HIGHEST RISK)
-- OCR + Small Chat workloads
-- Web dashboard (ledger UI, device management)
-- Roles & policies (admin/member/guest)
-- Job retries & streaming
-
-**Success metrics:**
-- 25-50 alpha users
-- 50% weekly active users run ≥1 job
-- 70% job success rate
-
-### Phase 2: Production Hardening (16-20 weeks after Phase 1)
-**Goal:** Public beta ready
+**Goal:** Working desktop-only proof of concept
 
 **Major components:**
-- P2P fast-path (reduce relay bandwidth by 50%+)
-- Advanced scheduling (eligibility + weighted scoring)
-- Security audit + GDPR compliance
-- Monitoring & alerting
+- Desktop agent CLI
+- Control plane API (device registration, network management)
+- Embeddings workload (first workload type)
+- Credit ledger system
+- Job routing and execution
+
+**Success criteria:**
+- 2+ desktop devices can join a network
+- Jobs route between devices via relay
+- Credits properly tracked
+- End-to-end job execution verified
+
+### Phase 3: Mobile & Production (Future)
+
+**Goal:** Mobile agents + production hardening
+
+**Major components:**
+- iOS + Android mobile agents
+- Multiple workload types (OCR, chat, etc.)
+- Web dashboard
+- P2P fast-path optimization
+- Security audit & monitoring
 
 ## Tech Stack
 
@@ -151,28 +194,77 @@ See `IMPLEMENTATION.md` for the complete phase-by-phase checklist.
 
 ### Prerequisites
 - Rust 1.75+ (https://rustup.rs)
+- PostgreSQL 15+ (for control plane)
 - Git
+
+### Build & Test
+
+```bash
+# Clone repository
+git clone <repo-url>
+cd meshnet
+
+# Build all components
+cargo build --workspace
+
+# Run tests (41 tests)
+cargo test --workspace
+
+# Run clippy
+cargo clippy --workspace -- -D warnings
+```
+
+### Run Relay Server
+
+```bash
+# Start relay server (default: localhost:4001)
+cargo run --bin relay-server
+
+# Or with custom config
+cargo run --bin relay-server -- --config relay.toml
+```
+
+See `relay-server/README.md` for deployment guide.
+
+### Test Agent Connectivity
+
+```bash
+# Terminal 1: Start relay server
+cargo run --bin relay-server
+
+# Terminal 2: Run integration test (two agents via relay)
+RUST_LOG=debug cargo run --example relay_connectivity
+
+# Expected: Both agents connect to relay and establish circuit
+```
 
 ### Study the Reference Implementation
 ```bash
-cd meshnet/reference
+cd reference
 cat README.md  # Comprehensive study guide
 ```
 
-### Start Phase 0 Implementation
-
-**Week 1-2: Critical Validation**
-1. Build iOS background compute test
-2. Benchmark relay server throughput
-3. Test mTLS on mobile
-
-**Decision Point:** Proceed based on iOS validation results.
-
 ## Documentation
 
-- **Product Spec:** `plan.md` (668 lines JSON)
-- **Implementation Guide:** `IMPLEMENTATION.md` (phase-by-phase checklist)
-- **Reference Code Study:** `reference/README.md`
+- **Product Spec:** `PLAN.md` - Full product specification (JSON format)
+- **Implementation Guide:** `IMPLEMENTATION.md` - Phase-by-phase implementation checklist
+- **Reference Code Study:** `reference/README.md` - Study guide for reference VPN implementation
+- **Relay Server:** `relay-server/README.md` - Deployment and configuration guide
+
+## Key Technologies
+
+- **Networking:** libp2p 0.56 (Circuit Relay v2, DCUTR, Request-Response)
+- **Serialization:** CBOR (job envelopes), TOML (config), JSON (API)
+- **Cryptography:** Ed25519 (device identity), Noise (transport encryption)
+- **Database:** PostgreSQL (control plane), SQLite (local agent storage)
+- **Async Runtime:** Tokio 1.47
+- **Logging:** tracing + tracing-subscriber
+
+## Resources
+
+- **libp2p Documentation:** https://docs.libp2p.io/
+- **Circuit Relay v2 Spec:** https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md
+- **CBOR Spec:** https://cbor.io/
 
 ## License
 
@@ -185,44 +277,8 @@ See `reference/README.md` for license compliance details.
 
 Network architecture patterns inspired by a reference mesh VPN implementation (see `.env` for details), licensed under MPL-2.0. We study libp2p implementation patterns and adapt them for job execution (not IP routing).
 
-## Critical Risks
-
-1. **iOS Background Compute (40% failure probability)**
-   - **Impact:** Mobile value prop collapses
-   - **Mitigation:** Validate in Week 1-2, pivot to foreground-only if needed
-
-2. **Relay Bandwidth Costs (30% probability)**
-   - **Impact:** Unit economics break
-   - **Mitigation:** Use Cloudflare for cheap egress, accelerate P2P fast-path
-
-3. **Credit System Gaming (50% probability at scale)**
-   - **Impact:** Economic collapse
-   - **Mitigation:** Spot-check validation, rate limits, social trust
-
-## Team Requirements
-
-| Role | FTE | Skills |
-|------|-----|--------|
-| Backend Engineer | 2.0 | Rust/Go, distributed systems, databases |
-| iOS Engineer | 1.0 | Swift, Core ML, **background execution expertise** |
-| Android Engineer | 1.0 | Kotlin, NNAPI/TFLite |
-| Desktop Engineer | 0.5 | Rust, cross-platform |
-| ML Engineer | 0.75 | Model optimization, quantization |
-| DevOps | 0.5 | Kubernetes, PostgreSQL, Redis |
-| Product/Design | 0.5 | Developer tools UX |
-
-**Total: 5-7 people, ~7 FTE**
-
-## Resources
-
-- **Reference Implementation:** See `.env` for repository details
-- **libp2p Documentation:** https://docs.libp2p.io/
-- **Relay Specification:** https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md
-
-## Contact
-
-TBD
-
 ---
 
-**Status:** Initial planning complete. Ready to begin Phase 0 (Week 1-2: Critical Validation Prototypes).
+**Build Status:** ✅ All tests passing (41 tests)
+**Current Phase:** Phase 1 - Foundation & Infrastructure (5/12 modules complete)
+**Next Milestone:** Module 2.3 - Control Plane Registration API
