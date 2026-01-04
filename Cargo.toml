@@ -20,7 +20,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Networking (libp2p ecosystem) - inspired by Carcass reference implementation
-libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify"] }
+libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "macros", "tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -44,7 +44,7 @@ thiserror = "2.0"
 
 # Metrics and observability
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
