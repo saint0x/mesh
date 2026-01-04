@@ -8,6 +8,7 @@ pub enum RelayError {
     Config(String),
 
     /// Network error occurred
+    #[allow(dead_code)]
     #[error("Network error: {0}")]
     Network(String),
 

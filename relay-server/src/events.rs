@@ -101,27 +101,26 @@ async fn handle_behaviour_event(event: RelayBehaviourEvent) {
 
     match event {
         // Identify protocol events
-        RelayBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
-            tracing::debug!(
-                peer_id = %peer_id,
-                protocol_version = %info.protocol_version,
-                agent_version = %info.agent_version,
-                listen_addrs = ?info.listen_addrs,
-                protocols = ?info.protocols,
-                "Peer identified"
-            );
-        }
-
-        RelayBehaviourEvent::Identify(identify::Event::Sent { .. }) => {
-            tracing::trace!("Sent identify info");
-        }
-
-        RelayBehaviourEvent::Identify(identify::Event::Pushed { .. }) => {
-            tracing::trace!("Pushed identify update");
-        }
-
-        RelayBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. }) => {
-            tracing::warn!(peer_id = %peer_id, error = ?error, "Identify error");
+        RelayBehaviourEvent::Identify(boxed_event) => match boxed_event.as_ref() {
+            identify::Event::Received { peer_id, info, .. } => {
+                tracing::debug!(
+                    peer_id = %peer_id,
+                    protocol_version = %info.protocol_version,
+                    agent_version = %info.agent_version,
+                    listen_addrs = ?info.listen_addrs,
+                    protocols = ?info.protocols,
+                    "Peer identified"
+                );
+            }
+            identify::Event::Sent { .. } => {
+                tracing::trace!("Sent identify info");
+            }
+            identify::Event::Pushed { .. } => {
+                tracing::trace!("Pushed identify update");
+            }
+            identify::Event::Error { peer_id, error, .. } => {
+                tracing::warn!(peer_id = %peer_id, error = ?error, "Identify error");
+            }
         }
 
         // Relay protocol events - Reservations

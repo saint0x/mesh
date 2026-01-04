@@ -46,6 +46,7 @@ pub struct LoggingConfig {
 
 impl Config {
     /// Get default configuration file path: `~/.meshnet/relay.toml`
+    #[allow(dead_code)]
     pub fn default_path() -> Result<PathBuf> {
         let home = dirs::home_dir()
             .ok_or_else(|| RelayError::Config("Cannot determine home directory".into()))?;

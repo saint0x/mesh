@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
 /// Network model
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Network {
     pub network_id: String,
     pub name: String,
@@ -12,7 +11,7 @@ pub struct Network {
 }
 
 /// Device model
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Device {
     pub device_id: String, // UUID as string
     pub network_id: String,
@@ -58,7 +57,7 @@ impl std::str::FromStr for DeviceStatus {
 }
 
 /// Ledger event model
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEvent {
     pub event_id: String, // UUID as string
     pub network_id: String,

@@ -66,6 +66,7 @@ impl TokenAuth {
     }
 
     /// Remove expired authentications
+    #[allow(dead_code)]
     pub fn cleanup_expired(&mut self) {
         let now = Instant::now();
         let before_count = self.authenticated_peers.len();
@@ -86,6 +87,7 @@ impl TokenAuth {
     }
 
     /// Get count of authenticated peers
+    #[allow(dead_code)]
     pub fn authenticated_count(&self) -> usize {
         self.authenticated_peers.len()
     }

@@ -1,6 +1,6 @@
-use sqlx::migrate::MigrateDatabase;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use std::str::FromStr;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use std::path::PathBuf;
 use thiserror::Error;
 
 pub mod models;
@@ -9,10 +9,10 @@ pub mod models;
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Rusqlite(#[from] rusqlite::Error),
 
-    #[error("Migration error: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("Connection pool error: {0}")]
+    Pool(#[from] r2d2::Error),
 
     #[error("Database not found: {0}")]
     NotFound(String),
@@ -23,55 +23,51 @@ pub enum DbError {
 
 pub type Result<T> = std::result::Result<T, DbError>;
 
-/// Database connection pool and configuration
+/// Database connection pool
+#[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl Database {
     /// Create a new database connection pool
-    ///
-    /// # Arguments
-    ///
-    /// * `database_url` - SQLite database URL (e.g., "sqlite:meshnet.db" or "sqlite::memory:")
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use control_plane::db::Database;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// // File-based database
-    /// let db = Database::new("sqlite:meshnet.db").await?;
-    ///
-    /// // In-memory database (for testing)
-    /// let db = Database::new("sqlite::memory:").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn new(database_url: &str) -> Result<Self> {
-        tracing::info!(url = %database_url, "Connecting to database");
+    pub fn new(database_path: &str) -> Result<Self> {
+        tracing::info!(path = %database_path, "Connecting to database");
 
-        // Create database if it doesn't exist (for file-based DBs)
-        if !database_url.contains(":memory:")
-            && !sqlx::Sqlite::database_exists(database_url).await?
-        {
-            tracing::info!("Database does not exist, creating...");
-            sqlx::Sqlite::create_database(database_url).await?;
+        // Create directory if needed (skip for :memory: databases)
+        if database_path != ":memory:" {
+            if let Some(parent) = std::path::Path::new(database_path).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    DbError::Config(format!("Failed to create database directory: {}", e))
+                })?;
+            }
         }
 
-        // Configure connection options
-        let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal) // Write-Ahead Logging for better concurrency
-            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal) // Balance safety and performance
-            .foreign_keys(true); // Enable foreign key constraints
+        // For in-memory databases, use shared cache to ensure all connections see the same data
+        // If the path contains "?mode=memory", it's a unique in-memory DB, use as-is
+        let is_memory = database_path == ":memory:" || database_path.contains("?mode=memory");
+        let connection_string = if database_path == ":memory:" {
+            "file::memory:?cache=shared"
+        } else {
+            database_path
+        };
+
+        // Create connection manager
+        let manager = SqliteConnectionManager::file(connection_string)
+            .with_init(move |conn| {
+                // Enable foreign keys
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                // Enable WAL mode for better concurrency (not applicable to :memory:)
+                if !is_memory {
+                    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+                }
+                Ok(())
+            });
 
         // Create connection pool
-        let pool = SqlitePoolOptions::new()
-            .max_connections(10)
-            .connect_with(options)
-            .await?;
+        let pool = Pool::builder()
+            .max_size(10)
+            .build(manager)?;
 
         tracing::info!("Database connected successfully");
 
@@ -79,22 +75,58 @@ impl Database {
     }
 
     /// Run database migrations
-    ///
-    /// Applies all pending migrations from the `migrations/` directory.
-    pub async fn migrate(&self) -> Result<()> {
+    pub fn migrate(&self) -> Result<()> {
         tracing::info!("Running database migrations");
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
+
+        let conn = self.pool.get()?;
+
+        // Read migration files and execute
+        // Use CARGO_MANIFEST_DIR to find migrations relative to crate root
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| ".".to_string());
+        let migrations_dir = std::path::Path::new(&manifest_dir).join("migrations");
+
+        if !migrations_dir.exists() {
+            return Err(DbError::Config(format!(
+                "Migrations directory not found at: {}",
+                migrations_dir.display()
+            )));
+        }
+
+        // Get all .sql files
+        let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)
+            .map_err(|e| DbError::Config(format!("Failed to read migrations directory: {}", e)))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().and_then(|s| s.to_str()) == Some("sql")
+            })
+            .collect();
+
+        // Sort by filename (assumes numeric prefix like 001_, 002_, etc.)
+        migration_files.sort_by_key(|entry| entry.path());
+
+        // Execute each migration
+        for entry in migration_files {
+            let path = entry.path();
+            tracing::info!(file = %path.display(), "Applying migration");
+
+            let sql = std::fs::read_to_string(&path)
+                .map_err(|e| DbError::Config(format!("Failed to read migration file: {}", e)))?;
+
+            conn.execute_batch(&sql)?;
+        }
+
         tracing::info!("Migrations completed successfully");
         Ok(())
     }
 
-    /// Get a reference to the connection pool
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    /// Get a connection from the pool
+    pub fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        Ok(self.pool.get()?)
     }
 
     /// Get default database path: `~/.meshnet/control-plane.db`
-    pub fn default_path() -> Result<String> {
+    pub fn default_path() -> Result<PathBuf> {
         let home = dirs::home_dir()
             .ok_or_else(|| DbError::Config("Could not determine home directory".to_string()))?;
 
@@ -102,97 +134,98 @@ impl Database {
         std::fs::create_dir_all(&db_dir)
             .map_err(|e| DbError::Config(format!("Failed to create database directory: {}", e)))?;
 
-        let db_path = db_dir.join("control-plane.db");
-        Ok(format!("sqlite:{}", db_path.display()))
+        Ok(db_dir.join("control-plane.db"))
     }
+}
 
-    /// Close the database connection pool
-    pub async fn close(self) {
-        tracing::info!("Closing database connection");
-        self.pool.close().await;
-    }
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Create a unique in-memory database for testing
+/// Each call returns a new isolated database
+#[cfg(test)]
+pub(crate) fn create_test_db() -> Database {
+    let id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let db_name = format!("file:testdb{}?mode=memory&cache=shared", id);
+    let db = Database::new(&db_name).expect("Failed to create test database");
+    db.migrate().expect("Failed to run migrations");
+    db
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_create_in_memory_db() {
-        let db = Database::new("sqlite::memory:")
-            .await
-            .expect("Failed to create in-memory database");
+    #[test]
+    fn test_create_in_memory_db() {
+        let db = Database::new(":memory:").expect("Failed to create in-memory database");
 
         // Verify we can execute a simple query
-        let result: (i64,) = sqlx::query_as("SELECT 1")
-            .fetch_one(db.pool())
-            .await
+        let conn = db.get_conn().expect("Failed to get connection");
+        let result: i64 = conn
+            .query_row("SELECT 1", [], |row| row.get(0))
             .expect("Failed to execute query");
 
-        assert_eq!(result.0, 1);
+        assert_eq!(result, 1);
     }
 
-    #[tokio::test]
-    async fn test_run_migrations() {
-        let db = Database::new("sqlite::memory:")
-            .await
-            .expect("Failed to create database");
-
-        db.migrate().await.expect("Failed to run migrations");
+    #[test]
+    fn test_run_migrations() {
+        let db = Database::new(":memory:").expect("Failed to create database");
+        db.migrate().expect("Failed to run migrations");
 
         // Verify tables were created
-        let tables: Vec<(String,)> =
-            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                .fetch_all(db.pool())
-                .await
-                .expect("Failed to query tables");
+        let conn = db.get_conn().expect("Failed to get connection");
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .expect("Failed to prepare statement");
 
-        let table_names: Vec<String> = tables.into_iter().map(|(name,)| name).collect();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("Failed to query tables")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("Failed to collect results");
 
-        assert!(table_names.contains(&"networks".to_string()));
-        assert!(table_names.contains(&"devices".to_string()));
-        assert!(table_names.contains(&"ledger_events".to_string()));
+        assert!(tables.contains(&"networks".to_string()));
+        assert!(tables.contains(&"devices".to_string()));
+        assert!(tables.contains(&"ledger_events".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_foreign_keys_enabled() {
-        let db = Database::new("sqlite::memory:")
-            .await
-            .expect("Failed to create database");
+    #[test]
+    fn test_foreign_keys_enabled() {
+        let db = Database::new(":memory:").expect("Failed to create database");
+        let conn = db.get_conn().expect("Failed to get connection");
 
-        let result: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
-            .fetch_one(db.pool())
-            .await
+        let result: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("Failed to check foreign keys");
 
-        assert_eq!(result.0, 1, "Foreign keys should be enabled");
+        assert_eq!(result, 1, "Foreign keys should be enabled");
     }
 
-    #[tokio::test]
-    async fn test_wal_mode_enabled() {
-        // Note: In-memory databases use "memory" journal mode, not WAL
-        // This test would pass with a file-based database
-        let db = Database::new("sqlite::memory:")
-            .await
-            .expect("Failed to create database");
+    #[test]
+    fn test_wal_mode_enabled() {
+        let db = Database::new(":memory:").expect("Failed to create database");
+        let conn = db.get_conn().expect("Failed to get connection");
 
-        let result: (String,) = sqlx::query_as("PRAGMA journal_mode")
-            .fetch_one(db.pool())
-            .await
+        let result: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("Failed to check journal mode");
 
         // In-memory DBs use "memory" mode, file DBs would use "wal"
         assert!(
-            result.0 == "memory" || result.0 == "wal",
+            result == "memory" || result == "wal",
             "Journal mode should be memory (for :memory:) or wal (for file)"
         );
     }
 
-    #[tokio::test]
-    async fn test_default_path() {
+    #[test]
+    fn test_default_path() {
         let path = Database::default_path().expect("Failed to get default path");
-        assert!(path.starts_with("sqlite:"));
-        assert!(path.contains(".meshnet"));
-        assert!(path.ends_with("control-plane.db"));
+        assert!(path.to_string_lossy().contains(".meshnet"));
+        assert!(path.to_string_lossy().ends_with("control-plane.db"));
     }
 }

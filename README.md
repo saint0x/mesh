@@ -7,9 +7,9 @@ Create a network, add devices and people, and route AI jobs across pooled comput
 ## Project Status
 
 **Current Phase:** Phase 1.5 - Network Layer Implementation (In Progress)
-**Completed Modules:** 5/12 Phase 1 modules
-**Test Coverage:** 41 tests passing (34 unit + 7 doc tests)
-**Next Milestone:** Module 2.3 - Control Plane Registration API
+**Completed Modules:** 6/12 Phase 1 modules
+**Test Coverage:** 78 tests passing (71 unit + 7 doc tests)
+**Next Milestone:** Module 3.1 - Embeddings Workload Executor
 
 ### Completed Modules
 
@@ -19,11 +19,11 @@ Create a network, add devices and people, and route AI jobs across pooled comput
 ✅ **Module 1.4: Relay Server** (Circuit Relay v2 + token auth)
 ✅ **Module 1.5: Network Swarm** (libp2p with Identify, RelayClient, DCUTR)
 ✅ **Module 2.2: Job Protocol** (Request-response job distribution with CBOR)
+✅ **Module 2.3: Control Plane Registration API** (Device registration, heartbeat, presence monitor, MVP certificates)
 
 ### Currently Building
 
-🚧 **Module 2.3:** Control Plane Registration API
-🚧 **Module 2.4:** Job execution engine
+🚧 **Module 3.1:** Embeddings Workload Executor (ONNX Runtime + all-MiniLM-L6-v2)
 
 ## What Is This?
 
@@ -60,11 +60,14 @@ mesh/
 │
 ├── agent/                 # ✅ Desktop agent implementation (Rust)
 │   ├── src/
-│   │   ├── device/        # ✅ Ed25519 identity, capabilities detection
+│   │   ├── device/        # ✅ Ed25519 identity, capabilities detection, certificate storage
 │   │   ├── network/       # ✅ libp2p mesh swarm + job protocol
 │   │   │   ├── mesh_swarm.rs    # ✅ Relay + DCUTR + Job Protocol
 │   │   │   ├── job_protocol.rs  # ✅ Request-response job distribution
 │   │   │   └── events.rs        # ✅ Network event types
+│   │   ├── api/           # ✅ Control plane client
+│   │   │   ├── registration.rs  # ✅ Registration client with retry + heartbeat loop
+│   │   │   └── types.rs         # ✅ API request/response types
 │   │   └── errors.rs      # ✅ Error handling
 │   └── examples/
 │       └── relay_connectivity.rs # ✅ Integration test example
@@ -76,9 +79,12 @@ mesh/
 │   │   └── auth.rs        # ✅ Token-based authentication
 │   └── README.md          # ✅ Deployment guide
 │
-├── control-plane/         # 🚧 Control plane (stub, TypeScript planned)
+├── control-plane/         # ✅ Control plane (Rust + Axum)
 │   └── src/
-│       └── db/            # ✅ PostgreSQL schema + migrations
+│       ├── api/           # ✅ REST API routes (registration, heartbeat)
+│       ├── services/      # ✅ Business logic (device service, certificates, presence)
+│       ├── db/            # ✅ SQLite database with migrations
+│       └── state.rs       # ✅ Application state
 │
 └── reference/             # Reference VPN code study (DO NOT USE DIRECTLY)
     ├── README.md          # Study guide for reference implementation
@@ -116,18 +122,19 @@ See `IMPLEMENTATION.md` for the complete phase-by-phase checklist.
 
 ### Phase 1: Foundation & Infrastructure (Current)
 
-**Status:** 5/12 modules complete
+**Status:** 6/12 modules complete
 
 **✅ Completed:**
 - Device identity system (Ed25519 keypairs, multibase serialization)
-- Database schemas (PostgreSQL + SQLite migrations)
+- Database schemas (SQLite migrations for control plane)
 - Relay server (Circuit Relay v2 with token auth)
 - Network swarm (libp2p: Identify + RelayClient + DCUTR)
 - Job protocol (request-response with CBOR serialization)
+- Control plane registration API (device registration, heartbeat, presence monitoring)
 
 **🚧 In Progress:**
-- Control plane registration API
-- Job execution engine
+- Embeddings workload executor (ONNX Runtime)
+- Job execution loop
 - Desktop agent CLI
 - Ledger & credit system
 
@@ -135,8 +142,9 @@ See `IMPLEMENTATION.md` for the complete phase-by-phase checklist.
 - ✅ Relay server deployable
 - ✅ Agent can connect to relay and establish circuits
 - ✅ Job protocol can send/receive job requests
-- 🚧 Desktop agent can register with control plane
-- 🚧 Desktop agent can execute jobs locally
+- ✅ Desktop agent can register with control plane
+- ✅ Control plane tracks device presence via heartbeats
+- 🚧 Desktop agent can execute embeddings jobs locally
 - 🚧 Credit tracking functional
 
 ### Phase 2: Desktop MVP (Planned)
@@ -170,10 +178,10 @@ See `IMPLEMENTATION.md` for the complete phase-by-phase checklist.
 ## Tech Stack
 
 ### Control Plane
-- **Language:** TypeScript (Node.js) or Rust (Axum)
-- **Database:** PostgreSQL 15+
-- **Cache:** Redis 7+
-- **Auth:** NextAuth.js or OAuth libraries
+- **Language:** Rust
+- **Framework:** Axum (async web framework)
+- **Database:** SQLite (with r2d2 connection pooling)
+- **Serialization:** CBOR (certificates), JSON (API)
 
 ### Relay Gateway
 - **Language:** Rust
@@ -207,7 +215,7 @@ cd meshnet
 # Build all components
 cargo build --workspace
 
-# Run tests (41 tests)
+# Run tests (78 tests)
 cargo test --workspace
 
 # Run clippy
@@ -279,6 +287,6 @@ Network architecture patterns inspired by a reference mesh VPN implementation (s
 
 ---
 
-**Build Status:** ✅ All tests passing (41 tests)
-**Current Phase:** Phase 1 - Foundation & Infrastructure (5/12 modules complete)
-**Next Milestone:** Module 2.3 - Control Plane Registration API
+**Build Status:** ✅ All tests passing (78 tests)
+**Current Phase:** Phase 1 - Foundation & Infrastructure (6/12 modules complete)
+**Next Milestone:** Module 3.1 - Embeddings Workload Executor

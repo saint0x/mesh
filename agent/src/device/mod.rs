@@ -249,6 +249,57 @@ impl DeviceConfig {
             keypair::public_key(&self.keypair).to_bytes(),
         )
     }
+
+    /// Get default certificate file path: `~/.meshnet/device-cert.bin`
+    pub fn default_certificate_path() -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            AgentError::Config("Could not determine home directory".to_string())
+        })?;
+
+        let meshnet_dir = home.join(".meshnet");
+        if !meshnet_dir.exists() {
+            fs::create_dir_all(&meshnet_dir)?;
+        }
+
+        Ok(meshnet_dir.join("device-cert.bin"))
+    }
+
+    /// Save device certificate to file
+    pub fn save_certificate(&self, certificate: &[u8]) -> Result<()> {
+        let cert_path = Self::default_certificate_path()?;
+
+        // Atomic write
+        let temp_path = cert_path.with_extension("bin.tmp");
+        fs::write(&temp_path, certificate)?;
+        fs::rename(&temp_path, &cert_path)?;
+
+        tracing::info!(path = %cert_path.display(), size = certificate.len(), "Certificate saved");
+        Ok(())
+    }
+
+    /// Load device certificate from file
+    pub fn load_certificate(&self) -> Result<Vec<u8>> {
+        let cert_path = Self::default_certificate_path()?;
+
+        if !cert_path.exists() {
+            return Err(AgentError::Config(format!(
+                "Certificate file not found: {}",
+                cert_path.display()
+            )));
+        }
+
+        let certificate = fs::read(&cert_path)?;
+        tracing::info!(path = %cert_path.display(), size = certificate.len(), "Certificate loaded");
+        Ok(certificate)
+    }
+
+    /// Check if device certificate exists
+    pub fn has_certificate(&self) -> bool {
+        Self::default_certificate_path()
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

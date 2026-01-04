@@ -22,6 +22,14 @@ pub enum AgentError {
     /// Network error (connection failed, protocol error, etc.)
     #[error("Network error: {0}")]
     Network(String),
+
+    /// HTTP client error
+    #[error("HTTP error: {0}")]
+    Http(String),
+
+    /// Device registration error
+    #[error("Registration error: {0}")]
+    Registration(String),
 }
 
 /// Result type alias for agent operations.
