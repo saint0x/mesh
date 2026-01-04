@@ -27,6 +27,9 @@
 .env.local
 .env.*.local
 
+# Reference information
+.env
+
 # macOS
 .DS_Store
 .AppleDouble

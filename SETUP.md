@@ -1,4 +1,4 @@
-# MeshNet Project Setup
+# Mesh Project Setup
 
 ## Project Structure
 
@@ -8,7 +8,7 @@ meshnet/
 ├── plan.md                 # Product specification (original JSON)
 ├── IMPLEMENTATION.md       # Detailed implementation roadmap
 ├── SETUP.md               # This file
-├── libs/                  # Utility libraries from Carcass
+├── libs/                  # Utility libraries from reference implementation
 │   ├── README.md          # Library documentation and attribution
 │   ├── cyn/               # Error chaining framework
 │   ├── ust/               # Terminal styling utilities
@@ -21,54 +21,54 @@ meshnet/
     └── control-plane/     # Control plane (might be separate repo)
 ```
 
-## What Was Copied from Carcass
+## What Was Copied from Reference Implementation
 
-We've copied 5 utility libraries from the Carcass project (https://github.com/cull-os/carcass):
+We've copied 5 utility libraries from the reference VPN implementation (see `.env` for details):
 
 ### 1. cyn - Error Chaining Framework ⭐ **CRITICAL**
 - **Files:** `libs/cyn/` (2 files)
 - **Purpose:** Production-grade error handling with context chains
 - **License:** MPL-2.0
 - **Why:** Best-in-class Rust error handling. Shows full error path instead of just final error.
-- **Usage in MeshNet:** All agent, relay, and control plane code will use cyn for error handling
+- **Usage in Mesh:** All agent, relay, and control plane code will use cyn for error handling
 
 ### 2. ust - Universal Styling
 - **Files:** `libs/ust/` (8 files)
 - **Purpose:** Terminal color codes and formatting
 - **License:** MPL-2.0
 - **Why:** Used by cyn for pretty error output. Also useful for CLI tools.
-- **Usage in MeshNet:** CLI applications, error rendering
+- **Usage in Mesh:** CLI applications, error rendering
 
 ### 3. dup - Cheap Clone Trait
 - **Files:** `libs/dup/` (5 files, including macros/)
 - **Purpose:** Distinguishes expensive clones from cheap clones (Arc/Rc)
 - **License:** MPL-2.0
 - **Why:** Used by cyn for efficient error chains
-- **Usage in MeshNet:** Error handling infrastructure
+- **Usage in Mesh:** Error handling infrastructure
 
 ### 4. ranged - Span and Size Types
 - **Files:** `libs/ranged/` (4 files)
 - **Purpose:** Text position tracking
 - **License:** MPL-2.0
 - **Why:** Dependency of ust
-- **Usage in MeshNet:** Indirect dependency
+- **Usage in Mesh:** Indirect dependency
 
 ### 5. cab-util - Expression Language Utilities
 - **Files:** `libs/cab-util/` (4 files)
 - **Purpose:** Helper utilities for string manipulation
 - **License:** MPL-2.0
 - **Why:** Dependency of ust
-- **Usage in MeshNet:** Indirect dependency
+- **Usage in Mesh:** Indirect dependency
 
 ## License Compliance
 
 All libraries in `libs/` are licensed under **MPL-2.0** (Mozilla Public License 2.0).
 
 ### Key Points:
-- ✅ We can use these libraries in MeshNet (even in proprietary software)
+- ✅ We can use these libraries in Mesh (even in proprietary software)
 - ✅ We can modify the libraries if needed
 - ⚠️ Any modifications to MPL-licensed files must remain MPL-licensed
-- ✅ MeshNet code that uses these libraries can be under any license we choose
+- ✅ Mesh code that uses these libraries can be under any license we choose
 
 See `libs/README.md` for full license compliance details.
 
@@ -172,10 +172,10 @@ cargo check --workspace
 
 ## References
 
-- **MeshNet Documentation:** `IMPLEMENTATION.md` (phase-by-phase checklist)
+- **Mesh Documentation:** `IMPLEMENTATION.md` (phase-by-phase checklist)
 - **Product Spec:** `plan.md` (original JSON specification)
 - **Utility Libraries:** `libs/README.md` (attribution and usage)
-- **Carcass Project:** https://github.com/cull-os/carcass
+- **Reference Implementation:** See `.env` for repository details
 
 ## Troubleshooting
 

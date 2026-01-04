@@ -25,9 +25,14 @@ Mesh enables:
 
 ### Non-Goals (v1)
 - ❌ Public anonymous marketplace compute
-- ❌ Precise FLOPs metering / cryptographic verifiable compute
+- ❌ Precise FLOPs metering (basic credit system is sufficient for v1)
 - ❌ Model-parallel distributed inference across many unreliable mobile nodes
 - ❌ On-chain tokenomics
+
+### Core Requirements
+- ✅ Cryptographically secure verification of compute results
+- ✅ Trust score system with fraud detection
+- ✅ VRF-based spot-checking for job validation
 
 ## Project Structure
 
@@ -51,7 +56,7 @@ mesh/
 
 ## Reference Implementation
 
-The `reference/` directory contains the **con** (VPN mesh networking) module from the Carcass project (https://github.com/cull-os/carcass, MPL-2.0 license) as architectural inspiration.
+The `reference/` directory contains a VPN mesh networking module (see `.env` for details, MPL-2.0 license) as architectural inspiration.
 
 **Key files to study:**
 1. **reference/behaviour.rs** (231 lines) - libp2p swarm with Relay + DCUTR for NAT traversal
@@ -60,7 +65,7 @@ The `reference/` directory contains the **con** (VPN mesh networking) module fro
 
 See `reference/README.md` for detailed study guide.
 
-### What We Learn from Carcass
+### What We Learn from Reference Implementation
 - ✅ Relay + DCUTR pattern for NAT traversal (battle-tested)
 - ✅ Lock-free ring buffer queuing (256 jobs/device)
 - ✅ Async state machine for protocol handlers
@@ -178,7 +183,7 @@ See `reference/README.md` for license compliance details.
 
 ## Attribution
 
-Network architecture patterns inspired by the Carcass mesh VPN project (https://github.com/cull-os/carcass), licensed under MPL-2.0. We study their libp2p implementation patterns and adapt them for job execution (not IP routing).
+Network architecture patterns inspired by a reference mesh VPN implementation (see `.env` for details), licensed under MPL-2.0. We study libp2p implementation patterns and adapt them for job execution (not IP routing).
 
 ## Critical Risks
 
@@ -210,7 +215,7 @@ Network architecture patterns inspired by the Carcass mesh VPN project (https://
 
 ## Resources
 
-- **Carcass Project:** https://github.com/cull-os/carcass
+- **Reference Implementation:** See `.env` for repository details
 - **libp2p Documentation:** https://docs.libp2p.io/
 - **Relay Specification:** https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md
 

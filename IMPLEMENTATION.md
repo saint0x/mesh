@@ -1,6 +1,6 @@
-# MeshAI Net: Implementation Roadmap
+# Mesh: Implementation Roadmap
 
-> **Note on External Research:** This implementation plan incorporates architectural patterns inspired by open-source P2P networking projects (particularly mesh VPN implementations using libp2p). All code will be implemented with MeshAI-specific naming and adaptations for our job execution use case.
+> **Note on External Research:** This implementation plan incorporates architectural patterns inspired by open-source P2P networking projects (particularly mesh VPN implementations using libp2p, see `.env` for details). All code will be implemented with Mesh-specific naming and adaptations for our job execution use case.
 
 ## Production Difficulty Assessment
 
@@ -598,7 +598,7 @@
   - Network list screen
   - Device detail screen
   - Job history screen
-- [ ] Integrate MeshNet SDK (Swift package wrapping Rust core via FFI)
+- [ ] Integrate Mesh SDK (Swift package wrapping Rust core via FFI)
 - [ ] Implement authentication (OAuth or magic link)
 - [ ] Add network selection/creation UI
 
@@ -687,7 +687,7 @@
   - Network list screen
   - Device detail screen
   - Job history screen
-- [ ] Integrate MeshNet SDK (Kotlin bindings via JNI to Rust core)
+- [ ] Integrate Mesh SDK (Kotlin bindings via JNI to Rust core)
 - [ ] Implement authentication
 - [ ] Add network selection/creation UI
 
@@ -709,7 +709,7 @@
   }
   ```
 - [ ] Create persistent notification
-  - "MeshAI is running - tap to manage"
+  - "Mesh is running - tap to manage"
   - Show current job status
 - [ ] Implement WorkManager for periodic tasks
   ```kotlin
@@ -1386,7 +1386,7 @@ Our networking layer adopts patterns proven in production mesh VPN systems:
 **Open Source Attribution:**
 - libp2p (MIT/Apache-2.0): Core P2P networking library
 - Network architecture inspired by mesh VPN patterns in open-source projects
-- All MeshAI-specific code uses original naming and implementations adapted for job execution use case
+- All Mesh-specific code uses original naming and implementations adapted for job execution use case
 
 **License:** TBD (recommend MIT or Apache-2.0 for agent/SDK, proprietary for control plane)
 
@@ -1449,7 +1449,7 @@ Our networking layer adopts patterns proven in production mesh VPN systems:
 
 ## Conclusion
 
-MeshAI Net is an ambitious but achievable project. The critical path is:
+Mesh is an ambitious but achievable project. The critical path is:
 
 1. **Validate iOS constraints early** (Week 1-2) - this determines mobile strategy
 2. **Leverage proven P2P patterns** (libp2p relay + DCUTR) - saves weeks of NAT debugging

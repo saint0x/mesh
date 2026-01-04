@@ -1,13 +1,12 @@
-# Carcass VPN Reference Implementation
+# VPN Mesh Reference Implementation
 
-This directory contains the **con** (VPN mesh networking) module from the Carcass project as a reference implementation. This code is **NOT used directly** in MeshNet - it serves as architectural inspiration for our own implementation.
+This directory contains a VPN mesh networking module as a reference implementation. This code is **NOT used directly** in Mesh - it serves as architectural inspiration for our own implementation.
 
 ## Source
 
-- **Project:** Carcass - https://github.com/cull-os/carcass
+- **Project Details:** See `.env` file in project root
 - **License:** MPL-2.0 (Mozilla Public License 2.0)
-- **Authors:** Cull OS contributors (RGBCube <git@rgbcu.be>)
-- **Module:** `con` - VPN mesh networking using libp2p
+- **Module:** VPN mesh networking using libp2p
 
 ## What This Code Does
 
@@ -18,7 +17,7 @@ The `con` module is a production mesh VPN implementation that:
 - Generates deterministic IPv4/IPv6 addresses from peer IDs
 - Implements custom IP packet forwarding protocol
 
-**Key Difference from MeshNet:** This code routes IP packets for a VPN. MeshNet routes **job payloads** for distributed AI workloads. We adapt the patterns, not the code.
+**Key Difference from Mesh:** This code routes IP packets for a VPN. Mesh routes **job payloads** for distributed AI workloads. We adapt the patterns, not the code.
 
 ## Files in This Reference
 
@@ -37,7 +36,7 @@ The `con` module is a production mesh VPN implementation that:
 - Transport stack configuration (QUIC, TCP, Noise, Yamux)
 - Event-driven architecture with tokio::select!
 
-**MeshNet adaptation:**
+**Mesh adaptation:**
 - Remove Kademlia DHT (we use centralized control plane)
 - Replace IP protocol with JobProtocol
 - Keep relay + DCUTR setup (proven NAT solution)
@@ -57,7 +56,7 @@ The `con` module is a production mesh VPN implementation that:
 - Producer/Consumer pattern for async work
 - Connection lifecycle management
 
-**MeshNet adaptation:**
+**Mesh adaptation:**
 - Replace `Packet(Vec<u8>)` with `JobEnvelope { job_id, payload, ... }`
 - Change serialization from raw bytes to CBOR
 - Add `Executing` state for running jobs
@@ -82,7 +81,7 @@ The `con` module is a production mesh VPN implementation that:
 - TOML config pattern
 - Keypair generation and persistence
 
-**MeshNet adaptation:**
+**Mesh adaptation:**
 - Keep keypair generation + multibase serialization
 - Add `network_id`, `control_plane_url` fields
 - Add `DeviceCapabilities` (CPU, GPU, RAM, tier)
@@ -100,9 +99,9 @@ The `con` module is a production mesh VPN implementation that:
 - Deterministic ID generation pattern
 - Bidirectional hash maps
 
-**MeshNet adaptation:**
+**Mesh adaptation:**
 - ⚠️ **DO NOT USE** - We don't need IP address generation
-- MeshNet uses device IDs (UUIDs) directly
+- Mesh uses device IDs (UUIDs) directly
 - Note: Has collision risk (TODO on line 79)
 
 ---
@@ -113,8 +112,8 @@ The `con` module is a production mesh VPN implementation that:
 - Platform-specific handling (macOS, Linux)
 - MTU configuration (1420 bytes)
 
-**MeshNet adaptation:**
-- ⚠️ **DO NOT USE** - MeshNet doesn't route IP packets
+**Mesh adaptation:**
+- ⚠️ **DO NOT USE** - Mesh doesn't route IP packets
 - We route job streams at application layer
 
 ---
@@ -179,7 +178,7 @@ type JobConsumer = ringbuf::CachingCons<
 enum ConnectionState {
     Reading(BoxFuture<'static, io::Result<(Stream, JobEnvelope)>>),
     Writing(BoxFuture<'static, io::Result<Stream>>),
-    Executing(Uuid, BoxFuture<'static, io::Result<JobResult>>),  // Added for MeshNet
+    Executing(Uuid, BoxFuture<'static, io::Result<JobResult>>),  // Added for Mesh
     Idle(Option<Stream>),
 }
 ```
@@ -214,13 +213,13 @@ mod keypair_serde {
 ❌ **TUN device code** (interface.rs) - We don't route IP packets
 ❌ **IP address generation** (address.rs) - Has collision risk, unnecessary for job routing
 ❌ **Kademlia DHT** (behaviour.rs) - We use centralized control plane
-❌ **Incomplete CLI commands** (main.rs) - Build MeshNet-specific CLI
+❌ **Incomplete CLI commands** (main.rs) - Build Mesh-specific CLI
 
 ---
 
 ## Implementation Checklist
 
-When implementing MeshNet networking based on this reference:
+When implementing Mesh networking based on this reference:
 
 ### Week 3-4: Core Networking (from behaviour.rs + ip.rs)
 - [ ] Create `src/network/mesh_swarm.rs` (inspired by behaviour.rs)
@@ -241,7 +240,7 @@ When implementing MeshNet networking based on this reference:
 - [ ] Create `src/device/device_config.rs` (inspired by config.rs)
   - [ ] Port Ed25519 keypair generation
   - [ ] Port multibase serde implementation
-  - [ ] Add MeshNet-specific fields (network_id, capabilities, control_plane_url)
+  - [ ] Add Mesh-specific fields (network_id, capabilities, control_plane_url)
   - [ ] TOML config format
 - [ ] Implement device registration with control plane
 - [ ] Test config save/load
@@ -274,15 +273,15 @@ This reference code is licensed under **MPL-2.0** (Mozilla Public License 2.0).
 ### What This Means:
 - ✅ We can study and learn from this code
 - ✅ We can implement similar patterns in our own code
-- ✅ MeshNet code can be under any license we choose
+- ✅ Mesh code can be under any license we choose
 - ⚠️ If we copy code verbatim, those files must remain MPL-2.0
 - ✅ Architectural patterns and algorithms are not copyrightable
 
 ### Our Approach:
 1. **Study** this code to understand libp2p patterns
-2. **Reimplement** patterns in MeshNet with our own names and structure
+2. **Reimplement** patterns in Mesh with our own names and structure
 3. **Adapt** for job execution use case (not IP routing)
-4. **Document** which patterns we learned from Carcass
+4. **Document** which patterns we learned from reference implementation
 
 **Full License:** See https://www.mozilla.org/en-US/MPL/2.0/
 
@@ -305,7 +304,7 @@ This reference code is licensed under **MPL-2.0** (Mozilla Public License 2.0).
 
 ## Additional Resources
 
-- **Carcass Project:** https://github.com/cull-os/carcass
+- **Reference Project:** See `.env` file in project root
 - **libp2p Documentation:** https://docs.libp2p.io/
 - **Relay Specification:** https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md
 - **Ringbuf Crate:** https://docs.rs/ringbuf/latest/ringbuf/
@@ -313,4 +312,4 @@ This reference code is licensed under **MPL-2.0** (Mozilla Public License 2.0).
 
 ---
 
-**Remember:** This is **reference code**, not production code for MeshNet. We learn the patterns and reimplement them for our job execution use case.
+**Remember:** This is **reference code**, not production code for Mesh. We learn the patterns and reimplement them for our job execution use case.
