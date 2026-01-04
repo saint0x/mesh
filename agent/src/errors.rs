@@ -40,6 +40,34 @@ impl From<toml::de::Error> for AgentError {
     }
 }
 
+// Implement From for libp2p noise errors
+impl From<libp2p::noise::Error> for AgentError {
+    fn from(e: libp2p::noise::Error) -> Self {
+        AgentError::Network(format!("Noise encryption error: {}", e))
+    }
+}
+
+// Implement From for libp2p transport errors
+impl From<libp2p::TransportError<std::io::Error>> for AgentError {
+    fn from(e: libp2p::TransportError<std::io::Error>) -> Self {
+        AgentError::Network(format!("Transport error: {}", e))
+    }
+}
+
+// Implement From for libp2p dial errors
+impl From<libp2p::swarm::DialError> for AgentError {
+    fn from(e: libp2p::swarm::DialError) -> Self {
+        AgentError::Network(format!("Dial error: {}", e))
+    }
+}
+
+// Implement From for libp2p listen errors
+impl From<libp2p::swarm::ListenError> for AgentError {
+    fn from(e: libp2p::swarm::ListenError) -> Self {
+        AgentError::Network(format!("Listen error: {}", e))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
