@@ -18,7 +18,7 @@ use uuid::Uuid;
 /// # Examples
 ///
 /// ```no_run
-/// use mesh_agent::DeviceConfig;
+/// use agent::DeviceConfig;
 ///
 /// // Generate new device configuration
 /// let config = DeviceConfig::generate(
@@ -69,7 +69,7 @@ impl DeviceConfig {
     /// # Examples
     ///
     /// ```
-    /// use mesh_agent::DeviceConfig;
+    /// use agent::DeviceConfig;
     ///
     /// let config = DeviceConfig::generate(
     ///     "my-device".to_string(),
@@ -126,7 +126,7 @@ impl DeviceConfig {
     /// # Examples
     ///
     /// ```no_run
-    /// use mesh_agent::DeviceConfig;
+    /// use agent::DeviceConfig;
     /// use std::path::Path;
     ///
     /// let config = DeviceConfig::generate(
@@ -196,7 +196,7 @@ impl DeviceConfig {
     /// # Examples
     ///
     /// ```no_run
-    /// use mesh_agent::DeviceConfig;
+    /// use agent::DeviceConfig;
     /// use std::path::Path;
     ///
     /// let path = Path::new("~/.meshnet/device.toml");
@@ -232,7 +232,7 @@ impl DeviceConfig {
     /// # Examples
     ///
     /// ```
-    /// use mesh_agent::DeviceConfig;
+    /// use agent::DeviceConfig;
     ///
     /// let config = DeviceConfig::generate(
     ///     "my-device".to_string(),

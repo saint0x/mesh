@@ -11,7 +11,7 @@ axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 tokio.workspace = true
-sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "uuid", "json", "time"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "uuid", "json", "time", "migrate"] }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -21,3 +21,4 @@ tracing-subscriber.workspace = true
 dotenvy = "0.15"
 time = { version = "0.3", features = ["serde"] }
 rust_decimal = "1.35"
+dirs = "5.0"

@@ -47,7 +47,7 @@ pub mod keypair_serde {
 /// # Example
 ///
 /// ```
-/// use mesh_agent::device::keypair::generate_keypair;
+/// use agent::device::keypair::{generate_keypair, public_key};
 ///
 /// let signing_key = generate_keypair();
 /// let verifying_key = public_key(&signing_key);

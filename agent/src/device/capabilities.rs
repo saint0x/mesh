@@ -87,7 +87,7 @@ impl DeviceCapabilities {
     /// # Example
     ///
     /// ```
-    /// use mesh_agent::DeviceCapabilities;
+    /// use agent::DeviceCapabilities;
     ///
     /// let caps = DeviceCapabilities::detect();
     /// println!("Device tier: {:?}", caps.tier);

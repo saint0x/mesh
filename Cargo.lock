@@ -593,6 +593,7 @@ name = "control-plane"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dirs",
  "dotenvy",
  "rust_decimal",
  "serde",
