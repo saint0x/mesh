@@ -10,6 +10,7 @@ repository.workspace = true
 tokio.workspace = true
 libp2p.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 toml.workspace = true
 ciborium.workspace = true

@@ -1,10 +1,14 @@
 // Event types for mesh network operations
 
-use libp2p::{PeerId, Multiaddr};
-use serde::{Serialize, Deserialize};
+use libp2p::request_response::ResponseChannel;
+use libp2p::{Multiaddr, PeerId};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::job_protocol::{JobEnvelope, JobResult};
 
 /// High-level events emitted by the mesh swarm
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum MeshEvent {
     /// Successfully connected to relay server
     RelayConnected {
@@ -19,9 +23,7 @@ pub enum MeshEvent {
     },
 
     /// Relay connection was lost
-    RelayDisconnected {
-        relay_peer_id: PeerId,
-    },
+    RelayDisconnected { relay_peer_id: PeerId },
 
     /// Successfully established connection to a peer
     PeerConnected {
@@ -30,9 +32,7 @@ pub enum MeshEvent {
     },
 
     /// Lost connection to a peer
-    PeerDisconnected {
-        peer_id: PeerId,
-    },
+    PeerDisconnected { peer_id: PeerId },
 
     /// Identify protocol received information about a peer
     PeerIdentified {
@@ -42,20 +42,13 @@ pub enum MeshEvent {
     },
 
     /// Listening on a new address (including relay addresses)
-    NewListenAddr {
-        address: Multiaddr,
-    },
+    NewListenAddr { address: Multiaddr },
 
     /// DCUTR (direct connection upgrade) succeeded
-    DirectConnectionUpgraded {
-        peer_id: PeerId,
-    },
+    DirectConnectionUpgraded { peer_id: PeerId },
 
     /// DCUTR failed
-    DirectConnectionUpgradeFailed {
-        peer_id: PeerId,
-        error: String,
-    },
+    DirectConnectionUpgradeFailed { peer_id: PeerId, error: String },
 
     /// Relay reservation succeeded
     ReservationAccepted {
@@ -64,8 +57,23 @@ pub enum MeshEvent {
     },
 
     /// Relay reservation was denied
-    ReservationDenied {
-        relay_peer_id: PeerId,
+    ReservationDenied { relay_peer_id: PeerId },
+
+    /// Received a job request from a peer
+    JobReceived {
+        peer_id: PeerId,
+        job: JobEnvelope,
+        channel: ResponseChannel<JobResult>,
+    },
+
+    /// Received a job result from a peer
+    JobCompleted { peer_id: PeerId, result: JobResult },
+
+    /// Failed to send a job request
+    JobSendFailed {
+        peer_id: PeerId,
+        job_id: Uuid,
+        error: String,
     },
 }
 

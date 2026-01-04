@@ -4,7 +4,9 @@
 // for NAT traversal and DCUTR for direct connection upgrades.
 
 mod events;
+mod job_protocol;
 mod mesh_swarm;
 
-pub use events::{MeshEvent, ConnectionInfo, ConnectionType};
+pub use events::{ConnectionInfo, ConnectionType, MeshEvent};
+pub use job_protocol::{JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
 pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig};

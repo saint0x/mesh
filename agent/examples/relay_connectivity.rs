@@ -16,17 +16,19 @@
 //   # Terminal 2: Run this integration test
 //   cargo run --example relay_connectivity
 
-use agent::{MeshSwarm, MeshEvent};
-use tracing::{info, warn, error};
+use agent::{MeshEvent, MeshSwarm};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     fmt()
-        .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("relay_connectivity=debug".parse()?)
-            .add_directive("agent=debug".parse()?))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("relay_connectivity=debug".parse()?)
+                .add_directive("agent=debug".parse()?),
+        )
         .init();
 
     info!("Starting relay connectivity integration test");
@@ -42,11 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Agent B PeerID: {}", peer_id_b);
 
     // Build swarms for both agents
-    let mut swarm_a = MeshSwarm::builder(keypair_a)
-        .build()?;
+    let mut swarm_a = MeshSwarm::builder(keypair_a).build()?;
 
-    let mut swarm_b = MeshSwarm::builder(keypair_b)
-        .build()?;
+    let mut swarm_b = MeshSwarm::builder(keypair_b).build()?;
 
     info!("Both agents initialized");
 
@@ -57,13 +57,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for Agent A to connect and get relay peer ID
     let relay_peer_id = loop {
         match swarm_a.next_event().await {
-            Some(MeshEvent::PeerConnected { peer_id, connection_info }) => {
+            Some(MeshEvent::PeerConnected {
+                peer_id,
+                connection_info,
+            }) => {
                 info!("Agent A: Connected to relay server {}", peer_id);
-                info!("Agent A: Connection type: {:?}", connection_info.connection_type);
+                info!(
+                    "Agent A: Connection type: {:?}",
+                    connection_info.connection_type
+                );
                 break peer_id;
             }
-            Some(MeshEvent::PeerIdentified { peer_id, agent_version, .. }) => {
-                info!("Agent A: Relay identified as {} ({})", peer_id, agent_version);
+            Some(MeshEvent::PeerIdentified {
+                peer_id,
+                agent_version,
+                ..
+            }) => {
+                info!(
+                    "Agent A: Relay identified as {} ({})",
+                    peer_id, agent_version
+                );
             }
             Some(event) => {
                 info!("Agent A: Event: {:?}", event);
@@ -114,8 +127,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Agent B: Connected to relay server {}", peer_id);
                 break;
             }
-            Some(MeshEvent::PeerIdentified { peer_id, agent_version, .. }) => {
-                info!("Agent B: Relay identified as {} ({})", peer_id, agent_version);
+            Some(MeshEvent::PeerIdentified {
+                peer_id,
+                agent_version,
+                ..
+            }) => {
+                info!(
+                    "Agent B: Relay identified as {} ({})",
+                    peer_id, agent_version
+                );
             }
             Some(event) => {
                 info!("Agent B: Event: {:?}", event);
@@ -158,7 +178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent_a_task = tokio::spawn(async move {
         loop {
             match swarm_a.next_event().await {
-                Some(MeshEvent::PeerConnected { peer_id, connection_info }) => {
+                Some(MeshEvent::PeerConnected {
+                    peer_id,
+                    connection_info,
+                }) => {
                     info!("Agent A: Peer connected: {}", peer_id);
                     if connection_info.is_relayed() {
                         info!("Agent A: ✅ SUCCESS! Relayed connection established");
@@ -185,7 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent_b_task = tokio::spawn(async move {
         loop {
             match swarm_b.next_event().await {
-                Some(MeshEvent::PeerConnected { peer_id, connection_info }) => {
+                Some(MeshEvent::PeerConnected {
+                    peer_id,
+                    connection_info,
+                }) => {
                     info!("Agent B: Peer connected: {}", peer_id);
                     if peer_id == peer_id_a {
                         if connection_info.is_relayed() {

@@ -20,7 +20,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Networking (libp2p ecosystem) - inspired by Carcass reference implementation
-libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "macros", "tokio"] }
+libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "request-response", "macros", "tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
