@@ -26,9 +26,8 @@
 .env
 .env.local
 .env.*.local
-
-# Reference information
-.env
+control-plane/.env
+control-plane/sqlx-data.json
 
 # macOS
 .DS_Store

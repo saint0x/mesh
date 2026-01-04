@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    # Future workspace members will go here:
-    # "agent",           # Desktop/mobile agent
-    # "relay",           # Relay server
-    # "control-plane",   # Control plane API (might be separate repo)
+    "agent",
+    "relay-server",
+    "control-plane",
 ]
 
 [workspace.package]
