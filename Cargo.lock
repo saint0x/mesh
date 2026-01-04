@@ -47,6 +47,7 @@ dependencies = [
  "multibase",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.17",
