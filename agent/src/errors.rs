@@ -30,6 +30,10 @@ pub enum AgentError {
     /// Device registration error
     #[error("Registration error: {0}")]
     Registration(String),
+
+    /// Job execution error
+    #[error("Execution error: {0}")]
+    Execution(String),
 }
 
 /// Result type alias for agent operations.
@@ -73,6 +77,13 @@ impl From<libp2p::swarm::DialError> for AgentError {
 impl From<libp2p::swarm::ListenError> for AgentError {
     fn from(e: libp2p::swarm::ListenError) -> Self {
         AgentError::Network(format!("Listen error: {}", e))
+    }
+}
+
+// Implement From for executor errors
+impl From<crate::executor::ExecutorError> for AgentError {
+    fn from(e: crate::executor::ExecutorError) -> Self {
+        AgentError::Execution(e.to_string())
     }
 }
 
