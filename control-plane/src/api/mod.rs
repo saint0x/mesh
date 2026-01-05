@@ -1,4 +1,5 @@
 pub mod error;
+pub mod ledger;
 pub mod routes;
 pub mod types;
 
@@ -19,6 +20,8 @@ pub fn create_router(state: AppState) -> Router {
         // Device management endpoints
         .route("/api/devices/register", post(routes::register_device))
         .route("/api/devices/:id/heartbeat", post(routes::heartbeat))
+        // Ledger endpoints
+        .route("/api/ledger/events", post(ledger::create_ledger_event))
         // Attach application state
         .with_state(state)
         // Middleware

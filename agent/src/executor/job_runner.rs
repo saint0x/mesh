@@ -230,6 +230,10 @@ pub struct JobRunner {
     executor: EmbeddingsExecutor,
     stats: Arc<JobStats>,
     shutdown_on_idle: bool,
+    ledger_client: Option<crate::telemetry::LedgerClient>,
+    device_id: Option<uuid::Uuid>,
+    network_id: Option<String>,
+    tier: Option<crate::device::Tier>,
 }
 
 impl JobRunner {
@@ -258,12 +262,31 @@ impl JobRunner {
             executor,
             stats: Arc::new(JobStats::new()),
             shutdown_on_idle: false,
+            ledger_client: None,
+            device_id: None,
+            network_id: None,
+            tier: None,
         }
     }
 
     /// Enable shutdown when idle (for testing/ephemeral jobs)
     pub fn with_shutdown_on_idle(mut self) -> Self {
         self.shutdown_on_idle = true;
+        self
+    }
+
+    /// Add ledger tracking to job runner
+    pub fn with_ledger(
+        mut self,
+        ledger_client: crate::telemetry::LedgerClient,
+        device_id: uuid::Uuid,
+        network_id: String,
+        tier: crate::device::Tier,
+    ) -> Self {
+        self.ledger_client = Some(ledger_client);
+        self.device_id = Some(device_id);
+        self.network_id = Some(network_id);
+        self.tier = Some(tier);
         self
     }
 
@@ -467,6 +490,34 @@ impl JobRunner {
             self.stats.record_failure(execution_time_ms);
         }
         self.stats.finish_job();
+
+        // Send ledger event if configured
+        if let (Some(client), Some(device_id), Some(network_id), Some(tier)) = (
+            &self.ledger_client,
+            &self.device_id,
+            &self.network_id,
+            &self.tier,
+        ) {
+            let credits = crate::telemetry::calculate_credits(execution_time_ms, tier);
+            let event = crate::telemetry::LedgerEvent {
+                network_id: network_id.clone(),
+                event_type: if result.success {
+                    "job_completed".to_string()
+                } else {
+                    "job_failed".to_string()
+                },
+                job_id: Some(job_id),
+                device_id: *device_id,
+                credits_amount: if result.success { Some(credits) } else { None },
+                metadata: serde_json::json!({
+                    "execution_time_ms": execution_time_ms,
+                    "workload": "embeddings",
+                }),
+            };
+
+            // Send asynchronously (don't block job result)
+            client.send_event_async(event);
+        }
 
         // Send response
         debug!(
