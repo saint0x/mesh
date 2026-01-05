@@ -4,6 +4,7 @@ pub mod errors;
 pub mod executor;
 pub mod network;
 pub mod observability;
+pub mod resource_manager;
 pub mod telemetry;
 
 pub use api::RegistrationClient;
@@ -16,4 +17,5 @@ pub use network::{
     ConnectionInfo, ConnectionType, MeshEvent, MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig,
 };
 pub use observability::{init_production_logging, init_simple_logging};
+pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
 pub use telemetry::{calculate_credits, LedgerClient, LedgerEvent};

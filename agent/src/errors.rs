@@ -34,6 +34,14 @@ pub enum AgentError {
     /// Job execution error
     #[error("Execution error: {0}")]
     Execution(String),
+
+    /// Resource management error
+    #[error("Resource error: {0}")]
+    Resource(String),
+
+    /// Cooldown is active, unlock not allowed
+    #[error("Cooldown active: {remaining_hours} hours remaining until unlock")]
+    CooldownActive { remaining_hours: u64 },
 }
 
 /// Result type alias for agent operations.
@@ -172,6 +180,14 @@ pub mod display {
             AgentError::Http(_) => {
                 eprintln!("{}", "  → Check network connectivity".yellow());
                 eprintln!("{}", "  → Verify the control plane URL is correct".yellow());
+            }
+            AgentError::Resource(_) => {
+                eprintln!("{}", "  → Check system memory availability".yellow());
+                eprintln!("{}", "  → Ensure sufficient privileges for memory locking".yellow());
+            }
+            AgentError::CooldownActive { remaining_hours } => {
+                eprintln!("{}", format!("  → Unlock will be available in {} hours", remaining_hours).yellow());
+                eprintln!("{}", "  → Use 'mesh resource-status' to check lock status".yellow());
             }
             _ => {}
         }

@@ -50,6 +50,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "futures",
+ "libc",
  "libp2p",
  "multibase",
  "rand 0.8.5",
@@ -66,6 +67,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

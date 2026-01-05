@@ -12,15 +12,16 @@
 //! - `status` - Show device and network status
 
 use agent::{
-    init_production_logging, init_simple_logging, DeviceConfig, EmbeddingsExecutor,
-    EmbeddingsInput, JobRunner, MeshSwarmBuilder, RegistrationClient,
+    format_bytes, init_production_logging, init_simple_logging, parse_memory_string,
+    DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner,
+    MeshSwarmBuilder, RegistrationClient, ResourceManager,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Mesh AI Agent - Distributed compute sharing network
@@ -97,6 +98,19 @@ enum Commands {
 
     /// Show agent metrics and statistics
     Metrics,
+
+    /// Lock resources for pool contribution
+    LockResources {
+        /// Amount of memory to lock (e.g., "7GB", "512MB", or bytes)
+        #[arg(short, long)]
+        memory: String,
+    },
+
+    /// Request unlock (requires 24h cooldown)
+    UnlockResources,
+
+    /// Show resource lock status
+    ResourceStatus,
 }
 
 #[tokio::main]
@@ -144,6 +158,21 @@ async fn main() -> Result<()> {
         Commands::Metrics => {
             // No logging for metrics (pure display)
             cmd_metrics().await?;
+        }
+
+        Commands::LockResources { memory } => {
+            init_simple_logging("info")?;
+            cmd_lock_resources(memory).await?;
+        }
+
+        Commands::UnlockResources => {
+            init_simple_logging("info")?;
+            cmd_unlock_resources().await?;
+        }
+
+        Commands::ResourceStatus => {
+            // No logging for status (pure display)
+            cmd_resource_status().await?;
         }
     }
 
@@ -552,4 +581,160 @@ struct SavedStats {
     last_updated: String,
 }
 
-use agent::EmbeddingsOutput;
+/// Lock resources for pool contribution
+async fn cmd_lock_resources(memory: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Locking Resources".bold().cyan());
+    println!("{}", "=================".cyan());
+
+    // Parse memory string
+    let bytes = parse_memory_string(&memory)
+        .context("Invalid memory format")?;
+
+    // Create and configure resource manager
+    let mut manager = ResourceManager::new()
+        .context("Failed to initialize resource manager")?;
+
+    manager.load_config()
+        .context("Failed to load resource config")?;
+
+    // Check if already locked
+    if manager.is_locked() {
+        println!("\n{}", "Memory is already locked!".yellow());
+        if let Some(remaining) = manager.time_until_unlock() {
+            println!("  Time until unlock: {} hours", remaining.as_secs() / 3600);
+        }
+        return Ok(());
+    }
+
+    // Set allocation
+    manager.set_allocation(bytes)
+        .context("Failed to set allocation")?;
+
+    println!("\n{}", "Allocation:".bold());
+    println!("  Requested:     {}", format_bytes(manager.user_allocated()));
+    println!("  With buffer:   {} (7% safety margin)", format_bytes(manager.locked_memory()));
+    println!("  Total system:  {}", format_bytes(manager.total_memory()));
+
+    // Lock memory
+    println!("\n{}", "Locking memory...".bold());
+
+    match manager.lock_memory() {
+        Ok(()) => {
+            println!("\n{}", "Memory locked successfully!".green().bold());
+            println!("  Lock timestamp: {:?}", manager.lock_timestamp());
+            println!("  Cooldown period: 24 hours");
+            println!("\n{}", "Note: Memory will remain locked for 24 hours.".yellow());
+            println!("{}", "Use 'mesh resource-status' to check lock status.".yellow());
+        }
+        Err(e) => {
+            println!("\n{}", format!("Failed to lock memory: {}", e).red());
+            println!("\n{}", "Possible causes:".yellow());
+            println!("  - Insufficient privileges (try running with sudo)");
+            println!("  - System memory limits (check ulimit -l)");
+            println!("  - Requested memory exceeds available resources");
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Request resource unlock (requires 24h cooldown)
+async fn cmd_unlock_resources() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Unlocking Resources".bold().cyan());
+    println!("{}", "===================".cyan());
+
+    // Create resource manager and load config
+    let mut manager = ResourceManager::new()
+        .context("Failed to initialize resource manager")?;
+
+    manager.load_config()
+        .context("Failed to load resource config")?;
+
+    // Check if locked
+    if !manager.is_locked() {
+        println!("\n{}", "Memory is not locked.".yellow());
+        return Ok(());
+    }
+
+    // Try to unlock
+    match manager.unlock_memory() {
+        Ok(()) => {
+            println!("\n{}", "Memory unlocked successfully!".green().bold());
+            println!("{}", "Resources are now available for other uses.".green());
+        }
+        Err(agent::AgentError::CooldownActive { remaining_hours }) => {
+            println!("\n{}", "Cannot unlock yet - cooldown active!".red().bold());
+            println!("  Remaining time: {} hours", remaining_hours);
+            println!("\n{}", "The 24-hour cooldown period has not elapsed.".yellow());
+            println!("{}", "This prevents frequent resource changes in the pool.".yellow());
+        }
+        Err(e) => {
+            println!("\n{}", format!("Failed to unlock memory: {}", e).red());
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Show resource lock status
+async fn cmd_resource_status() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Resource Lock Status".bold().cyan());
+    println!("{}", "====================".cyan());
+
+    // Create resource manager and load config
+    let mut manager = ResourceManager::new()
+        .context("Failed to initialize resource manager")?;
+
+    manager.load_config()
+        .context("Failed to load resource config")?;
+
+    println!("\n{}", "System Memory:".bold());
+    println!("  Total:         {}", format_bytes(manager.total_memory()));
+
+    println!("\n{}", "Allocation:".bold());
+    println!("  User request:  {}", format_bytes(manager.user_allocated()));
+    println!("  Locked (buf):  {}", format_bytes(manager.locked_memory()));
+
+    println!("\n{}", "Lock Status:".bold());
+    if manager.is_locked() {
+        println!("  Status:        {}", "LOCKED".green().bold());
+
+        if let Some(ts) = manager.lock_timestamp() {
+            match ts.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(duration) => {
+                    let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "Invalid timestamp".to_string());
+                    println!("  Locked at:     {}", datetime);
+                }
+                Err(_) => {
+                    warn!("Lock timestamp is before UNIX epoch - possible system clock issue");
+                    println!("  Locked at:     {}", "Invalid (clock error)".red());
+                }
+            }
+        }
+
+        if let Some(remaining) = manager.time_until_unlock() {
+            let hours = remaining.as_secs() / 3600;
+            let minutes = (remaining.as_secs() % 3600) / 60;
+            println!("  Unlock in:     {}h {}m", hours, minutes);
+        } else {
+            println!("  Unlock in:     {}", "Ready to unlock".green());
+        }
+    } else {
+        println!("  Status:        {}", "UNLOCKED".yellow());
+        println!("  Unlock in:     N/A");
+    }
+
+    println!();
+
+    Ok(())
+}
