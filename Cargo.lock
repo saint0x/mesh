@@ -593,6 +593,7 @@ dependencies = [
  "ciborium",
  "dirs",
  "ed25519-dalek",
+ "futures",
  "multibase",
  "r2d2",
  "r2d2_sqlite",
