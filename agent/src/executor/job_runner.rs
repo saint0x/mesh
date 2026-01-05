@@ -52,6 +52,12 @@ pub struct JobStats {
     pub start_time: Instant,
 }
 
+impl Default for JobStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JobStats {
     /// Create new job statistics tracker
     pub fn new() -> Self {
@@ -570,7 +576,7 @@ impl JobRunner {
                     );
                     println!(
                         "  Embedding: [{:.3}, {:.3}, {:.3}, ...] ({} dims)",
-                        preview.get(0).unwrap_or(&0.0),
+                        preview.first().unwrap_or(&0.0),
                         preview.get(1).unwrap_or(&0.0),
                         preview.get(2).unwrap_or(&0.0),
                         output.dimensions

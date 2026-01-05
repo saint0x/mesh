@@ -35,6 +35,13 @@ anyhow.workspace = true
 colored = "2.1"
 chrono = "0.4"
 
+# Platform-specific dependencies for memory locking
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Memory"] }
+
 # ML inference (mocked for now)
 # TODO: Add real ONNX Runtime when implementing full inference
 # ort = "2.0"
