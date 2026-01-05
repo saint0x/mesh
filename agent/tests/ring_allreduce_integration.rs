@@ -4,7 +4,12 @@
 //! Note: True network-based integration tests require running workers in separate
 //! processes with a relay server. These tests focus on algorithmic correctness.
 
-use agent::executor::{AllReducePhase, Tensor, TensorMessage};
+// Allow range loops in ring algorithm simulation - worker index is used both
+// for array indexing AND mathematical ring position calculations
+#![allow(clippy::needless_range_loop)]
+
+use agent::executor::Tensor;
+use agent::network::{AllReducePhase, TensorMessage};
 use uuid::Uuid;
 
 /// Simulates the ring all-reduce algorithm with n workers
@@ -137,36 +142,7 @@ fn test_ring_allreduce_varying_sizes() {
     }
 }
 
-/// Test TensorMessage serialization for network transport
-#[test]
-fn test_tensor_message_network_format() {
-    let job_id = Uuid::new_v4();
-    let msg = TensorMessage::new(
-        job_id,
-        0,
-        AllReducePhase::ReduceScatter,
-        0,
-        vec![1.0, 2.0, 3.0, 4.0, 5.0],
-        vec![5],
-    );
-
-    // Serialize
-    let bytes = msg.to_cbor().unwrap();
-
-    // Verify reasonable size (CBOR is compact)
-    assert!(bytes.len() < 200, "Message too large: {} bytes", bytes.len());
-
-    // Deserialize
-    let decoded = TensorMessage::from_cbor(&bytes).unwrap();
-
-    assert_eq!(decoded.job_id, job_id);
-    assert_eq!(decoded.layer_idx, 0);
-    assert_eq!(decoded.phase, AllReducePhase::ReduceScatter);
-    assert_eq!(decoded.step, 0);
-    assert_eq!(decoded.chunk_data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-}
-
-/// Test barrier message format
+/// Test barrier message creation
 #[test]
 fn test_barrier_message_format() {
     let job_id = Uuid::new_v4();
@@ -180,14 +156,11 @@ fn test_barrier_message_format() {
     );
 
     assert!(msg.is_barrier());
-
-    let bytes = msg.to_cbor().unwrap();
-    let decoded = TensorMessage::from_cbor(&bytes).unwrap();
-
-    assert!(decoded.is_barrier());
-    assert_eq!(decoded.phase, AllReducePhase::Barrier);
-    assert_eq!(decoded.chunk_data[0] as u32, 3);
+    assert_eq!(msg.phase, AllReducePhase::Barrier);
+    assert_eq!(msg.chunk_data[0] as u32, 3);
 }
+
+// Note: CBOR serialization tests are in agent/src/network/tensor_protocol.rs
 
 /// Test large tensor handling
 #[test]

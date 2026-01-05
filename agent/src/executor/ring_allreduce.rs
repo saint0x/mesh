@@ -12,8 +12,7 @@
 //! bandwidth-optimal gradient aggregation in distributed training.
 
 use crate::errors::{AgentError, Result};
-use crate::network::tensor_protocol::{AllReducePhase, TensorMessage};
-use crate::network::MeshSwarm;
+use crate::network::{AllReducePhase, MeshSwarm, TensorMessage};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -401,6 +400,7 @@ impl WorkerRing {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 
@@ -534,27 +534,7 @@ mod tests {
         assert!(msg.is_barrier());
     }
 
-    #[test]
-    fn test_tensor_message_cbor_roundtrip() {
-        let original = TensorMessage::new(
-            Uuid::new_v4(),
-            10,
-            AllReducePhase::AllGather,
-            5,
-            vec![1.0, 2.0, 3.0, 4.0, 5.0],
-            vec![5],
-        );
-
-        let bytes = original.to_cbor().unwrap();
-        let decoded = TensorMessage::from_cbor(&bytes).unwrap();
-
-        assert_eq!(decoded.job_id, original.job_id);
-        assert_eq!(decoded.layer_idx, original.layer_idx);
-        assert_eq!(decoded.phase, original.phase);
-        assert_eq!(decoded.step, original.step);
-        assert_eq!(decoded.chunk_data, original.chunk_data);
-        assert_eq!(decoded.chunk_shape, original.chunk_shape);
-    }
+    // Note: CBOR serialization tests are in agent/src/network/tensor_protocol.rs
 
     // ============== Ring All-Reduce Logic Tests ==============
 
@@ -739,7 +719,7 @@ mod tests {
 
         // Expected sums: [1+7+13, 2+8+14, 3+9+15, 4+10+16, 5+11+17, 6+12+18]
         //              = [21, 24, 27, 30, 33, 36]
-        let expected = vec![21.0, 24.0, 27.0, 30.0, 33.0, 36.0];
+        let expected = [21.0, 24.0, 27.0, 30.0, 33.0, 36.0];
 
         for result in &results {
             for (i, &value) in result.data.iter().enumerate() {
@@ -834,29 +814,5 @@ mod tests {
     }
 
     // ============== AllReducePhase Tests ==============
-
-    #[test]
-    fn test_allreduce_phase_serialization() {
-        let phases = [
-            AllReducePhase::ReduceScatter,
-            AllReducePhase::AllGather,
-            AllReducePhase::Barrier,
-        ];
-
-        for phase in phases {
-            let msg = TensorMessage::new(
-                Uuid::new_v4(),
-                0,
-                phase,
-                0,
-                vec![1.0],
-                vec![1],
-            );
-
-            let bytes = msg.to_cbor().unwrap();
-            let decoded = TensorMessage::from_cbor(&bytes).unwrap();
-
-            assert_eq!(decoded.phase, phase);
-        }
-    }
+    // Note: Phase serialization tests are in agent/src/network/tensor_protocol.rs
 }

@@ -1890,6 +1890,97 @@ clap = { version = "4", features = ["derive"] }
 
 ---
 
+## Phase 1/2: Tensor-Parallel Architecture (Completed)
+
+**Goal:** Enable distributed AI training with ring all-reduce across worker pools
+
+### ✅ Module TP-6.1: Ring Topology Manager (Control Plane)
+
+**Files:**
+- `control-plane/migrations/004_add_ring_topology.sql` - Database schema
+- `control-plane/src/services/ring_manager.rs` - Ring topology service
+- `control-plane/src/api/ring.rs` - Ring API endpoints
+- `control-plane/src/api/types.rs` - Request/response types
+
+**Implemented:**
+- ✅ Database migration for ring topology (devices, resource_locks, pools tables)
+- ✅ RingTopologyManager with sequential worker positioning
+- ✅ Deterministic shard assignment (0-8192 column range)
+- ✅ Atomic ring operations with database transactions
+- ✅ API endpoints: POST /api/ring/join, GET /api/ring/topology, DELETE /api/ring/leave
+- ✅ 45 tests passing, zero clippy warnings
+
+---
+
+### ✅ Module TP-6.2: Tensor Passing Protocol (Agent)
+
+**Files:**
+- `agent/src/network/tensor_protocol.rs` - libp2p tensor protocol
+- `agent/src/network/mesh_swarm.rs` - MeshSwarm tensor integration
+- `agent/src/network/events.rs` - TensorReceived event
+
+**Implemented:**
+- ✅ TensorMessage with CBOR serialization
+- ✅ AllReducePhase enum (ReduceScatter, AllGather, Barrier)
+- ✅ libp2p request-response protocol `/mesh/tensor/1.0.0`
+- ✅ 10MB message size limit enforcement
+- ✅ Ring communication methods (send_tensor, respond_to_tensor)
+- ✅ 13 tests passing, zero clippy warnings
+
+---
+
+### ✅ Module TP-6.3: Resource Locking (Agent)
+
+**Files:**
+- `agent/src/resource_manager.rs` - Cross-platform memory locking
+- `agent/src/main.rs` - CLI commands
+
+**Implemented:**
+- ✅ Cross-platform memory locking (mlock/VirtualLock)
+- ✅ 24-hour cooldown enforcement
+- ✅ 7% safety buffer on locked memory
+- ✅ Automatic re-lock on restart
+- ✅ CLI commands: lock-resources, unlock-resources, resource-status
+- ✅ Configuration persistence with atomic writes
+- ✅ 32 tests passing, zero clippy warnings
+
+---
+
+### ✅ Module TP-7.1: Ring All-Reduce Implementation (Agent)
+
+**Files:**
+- `agent/src/executor/ring_allreduce.rs` - Algorithm implementation
+- `agent/tests/ring_allreduce_integration.rs` - Integration tests
+
+**Implemented:**
+- ✅ Tensor struct with chunk/add/concat operations
+- ✅ WorkerRing topology management
+- ✅ Full ring_all_reduce algorithm (reduce-scatter + all-gather phases)
+- ✅ Barrier synchronization for layer coordination
+- ✅ Timeout handling for stalled workers
+- ✅ Integration with tensor_protocol for network transport
+- ✅ 20+ tests passing, zero clippy warnings
+
+**Reference:** Baidu Ring All-Reduce paper (https://arxiv.org/abs/1802.05799)
+
+---
+
+### Test Coverage Summary
+
+| Package | Unit Tests | Integration Tests | Doc Tests | Total |
+|---------|-----------|------------------|-----------|-------|
+| agent | 114 | 8 | 12 | 134 |
+| control-plane | 45 | 0 | 0 | 45 |
+| **Total** | **159** | **8** | **12** | **179** |
+
+**Test Locations:**
+- CBOR serialization tests: `agent/src/network/tensor_protocol.rs`
+- Ring algorithm tests: `agent/src/executor/ring_allreduce.rs`
+- Multi-worker integration: `agent/tests/ring_allreduce_integration.rs`
+- Ring topology tests: `control-plane/src/services/ring_manager.rs`
+
+---
+
 ## Conclusion
 
 **Desktop-First Strategy:** This revised roadmap prioritizes a working desktop prototype (Weeks 1-4), then validates mobile constraints (Week 5), allowing us to make informed decisions about Phase 1 scope based on real data, not assumptions.

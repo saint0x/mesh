@@ -15,5 +15,5 @@ pub mod types;
 
 pub use embeddings::EmbeddingsExecutor;
 pub use job_runner::{JobRunner, JobStats};
-pub use ring_allreduce::{AllReducePhase, Tensor, TensorMessage, WorkerRing};
+pub use ring_allreduce::{Tensor, WorkerRing};
 pub use types::{EmbeddingsInput, EmbeddingsOutput, ExecutorError, ExecutorResult};

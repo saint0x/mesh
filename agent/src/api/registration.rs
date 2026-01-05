@@ -202,6 +202,9 @@ mod tests {
     use super::*;
     use crate::device::{DeviceCapabilities, Tier};
 
+    /// Test helper to create mock device capabilities
+    /// Used by integration tests in tests/ directory
+    #[allow(dead_code)]
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
             cpu_cores: 8,

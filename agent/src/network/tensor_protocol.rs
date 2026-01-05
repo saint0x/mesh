@@ -398,7 +398,7 @@ mod tests {
             layer_idx: 0,
             phase: AllReducePhase::ReduceScatter,
             step: 0,
-            chunk_data: vec![1.23456789; 4_000_000], // Should exceed 10MB with non-zero values
+            chunk_data: vec![1.234_567_9; 4_000_000], // Should exceed 10MB with non-zero values
             chunk_shape: vec![4_000_000],
             timestamp: 0,
         };
