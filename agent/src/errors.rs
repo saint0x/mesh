@@ -88,6 +88,13 @@ impl From<toml::de::Error> for AgentError {
     }
 }
 
+// Implement From for JSON serialization errors
+impl From<serde_json::Error> for AgentError {
+    fn from(e: serde_json::Error) -> Self {
+        AgentError::Serialization(e.to_string())
+    }
+}
+
 // Implement From for libp2p noise errors
 impl From<libp2p::noise::Error> for AgentError {
     fn from(e: libp2p::noise::Error) -> Self {

@@ -13,7 +13,7 @@
 
 use agent::{
     DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, JobRunner, MeshSwarmBuilder,
-    RegistrationClient,
+    RegistrationClient, init_production_logging, init_simple_logging,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,7 +21,6 @@ use libp2p::{Multiaddr, PeerId};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use uuid::Uuid;
 
 /// Mesh AI Agent - Distributed compute sharing network
@@ -95,6 +94,9 @@ enum Commands {
 
     /// Show device and network status
     Status,
+
+    /// Show agent metrics and statistics
+    Metrics,
 }
 
 #[tokio::main]
@@ -107,8 +109,8 @@ async fn main() -> Result<()> {
             name,
             control_plane_url,
         } => {
-            // Simple logging for init
-            init_logging("info")?;
+            // Simple logging for init command
+            init_simple_logging("info")?;
             cmd_init(network_id, name, control_plane_url).await?;
         }
 
@@ -117,7 +119,8 @@ async fn main() -> Result<()> {
             control_plane_url,
             log_level,
         } => {
-            init_logging(&log_level)?;
+            // Production logging with file rotation for daemon
+            init_production_logging(&log_level, None)?;
             cmd_start(relay, control_plane_url).await?;
         }
 
@@ -129,28 +132,20 @@ async fn main() -> Result<()> {
             relay,
             log_level,
         } => {
-            init_logging(&log_level)?;
+            init_simple_logging(&log_level)?;
             cmd_job(input, target, workload, timeout_ms, relay).await?;
         }
 
         Commands::Status => {
-            init_logging("info")?;
+            init_simple_logging("info")?;
             cmd_status().await?;
         }
+
+        Commands::Metrics => {
+            // No logging for metrics (pure display)
+            cmd_metrics().await?;
+        }
     }
-
-    Ok(())
-}
-
-/// Initialize logging with the specified level
-fn init_logging(level: &str) -> Result<()> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
-
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(env_filter)
-        .init();
 
     Ok(())
 }
@@ -492,6 +487,68 @@ async fn cmd_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Display agent metrics
+async fn cmd_metrics() -> Result<()> {
+    use colored::Colorize;
+    use std::fs;
+    use std::path::PathBuf;
+
+    // Stats file path
+    let stats_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".meshnet")
+        .join("stats.json");
+
+    if !stats_path.exists() {
+        println!("{}", "No metrics available".yellow());
+        println!("\nThe agent hasn't been started yet, or metrics haven't been saved.");
+        println!("Run 'mesh start' to begin collecting metrics.\n");
+        return Ok(());
+    }
+
+    // Read stats file
+    let stats_json = fs::read_to_string(&stats_path)
+        .context("Failed to read stats file")?;
+
+    let stats: SavedStats = serde_json::from_str(&stats_json)
+        .context("Failed to parse stats file")?;
+
+    // Display metrics
+    println!("\n{}", "Agent Metrics".bold().cyan());
+    println!("{}", "=============".cyan());
+
+    println!("\n{}", "Job Statistics:".bold());
+    println!("  Total Jobs:       {}", stats.total_jobs);
+    println!("  Completed:        {}", stats.completed.to_string().green());
+    println!("  Failed:           {}", stats.failed.to_string().red());
+    println!("  Active:           {}", stats.active);
+    println!("  Success Rate:     {:.1}%", stats.success_rate);
+
+    println!("\n{}", "Performance:".bold());
+    println!("  Avg Execution:    {:.2}ms", stats.avg_execution_time_ms);
+    println!("  Total CPU Time:   {}ms", stats.total_execution_time_ms);
+
+    println!("\n{}", "System:".bold());
+    println!("  Uptime:           {}", stats.uptime);
+    println!("  Last Updated:     {}", stats.last_updated);
+    println!();
+
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedStats {
+    total_jobs: u64,
+    completed: u64,
+    failed: u64,
+    active: u64,
+    success_rate: f64,
+    avg_execution_time_ms: f64,
+    total_execution_time_ms: u64,
+    uptime: String,
+    last_updated: String,
 }
 
 use agent::EmbeddingsOutput;

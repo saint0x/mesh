@@ -34,7 +34,7 @@ use tracing::{debug, error, info, instrument, warn};
 /// Job execution statistics
 ///
 /// Tracks metrics about job execution for monitoring and debugging.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct JobStats {
     /// Total number of jobs successfully completed
     pub jobs_completed: AtomicU64,
@@ -47,12 +47,21 @@ pub struct JobStats {
 
     /// Number of jobs currently being executed
     pub active_jobs: AtomicU64,
+
+    /// Start time for uptime tracking
+    pub start_time: Instant,
 }
 
 impl JobStats {
     /// Create new job statistics tracker
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            jobs_completed: AtomicU64::new(0),
+            jobs_failed: AtomicU64::new(0),
+            total_execution_time_ms: AtomicU64::new(0),
+            active_jobs: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
     }
 
     /// Record a successful job completion
@@ -111,7 +120,31 @@ impl JobStats {
         self.active_jobs.load(Ordering::Relaxed)
     }
 
-    /// Print statistics summary
+    /// Get agent uptime in seconds
+    pub fn uptime_seconds(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+
+    /// Format uptime as human-readable string
+    pub fn uptime_string(&self) -> String {
+        let seconds = self.uptime_seconds();
+        let days = seconds / 86400;
+        let hours = (seconds % 86400) / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let secs = seconds % 60;
+
+        if days > 0 {
+            format!("{}d {}h {}m {}s", days, hours, minutes, secs)
+        } else if hours > 0 {
+            format!("{}h {}m {}s", hours, minutes, secs)
+        } else if minutes > 0 {
+            format!("{}m {}s", minutes, secs)
+        } else {
+            format!("{}s", secs)
+        }
+    }
+
+    /// Print statistics summary (for logging)
     pub fn print_summary(&self) {
         let total = self.total_jobs();
         let completed = self.jobs_completed.load(Ordering::Relaxed);
@@ -127,8 +160,63 @@ impl JobStats {
             active = active,
             avg_execution_time_ms = format!("{:.2}", avg_time),
             success_rate = format!("{:.1}%", success_rate),
+            uptime = %self.uptime_string(),
             "Job statistics"
         );
+    }
+
+    /// Display formatted metrics summary with colors (for CLI)
+    pub fn display(&self) {
+        use colored::Colorize;
+
+        println!("\n{}", "Agent Metrics".bold().cyan());
+        println!("{}", "=============".cyan());
+
+        println!("\n{}", "Job Statistics:".bold());
+        println!("  Total Jobs:       {}", self.total_jobs());
+        println!("  Completed:        {}", self.jobs_completed.load(Ordering::Relaxed).to_string().green());
+        println!("  Failed:           {}", self.jobs_failed.load(Ordering::Relaxed).to_string().red());
+        println!("  Active:           {}", self.active_jobs());
+        println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
+
+        println!("\n{}", "Performance:".bold());
+        println!("  Avg Execution:    {:.2}ms", self.avg_execution_time_ms());
+        println!("  Total CPU Time:   {}ms", self.total_execution_time_ms.load(Ordering::Relaxed));
+
+        println!("\n{}", "System:".bold());
+        println!("  Uptime:           {}", self.uptime_string());
+        println!();
+    }
+
+    /// Save statistics to file for `mesh metrics` command
+    pub fn save_to_file(&self) -> Result<()> {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let stats_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".meshnet")
+            .join("stats.json");
+
+        // Ensure directory exists
+        if let Some(parent) = stats_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let stats_json = serde_json::json!({
+            "total_jobs": self.total_jobs(),
+            "completed": self.jobs_completed.load(Ordering::Relaxed),
+            "failed": self.jobs_failed.load(Ordering::Relaxed),
+            "active": self.active_jobs(),
+            "success_rate": self.success_rate() * 100.0,
+            "avg_execution_time_ms": self.avg_execution_time_ms(),
+            "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
+            "uptime": self.uptime_string(),
+            "last_updated": chrono::Local::now().to_rfc3339(),
+        });
+
+        fs::write(&stats_path, serde_json::to_string_pretty(&stats_json)?)?;
+        Ok(())
     }
 }
 
@@ -219,6 +307,10 @@ impl JobRunner {
     pub async fn run(mut self) -> Result<()> {
         info!("Starting job execution loop");
 
+        // Periodic stats saver (every 30 seconds)
+        let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 // Handle network events
@@ -233,6 +325,14 @@ impl JobRunner {
                     }
                 }
 
+                // Save stats periodically
+                _ = stats_interval.tick() => {
+                    debug!("Saving stats to file");
+                    if let Err(e) = self.stats.save_to_file() {
+                        warn!(error = %e, "Failed to save stats");
+                    }
+                }
+
                 // Handle shutdown signal
                 _ = signal::ctrl_c() => {
                     info!("Received shutdown signal (Ctrl+C)");
@@ -241,9 +341,10 @@ impl JobRunner {
             }
         }
 
-        // Print final statistics
+        // Save final statistics
         info!("Shutting down job runner");
         self.stats.print_summary();
+        let _ = self.stats.save_to_file();
 
         Ok(())
     }

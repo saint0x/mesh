@@ -3,6 +3,7 @@ pub mod device;
 pub mod errors;
 pub mod executor;
 pub mod network;
+pub mod observability;
 
 pub use api::RegistrationClient;
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
@@ -13,3 +14,4 @@ pub use executor::{
 pub use network::{
     ConnectionInfo, ConnectionType, MeshEvent, MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig,
 };
+pub use observability::{init_production_logging, init_simple_logging};
