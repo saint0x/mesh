@@ -2,32 +2,43 @@
 
 **USE `./tl-client.sh` FOR ALL VERSION CONTROL - NOT GIT**
 
-TL (Timelapse) replaces git for checkpoint management. It provides automatic, instant snapshots of the working directory.
+TL replaces git completely. Automatic checkpoints + JJ integration for remote push/pull.
 
-### Commands Reference
+### Commands
 
 | Command | Purpose |
 |---------|---------|
-| `./tl-client.sh setup` | Initialize + start daemon (run first in any repo) |
-| `./tl-client.sh save` | Force immediate checkpoint |
-| `./tl-client.sh log [n]` | View checkpoint history |
-| `./tl-client.sh restore <id>` | Restore to checkpoint (overwrites current!) |
-| `./tl-client.sh diff <a> <b>` | Compare two checkpoints |
-| `./tl-client.sh pin <id> <name>` | Name important checkpoints |
-| `./tl-client.sh status` | Check daemon health |
-| `./tl-client.sh info` | Storage stats |
+| `setup` | Initialize + start daemon |
+| `save` | Force immediate checkpoint |
+| `log [n]` | View checkpoint history |
+| `restore <id>` | Restore to checkpoint |
+| `diff <a> <b>` | Compare checkpoints |
+| `pin <id> <name>` | Name checkpoint |
+| `unpin <name>` | Remove pin |
+| `gc` | Garbage collection |
+| `push` | Push to remote (via JJ) |
+| `pull` | Pull from remote (via JJ) |
+| `publish <id>` | Publish checkpoint for push |
+| `worktree` | Manage workspaces |
 
-### Required Workflow
+### Workflow
 
-1. **Start of session**: `./tl-client.sh setup`
-2. **After successful changes**: `./tl-client.sh save "description"`
-3. **Before risky work**: `./tl-client.sh save` (create restore point)
-4. **If something breaks**: `./tl-client.sh log` then `./tl-client.sh restore <id>`
-5. **Major milestones**: `./tl-client.sh pin <id> <milestone-name>`
+1. `./tl-client.sh setup` - Once per repo
+2. Make changes
+3. `./tl-client.sh save` - Checkpoint
+4. `./tl-client.sh publish HEAD` - Prepare for push
+5. `./tl-client.sh push` - Push to remote
+
+### Restore Workflow
+
+```
+./tl-client.sh log           # Find checkpoint
+./tl-client.sh restore <id>  # Restore
+```
 
 ### Key Facts
 
-- Automatic checkpoints every 5 seconds when files change
+- Auto-checkpoints every 5 seconds
 - Restore is instant (<100ms)
+- Push/pull via JJ integration
 - `save` is cheap - use liberally
-- Content-addressed storage with deduplication

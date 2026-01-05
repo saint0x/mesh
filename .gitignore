@@ -3,6 +3,12 @@
 **/*.rs.bk
 *.pdb
 
+# Timelapse checkpoints
+.tl/
+
+# Jujutsu version control
+.jj/
+
 # Cargo lock for libraries (keep for applications)
 # Cargo.lock
 
