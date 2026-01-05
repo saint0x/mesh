@@ -418,7 +418,7 @@ async fn cmd_job(
                                         println!("   Dimensions: {}", output.dimensions);
                                         println!(
                                             "   Embedding preview: [{:.3}, {:.3}, {:.3}, ...]",
-                                            preview.get(0).unwrap_or(&0.0),
+                                            preview.first().unwrap_or(&0.0),
                                             preview.get(1).unwrap_or(&0.0),
                                             preview.get(2).unwrap_or(&0.0),
                                         );
