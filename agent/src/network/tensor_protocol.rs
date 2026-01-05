@@ -23,6 +23,8 @@ pub enum AllReducePhase {
     /// All-gather phase: each node broadcasts its fully reduced chunk
     /// around the ring so all nodes end up with the complete result
     AllGather,
+    /// Barrier synchronization
+    Barrier,
 }
 
 /// Tensor message for ring all-reduce communication
@@ -45,6 +47,9 @@ pub struct TensorMessage {
 }
 
 impl TensorMessage {
+    /// Special step number indicating a barrier synchronization message
+    pub const BARRIER_STEP: u32 = 0xFFFFFFFF;
+
     /// Create a new tensor message with current timestamp
     pub fn new(
         job_id: Uuid,
@@ -66,6 +71,11 @@ impl TensorMessage {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         }
+    }
+
+    /// Check if this is a barrier message
+    pub fn is_barrier(&self) -> bool {
+        self.step == Self::BARRIER_STEP
     }
 
     /// Calculate the approximate size of this message in bytes.

@@ -1,0 +1,16 @@
+[store]
+blob_compression_threshold = 4096
+max_cache_size = 104857600
+version = 1
+
+[user]
+email = ""
+name = ""
+
+[vcs]
+git_initialized = true
+git_remote = "https://github.com/saint0x/mesh.git"
+jj_initialized = true
+
+[watcher]
+debounce_ms = 100

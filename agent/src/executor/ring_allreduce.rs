@@ -12,6 +12,7 @@
 //! bandwidth-optimal gradient aggregation in distributed training.
 
 use crate::errors::{AgentError, Result};
+use crate::network::tensor_protocol::{AllReducePhase, TensorMessage};
 use crate::network::MeshSwarm;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -122,76 +123,6 @@ impl Tensor {
     /// Check if the tensor is empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
-    }
-}
-
-/// Phase of the ring all-reduce algorithm
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AllReducePhase {
-    /// Phase 1: Reduce-scatter - each worker accumulates partial sums
-    ReduceScatter,
-    /// Phase 2: All-gather - workers exchange accumulated chunks
-    AllGather,
-    /// Barrier synchronization
-    Barrier,
-}
-
-/// Message sent between workers during ring all-reduce
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TensorMessage {
-    /// Job ID for this all-reduce operation
-    pub job_id: Uuid,
-    /// Layer index (for multi-layer gradient aggregation)
-    pub layer_idx: u32,
-    /// Current phase of the algorithm
-    pub phase: AllReducePhase,
-    /// Step number within the current phase
-    pub step: u32,
-    /// Chunk data being transmitted
-    pub chunk_data: Vec<f32>,
-    /// Shape of the chunk
-    pub chunk_shape: Vec<usize>,
-}
-
-impl TensorMessage {
-    /// Create a new tensor message
-    pub fn new(
-        job_id: Uuid,
-        layer_idx: u32,
-        phase: AllReducePhase,
-        step: u32,
-        chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
-    ) -> Self {
-        Self {
-            job_id,
-            layer_idx,
-            phase,
-            step,
-            chunk_data,
-            chunk_shape,
-        }
-    }
-
-    /// Special step number indicating a barrier synchronization message
-    pub const BARRIER_STEP: u32 = 0xFFFFFFFF;
-
-    /// Check if this is a barrier message
-    pub fn is_barrier(&self) -> bool {
-        self.step == Self::BARRIER_STEP
-    }
-
-    /// Serialize to CBOR bytes
-    pub fn to_cbor(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        ciborium::into_writer(self, &mut buf)
-            .map_err(|e| AgentError::Serialization(e.to_string()))?;
-        Ok(buf)
-    }
-
-    /// Deserialize from CBOR bytes
-    pub fn from_cbor(bytes: &[u8]) -> Result<Self> {
-        ciborium::from_reader(bytes).map_err(|e| AgentError::Serialization(e.to_string()))
     }
 }
 
@@ -407,65 +338,51 @@ impl WorkerRing {
     /// Send a message to the right neighbor and receive from the left neighbor
     ///
     /// This is the core communication primitive for ring all-reduce.
-    /// In a real implementation, send and receive would happen concurrently.
+    /// The send and receive operations happen concurrently via the tensor protocol.
     async fn send_to_right_recv_from_left(
         &mut self,
         message: TensorMessage,
     ) -> Result<TensorMessage> {
-        use crate::network::{JobEnvelope, JobResult, MeshEvent};
+        use crate::network::MeshEvent;
 
-        // Serialize message to CBOR
-        let payload = message.to_cbor()?;
+        // Send to right neighbor using tensor protocol
+        let _request_id = self.swarm.send_tensor(self.right_neighbor, message.clone());
 
-        // Create job envelope for the tensor message
-        let job = JobEnvelope {
-            job_id: message.job_id,
-            network_id: "ring-allreduce".to_string(),
-            workload_id: "tensor-exchange".to_string(),
-            payload,
-            timeout_ms: 30000, // 30 second timeout per step
-            auth_signature: vec![],
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-
-        // Send to right neighbor
-        self.swarm.send_job(self.right_neighbor, job)?;
+        debug!(
+            "Sent tensor to right neighbor {}, waiting for tensor from left neighbor {}",
+            self.right_neighbor, self.left_neighbor
+        );
 
         // Wait for message from left neighbor
         loop {
             if let Some(event) = self.swarm.next_event().await {
                 match event {
-                    MeshEvent::JobReceived { peer_id, job, channel } => {
+                    MeshEvent::TensorReceived {
+                        peer_id,
+                        tensor,
+                        channel,
+                    } => {
                         // Check if it's from our left neighbor
-                        if peer_id == self.left_neighbor && job.workload_id == "tensor-exchange" {
-                            // Deserialize the tensor message
-                            let tensor_msg = TensorMessage::from_cbor(&job.payload)?;
+                        if peer_id == self.left_neighbor {
+                            // Verify it's the same job and layer
+                            if tensor.job_id == message.job_id
+                                && tensor.layer_idx == message.layer_idx
+                            {
+                                // Send acknowledgment (echo back the tensor)
+                                let ack = tensor.clone();
+                                self.swarm.respond_to_tensor(channel, ack)?;
 
-                            // Send empty response to acknowledge
-                            let result = JobResult {
-                                job_id: job.job_id,
-                                success: true,
-                                result: None,
-                                error: None,
-                                execution_time_ms: 0,
-                            };
-                            self.swarm.respond_to_job(channel, result)?;
+                                debug!(
+                                    "Received tensor from left neighbor {}, phase={:?}, step={}",
+                                    peer_id, tensor.phase, tensor.step
+                                );
 
-                            return Ok(tensor_msg);
-                        } else {
-                            // Respond with success but continue waiting
-                            let result = JobResult {
-                                job_id: job.job_id,
-                                success: true,
-                                result: None,
-                                error: None,
-                                execution_time_ms: 0,
-                            };
-                            self.swarm.respond_to_job(channel, result)?;
+                                return Ok(tensor);
+                            }
                         }
+                        // If not from expected neighbor or wrong job/layer, acknowledge but continue
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
                     }
                     MeshEvent::PeerDisconnected { peer_id } => {
                         if peer_id == self.left_neighbor {

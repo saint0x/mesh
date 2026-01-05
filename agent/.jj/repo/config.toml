@@ -1,0 +1,10 @@
+# Timelapse JJ Configuration
+
+[revsets]
+log = "bookmarks() | @"
+
+[git]
+push-bookmark-prefix = "snap/"
+
+[ui]
+default-description = ""
