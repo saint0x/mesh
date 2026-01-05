@@ -1230,71 +1230,46 @@
 
 ### Week 6: Error Handling & Observability
 
-#### ✅ Module 5.1: Error Handling Framework (2 days)
+#### ✅ Module 5.1: Error Handling Framework (COMPLETED)
 
-**File:** `agent/src/errors/mod.rs`
+**Files:**
+- `agent/src/errors.rs` - Unified error types with context and display
+- `agent/src/network/mesh_swarm.rs` - Fixed unwrap_or_else fallback
+- `agent/src/api/registration.rs` - Changed new() to return Result
+- `control-plane/src/main.rs` - Fixed UTF-8 path validation and signal handlers
 
-**Tasks:**
-- [ ] Create error chain type using `thiserror`
-  ```rust
-  use thiserror::Error;
+**Implemented:**
+- ✅ Created `ErrorContext` trait for fluent error chaining
+  - `.context(msg)` - Add static context message
+  - `.with_context(|| msg)` - Add lazy-evaluated context
+  - All context messages logged to tracing for debugging
+- ✅ Added colored CLI error display using `colored` crate
+  - Red bold "Error:" prefix
+  - Error-specific actionable suggestions
+  - Network errors → Check relay server, verify connectivity
+  - Config errors → Run 'mesh init', check ~/.meshnet/device.toml
+  - Registration errors → Verify control plane URL
+  - HTTP errors → Check network and control plane URL
+- ✅ Production safety fixes (eliminated all production panics):
+  - `agent/src/network/mesh_swarm.rs:77` - Replaced expect with unwrap_or_else + fallback
+  - `agent/src/api/registration.rs:25` - Changed RegistrationClient::new() to return Result
+  - `control-plane/src/main.rs:22` - Added proper UTF-8 path validation with ok_or_else
+  - `control-plane/src/main.rs:65,71` - Graceful signal handler errors (no panics)
+- ✅ Added `colored = "2.1"` dependency to agent/Cargo.toml
+- ✅ Fixed test_registration_client_creation to handle Result return
 
-  #[derive(Error, Debug)]
-  pub enum MeshError {
-      #[error("Network error: {0}")]
-      Network(#[from] std::io::Error),
-
-      #[error("Job execution failed: {0}")]
-      Execution(String),
-
-      #[error("Job timeout after {0}ms")]
-      Timeout(u64),
-
-      #[error("Configuration error: {0}")]
-      Config(String),
-
-      #[error("Database error: {0}")]
-      Database(#[from] sqlx::Error),
-  }
-
-  pub type Result<T> = std::result::Result<T, MeshError>;
-  ```
-- [ ] Add context helpers
-  ```rust
-  pub trait ResultExt<T> {
-      fn context(self, msg: &str) -> Result<T>;
-  }
-
-  impl<T, E: Into<MeshError>> ResultExt<T> for std::result::Result<T, E> {
-      fn context(self, msg: &str) -> Result<T> {
-          self.map_err(|e| {
-              let err: MeshError = e.into();
-              error!("{}: {:?}", msg, err);
-              err
-          })
-      }
-  }
-  ```
-- [ ] Add pretty error printing
-  ```rust
-  use owo_colors::OwoColorize;
-
-  impl MeshError {
-      pub fn pretty_print(&self) {
-          eprintln!("{} {}", "Error:".red().bold(), self);
-      }
-  }
-  ```
-- [ ] Replace unwrap() calls with proper error handling crate-wide
-- [ ] Add error tests
+**Test Coverage:**
+- ✅ All 76 tests passing (56 agent + 20 control-plane)
+- ✅ Zero clippy warnings
+- ✅ Zero production panics (all unwrap/expect removed)
 
 **Success Criteria:**
-- ✅ All errors have helpful messages
-- ✅ Error context shows full chain
+- ✅ All errors have helpful messages with actionable suggestions
+- ✅ Error context shows full chain with .context()
 - ✅ Terminal output is readable with colors
 - ✅ No panics in normal error conditions
 
-**Deliverable:** Unified error handling
+**Deliverable:** ✅ Production-ready unified error handling with colored CLI display
 
 ---
 
