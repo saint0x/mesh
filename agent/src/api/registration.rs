@@ -17,14 +17,14 @@ pub struct RegistrationClient {
 
 impl RegistrationClient {
     /// Create a new registration client
-    pub fn new(control_plane_url: String) -> Self {
-        Self {
+    pub fn new(control_plane_url: String) -> Result<Self> {
+        Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
-                .expect("Failed to build HTTP client"),
+                .map_err(|e| AgentError::Http(format!("Failed to build HTTP client: {}", e)))?,
             control_plane_url,
-        }
+        })
     }
 
     /// Register device with the control plane
@@ -211,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_client_creation() {
-        let client = RegistrationClient::new("http://localhost:8080".to_string());
+        let client = RegistrationClient::new("http://localhost:8080".to_string()).unwrap();
         assert_eq!(client.control_plane_url, "http://localhost:8080");
     }
 

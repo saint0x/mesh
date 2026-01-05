@@ -19,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = Database::default_path()?;
     info!(path = %db_path.display(), "Using database");
 
-    let db = Database::new(db_path.to_str().unwrap())?;
+    let db_path_str = db_path
+        .to_str()
+        .ok_or_else(|| format!("Invalid database path (contains invalid UTF-8): {}", db_path.display()))?;
+    let db = Database::new(db_path_str)?;
 
     // Run migrations
     info!("Running database migrations");
@@ -60,17 +63,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Wait for shutdown signal (Ctrl+C)
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(e) = signal::ctrl_c().await {
+            tracing::error!("Failed to install Ctrl+C handler: {}", e);
+            // Sleep forever since we can't listen for signals
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                // Sleep forever since we can't listen for signals
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

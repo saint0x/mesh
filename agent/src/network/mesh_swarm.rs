@@ -74,7 +74,11 @@ impl Default for MeshSwarmConfig {
         Self {
             relay_addr: "/ip4/127.0.0.1/tcp/4001"
                 .parse()
-                .expect("invalid default relay address"),
+                .unwrap_or_else(|e| {
+                    tracing::error!("Failed to parse default relay address: {}", e);
+                    // Fallback to any valid multiaddr - this should never happen
+                    "/ip4/0.0.0.0/tcp/4001".parse().unwrap()
+                }),
             keep_alive: Duration::from_secs(60),
             job_protocol: JobProtocolConfig::default(),
         }

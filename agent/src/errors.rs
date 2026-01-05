@@ -39,6 +39,42 @@ pub enum AgentError {
 /// Result type alias for agent operations.
 pub type Result<T> = std::result::Result<T, AgentError>;
 
+/// Extension trait for adding context to errors
+pub trait ErrorContext<T> {
+    /// Add context message to error
+    fn context(self, msg: &str) -> Result<T>;
+
+    /// Add context using a closure (for lazy evaluation)
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String;
+}
+
+impl<T, E> ErrorContext<T> for std::result::Result<T, E>
+where
+    E: Into<AgentError>,
+{
+    fn context(self, msg: &str) -> Result<T> {
+        self.map_err(|e| {
+            let base: AgentError = e.into();
+            tracing::error!("{}: {:?}", msg, base);
+            base
+        })
+    }
+
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|e| {
+            let base: AgentError = e.into();
+            let msg = f();
+            tracing::error!("{}: {:?}", msg, base);
+            base
+        })
+    }
+}
+
 // Implement From for TOML serialization errors
 impl From<toml::ser::Error> for AgentError {
     fn from(e: toml::ser::Error) -> Self {
@@ -84,6 +120,49 @@ impl From<libp2p::swarm::ListenError> for AgentError {
 impl From<crate::executor::ExecutorError> for AgentError {
     fn from(e: crate::executor::ExecutorError) -> Self {
         AgentError::Execution(e.to_string())
+    }
+}
+
+/// Pretty error display module for CLI
+pub mod display {
+    use super::AgentError;
+    use colored::Colorize;
+
+    /// Print error with colors and actionable suggestions
+    pub fn print_error(err: &AgentError) {
+        eprintln!("{} {}", "Error:".red().bold(), err);
+
+        // Provide actionable suggestions based on error type
+        match err {
+            AgentError::Network(_) => {
+                eprintln!("{}", "  → Check that the relay server is running".yellow());
+                eprintln!("{}", "  → Verify network connectivity".yellow());
+            }
+            AgentError::Config(_) => {
+                eprintln!("{}", "  → Run 'mesh init' to generate a valid configuration".yellow());
+                eprintln!("{}", "  → Check config file at ~/.meshnet/device.toml".yellow());
+            }
+            AgentError::Registration(_) => {
+                eprintln!("{}", "  → Ensure control plane is running and accessible".yellow());
+                eprintln!("{}", "  → Check the control plane URL in your config".yellow());
+            }
+            AgentError::Execution(_) => {
+                eprintln!("{}", "  → Check that the job payload is valid".yellow());
+                eprintln!("{}", "  → Ensure the target peer is online".yellow());
+            }
+            AgentError::Http(_) => {
+                eprintln!("{}", "  → Check network connectivity".yellow());
+                eprintln!("{}", "  → Verify the control plane URL is correct".yellow());
+            }
+            _ => {}
+        }
+    }
+
+    /// Print error with full context chain (for verbose mode)
+    pub fn print_error_verbose(err: &AgentError) {
+        eprintln!("{} {}", "Error:".red().bold(), err);
+        eprintln!("{}", "Context chain:".yellow());
+        eprintln!("  {:#?}", err);
     }
 }
 

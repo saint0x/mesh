@@ -179,7 +179,7 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     println!("\n🌐 Registering with control plane...");
     println!("   URL: {}", control_plane_url);
 
-    let client = RegistrationClient::new(control_plane_url.clone());
+    let client = RegistrationClient::new(control_plane_url.clone())?;
 
     match client.register(&config).await {
         Ok(signed_cert) => {
@@ -296,7 +296,13 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     // Start heartbeat (in background)
     let heartbeat_config = config.clone();
     tokio::spawn(async move {
-        let client = RegistrationClient::new(heartbeat_config.control_plane_url.clone());
+        let client = match RegistrationClient::new(heartbeat_config.control_plane_url.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create heartbeat client: {}", e);
+                return;
+            }
+        };
         loop {
             if let Err(e) = client.heartbeat(heartbeat_config.device_id).await {
                 error!(error = %e, "Heartbeat failed");
