@@ -252,9 +252,8 @@ impl DeviceConfig {
 
     /// Get default certificate file path: `~/.meshnet/device-cert.bin`
     pub fn default_certificate_path() -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            AgentError::Config("Could not determine home directory".to_string())
-        })?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| AgentError::Config("Could not determine home directory".to_string()))?;
 
         let meshnet_dir = home.join(".meshnet");
         if !meshnet_dir.exists() {

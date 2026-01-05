@@ -130,7 +130,10 @@ impl RegistrationClient {
 
     /// Send a single heartbeat
     pub async fn heartbeat(&self, device_id: Uuid) -> Result<()> {
-        let url = format!("{}/api/devices/{}/heartbeat", self.control_plane_url, device_id);
+        let url = format!(
+            "{}/api/devices/{}/heartbeat",
+            self.control_plane_url, device_id
+        );
 
         let response = self
             .client
@@ -158,7 +161,9 @@ impl RegistrationClient {
             .map_err(|e| AgentError::Serialization(format!("Failed to parse response: {}", e)))?;
 
         if !heartbeat_response.success {
-            return Err(AgentError::Network("Heartbeat response indicated failure".to_string()));
+            return Err(AgentError::Network(
+                "Heartbeat response indicated failure".to_string(),
+            ));
         }
 
         debug!(

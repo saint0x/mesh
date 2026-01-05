@@ -73,8 +73,7 @@ impl EmbeddingsInput {
 
     /// Deserialize from CBOR bytes
     pub fn from_cbor(bytes: &[u8]) -> ExecutorResult<Self> {
-        ciborium::from_reader(bytes)
-            .map_err(|e| ExecutorError::Serialization(e.to_string()))
+        ciborium::from_reader(bytes).map_err(|e| ExecutorError::Serialization(e.to_string()))
     }
 }
 
@@ -114,8 +113,7 @@ impl EmbeddingsOutput {
 
     /// Deserialize from CBOR bytes
     pub fn from_cbor(bytes: &[u8]) -> ExecutorResult<Self> {
-        ciborium::from_reader(bytes)
-            .map_err(|e| ExecutorError::Serialization(e.to_string()))
+        ciborium::from_reader(bytes).map_err(|e| ExecutorError::Serialization(e.to_string()))
     }
 }
 
