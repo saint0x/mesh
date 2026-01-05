@@ -1273,52 +1273,68 @@
 
 ---
 
-#### ✅ Module 5.2: Basic Observability (2 days)
+#### ✅ Module 5.2: Basic Observability (COMPLETED)
 
-**Tasks:**
-- [ ] Add structured logging throughout codebase
-  ```rust
-  use tracing::{info, warn, error, debug, instrument};
+**Files:**
+- `agent/src/observability/mod.rs` - Observability module exports
+- `agent/src/observability/logging.rs` - Production logging functions
+- `agent/src/executor/job_runner.rs` - Enhanced JobStats with uptime and persistence
+- `agent/src/main.rs` - Added `mesh metrics` command
+- `agent/src/errors.rs` - Added From<serde_json::Error>
+- `LOGGING.md` - Comprehensive logging guide
 
-  #[instrument(skip(executor))]
-  async fn execute_job(job: &JobEnvelope, executor: &Executor) -> Result<JobResult> {
-      info!(job_id = %job.job_id, workload = %job.workload_id, "Starting job");
-      let start = Instant::now();
+**Implemented:**
+- ✅ **Production logging with file rotation**
+  - `init_production_logging()` - Daily log rotation to `~/.meshnet/logs/agent.log`
+  - Dual output: file (plain text, no colors) + stdout (formatted)
+  - `init_simple_logging()` for CLI commands (stdout only, minimal noise)
+  - Environment-based configuration via `RUST_LOG` (overrides --log-level)
+  - Automatic log directory creation with proper error handling
+- ✅ **Enhanced metrics tracking (JobStats)**
+  - Added `start_time: Instant` field for uptime tracking
+  - `uptime_seconds()` - Get agent uptime in seconds
+  - `uptime_string()` - Human-readable uptime (e.g., "2h 15m 30s")
+  - `display()` - Colored CLI output (green=completed, red=failed, cyan=headers)
+  - `save_to_file()` - Persist stats to `~/.meshnet/stats.json`
+  - Periodic auto-save every 30 seconds in job runner event loop
+  - Final save on graceful shutdown
+- ✅ **`mesh metrics` CLI command**
+  - Reads saved stats from `~/.meshnet/stats.json`
+  - Displays job statistics (total, completed, failed, active, success rate)
+  - Shows performance metrics (avg execution time, total CPU time)
+  - Shows system info (uptime, last updated timestamp)
+  - Graceful handling when no metrics available (agent not started yet)
+- ✅ **Structured logging throughout codebase**
+  - All critical operations instrumented with tracing
+  - Job lifecycle events (received, started, completed, failed)
+  - Network events (peer connected, relay connected, job send/receive)
+  - Contextual fields (job_id, peer_id, duration_ms, success)
+- ✅ **Comprehensive documentation (LOGGING.md)**
+  - Quick start guide with examples
+  - Log level reference (trace/debug/info/warn/error)
+  - Advanced RUST_LOG filtering (module-level, wildcards)
+  - Log file rotation details
+  - Production recommendations
+  - Troubleshooting section
 
-      let result = executor.execute(&job.payload).await?;
+**Dependencies Added:**
+- tracing-appender 0.2 - Daily log file rotation with configurable retention
+- chrono 0.4 - RFC3339 timestamp formatting for saved metrics
 
-      info!(
-          job_id = %job.job_id,
-          duration_ms = start.elapsed().as_millis(),
-          success = result.success,
-          "Job completed"
-      );
-
-      Ok(result)
-  }
-  ```
-- [ ] Add metrics counters (simple for MVP, Prometheus later)
-  ```rust
-  pub struct Metrics {
-      pub jobs_completed: AtomicU64,
-      pub jobs_failed: AtomicU64,
-      pub total_execution_time_ms: AtomicU64,
-  }
-  ```
-- [ ] Add `mesh metrics` CLI command to show stats
-- [ ] Add log file output (in addition to stdout)
-  ```rust
-  let file_appender = tracing_appender::rolling::daily("~/.meshnet/logs", "agent.log");
-  ```
-- [ ] Document logging levels (RUST_LOG environment variable)
+**Test Coverage:**
+- ✅ All 76 tests passing (56 agent + 20 control-plane)
+- ✅ Zero compilation warnings
+- ✅ Stats persistence tested manually
 
 **Success Criteria:**
-- ✅ All important operations logged
-- ✅ Logs include job_id, device_id, timestamps
-- ✅ Can adjust log level at runtime
-- ✅ Logs written to both stdout and file
+- ✅ All important operations logged with structured fields
+- ✅ Logs include job_id, device_id, timestamps, contextual info
+- ✅ Can adjust log level at runtime (RUST_LOG, --log-level)
+- ✅ Logs written to both stdout and file (~/.meshnet/logs/agent.log)
+- ✅ Daily log rotation working
+- ✅ Metrics persisted and viewable via `mesh metrics`
 
-**Deliverable:** Production-ready logging
+**Deliverable:** ✅ Production-ready observability with file rotation, metrics, and comprehensive documentation
 
 ---
 
