@@ -55,10 +55,14 @@ async fn main() -> Result<()> {
     let config = if config_path.exists() {
         Config::load(config_path)?
     } else {
-        eprintln!("Configuration file not found: {}", config_path.display());
-        eprintln!("\nGenerate a default configuration with:");
-        eprintln!("  relay-server --generate-config");
-        std::process::exit(1);
+        // Auto-generate default config on first run
+        let config = Config::default();
+        config.save(config_path)?;
+
+        println!("First run detected - created default configuration at: {}", config_path.display());
+        println!("Edit {} to customize relay settings\n", config_path.display());
+
+        config
     };
 
     // Setup logging
@@ -103,8 +107,10 @@ async fn main() -> Result<()> {
     swarm.listen_on(tcp_addr)
         .map_err(|e| errors::RelayError::Transport(format!("Failed to listen on TCP: {}", e)))?;
 
-    swarm.listen_on(quic_addr)
-        .map_err(|e| errors::RelayError::Transport(format!("Failed to listen on QUIC: {}", e)))?;
+    // QUIC is optional - warn if it fails but don't exit
+    if let Err(e) = swarm.listen_on(quic_addr) {
+        tracing::warn!(error = %e, "Failed to listen on QUIC, continuing with TCP only");
+    }
 
     tracing::info!("Relay server started successfully");
     println!("\nMesh Relay Server is running!");

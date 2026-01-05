@@ -68,8 +68,14 @@ pub fn public_key(signing_key: &SigningKey) -> VerifyingKey {
 /// Convert Ed25519 signing key to libp2p identity keypair
 pub fn to_libp2p_keypair(signing_key: &SigningKey) -> libp2p::identity::Keypair {
     let secret_bytes = signing_key.to_bytes();
-    let mut secret_vec = secret_bytes.to_vec();
-    let libp2p_keypair = libp2p::identity::ed25519::Keypair::try_from_bytes(&mut secret_vec)
+    let public_bytes = signing_key.verifying_key().to_bytes();
+
+    // libp2p expects 64 bytes: [secret_key (32) || public_key (32)]
+    let mut keypair_bytes = Vec::with_capacity(64);
+    keypair_bytes.extend_from_slice(&secret_bytes);
+    keypair_bytes.extend_from_slice(&public_bytes);
+
+    let libp2p_keypair = libp2p::identity::ed25519::Keypair::try_from_bytes(&mut keypair_bytes)
         .expect("Valid ed25519 keypair bytes");
     libp2p::identity::Keypair::from(libp2p_keypair)
 }

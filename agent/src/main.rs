@@ -43,11 +43,11 @@ enum Commands {
         network_id: String,
 
         /// Device name (e.g., "My Laptop")
-        #[arg(short = 'n', long, default_value = "My Device")]
+        #[arg(short = 'd', long, default_value = "My Device")]
         name: String,
 
         /// Control plane URL
-        #[arg(short, long, default_value = "http://localhost:8080")]
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
         control_plane_url: String,
     },
 
@@ -58,7 +58,7 @@ enum Commands {
         relay: String,
 
         /// Control plane URL
-        #[arg(short, long, default_value = "http://localhost:8080")]
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
         control_plane_url: String,
 
         /// Log level (trace, debug, info, warn, error)
