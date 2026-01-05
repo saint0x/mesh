@@ -6,7 +6,14 @@
 mod events;
 mod job_protocol;
 mod mesh_swarm;
+mod tensor_protocol;
 
 pub use events::{ConnectionInfo, ConnectionType, MeshEvent};
 pub use job_protocol::{JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
-pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig};
+pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections};
+pub use tensor_protocol::{
+    AllReducePhase, TensorMessage, TensorProtocol, TensorProtocolConfig, TENSOR_PROTOCOL_ID,
+};
+
+// Re-export libp2p types needed for handling network events
+pub use libp2p::request_response::{OutboundRequestId, ResponseChannel};

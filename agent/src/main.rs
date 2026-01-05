@@ -12,8 +12,8 @@
 //! - `status` - Show device and network status
 
 use agent::{
-    DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, JobRunner, MeshSwarmBuilder,
-    RegistrationClient, init_production_logging, init_simple_logging,
+    init_production_logging, init_simple_logging, DeviceConfig, EmbeddingsExecutor,
+    EmbeddingsInput, JobRunner, MeshSwarmBuilder, RegistrationClient,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -156,7 +156,8 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
 
     // Generate device configuration
     println!("📝 Generating device configuration...");
-    let config = DeviceConfig::generate(name.clone(), network_id.clone(), control_plane_url.clone());
+    let config =
+        DeviceConfig::generate(name.clone(), network_id.clone(), control_plane_url.clone());
 
     println!("   Device ID: {}", config.device_id);
     println!("   Network ID: {}", network_id);
@@ -188,7 +189,10 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
         Err(e) => {
             error!(error = %e, "Registration failed");
             eprintln!("\n✗ Registration failed: {}", e);
-            eprintln!("   Make sure the control plane is running at {}", control_plane_url);
+            eprintln!(
+                "   Make sure the control plane is running at {}",
+                control_plane_url
+            );
             return Err(e.into());
         }
     }
@@ -196,7 +200,9 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     println!("\n✅ Device initialized successfully!");
     println!("\nNext steps:");
     println!("  1. Start the agent:  cargo run --bin agent -- start");
-    println!("  2. Submit a job:     cargo run --bin agent -- job --input \"Hello\" --target <peer-id>");
+    println!(
+        "  2. Submit a job:     cargo run --bin agent -- job --input \"Hello\" --target <peer-id>"
+    );
 
     Ok(())
 }
@@ -222,9 +228,7 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     println!("   Tier: {:?}", config.capabilities.tier);
 
     // Parse relay address
-    let relay_addr: Multiaddr = relay
-        .parse()
-        .context("Invalid relay address")?;
+    let relay_addr: Multiaddr = relay.parse().context("Invalid relay address")?;
 
     println!("\n🌐 Connecting to relay server...");
     println!("   Relay: {}", relay_addr);
@@ -338,8 +342,7 @@ async fn cmd_job(
         .context("Failed to load device config. Run 'mesh init' first.")?;
 
     // Parse target peer ID
-    let target_peer: PeerId = PeerId::from_str(&target)
-        .context("Invalid peer ID format")?;
+    let target_peer: PeerId = PeerId::from_str(&target).context("Invalid peer ID format")?;
 
     println!("📋 Job Details:");
     println!("   Workload: {}", workload);
@@ -348,9 +351,7 @@ async fn cmd_job(
     println!("   Timeout: {}ms", timeout_ms);
 
     // Parse relay address
-    let relay_addr: Multiaddr = relay
-        .parse()
-        .context("Invalid relay address")?;
+    let relay_addr: Multiaddr = relay.parse().context("Invalid relay address")?;
 
     // Create ephemeral swarm for job submission
     let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
@@ -383,9 +384,7 @@ async fn cmd_job(
         payload,
         timeout_ms,
         auth_signature: vec![], // TODO: implement signature
-        created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs(),
+        created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
 
     println!("   Job ID: {}", job.job_id);
@@ -418,7 +417,7 @@ async fn cmd_job(
                                         println!("   Dimensions: {}", output.dimensions);
                                         println!(
                                             "   Embedding preview: [{:.3}, {:.3}, {:.3}, ...]",
-                                            preview.get(0).unwrap_or(&0.0),
+                                            preview.first().unwrap_or(&0.0),
                                             preview.get(1).unwrap_or(&0.0),
                                             preview.get(2).unwrap_or(&0.0),
                                         );
@@ -509,11 +508,10 @@ async fn cmd_metrics() -> Result<()> {
     }
 
     // Read stats file
-    let stats_json = fs::read_to_string(&stats_path)
-        .context("Failed to read stats file")?;
+    let stats_json = fs::read_to_string(&stats_path).context("Failed to read stats file")?;
 
-    let stats: SavedStats = serde_json::from_str(&stats_json)
-        .context("Failed to parse stats file")?;
+    let stats: SavedStats =
+        serde_json::from_str(&stats_json).context("Failed to parse stats file")?;
 
     // Display metrics
     println!("\n{}", "Agent Metrics".bold().cyan());
@@ -521,7 +519,10 @@ async fn cmd_metrics() -> Result<()> {
 
     println!("\n{}", "Job Statistics:".bold());
     println!("  Total Jobs:       {}", stats.total_jobs);
-    println!("  Completed:        {}", stats.completed.to_string().green());
+    println!(
+        "  Completed:        {}",
+        stats.completed.to_string().green()
+    );
     println!("  Failed:           {}", stats.failed.to_string().red());
     println!("  Active:           {}", stats.active);
     println!("  Success Rate:     {:.1}%", stats.success_rate);

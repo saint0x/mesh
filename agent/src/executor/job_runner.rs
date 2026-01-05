@@ -22,9 +22,9 @@
 //! the swarm, executes jobs using the executor, and sends results back through
 //! the swarm.
 
+use crate::errors::Result;
 use crate::executor::{EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput};
 use crate::network::{JobEnvelope, JobResult, MeshEvent, MeshSwarm};
-use crate::errors::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,6 +50,12 @@ pub struct JobStats {
 
     /// Start time for uptime tracking
     pub start_time: Instant,
+}
+
+impl Default for JobStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JobStats {
@@ -174,14 +180,26 @@ impl JobStats {
 
         println!("\n{}", "Job Statistics:".bold());
         println!("  Total Jobs:       {}", self.total_jobs());
-        println!("  Completed:        {}", self.jobs_completed.load(Ordering::Relaxed).to_string().green());
-        println!("  Failed:           {}", self.jobs_failed.load(Ordering::Relaxed).to_string().red());
+        println!(
+            "  Completed:        {}",
+            self.jobs_completed
+                .load(Ordering::Relaxed)
+                .to_string()
+                .green()
+        );
+        println!(
+            "  Failed:           {}",
+            self.jobs_failed.load(Ordering::Relaxed).to_string().red()
+        );
         println!("  Active:           {}", self.active_jobs());
         println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
 
         println!("\n{}", "Performance:".bold());
         println!("  Avg Execution:    {:.2}ms", self.avg_execution_time_ms());
-        println!("  Total CPU Time:   {}ms", self.total_execution_time_ms.load(Ordering::Relaxed));
+        println!(
+            "  Total CPU Time:   {}ms",
+            self.total_execution_time_ms.load(Ordering::Relaxed)
+        );
 
         println!("\n{}", "System:".bold());
         println!("  Uptime:           {}", self.uptime_string());
@@ -570,7 +588,7 @@ impl JobRunner {
                     );
                     println!(
                         "  Embedding: [{:.3}, {:.3}, {:.3}, ...] ({} dims)",
-                        preview.get(0).unwrap_or(&0.0),
+                        preview.first().unwrap_or(&0.0),
                         preview.get(1).unwrap_or(&0.0),
                         preview.get(2).unwrap_or(&0.0),
                         output.dimensions

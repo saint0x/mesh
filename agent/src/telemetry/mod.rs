@@ -1,3 +1,3 @@
 pub mod ledger;
 
-pub use ledger::{LedgerClient, LedgerEvent, calculate_credits};
+pub use ledger::{calculate_credits, LedgerClient, LedgerEvent};

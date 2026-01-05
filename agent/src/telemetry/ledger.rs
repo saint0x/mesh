@@ -111,10 +111,7 @@ impl LedgerClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "(failed to read response)".to_string());
-            return Err(AgentError::Http(format!(
-                "HTTP {} - {}",
-                status, body
-            )));
+            return Err(AgentError::Http(format!("HTTP {} - {}", status, body)));
         }
 
         let ledger_response = response

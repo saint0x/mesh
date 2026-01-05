@@ -146,12 +146,24 @@ pub mod display {
                 eprintln!("{}", "  → Verify network connectivity".yellow());
             }
             AgentError::Config(_) => {
-                eprintln!("{}", "  → Run 'mesh init' to generate a valid configuration".yellow());
-                eprintln!("{}", "  → Check config file at ~/.meshnet/device.toml".yellow());
+                eprintln!(
+                    "{}",
+                    "  → Run 'mesh init' to generate a valid configuration".yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "  → Check config file at ~/.meshnet/device.toml".yellow()
+                );
             }
             AgentError::Registration(_) => {
-                eprintln!("{}", "  → Ensure control plane is running and accessible".yellow());
-                eprintln!("{}", "  → Check the control plane URL in your config".yellow());
+                eprintln!(
+                    "{}",
+                    "  → Ensure control plane is running and accessible".yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "  → Check the control plane URL in your config".yellow()
+                );
             }
             AgentError::Execution(_) => {
                 eprintln!("{}", "  → Check that the job payload is valid".yellow());

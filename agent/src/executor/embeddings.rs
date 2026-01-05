@@ -158,12 +158,7 @@ impl EmbeddingsExecutor {
         input: &EmbeddingsInput,
         timeout_ms: u64,
     ) -> ExecutorResult<EmbeddingsOutput> {
-        match tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            self.execute(input),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), self.execute(input)).await {
             Ok(result) => result,
             Err(_) => {
                 warn!(timeout_ms = timeout_ms, "Execution timed out");
@@ -235,7 +230,9 @@ impl EmbeddingsExecutor {
 
         for i in 0..self.dimensions {
             // Simple LCG (Linear Congruential Generator) for deterministic randomness
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(i as u64);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(i as u64);
 
             // Map to [-1.0, 1.0] range
             let value = ((state as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32;
@@ -392,7 +389,11 @@ mod tests {
         let norm: f32 = output.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
 
         // L2 normalized vector should have norm ≈ 1.0
-        assert!((norm - 1.0).abs() < 0.001, "Norm should be 1.0, got {}", norm);
+        assert!(
+            (norm - 1.0).abs() < 0.001,
+            "Norm should be 1.0, got {}",
+            norm
+        );
     }
 
     #[tokio::test]
