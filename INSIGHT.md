@@ -1,6 +1,6 @@
 # Mesh: Architectural Insight - Tensor-Parallel Cooperative Pooling
 
-> **Higher-Level Vision:** This document describes the architectural vision for Mesh - a cooperative compute pooling system that enables groups of people to collectively run large AI models that no single device could run alone. The current `IMPLEMENTATION.md` roadmap focuses on building the foundational execution layer. This document explains the complete tensor-parallel architecture that enables distributed inference at scale.
+> **Implementation Status:** This document describes both the architectural vision AND tracks the actual implementation progress. Core infrastructure for tensor-parallel inference is now implemented in `agent/src/inference/`, `agent/src/checkpoint/`, and `agent/src/model/`.
 
 ---
 
@@ -892,162 +892,84 @@ Carol (not a worker) purchases 5% allocation
 
 ## Technical Implementation Details
 
-### How Current Codebase Evolves
+### Implementation Status
 
-**What we've already built (IMPLEMENTATION.md):**
+**Core Infrastructure (IMPLEMENTED):**
 
-✅ `agent/src/network/mesh_swarm.rs` - P2P connectivity (use for ring topology)
-✅ `agent/src/executor/job_runner.rs` - Job execution (extend for tensor ops)
-✅ `control-plane/` - Worker registration and heartbeats (extend for ring mgmt)
+✅ `agent/src/network/mesh_swarm.rs` - P2P connectivity with ring neighbor support
+✅ `agent/src/network/tensor_protocol.rs` - Tensor passing protocol for all-reduce
+✅ `agent/src/executor/worker_ring.rs` - Ring topology and all-reduce operations
+✅ `agent/src/inference/coordinator.rs` - Inference orchestration with ring join/leave
+✅ `agent/src/inference/job.rs` - InferenceJob, InferenceRequest, InferenceResult types
+✅ `agent/src/inference/stats.rs` - Statistics tracking (tokens, all-reduce ops, checkpoints)
+✅ `agent/src/checkpoint/manager.rs` - Checkpoint save/load/cleanup with CBOR serialization
+✅ `agent/src/checkpoint/types.rs` - Checkpoint, CheckpointMetadata, CheckpointConfig types
+✅ `agent/src/model/shard.rs` - ShardInfo, ShardAssignment, ModelInfo with 8192-column shard space
+✅ `agent/src/model/registry.rs` - ShardRegistry tracking lifecycle (Pending→Downloading→Downloaded→Ready)
+✅ `control-plane/` - Worker registration and heartbeats
 ✅ `relay-server/` - NAT traversal (fallback for P2P ring connections)
-✅ Job protocol - Request-response (extend for tensor passing)
 
-**What needs to be added:**
+**CLI Commands (IMPLEMENTED):**
 
-### 1. Ring Topology Manager (Control Plane)
+✅ `ring-status` - Show ring topology and neighbor connections
+✅ `shard-status` - Show model shard assignment and status
+✅ `inference-stats` - Show inference statistics
+✅ `pool-status` - Show pool membership and resource utilization
 
-```rust
-// control-plane/src/topology/ring_manager.rs
-struct RingTopologyManager {
-    workers: Vec<Worker>,           // All workers in pool
-    ring_sequence: Vec<DeviceId>,   // Ordered ring positions
-    model_registry: ModelRegistry,  // Which model shards exist
-}
+**Remaining Work:**
 
-impl RingTopologyManager {
-    // Worker joins pool
-    async fn add_worker(&mut self, worker: Worker) -> Result<RingPosition> {
-        // Find position in ring (append to end initially)
-        let position = self.workers.len() as u32;
+### 1. Model Weight Loading (safetensors)
 
-        // Assign model shard (which columns to download)
-        let shard = self.assign_shard(&worker, position)?;
-
-        // Update ring connections
-        self.update_ring_connections(position).await?;
-
-        Ok(RingPosition {
-            position,
-            shard,
-            left_neighbor: self.get_neighbor(position, -1),
-            right_neighbor: self.get_neighbor(position, 1),
-        })
-    }
-
-    // Assign model shard to worker
-    fn assign_shard(&self, worker: &Worker, position: u32) -> Result<ModelShard> {
-        let n = self.workers.len() + 1;
-        let columns_per_shard = 8192 / n;  // Total columns divided by workers
-
-        let start_col = position * columns_per_shard;
-        let end_col = start_col + columns_per_shard;
-
-        Ok(ModelShard {
-            model_id: "llama-70b".to_string(),
-            column_range: (start_col, end_col),
-            layer_count: 70,
-            estimated_memory: worker.contributed_memory,
-        })
-    }
-}
-```
-
-### 2. Tensor Passing Protocol (Agent)
+The infrastructure for shard management is complete (`agent/src/model/`), but actual weight loading needs:
 
 ```rust
-// agent/src/network/tensor_protocol.rs
-use libp2p::request_response::{Codec, RequestResponseProtocol};
-
-// Extend job protocol for tensor passing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TensorMessage {
-    pub job_id: JobId,
-    pub layer_idx: u32,
-    pub step_idx: u32,           // All-reduce step number
-    pub tensor_data: Vec<f32>,   // Actual tensor chunk
-    pub shape: Vec<usize>,       // Tensor dimensions
-}
-
-// Ring communication primitive
-async fn send_to_right_recv_from_left(
-    &mut self,
-    tensor: Tensor,
-) -> Result<Tensor> {
-    // Send to right neighbor (non-blocking)
-    let send_msg = TensorMessage {
-        job_id: self.current_job,
-        layer_idx: self.current_layer,
-        step_idx: self.all_reduce_step,
-        tensor_data: tensor.to_vec(),
-        shape: tensor.shape(),
-    };
-
-    self.swarm.send_to_peer(self.right_neighbor, send_msg)?;
-
-    // Receive from left neighbor (blocking)
-    let recv_msg = self.swarm.recv_from_peer(self.left_neighbor).await?;
-
-    // Deserialize tensor
-    let received_tensor = Tensor::from_vec(
-        recv_msg.tensor_data,
-        recv_msg.shape
-    )?;
-
-    Ok(received_tensor)
-}
-```
-
-### 3. Model Sharding and Loading (Agent)
-
-```rust
-// agent/src/model/shard_loader.rs
-struct ShardLoader {
-    model_id: String,
-    column_range: (u32, u32),
-    cache_dir: PathBuf,
-}
-
+// agent/src/model/loader.rs - TODO
 impl ShardLoader {
-    // Download shard from backup storage or peer
-    async fn download_shard(&self) -> Result<ModelWeights> {
+    // Download shard from storage (safetensors format)
+    async fn download_shard(&self, assignment: &ShardAssignment) -> Result<ModelWeights> {
         let shard_url = format!(
             "https://models.mesh.network/{}/shard_{}_{}.safetensors",
-            self.model_id,
-            self.column_range.0,
-            self.column_range.1
+            assignment.model_id,
+            assignment.column_start,
+            assignment.column_end
         );
 
-        info!("Downloading shard from {}", shard_url);
-
-        // Stream download with progress
-        let weights = download_with_progress(&shard_url).await?;
-
-        // Cache locally for future use
-        let cache_path = self.cache_dir.join(format!(
-            "{}_shard_{}_{}.safetensors",
-            self.model_id,
-            self.column_range.0,
-            self.column_range.1
-        ));
-
-        tokio::fs::write(&cache_path, &weights).await?;
+        // Stream download with progress updates to registry
+        let weights = download_with_progress(&shard_url, |progress| {
+            self.registry.update_download_progress(&assignment.model_id, progress)
+        }).await?;
 
         Ok(ModelWeights::from_safetensors(weights)?)
     }
+}
+```
 
-    // Load shard into locked GPU memory
-    async fn load_to_gpu(&self, weights: ModelWeights) -> Result<()> {
-        // Verify we have enough locked memory
-        if weights.size_bytes() > self.contributed_memory {
-            return Err(MeshError::InsufficientMemory);
-        }
+### 2. Actual Tensor Operations
 
-        // Load weights to GPU (use candle/burn for tensor ops)
-        self.gpu_allocator.load_weights(weights).await?;
+The forward pass structure exists in `coordinator.rs`, but actual tensor ops need implementation:
 
-        info!("Shard loaded to GPU: {} GB", weights.size_bytes() / 1_000_000_000);
-        Ok(())
-    }
+```rust
+// In generate_next_token() - placeholder code needs actual implementation:
+// 1. Get input tensor (from previous layer or prompt embeddings)
+// 2. Compute partial matmul with this worker's shard columns
+// 3. Call ring_all_reduce() to combine partial results
+// 4. Apply activation function
+// 5. Sample next token from logits
+```
+
+### 3. Control Plane Ring Manager
+
+```rust
+// control-plane/src/topology/ring_manager.rs - TODO
+struct RingTopologyManager {
+    workers: Vec<Worker>,
+    ring_sequence: Vec<DeviceId>,
+}
+
+impl RingTopologyManager {
+    async fn add_worker(&mut self, worker: Worker) -> Result<RingPosition>;
+    async fn remove_worker(&mut self, device_id: DeviceId) -> Result<()>;
+    async fn rebalance_shards(&mut self) -> Result<()>;
 }
 ```
 
@@ -1182,21 +1104,23 @@ impl ResourceManagerUI {
 
 ## Implementation Roadmap
 
-### Phase 1: Single-Pool Tensor Parallelism (Current Focus)
+### Phase 1: Single-Pool Tensor Parallelism (75% Complete)
 
 **Goal:** Build working tensor-parallel inference for 10-device pool
 
 **Components:**
-1. ✅ Worker registration and heartbeat (DONE via IMPLEMENTATION.md)
-2. ✅ P2P connectivity with DCUTR (DONE via IMPLEMENTATION.md)
-3. 🚧 Ring topology manager (control plane)
-4. 🚧 Model sharding and distribution
-5. 🚧 Ring all-reduce implementation
-6. 🚧 Tensor-parallel forward pass
-7. 🚧 Resource locking UI (client app)
-8. 🚧 Checkpointing system
-
-**Timeline:** 8-12 weeks
+1. ✅ Worker registration and heartbeat
+2. ✅ P2P connectivity with DCUTR and ring neighbor support
+3. ✅ Tensor passing protocol (`agent/src/network/tensor_protocol.rs`)
+4. ✅ Ring all-reduce implementation (`agent/src/executor/worker_ring.rs`)
+5. ✅ Inference coordinator with job lifecycle (`agent/src/inference/`)
+6. ✅ Model shard registry and assignment (`agent/src/model/`)
+7. ✅ Checkpointing system (`agent/src/checkpoint/`)
+8. ✅ CLI commands for monitoring (ring-status, shard-status, inference-stats, pool-status)
+9. 🚧 Ring topology manager (control plane)
+10. 🚧 Model weight loading (safetensors)
+11. 🚧 Actual tensor operations in forward pass
+12. 🚧 Resource locking UI (client app)
 
 ### Phase 2: Executor Containers and API
 
@@ -1209,8 +1133,6 @@ impl ResourceManagerUI {
 4. Credit quota enforcement
 5. Rate limiting per executor
 
-**Timeline:** 3-4 weeks
-
 ### Phase 3: Fault Tolerance and Production Hardening
 
 **Goal:** 99% reliability for production use
@@ -1222,8 +1144,6 @@ impl ResourceManagerUI {
 4. Dynamic rebalancing (workers join/leave)
 5. Monitoring and alerting
 
-**Timeline:** 6-8 weeks
-
 ### Phase 4: Multi-Pool Discovery (Future)
 
 **Goal:** Multiple cooperative pools can advertise capacity
@@ -1233,8 +1153,6 @@ impl ResourceManagerUI {
 2. Pool discovery by model_id
 3. Cross-pool reputation system
 4. Load balancing across pools
-
-**Timeline:** 4-6 weeks after Phase 3
 
 ---
 
@@ -1290,12 +1208,17 @@ Mesh is a **tensor-parallel distributed inference system** that enables cooperat
 
 ### Next Steps
 
-The current `IMPLEMENTATION.md` roadmap is building the foundational execution layer (P2P connectivity, job protocol, worker registration). This document provides the architectural vision for evolving that foundation into a full tensor-parallel cooperative pooling system.
+The core infrastructure is now implemented:
+- **Inference orchestration** - `agent/src/inference/` handles job lifecycle and token generation
+- **Checkpointing** - `agent/src/checkpoint/` provides fault tolerance with CBOR serialization
+- **Shard management** - `agent/src/model/` tracks shard lifecycle and assignments
+
+Remaining work focuses on:
+1. **Control plane ring manager** - Orchestrate worker join/leave and shard redistribution
+2. **Model weight loading** - Download and load safetensors shards into memory
+3. **Tensor operations** - Implement actual matmul and activation in forward pass
+4. **Client UI** - Resource locking slider with 24-hour cooldown
 
 **This is not a marketplace. This is not a blockchain. This is a cooperative compute pool using state-of-the-art distributed inference techniques.**
 
 Like DeepSpeed, but for consumer devices. Like Tailscale, but for AI inference.
-
----
-
-**Questions or feedback?** See `IMPLEMENTATION.md` for tactical implementation steps.
