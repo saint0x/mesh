@@ -8,10 +8,13 @@ use tracing::instrument;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    RingJoinRequest, RingJoinResponse, RingLeaveResponse, RingTopologyResponse, ShardInfo,
-    WorkerInfo,
+    CreateHandoffRequest, CreateHandoffResponse, HandoffInfo, ListHandoffsResponse,
+    RegisterCallbackRequest, RegisterCallbackResponse, RingJoinRequest, RingJoinResponse,
+    RingLeaveResponse, RingTopologyResponse, ShardInfo, TopologyVersionRequest,
+    TopologyVersionResponse, UpdateHandoffRequest, WorkerInfo,
 };
 use crate::services::ring_manager::Worker;
+use crate::services::topology_notifier::HandoffStatus;
 use crate::state::AppState;
 
 /// Query parameters for topology endpoint
@@ -55,6 +58,22 @@ pub async fn join_ring(
     let position = tokio::task::spawn_blocking(move || ring_manager.add_worker(worker))
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    // Send topology notification for worker join
+    let notifier = state.topology_notifier.clone();
+    let notification = notifier.worker_joined_notification(
+        &req.network_id,
+        &req.device_id,
+        position.position,
+        position.shard.column_range,
+        &position.left_neighbor,
+        &position.right_neighbor,
+    );
+
+    // Send notification asynchronously (don't block response)
+    tokio::spawn(async move {
+        let _ = notifier.notify_network(notification).await;
+    });
 
     Ok(Json(RingJoinResponse {
         success: true,
@@ -184,11 +203,234 @@ pub async fn leave_ring(
     let ring_manager = state.get_ring_manager(&network_id)?;
 
     // Execute blocking database operation in thread pool
-    tokio::task::spawn_blocking(move || ring_manager.handle_worker_failure(device_id))
+    let device_id_clone = device_id.clone();
+    tokio::task::spawn_blocking(move || ring_manager.handle_worker_failure(device_id_clone))
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
+    // Send topology notification for worker leave
+    let notifier = state.topology_notifier.clone();
+    let notification = notifier.worker_left_notification(&network_id, &device_id);
+
+    // Send notification asynchronously (don't block response)
+    tokio::spawn(async move {
+        let _ = notifier.notify_network(notification).await;
+    });
+
     Ok(Json(RingLeaveResponse { success: true }))
+}
+
+// ==================== Handoff Management Endpoints ====================
+
+/// Create a new shard handoff
+///
+/// POST /api/ring/handoff
+#[instrument(skip(state))]
+pub async fn create_handoff(
+    State(state): State<AppState>,
+    Json(req): Json<CreateHandoffRequest>,
+) -> ApiResult<Json<CreateHandoffResponse>> {
+    // Validate request
+    if req.source_device.is_empty() || req.target_device.is_empty() {
+        return Err(ApiError::BadRequest(
+            "source_device and target_device are required".to_string(),
+        ));
+    }
+    if req.column_start >= req.column_end {
+        return Err(ApiError::BadRequest(
+            "column_start must be less than column_end".to_string(),
+        ));
+    }
+
+    let handoff = state.topology_notifier.create_handoff(
+        req.network_id,
+        req.source_device,
+        req.target_device,
+        (req.column_start, req.column_end),
+        req.model_id,
+    )?;
+
+    Ok(Json(CreateHandoffResponse {
+        success: true,
+        handoff_id: handoff.handoff_id,
+        status: format!("{:?}", handoff.status).to_lowercase(),
+    }))
+}
+
+/// Get handoff status
+///
+/// GET /api/ring/handoff/:handoff_id
+#[instrument(skip(state))]
+pub async fn get_handoff(
+    State(state): State<AppState>,
+    Path(handoff_id): Path<String>,
+) -> ApiResult<Json<HandoffInfo>> {
+    let handoff = state
+        .topology_notifier
+        .get_handoff(&handoff_id)?
+        .ok_or_else(|| ApiError::NotFound(format!("Handoff {} not found", handoff_id)))?;
+
+    let progress = handoff.progress();
+    Ok(Json(HandoffInfo {
+        handoff_id: handoff.handoff_id,
+        network_id: handoff.network_id,
+        source_device: handoff.source_device,
+        target_device: handoff.target_device,
+        column_start: handoff.column_range.0,
+        column_end: handoff.column_range.1,
+        model_id: handoff.model_id,
+        status: format!("{:?}", handoff.status).to_lowercase(),
+        bytes_transferred: handoff.bytes_transferred,
+        total_bytes: handoff.total_bytes,
+        progress,
+        started_at: handoff.started_at,
+        completed_at: handoff.completed_at,
+        error: handoff.error,
+    }))
+}
+
+/// Update handoff status
+///
+/// PATCH /api/ring/handoff/:handoff_id
+#[instrument(skip(state))]
+pub async fn update_handoff(
+    State(state): State<AppState>,
+    Path(handoff_id): Path<String>,
+    Json(req): Json<UpdateHandoffRequest>,
+) -> ApiResult<Json<HandoffInfo>> {
+    // Parse status
+    let status = match req.status.to_lowercase().as_str() {
+        "pending" => HandoffStatus::Pending,
+        "preparing" => HandoffStatus::Preparing,
+        "transferring" => HandoffStatus::Transferring,
+        "verifying" => HandoffStatus::Verifying,
+        "completed" => HandoffStatus::Completed,
+        "failed" => HandoffStatus::Failed,
+        "cancelled" => HandoffStatus::Cancelled,
+        _ => return Err(ApiError::BadRequest(format!("Invalid status: {}", req.status))),
+    };
+
+    // Update handoff with bytes if provided
+    if let Some(total) = req.total_bytes {
+        // Get handoff and update total_bytes
+        if let Some(mut handoff) = state.topology_notifier.get_handoff(&handoff_id)? {
+            handoff.total_bytes = total;
+        }
+    }
+
+    state
+        .topology_notifier
+        .update_handoff_status(&handoff_id, status, req.bytes_transferred, req.error)?;
+
+    // Return updated handoff
+    get_handoff(State(state), Path(handoff_id)).await
+}
+
+/// List active handoffs for a network
+///
+/// GET /api/ring/handoffs?network_id=xxx
+#[derive(Debug, Deserialize)]
+pub struct HandoffsQuery {
+    pub network_id: String,
+}
+
+#[instrument(skip(state))]
+pub async fn list_handoffs(
+    State(state): State<AppState>,
+    Query(query): Query<HandoffsQuery>,
+) -> ApiResult<Json<ListHandoffsResponse>> {
+    let handoffs = state
+        .topology_notifier
+        .list_active_handoffs(&query.network_id)?;
+
+    let handoff_infos: Vec<HandoffInfo> = handoffs
+        .into_iter()
+        .map(|h| {
+            let progress = h.progress();
+            HandoffInfo {
+                handoff_id: h.handoff_id,
+                network_id: h.network_id,
+                source_device: h.source_device,
+                target_device: h.target_device,
+                column_start: h.column_range.0,
+                column_end: h.column_range.1,
+                model_id: h.model_id,
+                status: format!("{:?}", h.status).to_lowercase(),
+                bytes_transferred: h.bytes_transferred,
+                total_bytes: h.total_bytes,
+                progress,
+                started_at: h.started_at,
+                completed_at: h.completed_at,
+                error: h.error,
+            }
+        })
+        .collect();
+
+    Ok(Json(ListHandoffsResponse {
+        handoffs: handoff_infos,
+    }))
+}
+
+/// Cancel a handoff
+///
+/// DELETE /api/ring/handoff/:handoff_id
+#[instrument(skip(state))]
+pub async fn cancel_handoff(
+    State(state): State<AppState>,
+    Path(handoff_id): Path<String>,
+) -> ApiResult<Json<HandoffInfo>> {
+    state.topology_notifier.cancel_handoff(&handoff_id)?;
+    get_handoff(State(state), Path(handoff_id)).await
+}
+
+// ==================== Worker Callback Endpoints ====================
+
+/// Register worker callback for topology notifications
+///
+/// POST /api/ring/callback
+#[instrument(skip(state))]
+pub async fn register_callback(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterCallbackRequest>,
+) -> ApiResult<Json<RegisterCallbackResponse>> {
+    if req.device_id.is_empty() {
+        return Err(ApiError::BadRequest("device_id is required".to_string()));
+    }
+
+    state
+        .topology_notifier
+        .register_callback(req.device_id, req.callback_url)?;
+
+    Ok(Json(RegisterCallbackResponse { success: true }))
+}
+
+/// Unregister worker callback
+///
+/// DELETE /api/ring/callback/:device_id
+#[instrument(skip(state))]
+pub async fn unregister_callback(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> ApiResult<Json<RegisterCallbackResponse>> {
+    state.topology_notifier.unregister_callback(&device_id)?;
+    Ok(Json(RegisterCallbackResponse { success: true }))
+}
+
+/// Check topology version (for polling)
+///
+/// POST /api/ring/version
+#[instrument(skip(state))]
+pub async fn check_topology_version(
+    State(state): State<AppState>,
+    Json(req): Json<TopologyVersionRequest>,
+) -> ApiResult<Json<TopologyVersionResponse>> {
+    let current = state.topology_notifier.get_version(&req.network_id);
+    let has_updates = current > req.since_version;
+
+    Ok(Json(TopologyVersionResponse {
+        current_version: current,
+        has_updates,
+    }))
 }
 
 #[cfg(test)]

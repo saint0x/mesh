@@ -36,11 +36,20 @@
 //! - [`InferenceCoordinator`]: Main orchestrator for inference jobs
 //! - [`InferenceJob`]: Represents a single inference request
 //! - [`InferenceStats`]: Tracks inference performance metrics
+//! - [`tensor_ops`]: Tensor operations (matmul, activations, etc.)
+//! - [`kv_cache`]: KV cache management for transformer attention
+//! - [`forward_pass`]: Tensor-parallel forward pass implementation
 
 pub mod coordinator;
+pub mod forward_pass;
 pub mod job;
+pub mod kv_cache;
 pub mod stats;
+pub mod tensor_ops;
 
 pub use coordinator::{InferenceCoordinator, InferenceConfig};
-pub use job::{InferenceJob, InferenceRequest, InferenceResult, GenerationConfig};
+pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
+pub use job::{GenerationConfig, InferenceJob, InferenceRequest, InferenceResult};
+pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};
 pub use stats::InferenceStats;
+pub use tensor_ops::{Tensor1D, Tensor2D};

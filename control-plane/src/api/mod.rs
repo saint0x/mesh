@@ -5,7 +5,7 @@ pub mod routes;
 pub mod types;
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -27,6 +27,16 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ring/join", post(ring::join_ring))
         .route("/api/ring/topology", get(ring::get_topology))
         .route("/api/ring/leave/:device_id", delete(ring::leave_ring))
+        // Handoff management endpoints
+        .route("/api/ring/handoff", post(ring::create_handoff))
+        .route("/api/ring/handoff/:handoff_id", get(ring::get_handoff))
+        .route("/api/ring/handoff/:handoff_id", patch(ring::update_handoff))
+        .route("/api/ring/handoff/:handoff_id", delete(ring::cancel_handoff))
+        .route("/api/ring/handoffs", get(ring::list_handoffs))
+        // Worker callback/notification endpoints
+        .route("/api/ring/callback", post(ring::register_callback))
+        .route("/api/ring/callback/:device_id", delete(ring::unregister_callback))
+        .route("/api/ring/version", post(ring::check_topology_version))
         // Attach application state
         .with_state(state)
         // Middleware

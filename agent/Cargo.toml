@@ -42,11 +42,12 @@ libc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_System_Memory"] }
 
-# ML inference (mocked for now)
-# TODO: Add real ONNX Runtime when implementing full inference
+# ML inference
+# Using custom tensor ops for tensor-parallel inference
+# TODO: Add GPU acceleration via candle or ort when needed
 # ort = "2.0"
 # tokenizers = "0.20"
-# ndarray = "0.16"
+# candle-core = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"

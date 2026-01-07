@@ -133,3 +133,118 @@ pub struct RingLeaveResponse {
     /// Whether leave succeeded
     pub success: bool,
 }
+
+// ==================== Handoff API Types ====================
+
+/// Request to create a shard handoff
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateHandoffRequest {
+    /// Network ID
+    pub network_id: String,
+    /// Source device (giving up shard)
+    pub source_device: String,
+    /// Target device (receiving shard)
+    pub target_device: String,
+    /// Column range to transfer (start, end)
+    pub column_start: u32,
+    pub column_end: u32,
+    /// Model ID
+    pub model_id: String,
+}
+
+/// Response to handoff creation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateHandoffResponse {
+    /// Whether creation succeeded
+    pub success: bool,
+    /// Handoff ID
+    pub handoff_id: String,
+    /// Initial status
+    pub status: String,
+}
+
+/// Request to update handoff status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateHandoffRequest {
+    /// New status
+    pub status: String,
+    /// Optional bytes transferred
+    pub bytes_transferred: Option<u64>,
+    /// Optional total bytes
+    pub total_bytes: Option<u64>,
+    /// Optional error message
+    pub error: Option<String>,
+}
+
+/// Response with handoff details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffInfo {
+    /// Handoff ID
+    pub handoff_id: String,
+    /// Network ID
+    pub network_id: String,
+    /// Source device
+    pub source_device: String,
+    /// Target device
+    pub target_device: String,
+    /// Column range
+    pub column_start: u32,
+    pub column_end: u32,
+    /// Model ID
+    pub model_id: String,
+    /// Current status
+    pub status: String,
+    /// Bytes transferred
+    pub bytes_transferred: u64,
+    /// Total bytes
+    pub total_bytes: u64,
+    /// Progress (0.0 - 1.0)
+    pub progress: f32,
+    /// Start timestamp
+    pub started_at: u64,
+    /// Completion timestamp
+    pub completed_at: Option<u64>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Response listing handoffs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListHandoffsResponse {
+    /// Active handoffs
+    pub handoffs: Vec<HandoffInfo>,
+}
+
+/// Request to register worker callback
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterCallbackRequest {
+    /// Device ID
+    pub device_id: String,
+    /// Optional callback URL for webhooks
+    pub callback_url: Option<String>,
+}
+
+/// Response to callback registration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterCallbackResponse {
+    /// Whether registration succeeded
+    pub success: bool,
+}
+
+/// Request for topology version check (polling)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyVersionRequest {
+    /// Network ID
+    pub network_id: String,
+    /// Last known version
+    pub since_version: u64,
+}
+
+/// Response with topology version
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyVersionResponse {
+    /// Current version
+    pub current_version: u64,
+    /// Whether there are updates since the provided version
+    pub has_updates: bool,
+}
