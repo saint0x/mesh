@@ -42,6 +42,10 @@ pub enum AgentError {
     /// Cooldown is active, unlock not allowed
     #[error("Cooldown active: {remaining_hours} hours remaining until unlock")]
     CooldownActive { remaining_hours: u64 },
+
+    /// Queue error
+    #[error("Queue error: {0}")]
+    Queue(String),
 }
 
 /// Result type alias for agent operations.
