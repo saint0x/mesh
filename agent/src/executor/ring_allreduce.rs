@@ -129,7 +129,10 @@ impl Tensor {
 ///
 /// Each worker knows its position, the total number of workers,
 /// and its left/right neighbors in the ring.
-pub struct WorkerRing {
+///
+/// NOTE: WorkerRing borrows the MeshSwarm instead of owning it, allowing
+/// the coordinator to maintain ownership for the entire inference job.
+pub struct WorkerRing<'a> {
     /// This worker's position in the ring (0 to total_workers-1)
     pub my_position: u32,
     /// Total number of workers in the ring
@@ -138,11 +141,11 @@ pub struct WorkerRing {
     pub left_neighbor: PeerId,
     /// Peer ID of the right neighbor (we send to them in scatter phase)
     pub right_neighbor: PeerId,
-    /// Mesh swarm for network communication
-    pub swarm: MeshSwarm,
+    /// Mesh swarm for network communication (borrowed)
+    pub swarm: &'a mut MeshSwarm,
 }
 
-impl WorkerRing {
+impl<'a> WorkerRing<'a> {
     /// Create a new worker ring
     ///
     /// # Arguments
@@ -150,13 +153,13 @@ impl WorkerRing {
     /// * `total_workers` - Total number of workers in the ring
     /// * `left_neighbor` - Peer ID of the left neighbor
     /// * `right_neighbor` - Peer ID of the right neighbor
-    /// * `swarm` - Mesh swarm for network communication
+    /// * `swarm` - Mutable borrow of mesh swarm for network communication
     pub fn new(
         my_position: u32,
         total_workers: u32,
         left_neighbor: PeerId,
         right_neighbor: PeerId,
-        swarm: MeshSwarm,
+        swarm: &'a mut MeshSwarm,
     ) -> Self {
         Self {
             my_position,

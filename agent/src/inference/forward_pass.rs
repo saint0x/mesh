@@ -264,7 +264,7 @@ impl ForwardPass {
         &mut self,
         hidden: &Tensor2D,
         layer_idx: usize,
-        worker_ring: &mut WorkerRing,
+        worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<Tensor2D> {
         let layer = &self.weights.layers[layer_idx];
@@ -381,7 +381,7 @@ impl ForwardPass {
     pub async fn forward(
         &mut self,
         tokens: &[u32],
-        worker_ring: &mut WorkerRing,
+        worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<Tensor2D> {
         let start = Instant::now();
@@ -411,7 +411,7 @@ impl ForwardPass {
     pub async fn generate_next_token(
         &mut self,
         tokens: &[u32],
-        worker_ring: &mut WorkerRing,
+        worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         temperature: f32,
         top_p: f32,
@@ -435,7 +435,7 @@ impl ForwardPass {
     async fn ring_allreduce_tensor(
         &self,
         tensor: &Tensor2D,
-        worker_ring: &mut WorkerRing,
+        worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<Tensor2D> {

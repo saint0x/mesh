@@ -44,6 +44,7 @@ pub mod coordinator;
 pub mod forward_pass;
 pub mod job;
 pub mod kv_cache;
+pub mod mock_validation; // MOCK: For validation only - TODO: Remove when using real weights
 pub mod stats;
 pub mod tensor_ops;
 

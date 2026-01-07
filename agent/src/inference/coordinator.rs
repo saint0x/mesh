@@ -10,6 +10,7 @@
 //! - Returning results to the control plane
 
 use crate::errors::{AgentError, Result};
+use crate::executor::ring_allreduce::WorkerRing;
 use crate::network::MeshSwarm;
 use libp2p::PeerId;
 use std::sync::Arc;
@@ -18,7 +19,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+use super::forward_pass::{ForwardPass, ModelConfig};
 use super::job::{InferenceJob, InferenceRequest, InferenceResult};
+use super::mock_validation; // MOCK: For validation only - TODO: Remove when using real weights
 use super::stats::InferenceStats;
 
 /// Configuration for the inference coordinator
@@ -215,7 +218,8 @@ impl InferenceCoordinator {
             *active = Some(job.clone());
         }
 
-        // Token generation loop
+        // Run generation loop
+        // NOTE: WorkerRing is created per-token inside generate_next_token()
         let result = self.run_generation_loop(&mut job, &position).await;
 
         // Clear active job
@@ -280,6 +284,7 @@ impl InferenceCoordinator {
             }
 
             // Generate next token via tensor-parallel forward pass
+            // NOTE: WorkerRing is created per-token inside generate_next_token
             let next_token = self.generate_next_token(job, position).await?;
 
             // Add token to job
@@ -311,6 +316,10 @@ impl InferenceCoordinator {
 
     /// Generate the next token using tensor-parallel forward pass
     ///
+    /// MOCK: This implementation uses Xavier-initialized mock weights for validation.
+    /// TODO: Replace with safetensors weight loading when ready.
+    /// See agent/src/inference/mock_validation.rs for mock implementation details.
+    ///
     /// This is where the actual distributed computation happens:
     /// 1. Each worker computes partial matmul for their columns
     /// 2. Ring all-reduce combines results
@@ -320,69 +329,88 @@ impl InferenceCoordinator {
     async fn generate_next_token(
         &mut self,
         job: &mut InferenceJob,
-        _position: &WorkerPosition,
+        position: &WorkerPosition,
     ) -> Result<u32> {
-        let layer_start = Instant::now();
+        // MOCK: Using Xavier-initialized mock weights for validation
+        // TODO: Replace with safetensors weight loading when ready
+        // See agent/src/inference/mock_validation.rs for mock implementation details
 
-        // Verify ring neighbors are set (needed for all-reduce)
-        let _left_neighbor = self.swarm.left_neighbor().ok_or_else(|| {
-            AgentError::Network("Left neighbor not set".to_string())
-        })?;
-        let _right_neighbor = self.swarm.right_neighbor().ok_or_else(|| {
-            AgentError::Network("Right neighbor not set".to_string())
-        })?;
+        let start = Instant::now();
 
-        // For each layer, we need to:
-        // 1. Compute partial activation (my shard columns × input)
-        // 2. Ring all-reduce to get full activation
-        // 3. Apply activation function
-        // 4. Feed to next layer
+        // Create WorkerRing for this token generation
+        // NOTE: WorkerRing is lightweight (just metadata), so creating per-token is fine
+        let mut worker_ring = WorkerRing::new(
+            position.position,
+            position.total_workers,
+            position.left_neighbor,
+            position.right_neighbor,
+            self.swarm_mut(),
+        );
 
-        // This is a placeholder for actual tensor operations
-        // The real implementation will use the model weights
-        for layer_idx in 0..self.config.total_layers {
-            job.current_layer = layer_idx;
+        // MOCK: Generate Xavier-initialized weights for validation
+        // TODO: Replace this with actual safetensors loading:
+        //   let weights = load_weights_from_safetensors(&self.config.model_path, position.shard_column_range)?;
+        let config = ModelConfig::default();
+        let shard_cols =
+            (position.shard_column_range.1 - position.shard_column_range.0) as usize;
 
-            // Record layer start
-            let allreduce_start = Instant::now();
+        debug!(
+            job_id = %job.request.job_id,
+            position = position.position,
+            shard_cols = shard_cols,
+            "Generating mock weights for validation"
+        );
 
-            // Placeholder: In real implementation, this would:
-            // 1. Get input tensor (from previous layer or prompt embeddings)
-            // 2. Compute partial matmul with this worker's shard
-            // 3. Call ring_all_reduce to combine
-            // 4. Apply activation
+        // MOCK: Generate mock weights (deterministic from fixed seed)
+        let mock_weights = mock_validation::generate_mock_weights(&config, shard_cols, 12345);
 
-            // For now, we simulate the all-reduce timing
-            // Real implementation would use WorkerRing::ring_all_reduce()
+        // Create ForwardPass with mock weights
+        // NOTE: ForwardPass is created per-token (KV cache/position changes)
+        // TODO: In production, consider caching weights and reusing ForwardPass
+        let mut forward_pass = ForwardPass::new(
+            mock_weights,
+            position.shard_column_range.0 as usize,
+            position.shard_column_range.1 as usize,
+            position.total_workers,
+        );
 
-            // Record all-reduce time
-            let allreduce_time = allreduce_start.elapsed().as_millis() as u64;
-            self.stats.record_allreduce(allreduce_time);
+        // Build full token sequence (prompt + generated so far)
+        let mut all_tokens = job.request.prompt_tokens.clone();
+        all_tokens.extend(&job.generated_tokens);
+
+        debug!(
+            job_id = %job.request.job_id,
+            total_tokens = all_tokens.len(),
+            "Running forward pass with ring all-reduce"
+        );
+
+        // Run forward pass with ring all-reduce
+        // WorkerRing created per-token (lightweight metadata structure)
+        let next_token = forward_pass
+            .generate_next_token(
+                &all_tokens,
+                &mut worker_ring,
+                job.request.job_id,
+                job.request.config.temperature,
+                job.request.config.top_p,
+            )
+            .await?;
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        debug!(
+            job_id = %job.request.job_id,
+            next_token = next_token,
+            elapsed_ms = elapsed,
+            "Generated next token"
+        );
+
+        // Record statistics
+        self.stats.record_allreduce(elapsed);
+        for _ in 0..config.num_layers {
             self.stats.record_layer();
         }
 
-        let layer_time = layer_start.elapsed().as_millis() as u64;
-        debug!(
-            job_id = %job.request.job_id,
-            layer_time_ms = layer_time,
-            "Forward pass complete"
-        );
-
-        // Placeholder: Sample next token from logits
-        // Real implementation would use the final layer output
-        // For now, return a dummy token
-        let next_token = self.sample_token(job);
-
         Ok(next_token)
-    }
-
-    /// Sample a token (placeholder - will be replaced with actual sampling)
-    fn sample_token(&self, job: &InferenceJob) -> u32 {
-        // Placeholder: Generate a deterministic "token" based on position
-        // Real implementation would sample from logits with temperature/top-p
-        let base = job.request.prompt_tokens.iter().sum::<u32>();
-        let position = job.current_token_idx;
-        (base.wrapping_add(position).wrapping_mul(31337)) % 32000
     }
 
     /// Check if generation should stop
