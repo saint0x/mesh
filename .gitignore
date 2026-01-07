@@ -22,6 +22,8 @@
 
 # Claude AI artifacts
 .claude/
+CLAUDE.md
+PLAN.md
 
 # Temporary files
 *.tmp
