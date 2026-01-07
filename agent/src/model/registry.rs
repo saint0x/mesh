@@ -6,10 +6,9 @@
 use crate::errors::{AgentError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::shard::{ModelInfo, ShardAssignment, ShardInfo};
 

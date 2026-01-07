@@ -10,7 +10,6 @@
 //! - Returning results to the control plane
 
 use crate::errors::{AgentError, Result};
-use crate::executor::{Tensor, WorkerRing};
 use crate::network::MeshSwarm;
 use libp2p::PeerId;
 use std::sync::Arc;
@@ -321,15 +320,15 @@ impl InferenceCoordinator {
     async fn generate_next_token(
         &mut self,
         job: &mut InferenceJob,
-        position: &WorkerPosition,
+        _position: &WorkerPosition,
     ) -> Result<u32> {
         let layer_start = Instant::now();
 
-        // Create worker ring for all-reduce
-        let left_neighbor = self.swarm.left_neighbor().ok_or_else(|| {
+        // Verify ring neighbors are set (needed for all-reduce)
+        let _left_neighbor = self.swarm.left_neighbor().ok_or_else(|| {
             AgentError::Network("Left neighbor not set".to_string())
         })?;
-        let right_neighbor = self.swarm.right_neighbor().ok_or_else(|| {
+        let _right_neighbor = self.swarm.right_neighbor().ok_or_else(|| {
             AgentError::Network("Right neighbor not set".to_string())
         })?;
 

@@ -8,10 +8,9 @@
 
 use crate::errors::{AgentError, Result};
 use crate::inference::job::InferenceJob;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::types::{
@@ -264,8 +263,6 @@ impl CheckpointManager {
 
     /// Get total checkpoint storage usage
     pub async fn storage_usage(&self) -> Result<u64> {
-        let mut total = 0u64;
-
         fn dir_size(path: &Path) -> std::io::Result<u64> {
             let mut size = 0;
             if path.is_dir() {
@@ -282,8 +279,7 @@ impl CheckpointManager {
             Ok(size)
         }
 
-        total = dir_size(&self.config.checkpoint_dir)?;
-        Ok(total)
+        Ok(dir_size(&self.config.checkpoint_dir)?)
     }
 
     // === Private Methods ===
