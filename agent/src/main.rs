@@ -111,6 +111,22 @@ enum Commands {
 
     /// Show resource lock status
     ResourceStatus,
+
+    /// Show ring topology and worker position
+    RingStatus,
+
+    /// Show this worker's shard assignment
+    ShardStatus,
+
+    /// Show inference statistics
+    InferenceStats,
+
+    /// Show pool status (all workers in the ring)
+    PoolStatus {
+        /// Control plane URL
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
+        control_plane_url: String,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +189,26 @@ async fn main() -> Result<()> {
         Commands::ResourceStatus => {
             // No logging for status (pure display)
             cmd_resource_status().await?;
+        }
+
+        Commands::RingStatus => {
+            // No logging for status (pure display)
+            cmd_ring_status().await?;
+        }
+
+        Commands::ShardStatus => {
+            // No logging for status (pure display)
+            cmd_shard_status().await?;
+        }
+
+        Commands::InferenceStats => {
+            // No logging for stats (pure display)
+            cmd_inference_stats().await?;
+        }
+
+        Commands::PoolStatus { control_plane_url } => {
+            init_simple_logging("info")?;
+            cmd_pool_status(control_plane_url).await?;
         }
     }
 
@@ -736,5 +772,320 @@ async fn cmd_resource_status() -> Result<()> {
 
     println!();
 
+    Ok(())
+}
+
+/// Show ring topology and worker position
+async fn cmd_ring_status() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Ring Topology Status".bold().cyan());
+    println!("{}", "====================".cyan());
+
+    // Load device configuration
+    let config_path = DeviceConfig::default_path()?;
+    let config = match DeviceConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(_) => {
+            println!("\n{}", "Device not initialized".yellow());
+            println!("Run 'mesh init' to set up this device.\n");
+            return Ok(());
+        }
+    };
+
+    println!("\n{}", "Worker Identity:".bold());
+    println!("  Device ID:     {}", config.device_id);
+    println!("  Network ID:    {}", config.network_id);
+
+    // Try to load ring position from saved state
+    let ring_state_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".meshnet")
+        .join("ring_state.json");
+
+    if ring_state_path.exists() {
+        match std::fs::read_to_string(&ring_state_path) {
+            Ok(data) => {
+                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&data) {
+                    println!("\n{}", "Ring Position:".bold());
+                    if let Some(pos) = state.get("position") {
+                        println!("  Position:      {}", pos.to_string().green());
+                    }
+                    if let Some(total) = state.get("total_workers") {
+                        println!("  Total Workers: {}", total);
+                    }
+                    if let Some(left) = state.get("left_neighbor") {
+                        println!("  Left Neighbor: {}", left.as_str().unwrap_or("unknown"));
+                    }
+                    if let Some(right) = state.get("right_neighbor") {
+                        println!("  Right Neighbor: {}", right.as_str().unwrap_or("unknown"));
+                    }
+                } else {
+                    println!("\n{}", "Not currently in a ring".yellow());
+                }
+            }
+            Err(_) => {
+                println!("\n{}", "Not currently in a ring".yellow());
+            }
+        }
+    } else {
+        println!("\n{}", "Ring Status:".bold());
+        println!("  Status:        {}", "NOT JOINED".yellow());
+        println!("\n{}", "To join a ring, start the agent with 'mesh start'".dimmed());
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Show shard assignment status
+async fn cmd_shard_status() -> Result<()> {
+    use agent::{ShardRegistry, ShardStatus};
+    use colored::Colorize;
+
+    println!("\n{}", "Shard Status".bold().cyan());
+    println!("{}", "============".cyan());
+
+    // Load shard registry
+    let registry = match ShardRegistry::with_defaults() {
+        Ok(r) => r,
+        Err(e) => {
+            println!("\n{}", format!("Failed to load shard registry: {}", e).red());
+            return Ok(());
+        }
+    };
+
+    // Load from disk
+    if let Err(e) = registry.load().await {
+        println!("\n{}", format!("Failed to load shard data: {}", e).yellow());
+    }
+
+    let shards = registry.list_shards().await;
+
+    if shards.is_empty() {
+        println!("\n{}", "No shards assigned".yellow());
+        println!("{}", "Shards are assigned when you join a ring topology.".dimmed());
+    } else {
+        println!("\n{}", "Assigned Shards:".bold());
+        for (model_id, info, status) in &shards {
+            let status_str = match status {
+                ShardStatus::Pending => "PENDING".yellow().to_string(),
+                ShardStatus::Downloading => "DOWNLOADING".blue().to_string(),
+                ShardStatus::Downloaded => "DOWNLOADED".cyan().to_string(),
+                ShardStatus::Ready => "READY".green().bold().to_string(),
+                ShardStatus::Error => "ERROR".red().to_string(),
+            };
+
+            println!("\n  Model: {}", model_id.bold());
+            println!("    Status:       {}", status_str);
+            println!(
+                "    Columns:      {} - {}",
+                info.assignment.column_start, info.assignment.column_end
+            );
+            println!(
+                "    Worker Pos:   {}/{}",
+                info.assignment.worker_position, info.assignment.total_workers
+            );
+            if info.memory_bytes > 0 {
+                println!("    Memory:       {}", format_bytes(info.memory_bytes));
+            }
+            if info.download_progress > 0.0 && info.download_progress < 1.0 {
+                println!("    Download:     {:.1}%", info.download_progress * 100.0);
+            }
+        }
+    }
+
+    // Show total memory usage
+    let total_mem = registry.total_memory_usage().await;
+    if total_mem > 0 {
+        println!("\n{}", "Total Memory:".bold());
+        println!("  Shard Memory:  {}", format_bytes(total_mem));
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Show inference statistics
+async fn cmd_inference_stats() -> Result<()> {
+    use colored::Colorize;
+    use std::path::PathBuf;
+
+    println!("\n{}", "Inference Statistics".bold().cyan());
+    println!("{}", "====================".cyan());
+
+    // Load inference stats from file
+    let stats_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".meshnet")
+        .join("inference_stats.json");
+
+    if !stats_path.exists() {
+        println!("\n{}", "No inference statistics available".yellow());
+        println!("{}", "Statistics are recorded during inference jobs.".dimmed());
+        println!();
+        return Ok(());
+    }
+
+    let stats_json = std::fs::read_to_string(&stats_path)
+        .context("Failed to read inference stats file")?;
+
+    let stats: serde_json::Value = serde_json::from_str(&stats_json)
+        .context("Failed to parse inference stats")?;
+
+    println!("\n{}", "Job Statistics:".bold());
+    if let Some(completed) = stats.get("jobs_completed") {
+        println!("  Completed:       {}", completed.to_string().green());
+    }
+    if let Some(failed) = stats.get("jobs_failed") {
+        println!("  Failed:          {}", failed.to_string().red());
+    }
+    if let Some(rate) = stats.get("success_rate") {
+        println!("  Success Rate:    {:.1}%", rate.as_f64().unwrap_or(0.0) * 100.0);
+    }
+
+    println!("\n{}", "Token Statistics:".bold());
+    if let Some(tokens) = stats.get("total_tokens_generated") {
+        println!("  Tokens Generated: {}", tokens);
+    }
+    if let Some(prompt) = stats.get("total_prompt_tokens") {
+        println!("  Prompt Tokens:    {}", prompt);
+    }
+    if let Some(tps) = stats.get("avg_tokens_per_second") {
+        println!("  Avg Tokens/sec:   {:.2}", tps.as_f64().unwrap_or(0.0));
+    }
+
+    println!("\n{}", "Ring Performance:".bold());
+    if let Some(ops) = stats.get("allreduce_operations") {
+        println!("  All-Reduce Ops:   {}", ops);
+    }
+    if let Some(latency) = stats.get("avg_allreduce_latency_ms") {
+        println!("  Avg Latency:      {:.2}ms", latency.as_f64().unwrap_or(0.0));
+    }
+    if let Some(layers) = stats.get("total_layers_processed") {
+        println!("  Layers Processed: {}", layers);
+    }
+
+    println!("\n{}", "Fault Tolerance:".bold());
+    if let Some(ckpts) = stats.get("checkpoints_created") {
+        println!("  Checkpoints:      {}", ckpts);
+    }
+    if let Some(recoveries) = stats.get("checkpoint_recoveries") {
+        println!("  Recoveries:       {}", recoveries);
+    }
+
+    println!("\n{}", "System:".bold());
+    if let Some(uptime) = stats.get("uptime") {
+        println!("  Uptime:           {}", uptime.as_str().unwrap_or("unknown"));
+    }
+    if let Some(updated) = stats.get("last_updated") {
+        println!("  Last Updated:     {}", updated.as_str().unwrap_or("unknown"));
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Show pool status (all workers from control plane)
+async fn cmd_pool_status(control_plane_url: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Pool Status".bold().cyan());
+    println!("{}", "===========".cyan());
+
+    // Load device configuration to get network ID
+    let config_path = DeviceConfig::default_path()?;
+    let config = match DeviceConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(_) => {
+            println!("\n{}", "Device not initialized".yellow());
+            println!("Run 'mesh init' to set up this device.\n");
+            return Ok(());
+        }
+    };
+
+    println!("\n{}", "Fetching pool status...".dimmed());
+
+    // Fetch ring topology from control plane
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/ring/{}",
+        control_plane_url.trim_end_matches('/'),
+        config.network_id
+    );
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(data) = response.json::<serde_json::Value>().await {
+                    println!("\n{}", "Ring Topology:".bold());
+
+                    if let Some(workers) = data.get("workers").and_then(|w| w.as_array()) {
+                        println!("  Total Workers: {}", workers.len().to_string().green());
+                        println!();
+
+                        for (i, worker) in workers.iter().enumerate() {
+                            let device_id = worker
+                                .get("device_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let position = worker
+                                .get("ring_position")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let memory = worker
+                                .get("locked_memory")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let status = worker
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+
+                            let is_self = device_id == config.device_id.to_string();
+                            let prefix = if is_self { "→ " } else { "  " };
+
+                            let status_colored = match status {
+                                "online" => "ONLINE".green().to_string(),
+                                "offline" => "OFFLINE".red().to_string(),
+                                _ => status.yellow().to_string(),
+                            };
+
+                            println!(
+                                "{}Worker {} (pos {}): {} - {} RAM",
+                                prefix,
+                                i,
+                                position,
+                                status_colored,
+                                format_bytes(memory)
+                            );
+                        }
+                    } else {
+                        println!("  {}", "No workers in ring".yellow());
+                    }
+
+                    // Show shard distribution if available
+                    if let Some(total_columns) = data.get("total_columns").and_then(|v| v.as_u64()) {
+                        println!("\n{}", "Shard Distribution:".bold());
+                        println!("  Total Columns: {}", total_columns);
+                    }
+                } else {
+                    println!("  {}", "Failed to parse response".red());
+                }
+            } else {
+                println!(
+                    "  {} (HTTP {})",
+                    "Failed to fetch pool status".red(),
+                    response.status()
+                );
+            }
+        }
+        Err(e) => {
+            println!("  {}", format!("Connection failed: {}", e).red());
+            println!("  {}", "Make sure the control plane is running.".yellow());
+        }
+    }
+
+    println!();
     Ok(())
 }
