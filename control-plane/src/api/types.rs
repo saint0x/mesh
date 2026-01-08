@@ -248,3 +248,41 @@ pub struct TopologyVersionResponse {
     /// Whether there are updates since the provided version
     pub has_updates: bool,
 }
+
+// ==================== Distributed Inference API Types ====================
+
+/// Request to submit a distributed inference job
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitInferenceRequest {
+    /// Device ID submitting the job
+    pub device_id: String,
+    /// Network ID
+    pub network_id: String,
+    /// Model ID to use
+    pub model_id: String,
+    /// Input prompt text
+    pub prompt: String,
+    /// Maximum tokens to generate
+    pub max_tokens: u32,
+    /// Temperature for sampling
+    pub temperature: f32,
+    /// Top-p (nucleus) sampling
+    pub top_p: f32,
+}
+
+/// Response to inference submission
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitInferenceResponse {
+    /// Whether submission succeeded
+    pub success: bool,
+    /// Job ID for tracking
+    pub job_id: String,
+    /// Generated completion text (if immediate execution)
+    pub completion: Option<String>,
+    /// Number of tokens generated
+    pub completion_tokens: u32,
+    /// Total execution time in milliseconds
+    pub execution_time_ms: u64,
+    /// Error message if failed
+    pub error: Option<String>,
+}

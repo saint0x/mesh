@@ -38,6 +38,7 @@ use agent::{
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tracing::debug;
 use libp2p::{Multiaddr, PeerId};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -477,6 +478,243 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                 error!(error = %e, "Heartbeat failed");
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
+
+    // Start inference coordinator (in background)
+    let inference_config_task = config.clone();
+    let relay_addr_clone = relay_addr.clone();
+    tokio::spawn(async move {
+        use agent::inference::coordinator::{InferenceCoordinator, InferenceConfig};
+        use agent::inference::job::{InferenceRequest, GenerationConfig};
+        use uuid::Uuid;
+
+        let control_plane_url = inference_config_task.control_plane_url.clone();
+        let network_id = inference_config_task.network_id.clone();
+        let device_id = inference_config_task.device_id.to_string();
+        let http_client = reqwest::Client::new();
+
+        info!("Initializing inference coordinator");
+
+        // Create separate swarm for inference coordination (P2P communication during all-reduce)
+        let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&inference_config_task.keypair);
+        let mut inference_swarm = match MeshSwarmBuilder::new(libp2p_keypair)
+            .with_relay_addr(relay_addr_clone.clone())
+            .build()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "Failed to create inference swarm");
+                return;
+            }
+        };
+
+        // Connect to relay
+        if let Err(e) = inference_swarm.connect_to_relay() {
+            error!(error = %e, "Failed to connect inference swarm to relay");
+            return;
+        }
+
+        // Wait for relay connection
+        let mut relay_connected = false;
+        while !relay_connected {
+            if let Some(event) = inference_swarm.next_event().await {
+                if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
+                    info!("Inference swarm connected to relay");
+                    relay_connected = true;
+                }
+            }
+        }
+
+        // Create inference coordinator
+        let inference_config = InferenceConfig::default();
+        let mut coordinator = InferenceCoordinator::new(inference_swarm, inference_config);
+
+        info!("Inference coordinator initialized - starting job polling");
+
+        // Check if we have ring state
+        let ring_state_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".meshnet")
+            .join("ring_state.json");
+
+        let mut ring_position = None;
+        if ring_state_path.exists() {
+            match std::fs::read_to_string(&ring_state_path) {
+                Ok(data) => {
+                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let (Some(pos), Some(total), Some(left_peer_str), Some(right_peer_str)) = (
+                            state.get("position").and_then(|v| v.as_u64()),
+                            state.get("total_workers").and_then(|v| v.as_u64()),
+                            state.get("left_neighbor_peer_id").and_then(|v| v.as_str()),
+                            state.get("right_neighbor_peer_id").and_then(|v| v.as_str()),
+                        ) {
+                            // Parse peer IDs
+                            if let (Ok(left_peer), Ok(right_peer)) = (
+                                left_peer_str.parse::<libp2p::PeerId>(),
+                                right_peer_str.parse::<libp2p::PeerId>(),
+                            ) {
+                                use agent::inference::coordinator::WorkerPosition;
+
+                                // Get shard info from state
+                                let (col_start, col_end) = if let Some(shard) = state.get("shard") {
+                                    (
+                                        shard.get("column_start").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                        shard.get("column_end").and_then(|v| v.as_u64()).unwrap_or(8192) as u32,
+                                    )
+                                } else {
+                                    (0, 8192)
+                                };
+
+                                let position = WorkerPosition {
+                                    position: pos as u32,
+                                    total_workers: total as u32,
+                                    left_neighbor: left_peer,
+                                    right_neighbor: right_peer,
+                                    shard_column_range: (col_start, col_end),
+                                    shard_memory_bytes: 8_000_000_000, // 8GB default
+                                };
+
+                                info!(
+                                    position = pos,
+                                    total_workers = total,
+                                    shard_range = ?(col_start, col_end),
+                                    "Loaded ring position for inference"
+                                );
+
+                                // Join ring in coordinator
+                                if let Err(e) = coordinator.join_ring(position.clone()) {
+                                    error!(error = %e, "Failed to join ring in coordinator");
+                                } else {
+                                    ring_position = Some(position);
+                                }
+                            } else {
+                                warn!("Failed to parse peer IDs from ring state");
+                            }
+                        } else {
+                            warn!("Ring state missing required fields (position, total_workers, or peer IDs)");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to load ring state");
+                }
+            }
+        }
+
+        if ring_position.is_none() {
+            warn!("No ring position found - worker must join ring first via 'join-ring' command");
+            warn!("Inference jobs will be logged but not executed");
+        }
+
+        // Poll for inference jobs
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let poll_url = format!("{}/api/inference/poll/{}", control_plane_url, network_id);
+            match http_client.get(&poll_url).send().await {
+                Ok(response) => {
+                    if response.status() == 204 {
+                        continue; // No jobs
+                    }
+
+                    if !response.status().is_success() {
+                        warn!("Inference poll failed: {}", response.status());
+                        continue;
+                    }
+
+                    match response.json::<serde_json::Value>().await {
+                        Ok(job_data) => {
+                            let job_id = job_data.get("job_id")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| Uuid::parse_str(s).ok())
+                                .unwrap_or_else(Uuid::new_v4);
+
+                            let model_id = job_data.get("model_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("llama-70b")
+                                .to_string();
+
+                            let prompt_tokens: Vec<u32> = job_data.get("prompt_tokens")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+                                .unwrap_or_else(|| vec![1, 2, 3]);
+
+                            let max_tokens = job_data.get("max_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(10) as u32;
+
+                            let temperature = job_data.get("temperature")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(1.0) as f32;
+
+                            let top_p = job_data.get("top_p")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.9) as f32;
+
+                            info!(
+                                job_id = %job_id,
+                                model = %model_id,
+                                prompt_len = prompt_tokens.len(),
+                                max_tokens = max_tokens,
+                                "Received distributed inference job"
+                            );
+
+                            // Create inference request
+                            let request = InferenceRequest {
+                                job_id,
+                                network_id: network_id.clone(),
+                                model_id: model_id.clone(),
+                                prompt_tokens,
+                                config: GenerationConfig {
+                                    max_tokens,
+                                    temperature,
+                                    top_p,
+                                    ..Default::default()
+                                },
+                                executor_id: device_id.clone(),
+                                created_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                            };
+
+                            // Process inference job
+                            if ring_position.is_some() {
+                                info!(job_id = %job_id, "Processing inference job with coordinator");
+                                match coordinator.process_inference(request).await {
+                                    Ok(result) => {
+                                        info!(
+                                            job_id = %result.job_id,
+                                            success = result.success,
+                                            tokens = result.completion_tokens,
+                                            time_ms = result.execution_time_ms,
+                                            "Inference job completed"
+                                        );
+
+                                        // TODO: Send result back to control plane
+                                        // POST to /api/inference/result with InferenceResult
+                                    }
+                                    Err(e) => {
+                                        error!(job_id = %job_id, error = %e, "Inference job failed");
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    job_id = %job_id,
+                                    "Cannot process - worker not in ring. Run 'join-ring' first."
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to parse job response");
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "Inference poll failed");
+                }
+            }
         }
     });
 
@@ -1222,12 +1460,14 @@ async fn cmd_join_ring(model_id: String, control_plane_url: String, _relay: Stri
     #[derive(serde::Serialize)]
     struct JoinRingRequest {
         device_id: String,
-        model_id: String,
+        network_id: String,
+        contributed_memory: u64,
     }
 
     let request = JoinRingRequest {
         device_id: config.device_id.to_string(),
-        model_id: model_id.clone(),
+        network_id: config.network_id.clone(),
+        contributed_memory: 8_000_000_000, // 8GB default
     };
 
     match client.post(&url).json(&request).send().await {
@@ -1239,16 +1479,21 @@ async fn cmd_join_ring(model_id: String, control_plane_url: String, _relay: Stri
                     if let Some(position) = data.get("position") {
                         println!("  Position:        {}", position.to_string().green());
                     }
-                    if let Some(total) = data.get("total_workers") {
-                        println!("  Total Workers:   {}", total);
-                    }
-                    if let Some(col_start) = data.get("column_start") {
-                        if let Some(col_end) = data.get("column_end") {
-                            println!("  Column Range:    {} - {}", col_start, col_end);
+                    if let Some(shard) = data.get("shard") {
+                        if let Some(col_start) = shard.get("column_start") {
+                            if let Some(col_end) = shard.get("column_end") {
+                                println!("  Column Range:    {} - {}", col_start, col_end);
+                            }
                         }
                     }
+                    if let Some(left) = data.get("left_neighbor") {
+                        println!("  Left Neighbor:   {}", left.as_str().unwrap_or("unknown"));
+                    }
+                    if let Some(right) = data.get("right_neighbor") {
+                        println!("  Right Neighbor:  {}", right.as_str().unwrap_or("unknown"));
+                    }
 
-                    // Save ring state locally
+                    // Save ring state locally with peer IDs
                     let ring_state_path = dirs::home_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
                         .join(".meshnet")
@@ -1258,7 +1503,27 @@ async fn cmd_join_ring(model_id: String, control_plane_url: String, _relay: Stri
                         std::fs::create_dir_all(parent)?;
                     }
 
-                    std::fs::write(&ring_state_path, serde_json::to_string_pretty(&data)?)?;
+                    // Compute local peer ID from keypair
+                    let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
+                    let local_peer_id = libp2p::PeerId::from_public_key(&libp2p_keypair.public());
+
+                    // Augment data with peer IDs
+                    let mut enhanced_data = data.clone();
+                    if let Some(obj) = enhanced_data.as_object_mut() {
+                        obj.insert("local_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
+
+                        // For MVP: Use local peer ID for neighbors (works for single-worker ring)
+                        // TODO: For multi-worker rings, implement peer discovery or get PeerIDs from control plane
+                        obj.insert("left_neighbor_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
+                        obj.insert("right_neighbor_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
+
+                        // Calculate total_workers: for single worker ring, total is 1
+                        // For multi-worker, we'd get this from topology query
+                        // For now, assume single worker
+                        obj.insert("total_workers".to_string(), serde_json::Value::Number(1.into()));
+                    }
+
+                    std::fs::write(&ring_state_path, serde_json::to_string_pretty(&enhanced_data)?)?;
                     info!("Ring state saved to: {}", ring_state_path.display());
 
                     println!("\n{}", "Next steps:".bold());

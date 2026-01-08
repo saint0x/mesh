@@ -1,4 +1,5 @@
 pub mod error;
+pub mod inference;
 pub mod ledger;
 pub mod ring;
 pub mod routes;
@@ -37,6 +38,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ring/callback", post(ring::register_callback))
         .route("/api/ring/callback/:device_id", delete(ring::unregister_callback))
         .route("/api/ring/version", post(ring::check_topology_version))
+        // Distributed inference endpoints
+        .route("/api/inference/submit", post(inference::submit_inference))
+        .route("/api/inference/poll/:network_id", get(inference::poll_inference_job))
         // Attach application state
         .with_state(state)
         // Middleware
