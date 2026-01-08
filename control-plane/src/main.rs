@@ -1,3 +1,4 @@
+use clap::Parser;
 use control_plane::{api, services, AppState, Database};
 use services::certificate::ControlPlaneKeypair;
 use std::sync::Arc;
@@ -5,11 +6,36 @@ use tokio::signal;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+/// Mesh Control Plane - Network orchestration and coordination
+#[derive(Parser, Debug)]
+#[command(name = "control-plane")]
+#[command(about = "Mesh Control Plane for network coordination")]
+#[command(version)]
+struct Cli {
+    /// Port to listen on
+    #[arg(short, long, default_value = "8080")]
+    port: u16,
+
+    /// Override log level (trace, debug, info, warn, error)
+    #[arg(short, long)]
+    log_level: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
     // Initialize tracing
+    let log_level = match cli.log_level.as_deref() {
+        Some("trace") => Level::TRACE,
+        Some("debug") => Level::DEBUG,
+        Some("warn") => Level::WARN,
+        Some("error") => Level::ERROR,
+        _ => Level::INFO,
+    };
+
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_max_level(log_level)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -44,11 +70,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         services::presence_monitor(db).await;
     });
 
-    // Bind server
-    let addr = "0.0.0.0:8080";
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Try binding to requested port, with fallback to find available port
+    let addr = format!("0.0.0.0:{}", cli.port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            info!(address = %addr, "Control plane listening");
+            listener
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Port in use, try to find an available port
+            info!(port = cli.port, "Port already in use, searching for available port...");
 
-    info!(address = %addr, "Control plane listening");
+            let mut found = None;
+            for try_port in (cli.port + 1)..(cli.port + 100) {
+                let try_addr = format!("0.0.0.0:{}", try_port);
+                if let Ok(listener) = tokio::net::TcpListener::bind(&try_addr).await {
+                    info!(address = %try_addr, "Control plane listening on alternative port");
+                    println!("\n⚠️  Port {} was in use. Using port {} instead.", cli.port, try_port);
+                    println!("Update agent commands to use: --control-plane http://localhost:{}\n", try_port);
+                    found = Some(listener);
+                    break;
+                }
+            }
+
+            found.ok_or_else(|| {
+                format!("Could not find available port in range {}-{}. Please stop conflicting services.",
+                    cli.port, cli.port + 100)
+            })?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Start server with graceful shutdown
     axum::serve(listener, app)

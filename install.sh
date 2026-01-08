@@ -47,30 +47,36 @@ if ! command -v cargo &> /dev/null; then
 fi
 success "Rust found: $(rustc --version)"
 
-# Build release binary
-info "Building meshnet agent (this may take a few minutes)..."
-cargo build --release --bin agent
+# Build release binaries
+info "Building meshnet binaries (this may take a few minutes)..."
+cargo build --release
 
-# Check for binary in multiple possible locations
-BINARY_PATH=""
-if [ -f "target/release/agent" ]; then
-    BINARY_PATH="target/release/agent"
-elif [ -f "target/aarch64-apple-darwin/release/agent" ]; then
-    BINARY_PATH="target/aarch64-apple-darwin/release/agent"
-elif [ -f "target/x86_64-apple-darwin/release/agent" ]; then
-    BINARY_PATH="target/x86_64-apple-darwin/release/agent"
-elif [ -f "target/x86_64-unknown-linux-gnu/release/agent" ]; then
-    BINARY_PATH="target/x86_64-unknown-linux-gnu/release/agent"
-elif [ -f "target/aarch64-unknown-linux-gnu/release/agent" ]; then
-    BINARY_PATH="target/aarch64-unknown-linux-gnu/release/agent"
+# Detect target directory
+TARGET_DIR="target/release"
+if [ -d "target/aarch64-apple-darwin/release" ]; then
+    TARGET_DIR="target/aarch64-apple-darwin/release"
+elif [ -d "target/x86_64-apple-darwin/release" ]; then
+    TARGET_DIR="target/x86_64-apple-darwin/release"
+elif [ -d "target/x86_64-unknown-linux-gnu/release" ]; then
+    TARGET_DIR="target/x86_64-unknown-linux-gnu/release"
+elif [ -d "target/aarch64-unknown-linux-gnu/release" ]; then
+    TARGET_DIR="target/aarch64-unknown-linux-gnu/release"
 fi
 
-if [ -z "$BINARY_PATH" ]; then
-    error "Build failed - binary not found"
-    error "Checked: target/release/agent and platform-specific directories"
+# Check for binaries
+if [ ! -f "$TARGET_DIR/agent" ]; then
+    error "Build failed - agent binary not found in $TARGET_DIR"
     exit 1
 fi
-success "Build complete: $BINARY_PATH"
+if [ ! -f "$TARGET_DIR/relay-server" ]; then
+    error "Build failed - relay-server binary not found in $TARGET_DIR"
+    exit 1
+fi
+if [ ! -f "$TARGET_DIR/control-plane" ]; then
+    error "Build failed - control-plane binary not found in $TARGET_DIR"
+    exit 1
+fi
+success "Build complete: $TARGET_DIR"
 
 # Determine installation directory
 INSTALL_DIR="$HOME/.local/bin"
@@ -81,11 +87,18 @@ if [ ! -d "$INSTALL_DIR" ]; then
     mkdir -p "$INSTALL_DIR"
 fi
 
-# Install binary
-info "Installing binary to $INSTALL_DIR/mesh..."
-cp "$BINARY_PATH" "$INSTALL_DIR/mesh"
+# Install binaries
+info "Installing binaries to $INSTALL_DIR..."
+cp "$TARGET_DIR/agent" "$INSTALL_DIR/mesh"
+cp "$TARGET_DIR/relay-server" "$INSTALL_DIR/mesh-relay"
+cp "$TARGET_DIR/control-plane" "$INSTALL_DIR/mesh-control-plane"
 chmod +x "$INSTALL_DIR/mesh"
-success "Binary installed"
+chmod +x "$INSTALL_DIR/mesh-relay"
+chmod +x "$INSTALL_DIR/mesh-control-plane"
+success "Binaries installed:"
+success "  - mesh (agent CLI)"
+success "  - mesh-relay (relay server)"
+success "  - mesh-control-plane (control plane)"
 
 # Add to PATH if needed
 add_to_path() {
@@ -161,7 +174,9 @@ echo "  1. Initialize device:   mesh init --network-id test --name \"My Device\"
 echo "  2. Create a pool:       mesh pool-create --name \"My Pool\""
 echo "  3. Start agent:         mesh start"
 echo ""
-echo "For LAN discovery testing, see: LAN_DISCOVERY_TEST.md"
+echo "Device automation scripts:"
+echo "  ./device1.sh  - Start Device 1 (admin) - runs relay, control plane, and agent"
+echo "  ./device2.sh  - Start Device 2 (member) - joins pool and runs agent"
 echo ""
 
 # Test if mesh is immediately available

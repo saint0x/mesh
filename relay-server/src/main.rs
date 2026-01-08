@@ -22,6 +22,10 @@ struct Cli {
     #[arg(short, long, default_value = "~/.meshnet/relay.toml")]
     config: String,
 
+    /// Override TCP port (overrides config file)
+    #[arg(short, long)]
+    port: Option<u16>,
+
     /// Override log level (trace, debug, info, warn, error)
     #[arg(short, long)]
     log_level: Option<String>,
@@ -52,7 +56,7 @@ async fn main() -> Result<()> {
     let config_path = shellexpand::tilde(&cli.config);
     let config_path = std::path::Path::new(config_path.as_ref());
 
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         Config::load(config_path)?
     } else {
         // Auto-generate default config on first run
@@ -64,6 +68,13 @@ async fn main() -> Result<()> {
 
         config
     };
+
+    // Override port if specified via CLI
+    if let Some(port) = cli.port {
+        config.network.tcp_listen_addr = format!("/ip4/0.0.0.0/tcp/{}", port);
+        config.network.quic_listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port);
+        tracing::info!(port = port, "Port overridden via CLI argument");
+    }
 
     // Setup logging
     setup_logging(&config, cli.log_level.as_deref())?;

@@ -29,3 +29,4 @@ rand = "0.8"
 toml.workspace = true
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
