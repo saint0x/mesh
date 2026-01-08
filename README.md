@@ -54,7 +54,7 @@ Mesh enables:
 ```
 mesh/
 ├── PLAN.md                # Full product specification (JSON)
-├── IMPLEMENTATION.md      # Phase-by-phase implementation roadmap
+├── INSIGHT.md             # Architectural vision (tensor-parallel cooperation)
 ├── README.md              # This file
 ├── Cargo.toml             # Rust workspace configuration
 │
@@ -79,46 +79,17 @@ mesh/
 │   │   └── auth.rs        # ✅ Token-based authentication
 │   └── README.md          # ✅ Deployment guide
 │
-├── control-plane/         # ✅ Control plane (Rust + Axum)
-│   └── src/
-│       ├── api/           # ✅ REST API routes (registration, heartbeat)
-│       ├── services/      # ✅ Business logic (device service, certificates, presence)
-│       ├── db/            # ✅ SQLite database with migrations
-│       └── state.rs       # ✅ Application state
-│
-└── reference/             # Reference VPN code study (DO NOT USE DIRECTLY)
-    ├── README.md          # Study guide for reference implementation
-    ├── behaviour.rs       # libp2p swarm composition ⭐
-    ├── ip.rs              # Protocol handler + ring buffers ⭐
-    └── config.rs          # Ed25519 key management ⭐
+└── control-plane/         # ✅ Control plane (Rust + Axum)
+    └── src/
+        ├── api/           # ✅ REST API routes (registration, heartbeat)
+        ├── services/      # ✅ Business logic (device service, certificates, presence)
+        ├── db/            # ✅ SQLite database with migrations
+        └── state.rs       # ✅ Application state
 ```
-
-## Reference Implementation
-
-The `reference/` directory contains a VPN mesh networking module (see `.env` for details, MPL-2.0 license) as architectural inspiration.
-
-**Key files to study:**
-1. **reference/behaviour.rs** (231 lines) - libp2p swarm with Relay + DCUTR for NAT traversal
-2. **reference/ip.rs** (354 lines) - Async protocol handler with lock-free ring buffer queues
-3. **reference/config.rs** (128 lines) - Ed25519 keypair generation + multibase serialization
-
-See `reference/README.md` for detailed study guide.
-
-### What We Learn from Reference Implementation
-- ✅ Relay + DCUTR pattern for NAT traversal (battle-tested)
-- ✅ Lock-free ring buffer queuing (256 jobs/device)
-- ✅ Async state machine for protocol handlers
-- ✅ Ed25519 identity + mTLS transport
-- ✅ libp2p protocol composition
-
-### What We DON'T Copy
-- ❌ TUN device / IP routing (Mesh routes job streams, not IP packets)
-- ❌ IP address generation (has collision risk, unnecessary)
-- ❌ Kademlia DHT (Mesh uses centralized control plane)
 
 ## Implementation Roadmap
 
-See `IMPLEMENTATION.md` for the complete phase-by-phase checklist.
+See `INSIGHT.md` for the architectural vision and roadmap.
 
 ### Phase 1: Foundation & Infrastructure (Current)
 
@@ -246,17 +217,10 @@ RUST_LOG=debug cargo run --example relay_connectivity
 # Expected: Both agents connect to relay and establish circuit
 ```
 
-### Study the Reference Implementation
-```bash
-cd reference
-cat README.md  # Comprehensive study guide
-```
-
 ## Documentation
 
 - **Product Spec:** `PLAN.md` - Full product specification (JSON format)
-- **Implementation Guide:** `IMPLEMENTATION.md` - Phase-by-phase implementation checklist
-- **Reference Code Study:** `reference/README.md` - Study guide for reference VPN implementation
+- **Architecture:** `INSIGHT.md` - Architectural vision (tensor-parallel cooperation)
 - **Relay Server:** `relay-server/README.md` - Deployment and configuration guide
 
 ## Key Technologies
@@ -276,14 +240,7 @@ cat README.md  # Comprehensive study guide
 
 ## License
 
-**Mesh code:** MIT
-**Reference code (reference/):** MPL-2.0 (from Carcass project)
-
-See `reference/README.md` for license compliance details.
-
-## Attribution
-
-Network architecture patterns inspired by a reference mesh VPN implementation (see `.env` for details), licensed under MPL-2.0. We study libp2p implementation patterns and adapt them for job execution (not IP routing).
+MIT
 
 ---
 

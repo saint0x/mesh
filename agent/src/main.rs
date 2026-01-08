@@ -2,14 +2,34 @@
 //!
 //! The Mesh AI Agent is a distributed compute sharing daemon that allows devices
 //! to contribute spare compute resources for AI workloads (embeddings, OCR, etc.)
-//! and earn credits in the process.
+//! and distributed tensor-parallel inference.
 //!
 //! ## Commands
 //!
+//! ### Device Management
 //! - `init` - Initialize device and register with control plane
 //! - `start` - Run agent daemon to process jobs
-//! - `job` - Submit a job to the network
 //! - `status` - Show device and network status
+//! - `metrics` - Show agent metrics and statistics
+//!
+//! ### Job Submission
+//! - `job` - Submit a job to the network (embeddings, OCR)
+//! - `inference` - Submit distributed inference job
+//!
+//! ### Ring Topology
+//! - `join-ring` - Join ring topology for distributed inference
+//! - `leave-ring` - Leave ring topology
+//! - `ring-status` - Show ring topology and worker position
+//! - `pool-status` - Show pool status (all workers)
+//!
+//! ### Resource Management
+//! - `lock-resources` - Lock resources for pool contribution
+//! - `unlock-resources` - Request unlock (requires 24h cooldown)
+//! - `resource-status` - Show resource lock status
+//!
+//! ### Model Shards
+//! - `shard-status` - Show this worker's shard assignment
+//! - `inference-stats` - Show inference statistics
 
 use agent::{
     format_bytes, init_production_logging, init_simple_logging, parse_memory_string,
@@ -127,6 +147,63 @@ enum Commands {
         #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
         control_plane_url: String,
     },
+
+    /// Join ring topology for distributed inference
+    JoinRing {
+        /// Model ID (e.g., "llama-70b")
+        #[arg(short, long)]
+        model_id: String,
+
+        /// Control plane URL
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
+        control_plane_url: String,
+
+        /// Relay server address
+        #[arg(short, long, default_value = "/ip4/127.0.0.1/tcp/4001")]
+        relay: String,
+
+        /// Log level
+        #[arg(short, long, default_value = "info")]
+        log_level: String,
+    },
+
+    /// Leave ring topology
+    LeaveRing {
+        /// Control plane URL
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
+        control_plane_url: String,
+    },
+
+    /// Submit distributed inference job
+    Inference {
+        /// Prompt text
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Model ID
+        #[arg(short, long, default_value = "llama-70b")]
+        model_id: String,
+
+        /// Max tokens to generate
+        #[arg(short = 'n', long, default_value = "100")]
+        max_tokens: u32,
+
+        /// Temperature (0.0-2.0)
+        #[arg(short, long, default_value = "1.0")]
+        temperature: f32,
+
+        /// Top-p sampling threshold
+        #[arg(long, default_value = "0.9")]
+        top_p: f32,
+
+        /// Control plane URL
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
+        control_plane_url: String,
+
+        /// Log level
+        #[arg(short, long, default_value = "info")]
+        log_level: String,
+    },
 }
 
 #[tokio::main]
@@ -209,6 +286,34 @@ async fn main() -> Result<()> {
         Commands::PoolStatus { control_plane_url } => {
             init_simple_logging("info")?;
             cmd_pool_status(control_plane_url).await?;
+        }
+
+        Commands::JoinRing {
+            model_id,
+            control_plane_url,
+            relay,
+            log_level,
+        } => {
+            init_simple_logging(&log_level)?;
+            cmd_join_ring(model_id, control_plane_url, relay).await?;
+        }
+
+        Commands::LeaveRing { control_plane_url } => {
+            init_simple_logging("info")?;
+            cmd_leave_ring(control_plane_url).await?;
+        }
+
+        Commands::Inference {
+            prompt,
+            model_id,
+            max_tokens,
+            temperature,
+            top_p,
+            control_plane_url,
+            log_level,
+        } => {
+            init_simple_logging(&log_level)?;
+            cmd_inference(prompt, model_id, max_tokens, temperature, top_p, control_plane_url).await?;
         }
     }
 
@@ -1083,6 +1188,254 @@ async fn cmd_pool_status(control_plane_url: String) -> Result<()> {
         Err(e) => {
             println!("  {}", format!("Connection failed: {}", e).red());
             println!("  {}", "Make sure the control plane is running.".yellow());
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Join ring topology for distributed inference
+async fn cmd_join_ring(model_id: String, control_plane_url: String, _relay: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Joining Ring Topology".bold().cyan());
+    println!("{}", "=====================".cyan());
+
+    // Load device configuration
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh init' first.")?;
+
+    println!("\n{}", "Device Identity:".bold());
+    println!("  Device ID:     {}", config.device_id);
+    println!("  Model ID:      {}", model_id);
+
+    // Connect to control plane
+    println!("\n{}", "Requesting ring join...".dimmed());
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/ring/join",
+        control_plane_url.trim_end_matches('/')
+    );
+
+    #[derive(serde::Serialize)]
+    struct JoinRingRequest {
+        device_id: String,
+        model_id: String,
+    }
+
+    let request = JoinRingRequest {
+        device_id: config.device_id.to_string(),
+        model_id: model_id.clone(),
+    };
+
+    match client.post(&url).json(&request).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(data) = response.json::<serde_json::Value>().await {
+                    println!("\n{}", "✓ Joined ring successfully!".green().bold());
+
+                    if let Some(position) = data.get("position") {
+                        println!("  Position:        {}", position.to_string().green());
+                    }
+                    if let Some(total) = data.get("total_workers") {
+                        println!("  Total Workers:   {}", total);
+                    }
+                    if let Some(col_start) = data.get("column_start") {
+                        if let Some(col_end) = data.get("column_end") {
+                            println!("  Column Range:    {} - {}", col_start, col_end);
+                        }
+                    }
+
+                    // Save ring state locally
+                    let ring_state_path = dirs::home_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join(".meshnet")
+                        .join("ring_state.json");
+
+                    if let Some(parent) = ring_state_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    std::fs::write(&ring_state_path, serde_json::to_string_pretty(&data)?)?;
+                    info!("Ring state saved to: {}", ring_state_path.display());
+
+                    println!("\n{}", "Next steps:".bold());
+                    println!("  1. Start the agent:     cargo run --bin agent -- start");
+                    println!("  2. Submit inference:    cargo run --bin agent -- inference --prompt \"Hello\"");
+                }
+            } else {
+                println!("  {}", format!("Failed to join ring (HTTP {})", response.status()).red());
+                if let Ok(body) = response.text().await {
+                    println!("  Error: {}", body);
+                }
+                anyhow::bail!("Ring join failed");
+            }
+        }
+        Err(e) => {
+            println!("  {}", format!("Connection failed: {}", e).red());
+            println!("  {}", "Make sure the control plane is running.".yellow());
+            return Err(e.into());
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Leave ring topology
+async fn cmd_leave_ring(control_plane_url: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Leaving Ring Topology".bold().cyan());
+    println!("{}", "=====================".cyan());
+
+    // Load device configuration
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh init' first.")?;
+
+    println!("\n{}", "Requesting ring leave...".dimmed());
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/ring/leave/{}",
+        control_plane_url.trim_end_matches('/'),
+        config.device_id
+    );
+
+    match client.delete(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                println!("\n{}", "✓ Left ring successfully!".green().bold());
+
+                // Remove local ring state
+                let ring_state_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".meshnet")
+                    .join("ring_state.json");
+
+                if ring_state_path.exists() {
+                    std::fs::remove_file(&ring_state_path)?;
+                    info!("Removed ring state file");
+                }
+            } else {
+                println!("  {}", format!("Failed to leave ring (HTTP {})", response.status()).red());
+                if let Ok(body) = response.text().await {
+                    println!("  Error: {}", body);
+                }
+                anyhow::bail!("Ring leave failed");
+            }
+        }
+        Err(e) => {
+            println!("  {}", format!("Connection failed: {}", e).red());
+            return Err(e.into());
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Submit distributed inference job
+async fn cmd_inference(
+    prompt: String,
+    model_id: String,
+    max_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+    control_plane_url: String,
+) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Submitting Inference Job".bold().cyan());
+    println!("{}", "========================".cyan());
+
+    // Load device configuration
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh init' first.")?;
+
+    println!("\n{}", "Job Configuration:".bold());
+    println!("  Model:           {}", model_id);
+    println!("  Prompt:          \"{}\"", prompt);
+    println!("  Max Tokens:      {}", max_tokens);
+    println!("  Temperature:     {}", temperature);
+    println!("  Top-p:           {}", top_p);
+
+    // Create inference request payload
+    #[derive(serde::Serialize)]
+    struct InferenceJobRequest {
+        device_id: String,
+        model_id: String,
+        prompt: String,
+        max_tokens: u32,
+        temperature: f32,
+        top_p: f32,
+    }
+
+    let request = InferenceJobRequest {
+        device_id: config.device_id.to_string(),
+        model_id: model_id.clone(),
+        prompt: prompt.clone(),
+        max_tokens,
+        temperature,
+        top_p,
+    };
+
+    // Submit to control plane
+    println!("\n{}", "Submitting job...".dimmed());
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/inference/submit",
+        control_plane_url.trim_end_matches('/')
+    );
+
+    match client.post(&url).json(&request).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(result) = response.json::<serde_json::Value>().await {
+                    println!("\n{}", "✓ Inference completed!".green().bold());
+
+                    if let Some(job_id) = result.get("job_id") {
+                        println!("  Job ID:          {}", job_id.as_str().unwrap_or("unknown"));
+                    }
+
+                    if let Some(tokens_generated) = result.get("completion_tokens") {
+                        println!("  Tokens Generated: {}", tokens_generated);
+                    }
+
+                    if let Some(exec_time) = result.get("execution_time_ms") {
+                        println!("  Execution Time:   {}ms", exec_time);
+                    }
+
+                    if let Some(completion) = result.get("completion") {
+                        println!("\n{}", "Completion:".bold());
+                        println!("{}", completion.as_str().unwrap_or(""));
+                    } else if let Some(output) = result.get("output") {
+                        println!("\n{}", "Output:".bold());
+                        println!("{}", output.as_str().unwrap_or(""));
+                    }
+
+                    // Show that this used mock weights
+                    println!("\n{}", "Note: This inference used mock Xavier-initialized weights.".yellow());
+                    println!("{}", "Output is deterministic but not semantically coherent.".yellow());
+                    println!("{}", "Swap in real safetensors weights for production use.".yellow());
+                } else {
+                    println!("  {}", "Failed to parse response".red());
+                }
+            } else {
+                println!("  {}", format!("Inference failed (HTTP {})", response.status()).red());
+                if let Ok(body) = response.text().await {
+                    println!("  Error: {}", body);
+                }
+                anyhow::bail!("Inference job failed");
+            }
+        }
+        Err(e) => {
+            println!("  {}", format!("Connection failed: {}", e).red());
+            println!("  {}", "Make sure the control plane is running.".yellow());
+            return Err(e.into());
         }
     }
 

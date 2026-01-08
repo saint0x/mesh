@@ -44,6 +44,7 @@ pub mod coordinator;
 pub mod forward_pass;
 pub mod job;
 pub mod kv_cache;
+pub mod mock_loader; // MOCK: Mock shard loader for validation
 pub mod mock_validation; // MOCK: For validation only - TODO: Remove when using real weights
 pub mod stats;
 pub mod tensor_ops;
@@ -52,5 +53,6 @@ pub use coordinator::{InferenceCoordinator, InferenceConfig};
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
 pub use job::{GenerationConfig, InferenceJob, InferenceRequest, InferenceResult};
 pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};
+pub use mock_loader::{MockShardLoader, ShardLoader}; // Export loader trait and mock impl
 pub use stats::InferenceStats;
 pub use tensor_ops::{Tensor1D, Tensor2D};

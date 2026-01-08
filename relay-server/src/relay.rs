@@ -159,7 +159,6 @@ fn load_or_generate_keypair() -> Result<libp2p::identity::Keypair> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_build_swarm() {
@@ -170,20 +169,33 @@ mod tests {
 
     #[test]
     fn test_keypair_generation() {
-        let temp_dir = TempDir::new().unwrap();
-        let keypair_path = temp_dir.path().join("relay_keypair.bin");
+        // Clean up any existing keypair from previous test runs
+        let keypair_path = dirs::home_dir()
+            .expect("Cannot find home directory")
+            .join(".meshnet")
+            .join("relay_keypair.bin");
 
-        // Set HOME to temp dir for testing
-        std::env::set_var("HOME", temp_dir.path());
+        // Remove existing keypair file to ensure clean state
+        let _ = std::fs::remove_file(&keypair_path);
 
         // First call should generate keypair
         let keypair1 = load_or_generate_keypair().unwrap();
         let peer_id1 = keypair1.public().to_peer_id();
+
+        // Verify the file was created
+        assert!(
+            keypair_path.exists(),
+            "Keypair file should exist after generation: {}",
+            keypair_path.display()
+        );
 
         // Second call should load the same keypair
         let keypair2 = load_or_generate_keypair().unwrap();
         let peer_id2 = keypair2.public().to_peer_id();
 
         assert_eq!(peer_id1, peer_id2, "PeerID should be consistent across loads");
+
+        // Clean up after test
+        let _ = std::fs::remove_file(&keypair_path);
     }
 }
