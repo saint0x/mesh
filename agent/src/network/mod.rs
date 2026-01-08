@@ -6,11 +6,15 @@
 mod events;
 mod job_protocol;
 mod mesh_swarm;
+mod ring_gossip;
+mod ring_gossip_service;
 mod tensor_protocol;
 
 pub use events::{ConnectionInfo, ConnectionType, MeshEvent};
 pub use job_protocol::{JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
 pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections};
+pub use ring_gossip::{MemberStatus, RingGossipMessage, RingMember, RingState, RingTopology};
+pub use ring_gossip_service::RingGossipService;
 pub use tensor_protocol::{
     AllReducePhase, TensorMessage, TensorProtocol, TensorProtocolConfig, TENSOR_PROTOCOL_ID,
 };

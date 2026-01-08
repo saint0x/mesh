@@ -540,6 +540,7 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     {
         use agent::pki::PoolConfig;
         use agent::discovery::{BeaconBroadcaster, BeaconListener};
+        use agent::network::RingGossipService;
 
         match PoolConfig::list_pools() {
             Ok(pools) if !pools.is_empty() => {
@@ -561,7 +562,7 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
 
                 // Create beacon listener
                 match BeaconListener::new(pool_data.clone(), &device_keypair).await {
-                    Ok((listener, mut discovered_rx)) => {
+                    Ok((listener, mut discovered_rx, ring_gossip_from_lan_rx)) => {
                         // Spawn listener task
                         tokio::spawn(async move {
                             if let Err(e) = listener.run().await {
@@ -569,7 +570,7 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                             }
                         });
 
-                        // Spawn discovery handler task
+                        // Spawn discovery handler task (save peers to cache)
                         tokio::spawn(async move {
                             while let Some(peer) = discovered_rx.recv().await {
                                 info!(
@@ -578,30 +579,106 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                                     lan_addr = %peer.lan_addr,
                                     "LAN peer discovered"
                                 );
+
+                                // Save to peer cache
+                                if let Ok(mut cache) = PeerCache::load(&peer.pool_id) {
+                                    cache.upsert_peer(peer.clone());
+                                    if let Err(e) = cache.save(&peer.pool_id) {
+                                        error!(error = %e, "Failed to persist peer cache");
+                                    }
+                                }
                             }
                         });
 
                         println!("   ✓ Beacon listener started");
+
+                        // Create RingGossipService for each pool
+                        // For MVP, we'll create one service for the first pool
+                        if let Some((pool_config, _)) = pool_data.first() {
+                            let pool_id = pool_config.pool_id;
+                            let local_peer_id = agent::device::keypair::to_libp2p_keypair(&config.keypair)
+                                .public()
+                                .to_peer_id();
+
+                            info!(pool_id = %pool_id, "Creating RingGossipService");
+
+                            // Create channels for ring gossip
+                            let (ring_gossip_tx, ring_gossip_to_broadcaster_rx) = tokio::sync::mpsc::channel(100);
+
+                            // Create RingGossipService
+                            let (ring_service, _ring_state, mut topology_rx) = RingGossipService::new(
+                                pool_id,
+                                node_id,
+                                local_peer_id,
+                                device_keypair.clone(),
+                                ring_gossip_tx.clone(),
+                                ring_gossip_from_lan_rx,
+                            );
+
+                            // Spawn topology listener task (saves to file for InferenceCoordinator)
+                            let pool_id_for_topology = pool_id;
+                            tokio::spawn(async move {
+                                while let Ok(topology) = topology_rx.recv().await {
+                                    info!(
+                                        pool_id = %topology.pool_id,
+                                        members = topology.members.len(),
+                                        position = topology.my_position,
+                                        "Ring topology converged!"
+                                    );
+
+                                    // Save topology to file for InferenceCoordinator
+                                    let topology_path = dirs::home_dir()
+                                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                        .join(".meshnet")
+                                        .join(format!("ring_topology_{}.json", pool_id_for_topology.to_hex()));
+
+                                    if let Some(parent) = topology_path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+
+                                    if let Ok(topology_json) = serde_json::to_string_pretty(&topology) {
+                                        if let Err(e) = std::fs::write(&topology_path, topology_json) {
+                                            error!(error = %e, "Failed to save ring topology");
+                                        } else {
+                                            info!("Ring topology saved to: {}", topology_path.display());
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Create beacon broadcaster with ring gossip channel
+                            match BeaconBroadcaster::new(
+                                pool_data,
+                                device_keypair,
+                                None,
+                                4001,
+                                ring_gossip_to_broadcaster_rx
+                            ).await {
+                                Ok(broadcaster) => {
+                                    // Spawn broadcaster task
+                                    tokio::spawn(async move {
+                                        if let Err(e) = broadcaster.run().await {
+                                            error!("Beacon broadcaster error: {}", e);
+                                        }
+                                    });
+
+                                    println!("   ✓ Beacon broadcaster started");
+                                }
+                                Err(e) => {
+                                    error!("Failed to start beacon broadcaster: {}", e);
+                                }
+                            }
+
+                            // Spawn RingGossipService task
+                            tokio::spawn(async move {
+                                let _ = ring_service.run().await;
+                            });
+
+                            println!("   ✓ Ring gossip service started");
+                        }
                     }
                     Err(e) => {
                         error!("Failed to start beacon listener: {}", e);
-                    }
-                }
-
-                // Create beacon broadcaster
-                match BeaconBroadcaster::new(pool_data, device_keypair, 4001).await {
-                    Ok(broadcaster) => {
-                        // Spawn broadcaster task
-                        tokio::spawn(async move {
-                            if let Err(e) = broadcaster.run().await {
-                                error!("Beacon broadcaster error: {}", e);
-                            }
-                        });
-
-                        println!("   ✓ Beacon broadcaster started");
-                    }
-                    Err(e) => {
-                        error!("Failed to start beacon broadcaster: {}", e);
                     }
                 }
             }
@@ -1919,31 +1996,78 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
         anyhow::bail!("Pool ID does not match pool root pubkey");
     }
 
-    // Phase 1: Create self-signed membership cert (expires in 7 days)
-    // Phase 2: This would come from pool admin via HTTP API
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs() + (7 * 24 * 60 * 60); // 7 days
+    println!("\n{}", "📝 Requesting certificate from pool admin via LAN...".cyan());
 
-    // Create a temporary pool root to sign the cert (Phase 1 only)
-    // In Phase 2, the admin would sign this
-    println!("\n{}", "Note: Phase 1 uses self-signed membership certs.".yellow());
-    println!("{}", "In Phase 2, the pool admin will issue signed certificates.".yellow());
+    // Create certificate signing request
+    use agent::pki::CertSigningRequest;
+    use agent::discovery::{BeaconMessage, BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT};
+    use tokio::net::UdpSocket;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{timeout, Duration};
 
-    // For Phase 1, we create a membership cert signed by the pool root
-    // Since we don't have the private key, we'll create a self-signed cert
-    // This is acceptable for Phase 1 testing
-    use agent::pki::PoolRootKeyPair;
-    let temp_root = PoolRootKeyPair::from_private_bytes([0u8; 32])?; // Dummy for Phase 1
-    let mut membership_cert = PoolMembershipCert::new(
-        device_keypair.public,
-        &temp_root,
-        MembershipRole::Member,
-        expires_at,
-    );
+    let csr = CertSigningRequest::new(pool_id, &device_keypair, MembershipRole::Member);
 
-    // Override pool_id to match the actual pool
-    membership_cert.pool_id = pool_id;
+    // Wrap in BeaconMessage and serialize
+    let beacon_msg = BeaconMessage::CertRequest(csr);
+    let mut packet = Vec::new();
+    ciborium::ser::into_writer(&beacon_msg, &mut packet)?;
+
+    // Create sockets for multicast
+    let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    send_socket.set_multicast_ttl_v4(1)?;
+
+    let recv_socket = UdpSocket::bind(format!("0.0.0.0:{}", BEACON_MULTICAST_PORT)).await?;
+    recv_socket.join_multicast_v4(
+        BEACON_MULTICAST_ADDR.parse()?,
+        Ipv4Addr::new(0, 0, 0, 0),
+    )?;
+
+    let multicast_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
+
+    // Broadcast CSR
+    send_socket.send_to(&packet, multicast_addr).await?;
+    println!("{}", "✓ Certificate request broadcast on LAN".green());
+    println!("{}", "⏳ Waiting for admin to sign certificate (60s timeout)...".yellow());
+
+    // Listen for cert response
+    let mut buf = vec![0u8; 2048];
+    let my_device_pubkey = device_keypair.public;
+
+    let membership_cert = match timeout(Duration::from_secs(60), async {
+        loop {
+            match recv_socket.recv_from(&mut buf).await {
+                Ok((len, _sender_addr)) => {
+                    // Try to parse as BeaconMessage
+                    if let Ok(msg) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
+                        if let BeaconMessage::CertResponse(cert) = msg {
+                            // Check if this cert is for us
+                            if cert.device_pubkey == my_device_pubkey && cert.pool_id == pool_id {
+                                // Verify cert signature
+                                let current_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)?
+                                    .as_secs();
+
+                                if cert.verify(&pool_root_pubkey, current_time).is_ok() {
+                                    return Ok::<PoolMembershipCert, anyhow::Error>(cert);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    }).await {
+        Ok(cert_result) => cert_result?,
+        Err(_) => {
+            anyhow::bail!(
+                "{}",
+                "Timeout waiting for certificate from pool admin.\n\nPossible issues:\n  • Pool admin is not online on the same LAN\n  • Pool admin has not started their agent\n  • Firewall is blocking UDP multicast (239.192.0.1:42424)".red()
+            );
+        }
+    };
+
+    println!("{}", "✓ Received signed certificate from admin!".green().bold());
 
     // Create pool config
     let pool_name = name.unwrap_or_else(|| "Unnamed Pool".to_string());
@@ -1956,8 +2080,8 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     println!("\n{}", "Pool Details:".bold());
     println!("  Pool ID:           {}", pool_id.to_hex().green());
     println!("  Pool Name:         {}", pool_name);
-    println!("  Your Role:         {}", "member".cyan());
-    println!("  Expires:           {} days", (expires_at - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()) / 86400);
+    println!("  Your Role:         {}", format!("{:?}", membership_cert.role).to_lowercase().cyan());
+    println!("  Expires:           {} days", (membership_cert.expires_at - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()) / 86400);
 
     println!("\n{}", "Saved to:".dimmed());
     println!("  {}", PoolConfig::pool_dir(&pool_id)?.display());

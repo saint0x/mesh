@@ -4,6 +4,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Cryptographic pool identifier derived from pool root public key
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,10 +111,14 @@ pub struct DeviceKeyPair {
 impl DeviceKeyPair {
     /// Generate a new random device keypair
     pub fn generate() -> Self {
+        use rand::RngCore;
+
         let mut rng = OsRng;
-        let keypair = SigningKey::generate(&mut rng);
+        let mut private = [0u8; 32];
+        rng.fill_bytes(&mut private);
+
+        let keypair = SigningKey::from_bytes(&private);
         let public = keypair.verifying_key().to_bytes();
-        let private = keypair.to_bytes();
 
         DeviceKeyPair {
             public,
@@ -163,10 +168,14 @@ pub struct PoolRootKeyPair {
 impl PoolRootKeyPair {
     /// Generate a new random pool root keypair
     pub fn generate() -> Self {
+        use rand::RngCore;
+
         let mut rng = OsRng;
-        let keypair = SigningKey::generate(&mut rng);
+        let mut private = [0u8; 32];
+        rng.fill_bytes(&mut private);
+
+        let keypair = SigningKey::from_bytes(&private);
         let public = keypair.verifying_key().to_bytes();
-        let private = keypair.to_bytes();
 
         PoolRootKeyPair {
             public,
@@ -342,6 +351,101 @@ impl PoolMembershipCert {
         hasher.update(&self.expires_at.to_le_bytes());
         hasher.update(&self.signature);
         hasher.finalize().into()
+    }
+}
+
+/// Certificate Signing Request for P2P cert issuance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertSigningRequest {
+    /// Pool to join
+    pub pool_id: PoolId,
+    /// Device public key of requester
+    pub device_pubkey: [u8; 32],
+    /// Node ID (derived from device pubkey)
+    pub node_id: NodeId,
+    /// Requested role (Member or Admin)
+    pub requested_role: MembershipRole,
+    /// Request timestamp (Unix seconds)
+    pub timestamp: u64,
+    /// Self-signature to prove key ownership (hex encoded for serde)
+    #[serde(serialize_with = "hex_64_serialize", deserialize_with = "hex_64_deserialize")]
+    pub signature: [u8; 64],
+}
+
+impl CertSigningRequest {
+    /// Create a new CSR
+    pub fn new(
+        pool_id: PoolId,
+        device_keypair: &DeviceKeyPair,
+        requested_role: MembershipRole,
+    ) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Construct signing payload
+        let mut payload = Vec::new();
+        payload.extend_from_slice(pool_id.as_bytes());
+        payload.extend_from_slice(&device_keypair.public);
+        payload.push(match requested_role {
+            MembershipRole::Member => 0,
+            MembershipRole::Admin => 1,
+        });
+        payload.extend_from_slice(&timestamp.to_le_bytes());
+
+        // Self-sign to prove key ownership
+        let signature = device_keypair.sign(&payload);
+
+        Self {
+            pool_id,
+            device_pubkey: device_keypair.public,
+            node_id: device_keypair.node_id(),
+            requested_role,
+            timestamp,
+            signature,
+        }
+    }
+
+    /// Verify CSR signature
+    pub fn verify(&self) -> Result<()> {
+        // Verify node_id matches device_pubkey
+        let expected_node_id = NodeId::from_pubkey(&self.device_pubkey);
+        if self.node_id != expected_node_id {
+            return Err(anyhow!("Node ID does not match device pubkey"));
+        }
+
+        // Verify self-signature
+        let mut payload = Vec::new();
+        payload.extend_from_slice(self.pool_id.as_bytes());
+        payload.extend_from_slice(&self.device_pubkey);
+        payload.push(match self.requested_role {
+            MembershipRole::Member => 0,
+            MembershipRole::Admin => 1,
+        });
+        payload.extend_from_slice(&self.timestamp.to_le_bytes());
+
+        let verifying_key = VerifyingKey::from_bytes(&self.device_pubkey)
+            .map_err(|e| anyhow!("Invalid device pubkey: {}", e))?;
+
+        let signature = Signature::from_bytes(&self.signature);
+
+        verifying_key
+            .verify(&payload, &signature)
+            .map_err(|e| anyhow!("Invalid CSR signature: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Check if CSR is recent (within 5 minutes)
+    pub fn is_recent(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // CSR valid for 5 minutes
+        now.saturating_sub(self.timestamp) < 300
     }
 }
 

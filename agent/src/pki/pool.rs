@@ -44,8 +44,10 @@ impl PoolConfig {
         let pool_root = PoolRootKeyPair::generate();
         let pool_id = pool_root.pool_id();
 
-        // Admin role never expires (or set to far future)
-        let expires_at = u64::MAX;
+        // Admin role expires in 10 years (effectively never for testing)
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs() + (10 * 365 * 24 * 60 * 60); // 10 years
 
         // Issue self-signed membership cert as admin
         let membership_cert = PoolMembershipCert::new(
@@ -255,9 +257,16 @@ impl PoolConfig {
         cert.is_valid(&self.pool_root_pubkey, now)
     }
 
-    /// Get days until expiration (None if never expires)
+    /// Get days until expiration (None if very far future)
     pub fn days_until_expiry(&self) -> Option<i64> {
-        if self.expires_at == u64::MAX {
+        // If expires more than 5 years in future, treat as "never"
+        let five_years = 5 * 365 * 24 * 60 * 60;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if self.expires_at > now + five_years {
             return None;
         }
 

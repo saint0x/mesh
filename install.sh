@@ -51,11 +51,26 @@ success "Rust found: $(rustc --version)"
 info "Building meshnet agent (this may take a few minutes)..."
 cargo build --release --bin agent
 
-if [ ! -f "target/release/agent" ]; then
-    error "Build failed - binary not found at target/release/agent"
+# Check for binary in multiple possible locations
+BINARY_PATH=""
+if [ -f "target/release/agent" ]; then
+    BINARY_PATH="target/release/agent"
+elif [ -f "target/aarch64-apple-darwin/release/agent" ]; then
+    BINARY_PATH="target/aarch64-apple-darwin/release/agent"
+elif [ -f "target/x86_64-apple-darwin/release/agent" ]; then
+    BINARY_PATH="target/x86_64-apple-darwin/release/agent"
+elif [ -f "target/x86_64-unknown-linux-gnu/release/agent" ]; then
+    BINARY_PATH="target/x86_64-unknown-linux-gnu/release/agent"
+elif [ -f "target/aarch64-unknown-linux-gnu/release/agent" ]; then
+    BINARY_PATH="target/aarch64-unknown-linux-gnu/release/agent"
+fi
+
+if [ -z "$BINARY_PATH" ]; then
+    error "Build failed - binary not found"
+    error "Checked: target/release/agent and platform-specific directories"
     exit 1
 fi
-success "Build complete"
+success "Build complete: $BINARY_PATH"
 
 # Determine installation directory
 INSTALL_DIR="$HOME/.local/bin"
@@ -68,7 +83,7 @@ fi
 
 # Install binary
 info "Installing binary to $INSTALL_DIR/mesh..."
-cp target/release/agent "$INSTALL_DIR/mesh"
+cp "$BINARY_PATH" "$INSTALL_DIR/mesh"
 chmod +x "$INSTALL_DIR/mesh"
 success "Binary installed"
 

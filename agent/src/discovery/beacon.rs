@@ -1,8 +1,10 @@
+use crate::network::RingGossipMessage;
 use crate::pki::{
-    DeviceKeyPair, DiscoveredPeer, DiscoveryMethod, NodeId, PeerCache, PoolConfig, PoolId,
-    PoolMembershipCert,
+    CertSigningRequest, DeviceKeyPair, DiscoveredPeer, DiscoveryMethod, NodeId, PeerCache,
+    PoolConfig, PoolId, PoolMembershipCert,
 };
 use anyhow::Result;
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -18,6 +20,19 @@ pub const BEACON_MULTICAST_PORT: u16 = 42424;
 pub const BEACON_INTERVAL_SECS: u64 = 5;
 pub const STALE_PEER_THRESHOLD_SECS: u64 = 30;
 
+/// Beacon message types for LAN discovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BeaconMessage {
+    /// Regular pool presence announcement
+    PoolBeacon(PoolBeacon),
+    /// Certificate signing request from new member
+    CertRequest(CertSigningRequest),
+    /// Signed certificate response from admin
+    CertResponse(PoolMembershipCert),
+    /// Ring topology gossip
+    RingGossip(RingGossipMessage),
+}
+
 /// Pool beacon packet (UDP multicast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolBeacon {
@@ -27,6 +42,9 @@ pub struct PoolBeacon {
     pub pool_id: PoolId,
     /// Node identifier
     pub node_id: NodeId,
+    /// Libp2p PeerID (for P2P ring connections)
+    #[serde(with = "peer_id_opt_serde")]
+    pub peer_id: Option<PeerId>,
     /// QUIC listener port (future use)
     pub quic_port: u16,
     /// First 8 bytes of device pubkey (fingerprint)
@@ -69,12 +87,43 @@ mod hex_array {
     }
 }
 
+mod peer_id_opt_serde {
+    use libp2p::PeerId;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(peer_id: &Option<PeerId>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match peer_id {
+            Some(id) => serializer.serialize_str(&id.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<PeerId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let opt_str: Option<String> = Option::deserialize(deserializer)?;
+        match opt_str {
+            Some(s) => {
+                let peer_id = s.parse::<PeerId>().map_err(D::Error::custom)?;
+                Ok(Some(peer_id))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 impl PoolBeacon {
     /// Create a new beacon
     pub fn new(
         pool_config: &PoolConfig,
         membership_cert: &PoolMembershipCert,
         device_keypair: &DeviceKeyPair,
+        peer_id: Option<PeerId>,
         quic_port: u16,
     ) -> Self {
         let node_id = device_keypair.node_id();
@@ -108,6 +157,7 @@ impl PoolBeacon {
             version: 1,
             pool_id: pool_config.pool_id,
             node_id,
+            peer_id,
             quic_port,
             pubkey_fingerprint: fingerprint,
             membership_cert_hash: cert_hash,
@@ -130,7 +180,9 @@ pub struct BeaconBroadcaster {
     socket: Arc<UdpSocket>,
     pools: Vec<(PoolConfig, PoolMembershipCert)>,
     device_keypair: DeviceKeyPair,
+    peer_id: Option<PeerId>,
     quic_port: u16,
+    ring_gossip_rx: mpsc::Receiver<RingGossipMessage>,
 }
 
 impl BeaconBroadcaster {
@@ -138,7 +190,9 @@ impl BeaconBroadcaster {
     pub async fn new(
         pools: Vec<(PoolConfig, PoolMembershipCert)>,
         device_keypair: DeviceKeyPair,
+        peer_id: Option<PeerId>,
         quic_port: u16,
+        ring_gossip_rx: mpsc::Receiver<RingGossipMessage>,
     ) -> Result<Self> {
         // Create UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -156,58 +210,59 @@ impl BeaconBroadcaster {
             socket: Arc::new(socket),
             pools,
             device_keypair,
+            peer_id,
             quic_port,
+            ring_gossip_rx,
         })
     }
 
     /// Run beacon broadcaster loop
-    pub async fn run(self) -> Result<()> {
-        let mut interval = interval(Duration::from_secs(BEACON_INTERVAL_SECS));
+    pub async fn run(mut self) -> Result<()> {
+        let mut pool_beacon_interval = interval(Duration::from_secs(BEACON_INTERVAL_SECS));
         let target_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
 
         loop {
-            interval.tick().await;
-
-            for (pool_config, membership_cert) in &self.pools {
-                // Create beacon
-                let beacon = PoolBeacon::new(
-                    pool_config,
-                    membership_cert,
-                    &self.device_keypair,
-                    self.quic_port,
-                );
-
-                // Serialize to CBOR
-                let mut packet = Vec::new();
-                match ciborium::ser::into_writer(&beacon, &mut packet) {
-                    Ok(_) => {
-                        // Send beacon
-                        match self.socket.send_to(&packet, target_addr).await {
-                            Ok(sent) => {
-                                tracing::trace!(
-                                    pool_id = %pool_config.pool_id,
-                                    node_id = %beacon.node_id,
-                                    bytes = sent,
-                                    "Beacon sent"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    pool_id = %pool_config.pool_id,
-                                    error = %e,
-                                    "Failed to send beacon"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            pool_id = %pool_config.pool_id,
-                            error = %e,
-                            "Failed to serialize beacon"
+            tokio::select! {
+                _ = pool_beacon_interval.tick() => {
+                    // Broadcast pool presence beacons
+                    for (pool_config, membership_cert) in &self.pools {
+                        let beacon = PoolBeacon::new(
+                            pool_config,
+                            membership_cert,
+                            &self.device_keypair,
+                            self.peer_id,
+                            self.quic_port,
                         );
+
+                        let message = BeaconMessage::PoolBeacon(beacon.clone());
+                        self.broadcast_message(&message, &target_addr).await;
                     }
                 }
+
+                Some(ring_gossip) = self.ring_gossip_rx.recv() => {
+                    // Broadcast ring gossip
+                    let message = BeaconMessage::RingGossip(ring_gossip);
+                    self.broadcast_message(&message, &target_addr).await;
+                }
+            }
+        }
+    }
+
+    async fn broadcast_message(&self, message: &BeaconMessage, target_addr: &SocketAddr) {
+        let mut packet = Vec::new();
+        match ciborium::ser::into_writer(message, &mut packet) {
+            Ok(_) => {
+                match self.socket.send_to(&packet, target_addr).await {
+                    Ok(sent) => {
+                        tracing::trace!(bytes = sent, "Beacon message broadcast");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to broadcast message");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize message");
             }
         }
     }
@@ -220,6 +275,7 @@ pub struct BeaconListener {
     my_node_id: NodeId,
     discovered_tx: mpsc::Sender<DiscoveredPeer>,
     peer_cache: Arc<RwLock<HashMap<PoolId, PeerCache>>>,
+    ring_gossip_tx: Option<mpsc::Sender<RingGossipMessage>>,
 }
 
 impl BeaconListener {
@@ -227,7 +283,7 @@ impl BeaconListener {
     pub async fn new(
         pools: Vec<(PoolConfig, PoolMembershipCert)>,
         device_keypair: &DeviceKeyPair,
-    ) -> Result<(Self, mpsc::Receiver<DiscoveredPeer>)> {
+    ) -> Result<(Self, mpsc::Receiver<DiscoveredPeer>, mpsc::Receiver<RingGossipMessage>)> {
         // Create UDP socket
         let socket = UdpSocket::bind(format!("0.0.0.0:{}", BEACON_MULTICAST_PORT)).await?;
 
@@ -258,6 +314,7 @@ impl BeaconListener {
 
         let my_node_id = device_keypair.node_id();
         let (discovered_tx, discovered_rx) = mpsc::channel(100);
+        let (ring_gossip_tx, ring_gossip_rx) = mpsc::channel(100);
 
         tracing::info!(
             pools = my_pools.len(),
@@ -274,8 +331,10 @@ impl BeaconListener {
                 my_node_id,
                 discovered_tx,
                 peer_cache: Arc::new(RwLock::new(peer_cache_map)),
+                ring_gossip_tx: Some(ring_gossip_tx),
             },
             discovered_rx,
+            ring_gossip_rx,
         ))
     }
 
@@ -303,16 +362,29 @@ impl BeaconListener {
             // Receive beacon
             match self.socket.recv_from(&mut buf).await {
                 Ok((len, sender_addr)) => {
-                    // Parse beacon
-                    match ciborium::de::from_reader::<PoolBeacon, _>(&buf[..len]) {
-                        Ok(beacon) => {
-                            self.handle_beacon(beacon, sender_addr).await;
+                    // Parse beacon message
+                    match ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
+                        Ok(message) => {
+                            match message {
+                                BeaconMessage::PoolBeacon(beacon) => {
+                                    self.handle_pool_beacon(beacon, sender_addr).await;
+                                }
+                                BeaconMessage::CertRequest(request) => {
+                                    self.handle_cert_request(request, sender_addr).await;
+                                }
+                                BeaconMessage::CertResponse(cert) => {
+                                    self.handle_cert_response(cert, sender_addr).await;
+                                }
+                                BeaconMessage::RingGossip(gossip) => {
+                                    self.handle_ring_gossip(gossip).await;
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(
                                 error = %e,
                                 sender = %sender_addr,
-                                "Failed to parse beacon"
+                                "Failed to parse beacon message"
                             );
                         }
                     }
@@ -324,7 +396,7 @@ impl BeaconListener {
         }
     }
 
-    async fn handle_beacon(&mut self, beacon: PoolBeacon, sender_addr: SocketAddr) {
+    async fn handle_pool_beacon(&mut self, beacon: PoolBeacon, sender_addr: SocketAddr) {
         // Ignore our own beacons
         if beacon.node_id == self.my_node_id {
             return;
@@ -385,6 +457,206 @@ impl BeaconListener {
         let cache_map = self.peer_cache.read().await;
         cache_map.get(pool_id).cloned()
     }
+
+    /// Handle certificate signing request (admins only)
+    async fn handle_cert_request(&mut self, request: CertSigningRequest, sender_addr: SocketAddr) {
+        tracing::info!(
+            pool_id = %request.pool_id,
+            node_id = %request.node_id,
+            requested_role = ?request.requested_role,
+            sender = %sender_addr,
+            "Certificate signing request received"
+        );
+
+        // Check if we're admin for this pool
+        let admin_pool = self.my_pools.get(&request.pool_id);
+        let is_admin = admin_pool
+            .map(|(config, _)| config.role == crate::pki::MembershipRole::Admin)
+            .unwrap_or(false);
+
+        if !is_admin {
+            tracing::trace!("Ignoring CSR - not admin for this pool");
+            return;
+        }
+
+        // Verify CSR
+        if let Err(e) = request.verify() {
+            tracing::warn!(error = %e, "Invalid CSR signature");
+            return;
+        }
+
+        // Check if CSR is recent
+        if !request.is_recent() {
+            tracing::warn!("CSR is too old (>5 minutes)");
+            return;
+        }
+
+        // TODO: For Phase 1, we'll auto-approve Member role requests
+        // In Phase 2, add authorization policy check here
+        if request.requested_role == crate::pki::MembershipRole::Admin {
+            tracing::warn!("Cannot auto-approve Admin role request");
+            return;
+        }
+
+        // Load pool root keypair to sign cert
+        let pool_dir = crate::pki::PoolConfig::pool_dir(&request.pool_id)
+            .expect("Failed to get pool dir");
+        let root_keypair_path = pool_dir.join("pool-root-private");
+
+        let pool_root = match std::fs::read(&root_keypair_path) {
+            Ok(bytes) => {
+                if bytes.len() != 32 {
+                    tracing::error!("Invalid pool root keypair size");
+                    return;
+                }
+                let mut array = [0u8; 32];
+                array.copy_from_slice(&bytes);
+                match crate::pki::PoolRootKeyPair::from_private_bytes(array) {
+                    Ok(kp) => kp,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to load pool root keypair");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read pool root keypair");
+                return;
+            }
+        };
+
+        // Sign certificate (1 year expiry)
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 365 * 24 * 60 * 60;
+
+        let cert = PoolMembershipCert::new(
+            request.device_pubkey,
+            &pool_root,
+            request.requested_role,
+            expires_at,
+        );
+
+        tracing::info!(
+            pool_id = %request.pool_id,
+            node_id = %request.node_id,
+            role = ?request.requested_role,
+            "Signed membership certificate"
+        );
+
+        // Broadcast signed cert via LAN beacon
+        let message = BeaconMessage::CertResponse(cert);
+        let mut packet = Vec::new();
+        if let Err(e) = ciborium::ser::into_writer(&message, &mut packet) {
+            tracing::error!(error = %e, "Failed to serialize cert response");
+            return;
+        }
+
+        let target_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT)
+            .parse()
+            .unwrap();
+
+        if let Err(e) = self.socket.send_to(&packet, target_addr).await {
+            tracing::error!(error = %e, "Failed to send cert response");
+        } else {
+            tracing::info!(
+                pool_id = %request.pool_id,
+                node_id = %request.node_id,
+                "Cert response broadcast via LAN"
+            );
+        }
+    }
+
+    /// Handle certificate response (members waiting for cert)
+    async fn handle_cert_response(&mut self, cert: PoolMembershipCert, sender_addr: SocketAddr) {
+        tracing::info!(
+            pool_id = %cert.pool_id,
+            node_id = %cert.node_id(),
+            role = ?cert.role,
+            sender = %sender_addr,
+            "Certificate response received"
+        );
+
+        // Check if this cert is for us
+        let my_device_pubkey = self.my_pools.values().next().map(|(_config, my_cert)| my_cert.device_pubkey);
+        let is_for_me = my_device_pubkey.map(|pk| pk == cert.device_pubkey).unwrap_or(false);
+
+        if !is_for_me {
+            tracing::trace!("Cert not for us, ignoring");
+            return;
+        }
+
+        // Get pool root pubkey
+        let pool_root_pubkey = self
+            .my_pools
+            .get(&cert.pool_id)
+            .map(|(config, _)| config.pool_root_pubkey);
+
+        let pool_root_pubkey = match pool_root_pubkey {
+            Some(pk) => pk,
+            None => {
+                tracing::warn!("Received cert for unknown pool");
+                return;
+            }
+        };
+
+        // Verify cert
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Err(e) = cert.verify(&pool_root_pubkey, current_time) {
+            tracing::error!(error = %e, "Invalid certificate signature");
+            return;
+        }
+
+        // Save cert to disk
+        let pool_dir = match crate::pki::PoolConfig::pool_dir(&cert.pool_id) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to get pool dir");
+                return;
+            }
+        };
+
+        let cert_path = pool_dir.join("membership.cert");
+        let cert_json = match serde_json::to_string_pretty(&cert) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize cert");
+                return;
+            }
+        };
+
+        if let Err(e) = std::fs::write(&cert_path, cert_json) {
+            tracing::error!(error = %e, "Failed to save cert");
+            return;
+        }
+
+        tracing::info!(
+            pool_id = %cert.pool_id,
+            node_id = %cert.node_id(),
+            role = ?cert.role,
+            "Membership certificate saved"
+        );
+
+        // TODO: Phase 2 - Signal pool-join command that cert is ready via channel
+    }
+
+    /// Handle ring gossip message
+    async fn handle_ring_gossip(&mut self, gossip: RingGossipMessage) {
+        // Forward to ring gossip service
+        if let Some(tx) = &self.ring_gossip_tx {
+            if let Err(e) = tx.try_send(gossip) {
+                tracing::debug!(error = %e, "Failed to forward ring gossip");
+            } else {
+                tracing::trace!("Ring gossip forwarded to service");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -415,7 +687,7 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let beacon = PoolBeacon::new(&pool_config, &cert, &device, 4001);
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
 
         assert_eq!(beacon.version, 1);
         assert_eq!(beacon.pool_id, pool_id);
@@ -446,7 +718,7 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let beacon = PoolBeacon::new(&pool_config, &cert, &device, 4001);
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
 
         // Serialize to CBOR
         let mut bytes = Vec::new();
