@@ -2000,6 +2000,137 @@ async fn cmd_pool_create(name: String) -> Result<()> {
     Ok(())
 }
 
+/// Discover pool admin by listening for beacons
+async fn discover_pool_admin(
+    socket: &tokio::net::UdpSocket,
+    pool_id: PoolId,
+    timeout_duration: tokio::time::Duration,
+) -> Result<agent::discovery::PoolBeacon> {
+    use agent::discovery::BeaconMessage;
+    use tokio::time::Instant;
+
+    let start = Instant::now();
+    let mut buf = vec![0u8; 2048];
+
+    loop {
+        if start.elapsed() > timeout_duration {
+            anyhow::bail!(
+                "Timeout discovering pool admin.\n\nPossible issues:\n  • Pool admin is not online on the same LAN\n  • Pool admin has not started their agent\n  • Firewall is blocking UDP multicast (239.192.0.1:42424)"
+            );
+        }
+
+        // Listen for beacons with 2-second timeout per attempt
+        match tokio::time::timeout(tokio::time::Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, _addr))) => {
+                // Try to parse as BeaconMessage
+                if let Ok(BeaconMessage::PoolBeacon(beacon)) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
+                    // Check if this is an admin for our pool with capability to sign certs
+                    if beacon.pool_id == pool_id
+                        && beacon.can_sign_certs()
+                        && beacon.is_accepting_joins()
+                    {
+                        tracing::info!(
+                            node_id = %beacon.node_id.to_hex(),
+                            "Discovered pool admin via beacon"
+                        );
+                        return Ok(beacon);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = ?e, "Socket error while discovering admin");
+                continue;
+            }
+            Err(_) => {
+                // Timeout on this attempt, loop and try again
+                continue;
+            }
+        }
+    }
+}
+
+/// Request certificate from admin with retry mechanism
+async fn request_certificate_with_retry(
+    send_socket: &tokio::net::UdpSocket,
+    recv_socket: &tokio::net::UdpSocket,
+    pool_id: PoolId,
+    device_keypair: &DeviceKeyPair,
+    pool_root_pubkey: [u8; 32],
+    multicast_addr: std::net::SocketAddr,
+    total_timeout: tokio::time::Duration,
+    retry_interval: tokio::time::Duration,
+) -> Result<(PoolMembershipCert, std::net::SocketAddr)> {
+    use agent::pki::{CertSigningRequest, MembershipRole};
+    use agent::discovery::BeaconMessage;
+    use tokio::time::Instant;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Create certificate signing request
+    let csr = CertSigningRequest::new(pool_id, device_keypair, MembershipRole::Member);
+    let beacon_msg = BeaconMessage::CertRequest(csr);
+    let mut packet = Vec::new();
+    ciborium::ser::into_writer(&beacon_msg, &mut packet)?;
+
+    let start = Instant::now();
+    let my_device_pubkey = device_keypair.public;
+    let mut buf = vec![0u8; 2048];
+    let mut attempt = 1;
+
+    loop {
+        if start.elapsed() > total_timeout {
+            anyhow::bail!(
+                "Timeout waiting for certificate from pool admin.\n\nPossible issues:\n  • Pool admin stopped responding\n  • Pool ID or root pubkey is incorrect\n  • Admin rejected the certificate request"
+            );
+        }
+
+        // Broadcast certificate request
+        send_socket.send_to(&packet, multicast_addr).await?;
+        tracing::info!(attempt = attempt, "Sent certificate request to admin");
+
+        // Wait for response with retry_interval timeout
+        match tokio::time::timeout(retry_interval, recv_socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, sender_addr))) => {
+                // Try to parse as CertResponse
+                if let Ok(BeaconMessage::CertResponse(cert)) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
+                    // Check if this cert is for us
+                    if cert.device_pubkey == my_device_pubkey && cert.pool_id == pool_id {
+                        // Verify cert signature
+                        let current_time = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)?
+                            .as_secs();
+
+                        if cert.verify(&pool_root_pubkey, current_time).is_ok() {
+                            tracing::info!("Certificate received and verified from admin");
+
+                            // Save admin IP for relay/control plane discovery
+                            let admin_ip = sender_addr.ip().to_string();
+                            let pool_dir = PoolConfig::pool_dir(&pool_id)?;
+                            let admin_relay_file = pool_dir.join("admin_relay.toml");
+                            let admin_config = format!("[relay]\nip_address = \"{}\"\n", admin_ip);
+                            if let Err(e) = std::fs::write(&admin_relay_file, &admin_config) {
+                                tracing::warn!(error = ?e, "Failed to save admin relay info");
+                            } else {
+                                tracing::info!(admin_ip = %admin_ip, "Saved admin relay address");
+                            }
+
+                            return Ok((cert, sender_addr));
+                        } else {
+                            tracing::warn!("Received certificate failed signature verification");
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = ?e, "Socket error receiving certificate");
+            }
+            Err(_) => {
+                // Timeout, retry
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Join an existing pool
 async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: Option<String>) -> Result<()> {
     use colored::Colorize;
@@ -2034,21 +2165,13 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
         anyhow::bail!("Pool ID does not match pool root pubkey");
     }
 
-    println!("\n{}", "📝 Requesting certificate from pool admin via LAN...".cyan());
-
-    // Create certificate signing request
-    use agent::pki::CertSigningRequest;
-    use agent::discovery::{BeaconMessage, BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT};
+    // Setup multicast sockets for LAN discovery
+    use agent::discovery::{BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT};
     use tokio::net::UdpSocket;
     use std::net::{Ipv4Addr, SocketAddr};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::Duration;
 
-    let csr = CertSigningRequest::new(pool_id, &device_keypair, MembershipRole::Member);
-
-    // Wrap in BeaconMessage and serialize
-    let beacon_msg = BeaconMessage::CertRequest(csr);
-    let mut packet = Vec::new();
-    ciborium::ser::into_writer(&beacon_msg, &mut packet)?;
+    println!("\n{}", "Setting up LAN discovery...".cyan());
 
     // Create sockets for multicast
     let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -2062,61 +2185,35 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
 
     let multicast_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
 
-    // Broadcast CSR
-    send_socket.send_to(&packet, multicast_addr).await?;
-    println!("{}", "✓ Certificate request broadcast on LAN".green());
-    println!("{}", "⏳ Waiting for admin to sign certificate (60s timeout)...".yellow());
+    // Phase 1: Discover pool admin via beacons
+    println!("\n{}", "🔍 Discovering pool admin on LAN...".cyan());
+    println!("{}", "   Listening for admin beacons (15s timeout)".dimmed());
+    println!("{}", "   Make sure Device 1 (admin) is running!".dimmed());
 
-    // Listen for cert response
-    let mut buf = vec![0u8; 2048];
-    let my_device_pubkey = device_keypair.public;
+    let admin_beacon = discover_pool_admin(
+        &recv_socket,
+        pool_id,
+        Duration::from_secs(15),
+    ).await?;
 
-    let (membership_cert, admin_addr) = match timeout(Duration::from_secs(60), async {
-        loop {
-            match recv_socket.recv_from(&mut buf).await {
-                Ok((len, sender_addr)) => {
-                    // Try to parse as BeaconMessage
-                    if let Ok(msg) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
-                        if let BeaconMessage::CertResponse(cert) = msg {
-                            // Check if this cert is for us
-                            if cert.device_pubkey == my_device_pubkey && cert.pool_id == pool_id {
-                                // Verify cert signature
-                                let current_time = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)?
-                                    .as_secs();
+    println!("{}", format!("✓ Found admin node: {}", admin_beacon.node_id.to_hex()).green());
 
-                                if cert.verify(&pool_root_pubkey, current_time).is_ok() {
-                                    return Ok::<(PoolMembershipCert, SocketAddr), anyhow::Error>((cert, sender_addr));
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-    }).await {
-        Ok(cert_result) => cert_result?,
-        Err(_) => {
-            anyhow::bail!(
-                "{}",
-                "Timeout waiting for certificate from pool admin.\n\nPossible issues:\n  • Pool admin is not online on the same LAN\n  • Pool admin has not started their agent\n  • Firewall is blocking UDP multicast (239.192.0.1:42424)".red()
-            );
-        }
-    };
+    // Phase 2: Request certificate with retry mechanism
+    println!("\n{}", "📝 Requesting certificate from pool admin...".cyan());
+    println!("{}", "   Retrying every 2s (30s total timeout)".dimmed());
+
+    let (membership_cert, _admin_addr) = request_certificate_with_retry(
+        &send_socket,
+        &recv_socket,
+        pool_id,
+        &device_keypair,
+        pool_root_pubkey,
+        multicast_addr,
+        Duration::from_secs(30),  // Total timeout
+        Duration::from_secs(2),   // Retry interval
+    ).await?;
 
     println!("{}", "✓ Received signed certificate from admin!".green().bold());
-
-    // Save admin's IP address for relay/control plane connection
-    let admin_ip = admin_addr.ip().to_string();
-    let pool_dir = PoolConfig::pool_dir(&pool_id)?;
-    let admin_relay_file = pool_dir.join("admin_relay.toml");
-    let admin_config = format!("[relay]\nip_address = \"{}\"\n", admin_ip);
-    if let Err(e) = std::fs::write(&admin_relay_file, &admin_config) {
-        tracing::warn!(error = ?e, "Failed to save admin relay info");
-    } else {
-        tracing::info!(admin_ip = %admin_ip, "Saved admin relay address");
-    }
 
     // Create pool config
     let pool_name = name.unwrap_or_else(|| "Unnamed Pool".to_string());

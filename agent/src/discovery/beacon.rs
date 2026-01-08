@@ -20,6 +20,12 @@ pub const BEACON_MULTICAST_PORT: u16 = 42424;
 pub const BEACON_INTERVAL_SECS: u64 = 5;
 pub const STALE_PEER_THRESHOLD_SECS: u64 = 30;
 
+/// Capability flags for beacon capabilities_bitmap
+pub const CAPABILITY_CAN_SIGN_CERTS: u32 = 0x0001;  // Admin can sign member certificates
+pub const CAPABILITY_ACCEPTING_JOINS: u32 = 0x0002;  // Admin is accepting new pool joins
+pub const CAPABILITY_HAS_RELAY: u32 = 0x0004;        // Node has relay server running
+pub const CAPABILITY_HAS_CONTROL_PLANE: u32 = 0x0008; // Node has control plane running
+
 /// Beacon message types for LAN discovery
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BeaconMessage {
@@ -140,6 +146,14 @@ impl PoolBeacon {
             .unwrap()
             .as_secs();
 
+        // Set capabilities based on role
+        let mut capabilities = 0u32;
+        if pool_config.role == crate::pki::MembershipRole::Admin {
+            capabilities |= CAPABILITY_CAN_SIGN_CERTS;
+            capabilities |= CAPABILITY_ACCEPTING_JOINS;
+        }
+        // TODO: Set CAPABILITY_HAS_RELAY and CAPABILITY_HAS_CONTROL_PLANE from config
+
         // Construct signing payload
         let mut payload = Vec::new();
         payload.push(1); // version
@@ -148,7 +162,7 @@ impl PoolBeacon {
         payload.extend_from_slice(&quic_port.to_le_bytes());
         payload.extend_from_slice(&fingerprint);
         payload.extend_from_slice(&cert_hash);
-        payload.extend_from_slice(&0u32.to_le_bytes()); // capabilities
+        payload.extend_from_slice(&capabilities.to_le_bytes());
         payload.extend_from_slice(&timestamp.to_le_bytes());
 
         let signature = device_keypair.sign(&payload);
@@ -161,7 +175,7 @@ impl PoolBeacon {
             quic_port,
             pubkey_fingerprint: fingerprint,
             membership_cert_hash: cert_hash,
-            capabilities_bitmap: 0,
+            capabilities_bitmap: capabilities,
             timestamp,
             signature,
         }
@@ -172,6 +186,26 @@ impl PoolBeacon {
         // TODO: Implement signature verification in Phase 2
         // For Phase 1, trust LAN beacons
         true
+    }
+
+    /// Check if this beacon advertises the capability to sign certificates (admin)
+    pub fn can_sign_certs(&self) -> bool {
+        self.capabilities_bitmap & CAPABILITY_CAN_SIGN_CERTS != 0
+    }
+
+    /// Check if this beacon is accepting new pool joins
+    pub fn is_accepting_joins(&self) -> bool {
+        self.capabilities_bitmap & CAPABILITY_ACCEPTING_JOINS != 0
+    }
+
+    /// Check if this node has a relay server
+    pub fn has_relay(&self) -> bool {
+        self.capabilities_bitmap & CAPABILITY_HAS_RELAY != 0
+    }
+
+    /// Check if this node has a control plane
+    pub fn has_control_plane(&self) -> bool {
+        self.capabilities_bitmap & CAPABILITY_HAS_CONTROL_PLANE != 0
     }
 }
 
@@ -730,5 +764,112 @@ mod tests {
         assert_eq!(decoded.pool_id, beacon.pool_id);
         assert_eq!(decoded.node_id, beacon.node_id);
         assert_eq!(decoded.quic_port, beacon.quic_port);
+    }
+
+    #[test]
+    fn test_admin_beacon_capabilities() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        // Create admin certificate
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Admin,  // Admin role
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Admin,  // Admin role
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
+
+        // Verify admin capabilities
+        assert!(beacon.can_sign_certs(), "Admin beacon should have can_sign_certs=true");
+        assert!(beacon.is_accepting_joins(), "Admin beacon should have is_accepting_joins=true");
+        assert_eq!(beacon.capabilities_bitmap & CAPABILITY_CAN_SIGN_CERTS, CAPABILITY_CAN_SIGN_CERTS);
+        assert_eq!(beacon.capabilities_bitmap & CAPABILITY_ACCEPTING_JOINS, CAPABILITY_ACCEPTING_JOINS);
+    }
+
+    #[test]
+    fn test_member_beacon_capabilities() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        // Create member certificate
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Member,  // Member role
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Member,  // Member role
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
+
+        // Verify member does NOT have signing capabilities
+        assert!(!beacon.can_sign_certs(), "Member beacon should have can_sign_certs=false");
+        assert!(!beacon.is_accepting_joins(), "Member beacon should have is_accepting_joins=false");
+        assert_eq!(beacon.capabilities_bitmap & CAPABILITY_CAN_SIGN_CERTS, 0);
+        assert_eq!(beacon.capabilities_bitmap & CAPABILITY_ACCEPTING_JOINS, 0);
+    }
+
+    #[test]
+    fn test_beacon_capability_serialization() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        // Create admin beacon with capabilities
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Admin,
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Admin,
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
+
+        // Serialize to CBOR
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&beacon, &mut bytes).unwrap();
+
+        // Deserialize
+        let decoded: PoolBeacon = ciborium::de::from_reader(&bytes[..]).unwrap();
+
+        // Verify capabilities are preserved
+        assert_eq!(decoded.capabilities_bitmap, beacon.capabilities_bitmap);
+        assert_eq!(decoded.can_sign_certs(), beacon.can_sign_certs());
+        assert_eq!(decoded.is_accepting_joins(), beacon.is_accepting_joins());
+        assert!(decoded.can_sign_certs(), "Deserialized admin beacon should still have can_sign_certs=true");
+        assert!(decoded.is_accepting_joins(), "Deserialized admin beacon should still have is_accepting_joins=true");
     }
 }
