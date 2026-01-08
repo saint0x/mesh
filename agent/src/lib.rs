@@ -1,12 +1,14 @@
 pub mod api;
 pub mod checkpoint;
 pub mod device;
+pub mod discovery;
 pub mod errors;
 pub mod executor;
 pub mod inference;
 pub mod model;
 pub mod network;
 pub mod observability;
+pub mod pki;
 pub mod resource_manager;
 pub mod telemetry;
 

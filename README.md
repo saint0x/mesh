@@ -4,6 +4,41 @@
 
 **Enable groups to pool compute resources and collectively run AI models too large for any individual machine.**
 
+## Quick Install
+
+```bash
+# Clone and install
+git clone <repo-url>
+cd meshnet
+./install.sh
+
+# Restart your shell or run:
+source ~/.zshrc  # or ~/.bashrc
+
+# Verify installation
+mesh --version
+```
+
+This installs the `mesh` command to `~/.local/bin` and updates your PATH.
+
+### Quick Start
+
+```bash
+# Initialize your device
+mesh init --network-id test --name "My Laptop"
+
+# LAN Discovery (Phase 1)
+mesh pool-create --name "My Pool"              # Create a pool
+mesh pool-join --pool-id <id> --pool-root-pubkey <key>  # Join pool
+mesh pool-list                                   # List pools
+mesh start                                       # Start agent with LAN discovery
+
+# Check discovered peers on your LAN
+mesh pool-peers --pool-id <id>
+```
+
+See [LAN_DISCOVERY_TEST.md](LAN_DISCOVERY_TEST.md) for multi-device testing.
+
 ## The Core Problem
 
 You can't run a 64GB Llama-70B model on your 8GB laptop. But 10 friends with 8GB laptops **can** run it together.

@@ -36,6 +36,7 @@ use agent::{
     DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner,
     MeshSwarmBuilder, RegistrationClient, ResourceManager,
 };
+use agent::pki::{DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::debug;
@@ -205,6 +206,38 @@ enum Commands {
         #[arg(short, long, default_value = "info")]
         log_level: String,
     },
+
+    /// Create a new pool (become admin)
+    PoolCreate {
+        /// Pool name
+        #[arg(short, long)]
+        name: String,
+    },
+
+    /// Join an existing pool
+    PoolJoin {
+        /// Pool ID (hex)
+        #[arg(long)]
+        pool_id: String,
+
+        /// Pool root public key (hex)
+        #[arg(long)]
+        pool_root_pubkey: String,
+
+        /// Pool name (optional)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+
+    /// List all pools
+    PoolList,
+
+    /// Show discovered peers in a pool
+    PoolPeers {
+        /// Pool ID (hex)
+        #[arg(long)]
+        pool_id: String,
+    },
 }
 
 #[tokio::main]
@@ -315,6 +348,28 @@ async fn main() -> Result<()> {
         } => {
             init_simple_logging(&log_level)?;
             cmd_inference(prompt, model_id, max_tokens, temperature, top_p, control_plane_url).await?;
+        }
+
+        Commands::PoolCreate { name } => {
+            init_simple_logging("info")?;
+            cmd_pool_create(name).await?;
+        }
+
+        Commands::PoolJoin {
+            pool_id,
+            pool_root_pubkey,
+            name,
+        } => {
+            init_simple_logging("info")?;
+            cmd_pool_join(pool_id, pool_root_pubkey, name).await?;
+        }
+
+        Commands::PoolList => {
+            cmd_pool_list().await?;
+        }
+
+        Commands::PoolPeers { pool_id } => {
+            cmd_pool_peers(pool_id).await?;
         }
     }
 
@@ -480,6 +535,85 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
+
+    // Start LAN beacon discovery (if pools configured)
+    {
+        use agent::pki::PoolConfig;
+        use agent::discovery::{BeaconBroadcaster, BeaconListener};
+
+        match PoolConfig::list_pools() {
+            Ok(pools) if !pools.is_empty() => {
+                println!("\n🔍 Starting LAN beacon discovery...");
+                println!("   Pools: {}", pools.len());
+
+                // Extract configs and certs
+                let pool_data: Vec<(PoolConfig, PoolMembershipCert)> = pools
+                    .into_iter()
+                    .map(|(_, config, cert)| (config, cert))
+                    .collect();
+
+                // Create device keypair (should always succeed since we loaded the config)
+                let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())
+                    .expect("Failed to create device keypair - this should never happen");
+
+                let node_id = device_keypair.node_id();
+                println!("   Node ID: {}", node_id.to_hex());
+
+                // Create beacon listener
+                match BeaconListener::new(pool_data.clone(), &device_keypair).await {
+                    Ok((listener, mut discovered_rx)) => {
+                        // Spawn listener task
+                        tokio::spawn(async move {
+                            if let Err(e) = listener.run().await {
+                                error!("Beacon listener error: {}", e);
+                            }
+                        });
+
+                        // Spawn discovery handler task
+                        tokio::spawn(async move {
+                            while let Some(peer) = discovered_rx.recv().await {
+                                info!(
+                                    pool_id = %peer.pool_id,
+                                    node_id = %peer.node_id,
+                                    lan_addr = %peer.lan_addr,
+                                    "LAN peer discovered"
+                                );
+                            }
+                        });
+
+                        println!("   ✓ Beacon listener started");
+                    }
+                    Err(e) => {
+                        error!("Failed to start beacon listener: {}", e);
+                    }
+                }
+
+                // Create beacon broadcaster
+                match BeaconBroadcaster::new(pool_data, device_keypair, 4001).await {
+                    Ok(broadcaster) => {
+                        // Spawn broadcaster task
+                        tokio::spawn(async move {
+                            if let Err(e) = broadcaster.run().await {
+                                error!("Beacon broadcaster error: {}", e);
+                            }
+                        });
+
+                        println!("   ✓ Beacon broadcaster started");
+                    }
+                    Err(e) => {
+                        error!("Failed to start beacon broadcaster: {}", e);
+                    }
+                }
+            }
+            Ok(_) => {
+                info!("No pools configured - LAN discovery disabled");
+                println!("\n💡 No pools configured. Use 'pool-create' or 'pool-join' to enable LAN discovery.");
+            }
+            Err(e) => {
+                error!("Failed to list pools: {}", e);
+            }
+        }
+    }
 
     // Start inference coordinator (in background)
     let inference_config_task = config.clone();
@@ -1703,6 +1837,276 @@ async fn cmd_inference(
             return Err(e.into());
         }
     }
+
+    println!();
+    Ok(())
+}
+
+/// Create a new pool (become admin)
+async fn cmd_pool_create(name: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Creating New Pool".bold().cyan());
+    println!("{}", "=================".cyan());
+
+    // Load device configuration
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh init' first.")?;
+
+    // Create device keypair from config
+    let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
+
+    // Create pool
+    let (pool_config, pool_root, membership_cert) = PoolConfig::create_pool(name.clone(), &device_keypair)?;
+
+    // Save pool configuration
+    pool_config.save(&membership_cert, Some(&pool_root))?;
+
+    println!("\n{}", "✓ Pool created successfully!".green().bold());
+    println!("\n{}", "Pool Details:".bold());
+    println!("  Pool ID:           {}", pool_config.pool_id.to_hex().green());
+    println!("  Pool Name:         {}", name);
+    println!("  Your Role:         {}", "admin".green());
+    println!("\n{}", "Pool Root Public Key (share this with team members):".bold());
+    println!("  {}", hex::encode(pool_root.public));
+
+    println!("\n{}", "Saved to:".dimmed());
+    println!("  {}", PoolConfig::pool_dir(&pool_config.pool_id)?.display());
+
+    println!("\n{}", "Next steps:".bold());
+    println!("  1. Share the Pool ID and Pool Root Public Key with team members");
+    println!("  2. Team members run: cargo run --bin agent -- pool-join \\");
+    println!("       --pool-id {} \\", pool_config.pool_id.to_hex());
+    println!("       --pool-root-pubkey {}", hex::encode(pool_root.public));
+    println!("  3. Start the agent to begin LAN discovery: cargo run --bin agent -- start");
+
+    println!();
+    Ok(())
+}
+
+/// Join an existing pool
+async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: Option<String>) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Joining Pool".bold().cyan());
+    println!("{}", "============".cyan());
+
+    // Load device configuration
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh init' first.")?;
+
+    // Create device keypair from config
+    let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
+
+    // Parse pool ID
+    let pool_id = PoolId::from_hex(&pool_id_hex)
+        .context("Invalid pool ID hex")?;
+
+    // Parse pool root pubkey
+    let pubkey_bytes = hex::decode(&pool_root_pubkey_hex)
+        .context("Invalid pool root pubkey hex")?;
+    if pubkey_bytes.len() != 32 {
+        anyhow::bail!("Pool root pubkey must be 32 bytes");
+    }
+    let mut pool_root_pubkey = [0u8; 32];
+    pool_root_pubkey.copy_from_slice(&pubkey_bytes);
+
+    // Verify pool ID matches pubkey
+    let expected_pool_id = PoolId::from_pubkey(&pool_root_pubkey);
+    if pool_id != expected_pool_id {
+        anyhow::bail!("Pool ID does not match pool root pubkey");
+    }
+
+    // Phase 1: Create self-signed membership cert (expires in 7 days)
+    // Phase 2: This would come from pool admin via HTTP API
+    let expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs() + (7 * 24 * 60 * 60); // 7 days
+
+    // Create a temporary pool root to sign the cert (Phase 1 only)
+    // In Phase 2, the admin would sign this
+    println!("\n{}", "Note: Phase 1 uses self-signed membership certs.".yellow());
+    println!("{}", "In Phase 2, the pool admin will issue signed certificates.".yellow());
+
+    // For Phase 1, we create a membership cert signed by the pool root
+    // Since we don't have the private key, we'll create a self-signed cert
+    // This is acceptable for Phase 1 testing
+    use agent::pki::PoolRootKeyPair;
+    let temp_root = PoolRootKeyPair::from_private_bytes([0u8; 32])?; // Dummy for Phase 1
+    let mut membership_cert = PoolMembershipCert::new(
+        device_keypair.public,
+        &temp_root,
+        MembershipRole::Member,
+        expires_at,
+    );
+
+    // Override pool_id to match the actual pool
+    membership_cert.pool_id = pool_id;
+
+    // Create pool config
+    let pool_name = name.unwrap_or_else(|| "Unnamed Pool".to_string());
+    let pool_config = PoolConfig::join_pool(pool_id, pool_name.clone(), pool_root_pubkey, membership_cert.clone())?;
+
+    // Save pool configuration
+    pool_config.save(&membership_cert, None)?;
+
+    println!("\n{}", "✓ Joined pool successfully!".green().bold());
+    println!("\n{}", "Pool Details:".bold());
+    println!("  Pool ID:           {}", pool_id.to_hex().green());
+    println!("  Pool Name:         {}", pool_name);
+    println!("  Your Role:         {}", "member".cyan());
+    println!("  Expires:           {} days", (expires_at - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()) / 86400);
+
+    println!("\n{}", "Saved to:".dimmed());
+    println!("  {}", PoolConfig::pool_dir(&pool_id)?.display());
+
+    println!("\n{}", "Next steps:".bold());
+    println!("  Start the agent to begin LAN discovery: cargo run --bin agent -- start");
+    println!("  Your device will broadcast beacons on LAN for this pool.");
+
+    println!();
+    Ok(())
+}
+
+/// List all pools
+async fn cmd_pool_list() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Pools".bold().cyan());
+    println!("{}", "=====".cyan());
+
+    // Load device config to get node ID
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh init' first.")?;
+
+    let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
+    let node_id = device_keypair.node_id();
+
+    // List pools
+    let pools = PoolConfig::list_pools()?;
+
+    if pools.is_empty() {
+        println!("\n{}", "No pools configured.".yellow());
+        println!("\n{}", "Create a new pool:".bold());
+        println!("  cargo run --bin agent -- pool-create --name \"My Pool\"");
+        println!("\n{}", "Or join an existing pool:".bold());
+        println!("  cargo run --bin agent -- pool-join --pool-id <id> --pool-root-pubkey <pubkey>");
+        println!();
+        return Ok(());
+    }
+
+    println!("\n{}", format!("Total pools: {}", pools.len()).bold());
+    println!();
+
+    for (pool_id, pool_config, cert) in pools {
+        println!("{}", format!("Pool: {}", pool_config.name).bold());
+        println!("  Pool ID:         {}", pool_id.to_hex().dimmed());
+        println!("  Your Node ID:    {}", node_id.to_hex().dimmed());
+        println!("  Role:            {}", match pool_config.role {
+            MembershipRole::Admin => "admin".green(),
+            MembershipRole::Member => "member".cyan(),
+        });
+
+        if let Some(days) = pool_config.days_until_expiry() {
+            if days > 0 {
+                println!("  Expires in:      {} days", days);
+            } else {
+                println!("  Expires in:      {} (EXPIRED)", "0 days".red());
+            }
+        } else {
+            println!("  Expires in:      {}", "Never".green());
+        }
+
+        println!("  Created:         {}", pool_config.created_at.dimmed());
+
+        // Check if cert is valid
+        if pool_config.is_cert_valid(&cert) {
+            println!("  Status:          {}", "Valid".green());
+        } else {
+            println!("  Status:          {}", "Invalid/Expired".red());
+        }
+
+        println!();
+    }
+
+    println!("{}", "Commands:".bold());
+    println!("  View peers:      cargo run --bin agent -- pool-peers --pool-id <pool-id>");
+    println!("  Start discovery: cargo run --bin agent -- start");
+
+    println!();
+    Ok(())
+}
+
+/// Show discovered peers in a pool
+async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Pool Peers".bold().cyan());
+    println!("{}", "==========".cyan());
+
+    // Parse pool ID
+    let pool_id = PoolId::from_hex(&pool_id_hex)
+        .context("Invalid pool ID hex")?;
+
+    // Load pool config
+    let (pool_config, _) = PoolConfig::load(&pool_id)
+        .context("Pool not found. Run 'pool-join' or 'pool-create' first.")?;
+
+    println!("\n{}", format!("Pool: {}", pool_config.name).bold());
+    println!("  Pool ID: {}", pool_id.to_hex().dimmed());
+
+    // Load peer cache
+    let peer_cache = PeerCache::load(&pool_id)?;
+
+    let peers = peer_cache.get_peers(&pool_id);
+
+    if peers.is_empty() {
+        println!("\n{}", "No peers discovered yet.".yellow());
+        println!("\n{}", "Start the agent to begin LAN discovery:".bold());
+        println!("  cargo run --bin agent -- start");
+        println!("\n{}", "Make sure other devices are on the same LAN and running the agent.".dimmed());
+        println!();
+        return Ok(());
+    }
+
+    println!("\n{}", format!("Discovered peers: {}", peers.len()).bold());
+    println!();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs();
+
+    for peer in peers {
+        let age_secs = now.saturating_sub(peer.last_seen);
+        let age_str = if age_secs < 60 {
+            format!("{}s ago", age_secs)
+        } else if age_secs < 3600 {
+            format!("{}m ago", age_secs / 60)
+        } else {
+            format!("{}h ago", age_secs / 3600)
+        };
+
+        let status = if age_secs < 30 {
+            "ONLINE".green()
+        } else if age_secs < 300 {
+            "STALE".yellow()
+        } else {
+            "OFFLINE".red()
+        };
+
+        println!("{}", format!("Peer: {}", peer.node_id.to_hex()).bold());
+        println!("  LAN Address:     {}", peer.lan_addr);
+        println!("  Discovery:       {:?}", peer.discovery_method);
+        println!("  Status:          {}", status);
+        println!("  Last Seen:       {}", age_str.dimmed());
+        println!();
+    }
+
+    println!("{}", "Note: Peers are discovered via LAN beacons.".dimmed());
+    println!("{}", "Ensure all devices are on the same WiFi/Ethernet network.".dimmed());
 
     println!();
     Ok(())

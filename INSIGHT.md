@@ -158,6 +158,662 @@ Per token: ~6.3s / 100 tokens = 63ms per token ✅ FAST ENOUGH
 
 ---
 
+## HTTP vs LAN Architecture: Multi-Tier Discovery and Connectivity
+
+### Core Design Principle
+
+**LAN is prioritized inside a pool (the universe), and HTTP is prioritized outside the pool (the platform/control plane).**
+
+Pools are **"universes"** because they're cryptographic domains: you don't "join by knowing a pool exists", you join by presenting pool membership credentials.
+
+### Two-Plane Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   CONTROL PLANE (HTTP/HTTPS)                     │
+│  • Platform API (user auth, device enrollment, pools)            │
+│  • Rendezvous API (presence metadata, "where is node X?")        │
+│  • Relay directory (NAT traversal fallback)                      │
+│                                                                   │
+│  Runs when internet exists. NOT required for intra-LAN once      │
+│  provisioned. Never sees pool traffic (only coordination).       │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼ (bootstrap membership, presence hints)
+┌─────────────────────────────────────────────────────────────────┐
+│                    POOL PLANE (LAN + QUIC)                       │
+│  • LAN discovery beacon (UDP multicast)                          │
+│  • QUIC overlay with mutual authentication                       │
+│  • Pool membership verification (PKI)                            │
+│  • Peer table (LAN → Cached → Rendezvous → Relay)               │
+│                                                                   │
+│  Runs always (LAN/offline ok). This is the "universe".           │
+│  Works fully offline once membership certs are provisioned.      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Entities and Key Material
+
+#### Platform Objects
+- **User**: Human identity on platform
+- **Device**: Node (desktop/server; later mobile)
+- **Pool**: Private universe (membership domain)
+- **Rendezvous Server**: Presence directory (not traffic)
+
+#### Key Material (PKI System)
+- **UserKeyPair**: Long-lived identity key (platform + signing)
+- **DeviceKeyPair**: Long-lived node identity key
+- **PoolRootKeyPair**: Pool CA (signs membership certs)
+- **PoolMembershipCert**: "DeviceKey belongs to PoolID, role=member/admin, expires=..."
+
+#### Identifiers
+- **user_id**: Platform UUID
+- **device_id**: Platform UUID (not trusted for auth)
+- **node_id**: `hash(DevicePubKey)` (network identity)
+- **pool_id**: `hash(PoolRootPubKey)` (universe identity)
+
+```rust
+// Core PKI types
+struct PoolRootKeyPair {
+    public: [u8; 32],   // Ed25519 public key
+    private: [u8; 32],  // Ed25519 private key (never leaves admin device)
+}
+
+struct PoolMembershipCert {
+    device_pubkey: [u8; 32],
+    pool_id: PoolId,
+    role: MembershipRole,  // Member or Admin
+    expires_at: u64,       // Unix timestamp
+    signature: [u8; 64],   // Signed by PoolRootKeyPair
+}
+
+enum MembershipRole {
+    Member,  // Can participate in pool
+    Admin,   // Can issue membership certs
+}
+```
+
+### Lifecycle: Device → Pool → Universe
+
+#### 1. Device Enrollment (HTTP)
+
+**Goal:** Bind a physical node to a user identity.
+
+```rust
+// Device generates keypair locally
+let device_keypair = DeviceKeyPair::generate();
+
+// Register with platform
+POST /v1/devices/register {
+    "device_pubkey": device_keypair.public,
+    "metadata": {
+        "os": "macos",
+        "version": "0.1.0",
+        "capabilities": {...}
+    }
+}
+
+// Platform response
+{
+    "device_id": "uuid-1234",
+    "node_id": "hash(device_pubkey)"
+}
+```
+
+**Result:** Platform knows "this device belongs to this user". Device has stable network identity `node_id`.
+
+#### 2. Pool Creation (HTTP)
+
+**Goal:** Create a cryptographic universe.
+
+```rust
+// Creator generates pool root keypair (CLIENT-SIDE, platform never sees private key)
+let pool_root = PoolRootKeyPair::generate();
+
+// Create pool
+POST /v1/pools {
+    "pool_root_pubkey": pool_root.public,
+    "name": "My Team Pool",
+    "description": "Cooperative inference pool for our team"
+}
+
+// Platform response
+{
+    "pool_id": "hash(pool_root_pubkey)",
+    "created_at": 1234567890
+}
+```
+
+**Result:** A pool exists as a PKI domain. Creator becomes pool admin.
+
+#### 3. Membership Issuance (HTTP or Direct)
+
+**Goal:** Grant a device permission to exist in the universe.
+
+```rust
+// Admin creates invite
+POST /v1/pools/{pool_id}/invites {
+    "role": "member",
+    "expiry": 604800  // 7 days
+}
+
+// Returns invite token (just a delivery mechanism, not authority)
+
+// Device presents invite to admin (or admin service)
+POST /v1/pools/{pool_id}/memberships/issue {
+    "device_pubkey": "...",
+    "role": "member",
+    "expiry": 2592000,  // 30 days
+    "invite_token": "..."
+}
+
+// Admin (or pool admin service) mints membership cert
+let membership_cert = PoolMembershipCert {
+    device_pubkey: device.public,
+    pool_id,
+    role: MembershipRole::Member,
+    expires_at: now() + 30_days,
+    signature: pool_root.sign(device_pubkey || pool_id || role || expires_at)
+};
+
+// Device stores membership cert locally
+~/.meshnet/pools/{pool_id}/membership.cert
+```
+
+**Result:** Device can now mutually authenticate inside that pool **without platform**.
+
+### LAN Discovery: Offline-First Beacon System
+
+#### Custom Beacon Protocol (UDP Multicast)
+
+**Why not mDNS?** mDNS works but is messy (record types, name collisions). Custom beacon is simpler and fully controlled.
+
+```rust
+// Beacon packet (CBOR serialized)
+struct PoolBeacon {
+    version: u8,
+    pool_id: PoolId,
+    node_id: NodeId,
+    quic_port: u16,
+    pubkey_fingerprint: [u8; 8],  // First 8 bytes of device pubkey
+    membership_cert_hash: [u8; 32],
+    capabilities_bitmap: u32,
+    timestamp: u64,
+    signature: [u8; 64],  // Signed by DevicePrivKey
+}
+
+// Multicast group
+const BEACON_MULTICAST_ADDR: &str = "239.192.0.1:42424";
+const BEACON_INTERVAL: Duration = Duration::from_secs(5);
+
+// Sender behavior
+async fn broadcast_beacons(pools: Vec<Pool>) {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.set_multicast_loop_v4(false)?;
+
+    loop {
+        for pool in &pools {
+            let beacon = PoolBeacon {
+                version: 1,
+                pool_id: pool.id,
+                node_id: pool.my_node_id,
+                quic_port: pool.quic_listener_port,
+                pubkey_fingerprint: pool.device_pubkey[..8].try_into()?,
+                membership_cert_hash: hash(&pool.membership_cert),
+                capabilities_bitmap: pool.capabilities.to_bitmap(),
+                timestamp: now(),
+                signature: pool.device_keypair.sign(&serialize_beacon_data()),
+            };
+
+            let packet = cbor::serialize(&beacon)?;
+            socket.send_to(&packet, BEACON_MULTICAST_ADDR).await?;
+        }
+
+        tokio::time::sleep(BEACON_INTERVAL).await;
+    }
+}
+
+// Receiver behavior
+async fn listen_for_beacons(my_pools: Vec<Pool>) -> mpsc::Receiver<DiscoveredPeer> {
+    let socket = UdpSocket::bind(BEACON_MULTICAST_ADDR).await?;
+    socket.join_multicast_v4(
+        Ipv4Addr::new(239, 192, 0, 1),
+        Ipv4Addr::new(0, 0, 0, 0)
+    )?;
+
+    let (tx, rx) = mpsc::channel(100);
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+
+        loop {
+            let (len, sender_addr) = socket.recv_from(&mut buf).await?;
+            let beacon: PoolBeacon = cbor::deserialize(&buf[..len])?;
+
+            // Check if we belong to this pool
+            if let Some(pool) = my_pools.iter().find(|p| p.id == beacon.pool_id) {
+                // Verify signature (optional in v1, recommended)
+                if verify_beacon_signature(&beacon) {
+                    tx.send(DiscoveredPeer {
+                        pool_id: beacon.pool_id,
+                        node_id: beacon.node_id,
+                        lan_addr: format!("{}:{}", sender_addr.ip(), beacon.quic_port),
+                        discovery_method: DiscoveryMethod::LAN,
+                    }).await?;
+                }
+            }
+        }
+    });
+
+    rx
+}
+```
+
+**Why this is offline:**
+- No platform required
+- No global lookup needed
+- Works on airplane Wi-Fi / private LAN / unplugged environments
+
+#### LAN Discovery Range
+
+**What works:**
+- ✅ Same WiFi network
+- ✅ Same Ethernet network
+- ✅ Mixed WiFi + Ethernet on same router/switch
+- ✅ Same building/house
+
+**What doesn't work:**
+- ❌ Across routers (different subnets)
+- ❌ Different physical locations
+- ❌ VPNs (unless VPN supports multicast)
+
+**Solution for cross-location:** HTTP rendezvous (next section)
+
+### HTTP Rendezvous: Internet-Wide Discovery
+
+When nodes are **not** on the same LAN, LAN discovery won't help. Use HTTP rendezvous as the connector.
+
+```rust
+// Presence record (stored on rendezvous server)
+struct PresenceRecord {
+    pool_id: PoolId,
+    node_id: NodeId,
+    endpoints: Vec<Endpoint>,
+    last_seen: u64,
+    signature: [u8; 64],  // Signed by DevicePrivKey (prevents spoofing)
+}
+
+struct Endpoint {
+    address: String,      // "203.0.113.45:41234"
+    endpoint_type: EndpointType,
+}
+
+enum EndpointType {
+    Public,        // Directly routable public IP
+    StunDerived,   // Reflexive address from STUN
+    Relay,         // Relay server address
+}
+
+// Node periodically POSTs presence when online
+POST /v1/presence {
+    "pool_id": "abc123",
+    "node_id": "def456",
+    "endpoints": [
+        {"address": "203.0.113.45:41234", "type": "public"},
+        {"address": "relay.mesh.example.com:443", "type": "relay"}
+    ],
+    "timestamp": 1234567890,
+    "signature": "..."  // sign(pool_id || node_id || endpoints || timestamp)
+}
+
+// Node looks up peers in its pool
+GET /v1/pools/{pool_id}/presence?node_ids=node1,node2,node3
+
+// Response
+{
+    "peers": [
+        {
+            "node_id": "node1",
+            "endpoints": [...],
+            "last_seen": 1234567890
+        },
+        ...
+    ]
+}
+
+// Privacy tradeoff:
+// - More private: targeted lookups ("I want node X")
+// - More convenient: list all active peers ("who's online in this pool?")
+```
+
+### QUIC Overlay with Mutual Authentication
+
+All pool traffic uses QUIC with mutual authentication via pool membership certificates.
+
+```rust
+// QUIC handshake with mutual auth
+async fn connect_to_peer(
+    peer_endpoint: String,
+    my_pool: &Pool,
+    peer_node_id: NodeId,
+) -> Result<Connection> {
+    let mut client_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(Arc::new(
+            PoolCertVerifier { pool_root_pubkey: my_pool.root_pubkey }
+        ))
+        .with_client_cert_resolver(Arc::new(
+            PoolMembershipCertResolver { membership_cert: my_pool.membership_cert.clone() }
+        ));
+
+    let client = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+
+    let conn = client.connect_with(
+        client_config,
+        peer_endpoint.parse()?,
+        "mesh"
+    )?.await?;
+
+    // At this point, both sides have verified:
+    // 1. Peer's membership cert is signed by PoolRootPubKey
+    // 2. Peer's pool_id matches our pool_id
+    // 3. Cert is not expired
+    // 4. Peer possesses the private key for their DeviceKeyPair
+
+    Ok(conn)
+}
+
+// Custom certificate verifier for pool membership
+struct PoolCertVerifier {
+    pool_root_pubkey: [u8; 32],
+}
+
+impl ServerCertVerifier for PoolCertVerifier {
+    fn verify_server_cert(
+        &self,
+        cert: &Certificate,
+        // ... other params
+    ) -> Result<ServerCertVerified> {
+        // Parse pool membership cert from certificate
+        let membership_cert = parse_pool_membership_cert(cert)?;
+
+        // Verify signature using pool root pubkey
+        if !verify_signature(
+            &membership_cert,
+            &self.pool_root_pubkey,
+        ) {
+            return Err(Error::InvalidCertificate);
+        }
+
+        // Verify not expired
+        if membership_cert.expires_at < now() {
+            return Err(Error::ExpiredCertificate);
+        }
+
+        Ok(ServerCertVerified::assertion())
+    }
+}
+```
+
+**Security guarantees:**
+- Only members with valid membership certs can connect
+- All traffic is end-to-end encrypted (relay can't read)
+- Platform never sees pool traffic
+- Works offline (once certs are provisioned)
+
+### Priority State Machine: LAN → Cached → Rendezvous → Relay
+
+```rust
+// Peer connection manager
+struct PeerConnectionManager {
+    pool_id: PoolId,
+    peers: HashMap<NodeId, PeerState>,
+}
+
+struct PeerState {
+    node_id: NodeId,
+    connection: Option<Connection>,
+    known_endpoints: Vec<KnownEndpoint>,
+}
+
+struct KnownEndpoint {
+    address: String,
+    source: EndpointSource,
+    last_success: Option<SystemTime>,
+    priority: u8,
+}
+
+enum EndpointSource {
+    LAN,         // Priority 0 (highest) - discovered via beacon
+    Cached,      // Priority 1 - previously successful endpoint
+    Rendezvous,  // Priority 2 - from HTTP presence lookup
+    Relay,       // Priority 3 (lowest) - fallback relay
+}
+
+impl PeerConnectionManager {
+    async fn connect_to_peer(&mut self, node_id: NodeId) -> Result<Connection> {
+        let peer = self.peers.get_mut(&node_id)
+            .ok_or(Error::PeerNotFound)?;
+
+        // Sort endpoints by priority (LAN first)
+        peer.known_endpoints.sort_by_key(|e| e.priority);
+
+        // Attempt parallel dials with staggered delays
+        let mut dial_tasks = vec![];
+
+        for (i, endpoint) in peer.known_endpoints.iter().enumerate() {
+            let endpoint = endpoint.clone();
+            let delay = Duration::from_millis(i as u64 * 200);  // Stagger by 200ms
+
+            dial_tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+
+                match endpoint.source {
+                    EndpointSource::LAN => {
+                        info!("Attempting LAN connection to {}", endpoint.address);
+                        connect_quic_direct(&endpoint.address).await
+                    },
+                    EndpointSource::Cached => {
+                        info!("Attempting cached endpoint {}", endpoint.address);
+                        connect_quic_direct(&endpoint.address).await
+                    },
+                    EndpointSource::Rendezvous => {
+                        info!("Attempting rendezvous endpoint {}", endpoint.address);
+                        connect_quic_with_holepunch(&endpoint.address).await
+                    },
+                    EndpointSource::Relay => {
+                        info!("Attempting relay connection to {}", endpoint.address);
+                        connect_quic_via_relay(&endpoint.address).await
+                    },
+                }
+            }));
+        }
+
+        // Return first successful connection
+        let (conn, _remaining) = select_ok(dial_tasks).await?;
+
+        Ok(conn)
+    }
+
+    // Update endpoints from LAN beacon
+    fn update_from_beacon(&mut self, beacon: PoolBeacon, sender_ip: IpAddr) {
+        let peer = self.peers.entry(beacon.node_id).or_insert_with(|| {
+            PeerState {
+                node_id: beacon.node_id,
+                connection: None,
+                known_endpoints: vec![],
+            }
+        });
+
+        let lan_endpoint = KnownEndpoint {
+            address: format!("{}:{}", sender_ip, beacon.quic_port),
+            source: EndpointSource::LAN,
+            last_success: None,
+            priority: 0,  // Highest priority
+        };
+
+        // Replace old LAN endpoint if exists, otherwise add
+        if let Some(existing) = peer.known_endpoints.iter_mut()
+            .find(|e| matches!(e.source, EndpointSource::LAN)) {
+            *existing = lan_endpoint;
+        } else {
+            peer.known_endpoints.push(lan_endpoint);
+        }
+    }
+
+    // Update endpoints from HTTP rendezvous
+    async fn update_from_rendezvous(&mut self, node_id: NodeId) -> Result<()> {
+        let presence = fetch_presence(&self.pool_id, &node_id).await?;
+
+        let peer = self.peers.entry(node_id).or_insert_with(|| {
+            PeerState {
+                node_id,
+                connection: None,
+                known_endpoints: vec![],
+            }
+        });
+
+        for endpoint in presence.endpoints {
+            let priority = match endpoint.endpoint_type {
+                EndpointType::Public => 2,
+                EndpointType::StunDerived => 2,
+                EndpointType::Relay => 3,
+            };
+
+            peer.known_endpoints.push(KnownEndpoint {
+                address: endpoint.address,
+                source: EndpointSource::Rendezvous,
+                last_success: None,
+                priority,
+            });
+        }
+
+        Ok(())
+    }
+}
+```
+
+### Offline Semantics: What Works and What Doesn't
+
+**What you CAN guarantee:**
+- ✅ If nodes can reach each other on the LAN: pool works fully offline
+- ✅ If nodes have a reachable path (VPN, direct IP) without platform: also works
+- ✅ Cached endpoints from previous sessions: will try connecting
+
+**What you CANNOT guarantee:**
+- ❌ Discovering a brand-new remote node across the internet while offline
+  - (No control plane, no rendezvous, no magic)
+
+**Practical approach:**
+1. Cache peer endpoints locally (`~/.meshnet/pools/{pool_id}/peer_cache.json`)
+2. LAN discovery for immediate locality (works offline)
+3. When internet returns, refresh presence and reconnect
+
+### Revocation and Security
+
+#### v1 (Simple, Strong Enough)
+
+```rust
+// Membership certs are SHORT-LIVED
+const MEMBERSHIP_CERT_EXPIRY: Duration = Duration::from_secs(7 * 24 * 3600);  // 7 days
+
+// Renewal requires platform/admin approval
+async fn renew_membership(pool_id: PoolId) -> Result<PoolMembershipCert> {
+    // Request renewal from admin
+    POST /v1/pools/{pool_id}/memberships/renew {
+        "device_id": my_device_id,
+        "current_cert_hash": hash(&my_cert)
+    }
+
+    // Admin reviews and re-issues (or denies)
+}
+
+// Stolen certs expire quickly (max 7 days of damage)
+```
+
+**Benefits:**
+- Simple: no revocation lists needed
+- Automatic cleanup: expired certs are useless
+- Admin control: renewal requires approval
+
+#### v2 (More Complex, Future)
+
+```rust
+// Revocation lists (CRLs)
+struct RevocationList {
+    pool_id: PoolId,
+    revoked_certs: Vec<RevokedCert>,
+    version: u64,
+    signature: [u8; 64],  // Signed by PoolRoot
+}
+
+struct RevokedCert {
+    cert_hash: [u8; 32],
+    revoked_at: u64,
+    reason: RevocationReason,
+}
+
+// Gossip revocations inside pool
+// Each node maintains local CRL, syncs with peers
+```
+
+### Complete API Specification
+
+#### Platform API (HTTP)
+
+```rust
+// Auth & Devices
+POST /v1/devices/register
+    Request: { device_pubkey, metadata }
+    Response: { device_id, node_id }
+
+// Pools
+POST /v1/pools
+    Request: { pool_root_pubkey, name, description }
+    Response: { pool_id, created_at }
+
+POST /v1/pools/{pool_id}/invites
+    Request: { role, expiry }
+    Response: { invite_token, expires_at }
+
+// Membership
+POST /v1/pools/{pool_id}/memberships/issue
+    Request: { device_pubkey, role, expiry, invite_token }
+    Response: { membership_cert }
+
+POST /v1/pools/{pool_id}/memberships/renew
+    Request: { device_id, current_cert_hash }
+    Response: { membership_cert }
+
+// Rendezvous Presence
+POST /v1/presence
+    Request: { pool_id, node_id, endpoints, timestamp, signature }
+    Response: { success }
+
+GET /v1/pools/{pool_id}/presence?node_ids=node1,node2
+    Response: { peers: [{ node_id, endpoints, last_seen }] }
+
+GET /v1/pools/{pool_id}/presence/active
+    Response: { peers: [...] }  // All active nodes in pool
+```
+
+### What This Gives You
+
+✅ **Offline-first LAN pools** - Work without internet once provisioned
+✅ **Internet as connector** - Use HTTP to map LAN boundaries globally
+✅ **Private universes** - Each pool is a PKI domain with membership control
+✅ **Priority routing** - LAN is king inside pool, HTTP bridges between pools
+✅ **Zero-config discovery** - Run binary, beacons find local peers automatically
+✅ **Secure by default** - Mutual auth, E2E encryption, membership verification
+✅ **Platform can disappear** - LAN pools operate independently
+
+**This architecture combines the best of both:**
+- Your approach: Custom beacon, PKI, QUIC mutual auth, offline-first
+- Standard protocols: QUIC, Ed25519, multicast UDP
+- Clear separation: HTTP for coordination, LAN/QUIC for data
+
+---
+
 ## Worker Model: Cooperative Resource Contribution
 
 ### What is a Worker?
