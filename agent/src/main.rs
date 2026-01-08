@@ -473,19 +473,41 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
 
     // Wait for relay connection event
     println!("   Waiting for relay connection...");
-    let mut relay_connected = false;
-    while !relay_connected {
-        if let Some(event) = swarm.next_event().await {
-            match event {
-                agent::MeshEvent::RelayConnected { .. } => {
-                    println!("   ✓ Connected to relay");
-                    relay_connected = true;
+
+    // Try to get RelayConnected event with timeout
+    let relay_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            loop {
+                if let Some(event) = swarm.next_event().await {
+                    match event {
+                        agent::MeshEvent::RelayConnected { .. } => {
+                            return Ok(());
+                        }
+                        agent::MeshEvent::RelayConnectionFailed { error, .. } => {
+                            anyhow::bail!("Relay connection failed: {}", error);
+                        }
+                        _ => {}
+                    }
                 }
-                agent::MeshEvent::RelayConnectionFailed { error, .. } => {
-                    error!(error = %error, "Failed to connect to relay");
-                    anyhow::bail!("Relay connection failed: {}", error);
-                }
-                _ => {}
+            }
+        }
+    ).await;
+
+    match relay_result {
+        Ok(Ok(())) => {
+            println!("   ✓ Connected to relay");
+        }
+        Ok(Err(e)) => {
+            return Err(e);
+        }
+        Err(_timeout) => {
+            // Event timeout - verify connection exists at libp2p level
+            warn!("RelayConnected event timeout - checking libp2p connection");
+            if !swarm.connected_peers().is_empty() {
+                println!("   ✓ Connected to relay (verified via libp2p)");
+            } else {
+                anyhow::bail!("Relay connection timeout - no connection established");
             }
         }
     }
@@ -501,20 +523,36 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     swarm.listen_on_relay(relay_peer_id)?;
 
     // Wait for reservation
-    let mut reservation_accepted = false;
-    while !reservation_accepted {
-        if let Some(event) = swarm.next_event().await {
-            match event {
-                agent::MeshEvent::ReservationAccepted { .. } => {
-                    println!("   ✓ Relay reservation accepted");
-                    reservation_accepted = true;
+    let reservation_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            loop {
+                if let Some(event) = swarm.next_event().await {
+                    match event {
+                        agent::MeshEvent::ReservationAccepted { .. } => {
+                            return Ok(());
+                        }
+                        agent::MeshEvent::ReservationDenied { .. } => {
+                            anyhow::bail!("Relay reservation denied");
+                        }
+                        _ => {}
+                    }
                 }
-                agent::MeshEvent::ReservationDenied { .. } => {
-                    error!("Relay reservation denied");
-                    anyhow::bail!("Relay reservation denied");
-                }
-                _ => {}
             }
+        }
+    ).await;
+
+    match reservation_result {
+        Ok(Ok(())) => {
+            println!("   ✓ Relay reservation accepted");
+        }
+        Ok(Err(e)) => {
+            return Err(e);
+        }
+        Err(_timeout) => {
+            warn!("ReservationAccepted event timeout - proceeding anyway");
+            println!("   ⚠️  Relay reservation (event timeout, proceeding)");
+            // Continue anyway - reservation might have succeeded despite event not firing
         }
     }
 
@@ -2033,10 +2071,10 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     let mut buf = vec![0u8; 2048];
     let my_device_pubkey = device_keypair.public;
 
-    let membership_cert = match timeout(Duration::from_secs(60), async {
+    let (membership_cert, admin_addr) = match timeout(Duration::from_secs(60), async {
         loop {
             match recv_socket.recv_from(&mut buf).await {
-                Ok((len, _sender_addr)) => {
+                Ok((len, sender_addr)) => {
                     // Try to parse as BeaconMessage
                     if let Ok(msg) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
                         if let BeaconMessage::CertResponse(cert) = msg {
@@ -2048,7 +2086,7 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
                                     .as_secs();
 
                                 if cert.verify(&pool_root_pubkey, current_time).is_ok() {
-                                    return Ok::<PoolMembershipCert, anyhow::Error>(cert);
+                                    return Ok::<(PoolMembershipCert, SocketAddr), anyhow::Error>((cert, sender_addr));
                                 }
                             }
                         }
@@ -2068,6 +2106,17 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     };
 
     println!("{}", "✓ Received signed certificate from admin!".green().bold());
+
+    // Save admin's IP address for relay/control plane connection
+    let admin_ip = admin_addr.ip().to_string();
+    let pool_dir = PoolConfig::pool_dir(&pool_id)?;
+    let admin_relay_file = pool_dir.join("admin_relay.toml");
+    let admin_config = format!("[relay]\nip_address = \"{}\"\n", admin_ip);
+    if let Err(e) = std::fs::write(&admin_relay_file, &admin_config) {
+        tracing::warn!(error = ?e, "Failed to save admin relay info");
+    } else {
+        tracing::info!(admin_ip = %admin_ip, "Saved admin relay address");
+    }
 
     // Create pool config
     let pool_name = name.unwrap_or_else(|| "Unnamed Pool".to_string());

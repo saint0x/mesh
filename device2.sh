@@ -34,6 +34,13 @@ cargo build --release
 echo "✓ Build complete"
 echo ""
 
+# Detect binary path (macOS uses aarch64-apple-darwin)
+if [ -f "./target/aarch64-apple-darwin/release/agent" ]; then
+    BINARY_PATH="./target/aarch64-apple-darwin/release"
+else
+    BINARY_PATH="./target/release"
+fi
+
 # Kill any existing agent processes
 echo "🧹 Cleaning up old agent processes..."
 pkill -f "agent.*start" 2>/dev/null || true
@@ -44,7 +51,7 @@ echo ""
 # Initialize device if not already done
 if [ ! -f ~/.meshnet/device.toml ]; then
     echo "🔧 Initializing device..."
-    ./target/release/agent init \
+    "$BINARY_PATH/agent" init \
         --network-id "$NETWORK_ID" \
         --name "$DEVICE_NAME" \
         --control-plane "http://localhost:$CONTROL_PLANE_PORT"
@@ -63,7 +70,7 @@ if [ ! -d "$POOL_DIR" ]; then
     echo "   Make sure Device 1 (admin) is running on the same LAN!"
     echo ""
 
-    ./target/release/agent pool-join \
+    "$BINARY_PATH/agent" pool-join \
         --pool-id "$POOL_ID" \
         --pool-root-pubkey "$POOL_ROOT_PUBKEY" \
         --name "$POOL_NAME"
@@ -75,6 +82,30 @@ else
     echo "✓ Already member of pool (found $POOL_DIR)"
     echo ""
 fi
+
+# Detect admin's relay and control plane addresses from saved info
+POOL_DIR="$HOME/.meshnet/pools/$POOL_ID"
+ADMIN_RELAY_INFO="$POOL_DIR/admin_relay.toml"
+
+if [ -f "$ADMIN_RELAY_INFO" ]; then
+    ADMIN_IP=$(grep "ip_address" "$ADMIN_RELAY_INFO" | cut -d'"' -f2)
+    if [ -n "$ADMIN_IP" ]; then
+        RELAY_ADDR="/ip4/$ADMIN_IP/tcp/$RELAY_PORT"
+        CONTROL_PLANE_ADDR="http://$ADMIN_IP:$CONTROL_PLANE_PORT"
+        echo "✓ Using admin's relay at $ADMIN_IP:$RELAY_PORT"
+        echo "✓ Using admin's control plane at $ADMIN_IP:$CONTROL_PLANE_PORT"
+    else
+        RELAY_ADDR="/ip4/127.0.0.1/tcp/$RELAY_PORT"
+        CONTROL_PLANE_ADDR="http://localhost:$CONTROL_PLANE_PORT"
+        echo "⚠️  Could not parse admin IP, using localhost"
+    fi
+else
+    # Fallback to localhost (single-machine setup or old pool)
+    RELAY_ADDR="/ip4/127.0.0.1/tcp/$RELAY_PORT"
+    CONTROL_PLANE_ADDR="http://localhost:$CONTROL_PLANE_PORT"
+    echo "ℹ️  No admin relay info found, using localhost"
+fi
+echo ""
 
 # Create log directory
 mkdir -p ~/.meshnet/logs
@@ -99,9 +130,9 @@ cleanup() {
 trap cleanup INT TERM
 
 # Start agent in foreground
-./target/release/agent start \
-    --relay "/ip4/127.0.0.1/tcp/$RELAY_PORT" \
-    --control-plane "http://localhost:$CONTROL_PLANE_PORT" \
+"$BINARY_PATH/agent" start \
+    --relay "$RELAY_ADDR" \
+    --control-plane "$CONTROL_PLANE_ADDR" \
     --log-level info
 
 cleanup
