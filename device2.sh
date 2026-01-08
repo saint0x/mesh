@@ -12,36 +12,21 @@ echo "  MESH - Device 2 (Pool Member)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
+# Hardcoded pool credentials (from Device 1 admin)
+POOL_ID="18df84ceb61ea385ca3692d2c56de53dfe03bf31ff6414f1fc9cc2c7ec08ef3a"
+POOL_ROOT_PUBKEY="d71df381393fd1da8c3ae1e613d44a63e04239834ae8ac2b347c982b03f79cab"
+
 # Configuration
 DEVICE_NAME="${DEVICE_NAME:-Device2-Member}"
-POOL_INFO_FILE="${POOL_INFO_FILE:-$SCRIPT_DIR/.pool-info}"
+POOL_NAME="${POOL_NAME:-test-pool}"
+NETWORK_ID="${NETWORK_ID:-test-network}"
+RELAY_PORT="${RELAY_PORT:-4001}"
+CONTROL_PLANE_PORT="${CONTROL_PLANE_PORT:-8080}"
 
-# Check if pool info exists
-if [ ! -f "$POOL_INFO_FILE" ]; then
-    echo "❌ Pool info file not found: $POOL_INFO_FILE"
-    echo ""
-    echo "Please provide pool details:"
-    echo ""
-    read -p "Pool ID: " POOL_ID
-    read -p "Pool Root Pubkey: " POOL_ROOT_PUBKEY
-    read -p "Pool Name [test-pool]: " POOL_NAME
-    read -p "Network ID [test-network]: " NETWORK_ID
-    read -p "Relay Port [4001]: " RELAY_PORT
-    read -p "Control Plane Port [8080]: " CONTROL_PLANE_PORT
-
-    POOL_NAME="${POOL_NAME:-test-pool}"
-    NETWORK_ID="${NETWORK_ID:-test-network}"
-    RELAY_PORT="${RELAY_PORT:-4001}"
-    CONTROL_PLANE_PORT="${CONTROL_PLANE_PORT:-8080}"
-else
-    echo "✓ Found pool info file: $POOL_INFO_FILE"
-    source "$POOL_INFO_FILE"
-    echo ""
-    echo "  Pool ID:         $POOL_ID"
-    echo "  Pool Name:       $POOL_NAME"
-    echo "  Network ID:      $NETWORK_ID"
-    echo ""
-fi
+echo "  Pool ID:         $POOL_ID"
+echo "  Pool Root Pubkey: ${POOL_ROOT_PUBKEY:0:16}..."
+echo "  Pool Name:       $POOL_NAME"
+echo ""
 
 # Build project
 echo "📦 Building Mesh binaries (release mode)..."
