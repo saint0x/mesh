@@ -13,8 +13,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 # Hardcoded pool credentials (from Device 1 admin)
-POOL_ID="18df84ceb61ea385ca3692d2c56de53dfe03bf31ff6414f1fc9cc2c7ec08ef3a"
-POOL_ROOT_PUBKEY="d71df381393fd1da8c3ae1e613d44a63e04239834ae8ac2b347c982b03f79cab"
+POOL_ID="602e587a5e549df0335ddddde1d7a73e163116015dfd047d071640f36e74e00a"
+POOL_ROOT_PUBKEY="08b75d02170a95193f595961eec988e11e103fbea60ba6c607570550dc859150"
 
 # Configuration
 DEVICE_NAME="${DEVICE_NAME:-Device2-Member}"

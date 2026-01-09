@@ -556,29 +556,17 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
         }
     }
 
-    // Start heartbeat (in background)
-    let heartbeat_config = config.clone();
-    tokio::spawn(async move {
-        let client = match RegistrationClient::new(heartbeat_config.control_plane_url.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to create heartbeat client: {}", e);
-                return;
-            }
-        };
-        loop {
-            if let Err(e) = client.heartbeat(heartbeat_config.device_id).await {
-                error!(error = %e, "Heartbeat failed");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        }
-    });
-
     // Start LAN beacon discovery (if pools configured)
     {
         use agent::pki::PoolConfig;
         use agent::discovery::{BeaconBroadcaster, BeaconListener};
         use agent::network::RingGossipService;
+
+        // Check if pools exist before starting any background services
+        let has_pools = match PoolConfig::list_pools() {
+            Ok(pools) => !pools.is_empty(),
+            Err(_) => false,
+        };
 
         match PoolConfig::list_pools() {
             Ok(pools) if !pools.is_empty() => {
@@ -716,7 +704,14 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to start beacon listener: {}", e);
+                        // Don't fatal error if beacon listener fails to start
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to start beacon listener (another process may be using port {})",
+                            42424
+                        );
+                        tracing::info!("Continuing in degraded mode (no LAN beacon discovery)");
+                        println!("   ⚠️  Beacon listener failed to start (LAN discovery disabled)");
                     }
                 }
             }
@@ -727,6 +722,34 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
             Err(e) => {
                 error!("Failed to list pools: {}", e);
             }
+        }
+
+        // Start heartbeat (in background) ONLY if pools exist
+        // This prevents 404 errors for devices that only joined pools without init
+        if has_pools {
+            let heartbeat_config = config.clone();
+            tokio::spawn(async move {
+                let client = match RegistrationClient::new(heartbeat_config.control_plane_url.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to create heartbeat client (non-fatal)");
+                        return;
+                    }
+                };
+
+                // Wait for beacon listener to be ready before starting heartbeat
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+                loop {
+                    if let Err(e) = client.heartbeat(heartbeat_config.device_id).await {
+                        // Downgrade to WARN (not ERROR) since this is non-fatal for LAN-only operation
+                        tracing::warn!(error = %e, "Heartbeat failed (control plane may be offline)");
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            });
+        } else {
+            tracing::info!("Skipping heartbeat (no pools configured, LAN-only mode)");
         }
     }
 
@@ -2177,7 +2200,24 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
     send_socket.set_multicast_ttl_v4(1)?;
 
-    let recv_socket = UdpSocket::bind(format!("0.0.0.0:{}", BEACON_MULTICAST_PORT)).await?;
+    // Create receive socket with socket2 to set reuse options before binding
+    // This allows multiple processes to bind to the same multicast port
+    let recv_addr: SocketAddr = format!("0.0.0.0:{}", BEACON_MULTICAST_PORT).parse()?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;  // Allow SO_REUSEPORT on macOS/Linux
+    socket.set_nonblocking(true)?;
+    socket.bind(&recv_addr.into())?;
+
+    // Convert to tokio UdpSocket
+    let recv_socket: std::net::UdpSocket = socket.into();
+    let recv_socket = UdpSocket::from_std(recv_socket)?;
+
     recv_socket.join_multicast_v4(
         BEACON_MULTICAST_ADDR.parse()?,
         Ipv4Addr::new(0, 0, 0, 0),
@@ -2219,8 +2259,29 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     let pool_name = name.unwrap_or_else(|| "Unnamed Pool".to_string());
     let pool_config = PoolConfig::join_pool(pool_id, pool_name.clone(), pool_root_pubkey, membership_cert.clone())?;
 
-    // Save pool configuration
-    pool_config.save(&membership_cert, None)?;
+    // Save pool configuration with explicit error handling
+    let pool_dir = PoolConfig::pool_dir(&pool_id)?;
+    tracing::info!(pool_dir = %pool_dir.display(), "Saving pool configuration");
+
+    pool_config.save(&membership_cert, None)
+        .context(format!("Failed to save pool configuration to {}", pool_dir.display()))?;
+
+    // Verify files were actually written
+    let pool_config_file = pool_dir.join("config.toml");
+    let cert_file = pool_dir.join("membership_cert.pem");
+
+    if !pool_config_file.exists() {
+        anyhow::bail!("Pool config file was not created at {}", pool_config_file.display());
+    }
+    if !cert_file.exists() {
+        anyhow::bail!("Certificate file was not created at {}", cert_file.display());
+    }
+
+    tracing::info!(
+        config_file = %pool_config_file.display(),
+        cert_file = %cert_file.display(),
+        "Pool configuration files verified"
+    );
 
     println!("\n{}", "✓ Joined pool successfully!".green().bold());
     println!("\n{}", "Pool Details:".bold());
@@ -2230,11 +2291,13 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     println!("  Expires:           {} days", (membership_cert.expires_at - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()) / 86400);
 
     println!("\n{}", "Saved to:".dimmed());
-    println!("  {}", PoolConfig::pool_dir(&pool_id)?.display());
+    println!("  {}", pool_dir.display());
+    println!("  Config:      {}", pool_config_file.file_name().unwrap().to_string_lossy());
+    println!("  Certificate: {}", cert_file.file_name().unwrap().to_string_lossy());
 
     println!("\n{}", "Next steps:".bold());
-    println!("  Start the agent to begin LAN discovery: cargo run --bin agent -- start");
-    println!("  Your device will broadcast beacons on LAN for this pool.");
+    println!("  Run the agent to join the mesh: ./agent start");
+    println!("  (The agent will automatically broadcast beacons for discovered pools)");
 
     println!();
     Ok(())

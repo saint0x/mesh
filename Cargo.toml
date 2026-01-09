@@ -54,6 +54,7 @@ clap = { version = "4.5", features = ["derive"] }
 # Utilities
 tokio-util = "0.7"
 bytes = "1.9"
+socket2 = "0.5"
 
 [profile.release]
 opt-level = 3

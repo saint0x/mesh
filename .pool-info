@@ -1,0 +1,6 @@
+POOL_ID=602e587a5e549df0335ddddde1d7a73e163116015dfd047d071640f36e74e00a
+POOL_ROOT_PUBKEY=2.Teammembersrun:cargorun--binagent--pool-join\
+POOL_NAME=test-pool
+NETWORK_ID=test-network
+RELAY_PORT=4001
+CONTROL_PLANE_PORT=8080

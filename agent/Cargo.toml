@@ -36,6 +36,7 @@ clap.workspace = true
 anyhow.workspace = true
 colored = "2.1"
 chrono = "0.4"
+socket2.workspace = true
 
 # Platform-specific dependencies for memory locking
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

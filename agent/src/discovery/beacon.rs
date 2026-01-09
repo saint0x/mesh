@@ -310,6 +310,10 @@ pub struct BeaconListener {
     discovered_tx: mpsc::Sender<DiscoveredPeer>,
     peer_cache: Arc<RwLock<HashMap<PoolId, PeerCache>>>,
     ring_gossip_tx: Option<mpsc::Sender<RingGossipMessage>>,
+    /// Track recently processed certificate requests by device_pubkey to prevent spam
+    cert_request_cache: HashMap<[u8; 32], std::time::Instant>,
+    /// Track recently processed certificate responses by device_pubkey
+    cert_response_cache: HashMap<[u8; 32], std::time::Instant>,
 }
 
 impl BeaconListener {
@@ -366,6 +370,8 @@ impl BeaconListener {
                 discovered_tx,
                 peer_cache: Arc::new(RwLock::new(peer_cache_map)),
                 ring_gossip_tx: Some(ring_gossip_tx),
+                cert_request_cache: HashMap::new(),
+                cert_response_cache: HashMap::new(),
             },
             discovered_rx,
             ring_gossip_rx,
@@ -392,7 +398,37 @@ impl BeaconListener {
             }
         });
 
+        // Track last cache cleanup time
+        let mut last_cache_cleanup = std::time::Instant::now();
+
         loop {
+            // Periodically clean up old certificate cache entries (every 60 seconds)
+            if last_cache_cleanup.elapsed() > Duration::from_secs(60) {
+                let before_req = self.cert_request_cache.len();
+                let before_resp = self.cert_response_cache.len();
+
+                // Remove entries older than 5 minutes
+                self.cert_request_cache.retain(|_, last_seen| {
+                    last_seen.elapsed() < Duration::from_secs(300)
+                });
+                self.cert_response_cache.retain(|_, last_seen| {
+                    last_seen.elapsed() < Duration::from_secs(300)
+                });
+
+                let after_req = self.cert_request_cache.len();
+                let after_resp = self.cert_response_cache.len();
+
+                if before_req != after_req || before_resp != after_resp {
+                    tracing::debug!(
+                        request_cache_removed = before_req - after_req,
+                        response_cache_removed = before_resp - after_resp,
+                        "Cleaned up certificate cache"
+                    );
+                }
+
+                last_cache_cleanup = std::time::Instant::now();
+            }
+
             // Receive beacon
             match self.socket.recv_from(&mut buf).await {
                 Ok((len, sender_addr)) => {
@@ -513,6 +549,19 @@ impl BeaconListener {
             return;
         }
 
+        // Check if we've already processed this request recently (within 30 seconds)
+        // This prevents certificate spam when Device 2 retries every 2 seconds
+        let request_key = request.device_pubkey;
+        if let Some(&last_processed) = self.cert_request_cache.get(&request_key) {
+            if last_processed.elapsed() < std::time::Duration::from_secs(30) {
+                tracing::debug!(
+                    device_pubkey = %hex::encode(&request_key[..8]),
+                    "Ignoring duplicate certificate request (already processed)"
+                );
+                return;
+            }
+        }
+
         // Verify CSR
         if let Err(e) = request.verify() {
             tracing::warn!(error = %e, "Invalid CSR signature");
@@ -573,11 +622,14 @@ impl BeaconListener {
             expires_at,
         );
 
+        // Mark this request as processed to prevent duplicate signing
+        self.cert_request_cache.insert(request_key, std::time::Instant::now());
+
         tracing::info!(
             pool_id = %request.pool_id,
             node_id = %request.node_id,
             role = ?request.requested_role,
-            "Signed membership certificate"
+            "Signed membership certificate (first time)"
         );
 
         // Broadcast signed cert via LAN beacon
