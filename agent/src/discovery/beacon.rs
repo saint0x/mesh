@@ -322,13 +322,63 @@ impl BeaconListener {
         pools: Vec<(PoolConfig, PoolMembershipCert)>,
         device_keypair: &DeviceKeyPair,
     ) -> Result<(Self, mpsc::Receiver<DiscoveredPeer>, mpsc::Receiver<RingGossipMessage>)> {
-        // Create UDP socket
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", BEACON_MULTICAST_PORT)).await?;
+        // === PRODUCTION MULTICAST SOCKET CONFIGURATION FOR macOS ===
+        //
+        // CRITICAL: macOS requires SO_REUSEPORT for multicast UDP sockets.
+        // Unlike Linux (which uses SO_REUSEADDR), macOS will return "Address already
+        // in use" if SO_REUSEPORT is not set when multiple sockets bind to the same port.
+        //
+        // References:
+        // - https://lore.kernel.org/all/20220502003830.31062-1-cheptsov@ispras.ru/T/
+        // - https://github.com/openframeworks/openFrameworks/issues/2937
+        //
+        // MULTICAST BEHAVIOR:
+        // - Each socket with SO_REUSEPORT that joins a multicast group receives
+        //   a COPY of every multicast packet (this is by design, not a bug)
+        // - Deduplication must be handled at application layer (via cert_request_cache)
+        // - IP_MULTICAST_LOOP disabled to prevent receiving our own broadcasts
+        //
+        // CROSS-PLATFORM:
+        // - SO_REUSEADDR works on both Linux and macOS for binding
+        // - SO_REUSEPORT required on macOS, optional on Linux
+        // - socket2 crate provides consistent API across platforms
 
-        // Join multicast group
+        let recv_addr: std::net::SocketAddr = format!("0.0.0.0:{}", BEACON_MULTICAST_PORT)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid multicast address: {}", e))?;
+
+        // Create raw socket with socket2 for pre-bind configuration
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+
+        // Set SO_REUSEADDR (allows rebinding after crash/restart)
+        socket.set_reuse_address(true)?;
+
+        // Set SO_REUSEPORT (REQUIRED on macOS for multicast)
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+
+        // Set nonblocking mode for tokio compatibility
+        socket.set_nonblocking(true)?;
+
+        // Bind to multicast port
+        socket.bind(&recv_addr.into())?;
+
+        // Convert socket2 → std::net → tokio (standard pattern for socket options)
+        let std_socket: std::net::UdpSocket = socket.into();
+        let socket = UdpSocket::from_std(std_socket)?;
+
+        // Disable multicast loopback (don't receive our own broadcasts)
+        // This prevents the sender from receiving its own multicast packets
+        socket.set_multicast_loop_v4(false)?;
+
+        // Join the multicast group (must be done AFTER bind)
         socket.join_multicast_v4(
             BEACON_MULTICAST_ADDR.parse()?,
-            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(0, 0, 0, 0),  // Listen on all interfaces
         )?;
 
         // Build pool map
@@ -359,7 +409,7 @@ impl BeaconListener {
             multicast_addr = BEACON_MULTICAST_ADDR,
             multicast_port = BEACON_MULTICAST_PORT,
             node_id = %my_node_id,
-            "Beacon listener initialized"
+            "Beacon listener initialized with SO_REUSEPORT (macOS-compatible)"
         );
 
         Ok((
@@ -530,15 +580,7 @@ impl BeaconListener {
 
     /// Handle certificate signing request (admins only)
     async fn handle_cert_request(&mut self, request: CertSigningRequest, sender_addr: SocketAddr) {
-        tracing::info!(
-            pool_id = %request.pool_id,
-            node_id = %request.node_id,
-            requested_role = ?request.requested_role,
-            sender = %sender_addr,
-            "Certificate signing request received"
-        );
-
-        // Check if we're admin for this pool
+        // 1. Check if we're admin for this pool (fast path rejection)
         let admin_pool = self.my_pools.get(&request.pool_id);
         let is_admin = admin_pool
             .map(|(config, _)| config.role == crate::pki::MembershipRole::Admin)
@@ -549,18 +591,31 @@ impl BeaconListener {
             return;
         }
 
-        // Check if we've already processed this request recently (within 30 seconds)
+        // 2. Check deduplication BEFORE logging (prevents spam)
         // This prevents certificate spam when Device 2 retries every 2 seconds
+        // and when multiple multicast copies arrive (macOS SO_REUSEPORT behavior)
         let request_key = request.device_pubkey;
         if let Some(&last_processed) = self.cert_request_cache.get(&request_key) {
             if last_processed.elapsed() < std::time::Duration::from_secs(30) {
+                // Only log duplicates at DEBUG level
                 tracing::debug!(
                     device_pubkey = %hex::encode(&request_key[..8]),
+                    sender = %sender_addr,
+                    elapsed_ms = last_processed.elapsed().as_millis(),
                     "Ignoring duplicate certificate request (already processed)"
                 );
                 return;
             }
         }
+
+        // 3. NOW log at INFO level (only for NEW requests that will be processed)
+        tracing::info!(
+            pool_id = %request.pool_id,
+            node_id = %request.node_id,
+            requested_role = ?request.requested_role,
+            sender = %sender_addr,
+            "Certificate signing request received (processing new request)"
+        );
 
         // Verify CSR
         if let Err(e) = request.verify() {

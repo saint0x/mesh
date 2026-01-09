@@ -2218,6 +2218,11 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     let recv_socket: std::net::UdpSocket = socket.into();
     let recv_socket = UdpSocket::from_std(recv_socket)?;
 
+    // Disable multicast loopback (don't receive our own cert requests)
+    // This prevents the socket from receiving packets it sends to the same group
+    // Consistent with BeaconListener and BeaconBroadcaster behavior
+    recv_socket.set_multicast_loop_v4(false)?;
+
     recv_socket.join_multicast_v4(
         BEACON_MULTICAST_ADDR.parse()?,
         Ipv4Addr::new(0, 0, 0, 0),
