@@ -50,6 +50,7 @@ pub async fn join_ring(
         device_id: req.device_id.clone(),
         network_id: req.network_id.clone(),
         contributed_memory: req.contributed_memory,
+        contributed_storage: req.contributed_storage.unwrap_or(0),
         ring_position: None,
         status: "online".to_string(),
     };
@@ -489,6 +490,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: None,
         };
 
         let result = join_ring(
@@ -515,6 +517,7 @@ mod tests {
             device_id: "nonexistent".to_string(),
             network_id: "test-network".to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: None,
         };
 
         let result = join_ring(
@@ -544,6 +547,7 @@ mod tests {
                 device_id,
                 network_id: network_id.to_string(),
                 contributed_memory: 8_000_000_000,
+                contributed_storage: None,
             };
 
             let _ = join_ring(
@@ -603,6 +607,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: None,
         };
 
         let _ = join_ring(
@@ -677,6 +682,7 @@ mod tests {
                     device_id: format!("device-{}", i),
                     network_id,
                     contributed_memory: 8_000_000_000,
+                    contributed_storage: None,
                 };
                 join_ring(axum::extract::State(state), axum::Json(request)).await
             });

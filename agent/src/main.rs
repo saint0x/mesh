@@ -33,8 +33,8 @@
 
 use agent::{
     format_bytes, init_production_logging, init_simple_logging, parse_memory_string,
-    DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner,
-    MeshSwarmBuilder, RegistrationClient, ResourceManager,
+    parse_storage_string, DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput,
+    JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager, StorageManager,
 };
 use agent::pki::{DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert};
 use anyhow::{Context, Result};
@@ -238,6 +238,33 @@ enum Commands {
         #[arg(long)]
         pool_id: String,
     },
+
+    /// Reserve disk storage for pool contribution
+    LockStorage {
+        /// Amount of storage to reserve (e.g., "50GB", "100MB", or bytes)
+        #[arg(short, long)]
+        storage: String,
+    },
+
+    /// Release reserved storage (requires 24h cooldown)
+    UnlockStorage,
+
+    /// Show storage reservation status
+    StorageStatus,
+
+    /// Install mesh agent as a system service (systemd/launchd)
+    InstallService {
+        /// Relay server address
+        #[arg(short, long, default_value = "/ip4/127.0.0.1/tcp/4001")]
+        relay: String,
+
+        /// Control plane URL
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
+        control_plane_url: String,
+    },
+
+    /// Uninstall mesh agent system service
+    UninstallService,
 }
 
 #[tokio::main]
@@ -371,6 +398,33 @@ async fn main() -> Result<()> {
         Commands::PoolPeers { pool_id } => {
             cmd_pool_peers(pool_id).await?;
         }
+
+        Commands::LockStorage { storage } => {
+            init_simple_logging("info")?;
+            cmd_lock_storage(storage).await?;
+        }
+
+        Commands::UnlockStorage => {
+            init_simple_logging("info")?;
+            cmd_unlock_storage().await?;
+        }
+
+        Commands::StorageStatus => {
+            cmd_storage_status().await?;
+        }
+
+        Commands::InstallService {
+            relay,
+            control_plane_url,
+        } => {
+            init_simple_logging("info")?;
+            cmd_install_service(relay, control_plane_url).await?;
+        }
+
+        Commands::UninstallService => {
+            init_simple_logging("info")?;
+            cmd_uninstall_service().await?;
+        }
     }
 
     Ok(())
@@ -452,6 +506,37 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     println!("📋 Device: {} ({})", config.name, config.device_id);
     println!("   Network: {}", config.network_id);
     println!("   Tier: {:?}", config.capabilities.tier);
+
+    // Verify and re-lock committed resources on startup
+    {
+        let mut mem_mgr = ResourceManager::new()
+            .context("Failed to initialize resource manager")?;
+        mem_mgr.load_config().ok();
+        if mem_mgr.is_locked() {
+            info!(
+                locked_memory = format_bytes(mem_mgr.locked_memory()),
+                pinned = mem_mgr.is_memory_pinned(),
+                "Memory lock commitment active"
+            );
+            println!("   Memory locked: {} (pinned: {})",
+                format_bytes(mem_mgr.locked_memory()),
+                if mem_mgr.is_memory_pinned() { "yes" } else { "no" });
+        }
+
+        let mut stor_mgr = StorageManager::new()
+            .context("Failed to initialize storage manager")?;
+        stor_mgr.load_config().ok();
+        if stor_mgr.is_locked() {
+            info!(
+                reserved_storage = format_bytes(stor_mgr.reserved_storage()),
+                on_disk = stor_mgr.is_reservation_active(),
+                "Storage reservation active"
+            );
+            println!("   Storage reserved: {} (on disk: {})",
+                format_bytes(stor_mgr.reserved_storage()),
+                if stor_mgr.is_reservation_active() { "yes" } else { "no" });
+        }
+    }
 
     // Parse relay address
     let relay_addr: Multiaddr = relay.parse().context("Invalid relay address")?;
@@ -1386,6 +1471,437 @@ async fn cmd_resource_status() -> Result<()> {
     }
 
     println!();
+
+    Ok(())
+}
+
+/// Reserve disk storage for pool contribution
+async fn cmd_lock_storage(storage: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Locking Storage".bold().cyan());
+    println!("{}", "===============".cyan());
+
+    let bytes = parse_storage_string(&storage)
+        .context("Failed to parse storage amount")?;
+
+    let mut manager = StorageManager::new()
+        .context("Failed to initialize storage manager")?;
+
+    manager.load_config()
+        .context("Failed to load storage config")?;
+
+    if manager.is_locked() {
+        println!("\n{}", "Storage is already reserved.".yellow());
+        println!("  Reserved:  {}", format_bytes(manager.reserved_storage()));
+        println!("\nTo change allocation, unlock first (after cooldown).");
+        return Ok(());
+    }
+
+    manager.set_allocation(bytes)
+        .context("Failed to set storage allocation")?;
+
+    match manager.lock_storage() {
+        Ok(()) => {
+            println!("\n{}", "Storage reserved successfully!".green().bold());
+            println!("  Requested:     {}", format_bytes(manager.user_allocated()));
+            println!("  Reserved:      {}", format_bytes(manager.reserved_storage()));
+            println!("  Available:     {}", format_bytes(manager.available_space()));
+            println!("  Location:      {}", manager.reservation_dir().display());
+            println!("  Cooldown:      24 hours before unlock allowed");
+        }
+        Err(e) => {
+            println!("\n{}", format!("Failed to reserve storage: {}", e).red());
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Release reserved storage (requires 24h cooldown)
+async fn cmd_unlock_storage() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Unlocking Storage".bold().cyan());
+    println!("{}", "=================".cyan());
+
+    let mut manager = StorageManager::new()
+        .context("Failed to initialize storage manager")?;
+
+    manager.load_config()
+        .context("Failed to load storage config")?;
+
+    if !manager.is_locked() {
+        println!("\n{}", "Storage is not reserved.".yellow());
+        return Ok(());
+    }
+
+    match manager.unlock_storage() {
+        Ok(()) => {
+            println!("\n{}", "Storage released successfully!".green().bold());
+        }
+        Err(e) => {
+            println!("\n{}", format!("Failed to release storage: {}", e).red());
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Show storage reservation status
+async fn cmd_storage_status() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Storage Reservation Status".bold().cyan());
+    println!("{}", "==========================".cyan());
+
+    let mut manager = StorageManager::new()
+        .context("Failed to initialize storage manager")?;
+
+    manager.load_config()
+        .context("Failed to load storage config")?;
+
+    println!("\n{}", "Disk Space:".bold());
+    println!("  Available:     {}", format_bytes(manager.available_space()));
+
+    println!("\n{}", "Reservation:".bold());
+    println!("  User request:  {}", format_bytes(manager.user_allocated()));
+    println!("  Reserved (buf):{}", format_bytes(manager.reserved_storage()));
+
+    if manager.is_locked() {
+        let used_real: u64 = manager.manifest().entries.iter()
+            .filter(|e| e.entry_type != agent::storage_manager::StorageEntryType::Reservation)
+            .map(|e| e.size_bytes)
+            .sum();
+        println!("  Used by data:  {}", format_bytes(used_real));
+        println!("  Remaining:     {}", format_bytes(manager.user_allocated().saturating_sub(used_real)));
+    }
+
+    println!("\n{}", "Lock Status:".bold());
+    if manager.is_locked() {
+        println!("  Status:        {}", "RESERVED".green().bold());
+        println!("  On disk:       {}", if manager.is_reservation_active() { "Yes".green().to_string() } else { "No (missing)".red().to_string() });
+        println!("  Location:      {}", manager.reservation_dir().display());
+
+        if let Some(ts) = manager.lock_timestamp() {
+            match ts.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(duration) => {
+                    let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "Invalid timestamp".to_string());
+                    println!("  Reserved at:   {}", datetime);
+                }
+                Err(_) => {
+                    println!("  Reserved at:   {}", "Invalid (clock error)".red());
+                }
+            }
+        }
+
+        if let Some(remaining) = manager.time_until_unlock() {
+            let hours = remaining.as_secs() / 3600;
+            let minutes = (remaining.as_secs() % 3600) / 60;
+            println!("  Unlock in:     {}h {}m", hours, minutes);
+        } else {
+            println!("  Unlock in:     {}", "Ready to unlock".green());
+        }
+
+        // Show manifest entries
+        let entries: Vec<_> = manager.manifest().entries.iter()
+            .filter(|e| e.entry_type != agent::storage_manager::StorageEntryType::Reservation)
+            .collect();
+        if !entries.is_empty() {
+            println!("\n{}", "Stored Data:".bold());
+            for entry in entries {
+                println!("  [{:?}] {} - {} (owner: {})",
+                    entry.entry_type,
+                    entry.relative_path,
+                    format_bytes(entry.size_bytes),
+                    entry.owner_id,
+                );
+            }
+        }
+    } else {
+        println!("  Status:        {}", "NOT RESERVED".yellow());
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Install mesh agent as a system service
+async fn cmd_install_service(relay: String, control_plane_url: String) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Installing System Service".bold().cyan());
+    println!("{}", "=========================".cyan());
+
+    let agent_binary = std::env::current_exe()
+        .context("Failed to determine agent binary path")?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_content = format!(
+            r#"[Unit]
+Description=Mesh AI Agent - Distributed Compute Daemon
+Documentation=https://github.com/saint0x/mesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={binary} start --relay {relay} --control-plane {cp}
+Restart=on-failure
+RestartSec=10
+WatchdogSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mesh-agent
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={meshnet_dir}
+PrivateTmp=true
+
+# Resource limits
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+"#,
+            binary = agent_binary.display(),
+            relay = relay,
+            cp = control_plane_url,
+            meshnet_dir = dirs::home_dir()
+                .map(|h| h.join(".meshnet").display().to_string())
+                .unwrap_or_else(|| "/root/.meshnet".to_string()),
+        );
+
+        let service_path = std::path::Path::new("/etc/systemd/system/mesh-agent.service");
+
+        if service_path.exists() {
+            println!("{}", "Service already installed. Overwriting...".yellow());
+        }
+
+        std::fs::write(service_path, &unit_content)
+            .context("Failed to write systemd unit file. Run with sudo.")?;
+
+        println!("{}", "Systemd unit file written.".green());
+        println!("  Path: {}", service_path.display());
+
+        // Reload and enable
+        let status = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status();
+
+        if let Ok(s) = status {
+            if s.success() {
+                println!("{}", "Systemd daemon reloaded.".green());
+            }
+        }
+
+        let status = std::process::Command::new("systemctl")
+            .args(["enable", "mesh-agent.service"])
+            .status();
+
+        if let Ok(s) = status {
+            if s.success() {
+                println!("{}", "Service enabled (will start on boot).".green());
+            }
+        }
+
+        println!("\n{}", "Next steps:".bold());
+        println!("  Start now:     sudo systemctl start mesh-agent");
+        println!("  Check status:  sudo systemctl status mesh-agent");
+        println!("  View logs:     journalctl -u mesh-agent -f");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_label = "ai.mesh.agent";
+        let plist_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{binary}</string>
+        <string>start</string>
+        <string>--relay</string>
+        <string>{relay}</string>
+        <string>--control-plane</string>
+        <string>{cp}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>{meshnet_dir}/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>{meshnet_dir}/agent.err</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+    </dict>
+</dict>
+</plist>
+"#,
+            label = plist_label,
+            binary = agent_binary.display(),
+            relay = relay,
+            cp = control_plane_url,
+            meshnet_dir = dirs::home_dir()
+                .map(|h| h.join(".meshnet").display().to_string())
+                .unwrap_or_else(|| "~/.meshnet".to_string()),
+        );
+
+        let plist_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?
+            .join("Library/LaunchAgents");
+
+        std::fs::create_dir_all(&plist_dir)?;
+        let plist_path = plist_dir.join(format!("{}.plist", plist_label));
+
+        if plist_path.exists() {
+            // Unload existing before overwriting
+            std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .ok();
+            println!("{}", "Existing service unloaded. Overwriting...".yellow());
+        }
+
+        std::fs::write(&plist_path, &plist_content)?;
+        println!("{}", "LaunchAgent plist written.".green());
+        println!("  Path: {}", plist_path.display());
+
+        let status = std::process::Command::new("launchctl")
+            .args(["load", &plist_path.to_string_lossy()])
+            .status();
+
+        if let Ok(s) = status {
+            if s.success() {
+                println!("{}", "Service loaded and started.".green());
+            }
+        }
+
+        println!("\n{}", "Next steps:".bold());
+        println!("  Check status:  launchctl list | grep mesh");
+        println!("  View logs:     tail -f ~/.meshnet/agent.log");
+        println!("  Stop:          launchctl unload {}", plist_path.display());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        println!("{}", "Windows service installation:".bold());
+        println!("  Use NSSM (Non-Sucking Service Manager) or sc.exe:");
+        println!("  nssm install MeshAgent \"{}\" start --relay {} --control-plane {}",
+            agent_binary.display(), relay, control_plane_url);
+        println!("\n  Or use Task Scheduler for user-level autostart.");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        println!("Service installation is not supported on this platform.");
+        println!("Run the agent manually: {} start --relay {} --control-plane {}",
+            agent_binary.display(), relay, control_plane_url);
+    }
+
+    Ok(())
+}
+
+/// Uninstall mesh agent system service
+async fn cmd_uninstall_service() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Uninstalling System Service".bold().cyan());
+    println!("{}", "===========================".cyan());
+
+    #[cfg(target_os = "linux")]
+    {
+        let service_path = std::path::Path::new("/etc/systemd/system/mesh-agent.service");
+
+        if !service_path.exists() {
+            println!("{}", "Service is not installed.".yellow());
+            return Ok(());
+        }
+
+        // Stop and disable
+        std::process::Command::new("systemctl")
+            .args(["stop", "mesh-agent.service"])
+            .status()
+            .ok();
+        std::process::Command::new("systemctl")
+            .args(["disable", "mesh-agent.service"])
+            .status()
+            .ok();
+
+        std::fs::remove_file(service_path)
+            .context("Failed to remove unit file. Run with sudo.")?;
+
+        std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status()
+            .ok();
+
+        println!("{}", "Service stopped, disabled, and removed.".green());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_label = "ai.mesh.agent";
+        let plist_path = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", plist_label));
+
+        if !plist_path.exists() {
+            println!("{}", "Service is not installed.".yellow());
+            return Ok(());
+        }
+
+        std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .status()
+            .ok();
+
+        std::fs::remove_file(&plist_path)?;
+
+        println!("{}", "Service unloaded and removed.".green());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        println!("{}", "Windows service removal:".bold());
+        println!("  nssm remove MeshAgent confirm");
+        println!("  Or remove from Task Scheduler.");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        println!("Service installation is not supported on this platform.");
+    }
 
     Ok(())
 }

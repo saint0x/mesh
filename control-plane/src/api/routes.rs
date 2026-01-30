@@ -31,6 +31,7 @@ pub async fn register_device(
     let device_id = req.device_id.clone();
     let network_id = req.network_id.clone();
     let contributed_memory = req.contributed_memory;
+    let contributed_storage = req.contributed_storage;
 
     // Execute blocking database operation in thread pool
     let db = state.db.clone();
@@ -60,6 +61,7 @@ pub async fn register_device(
             device_id: device_id.clone(),
             network_id: network_id.clone(),
             contributed_memory: memory,
+            contributed_storage: contributed_storage.unwrap_or(0),
             ring_position: None,
             status: "online".to_string(),
         };
@@ -155,6 +157,7 @@ mod tests {
             public_key: vec![42u8; 32],
             capabilities: test_capabilities(),
             contributed_memory: None,
+            contributed_storage: None,
         };
 
         // Call handler directly
@@ -246,6 +249,7 @@ mod tests {
             public_key: vec![43u8; 32], // Different key to avoid conflicts
             capabilities: test_capabilities(),
             contributed_memory: Some(8_000_000_000),
+            contributed_storage: None,
         };
 
         // Call handler directly

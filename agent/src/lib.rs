@@ -10,6 +10,7 @@ pub mod network;
 pub mod observability;
 pub mod pki;
 pub mod resource_manager;
+pub mod storage_manager;
 pub mod telemetry;
 
 // Workaround: re-export scheduler for now (stub module)
@@ -34,4 +35,5 @@ pub use network::{
 };
 pub use observability::{init_production_logging, init_simple_logging};
 pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
+pub use storage_manager::{parse_storage_string, StorageManager};
 pub use telemetry::{calculate_credits, LedgerClient, LedgerEvent};

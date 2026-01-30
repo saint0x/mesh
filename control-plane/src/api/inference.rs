@@ -260,6 +260,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: None,
         };
 
         let _ = join_ring(axum::extract::State(state.clone()), axum::Json(join_request))
@@ -361,6 +362,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: None,
         };
 
         let _ = join_ring(axum::extract::State(state.clone()), axum::Json(join_request))
@@ -402,6 +404,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: None,
         };
 
         let _ = join_ring(axum::extract::State(state.clone()), axum::Json(join_request))

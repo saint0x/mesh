@@ -35,6 +35,7 @@ pub struct Worker {
     pub device_id: DeviceId,
     pub network_id: String,
     pub contributed_memory: u64,
+    pub contributed_storage: u64,
     pub ring_position: Option<u32>,
     pub status: String,
 }
@@ -100,7 +101,8 @@ impl RingTopologyManager {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT device_id, network_id, contributed_memory, ring_position, status
+                SELECT device_id, network_id, contributed_memory, ring_position, status,
+                       contributed_storage
                 FROM devices
                 WHERE network_id = ? AND ring_position IS NOT NULL
                 ORDER BY ring_position
@@ -116,6 +118,7 @@ impl RingTopologyManager {
                     contributed_memory: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
                     ring_position: row.get(3)?,
                     status: row.get(4)?,
+                    contributed_storage: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
                 })
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -244,6 +247,7 @@ impl RingTopologyManager {
                 shard_column_start = ?,
                 shard_column_end = ?,
                 contributed_memory = ?,
+                contributed_storage = ?,
                 left_neighbor_id = ?,
                 right_neighbor_id = ?
             WHERE device_id = ?
@@ -253,6 +257,7 @@ impl RingTopologyManager {
                 shard.column_range.0,
                 shard.column_range.1,
                 worker.contributed_memory as i64,
+                worker.contributed_storage as i64,
                 &left_neighbor,
                 &right_neighbor,
                 &worker.device_id
@@ -330,6 +335,63 @@ impl RingTopologyManager {
         }
     }
 
+    /// Calculate resource-weighted shard assignments for all workers in the ring.
+    ///
+    /// Each worker's shard size is proportional to its effective resource budget:
+    ///   effective_budget = contributed_memory + contributed_storage
+    ///
+    /// Workers with more resources get more columns. Falls back to uniform
+    /// distribution if all budgets are zero.
+    pub fn assign_shards_weighted(&self, workers_ordered: &[&Worker]) -> Vec<ModelShard> {
+        let n = workers_ordered.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // Calculate effective budget per worker (memory + storage)
+        let budgets: Vec<u64> = workers_ordered
+            .iter()
+            .map(|w| w.contributed_memory + w.contributed_storage)
+            .collect();
+
+        let total_budget: u64 = budgets.iter().sum();
+
+        // If all budgets are zero, fall back to uniform distribution
+        if total_budget == 0 {
+            return (0..n as u32)
+                .map(|pos| self.assign_shard(pos, n as u32))
+                .collect();
+        }
+
+        // Distribute columns proportionally to budget
+        let mut shards = Vec::with_capacity(n);
+        let mut col_start: u32 = 0;
+        let mut assigned: u32 = 0;
+
+        for (i, budget) in budgets.iter().enumerate() {
+            let cols = if i == n - 1 {
+                // Last worker gets remaining columns to avoid rounding gaps
+                TOTAL_SHARD_COLUMNS - assigned
+            } else {
+                // Proportional allocation, minimum 1 column per worker
+                let proportional =
+                    ((*budget as f64 / total_budget as f64) * TOTAL_SHARD_COLUMNS as f64) as u32;
+                proportional.max(1)
+            };
+
+            shards.push(ModelShard {
+                model_id: self.default_model_id.clone(),
+                column_range: (col_start, col_start + cols),
+                estimated_memory: cols as u64 * 1_000_000,
+            });
+
+            col_start += cols;
+            assigned += cols;
+        }
+
+        shards
+    }
+
     /// Update ring connections for all workers
     ///
     /// Updates left_neighbor and right_neighbor for all workers in the ring.
@@ -365,7 +427,10 @@ impl RingTopologyManager {
         Ok(())
     }
 
-    /// Internal method to update ring connections within a transaction
+    /// Internal method to update ring connections within a transaction.
+    ///
+    /// Accepts an optional reference to the workers map to avoid re-acquiring
+    /// the lock when called from contexts that already hold it (e.g., add_worker).
     fn update_ring_connections_internal(
         &self,
         conn: &rusqlite::Connection,
@@ -375,6 +440,34 @@ impl RingTopologyManager {
         if total_workers == 0 {
             return Ok(());
         }
+
+        // Try to read workers for weighted assignment.
+        // Use try_read to avoid deadlock when called from add_worker (which holds write lock).
+        let weighted_shards = match self.workers.try_read() {
+            Ok(workers_map) => {
+                let ordered_workers: Vec<&Worker> = ring_seq
+                    .iter()
+                    .filter_map(|id| workers_map.get(id))
+                    .collect();
+
+                let has_resource_data = ordered_workers.len() == ring_seq.len()
+                    && ordered_workers
+                        .iter()
+                        .any(|w| w.contributed_memory > 0 || w.contributed_storage > 0);
+
+                if has_resource_data {
+                    Some(self.assign_shards_weighted(&ordered_workers))
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                // Lock is held by caller (e.g., add_worker) - fall back to uniform assignment.
+                // This is correct because add_worker calls this before the new worker's
+                // resource data is fully committed, so uniform is appropriate.
+                None
+            }
+        };
 
         for (pos, device_id) in ring_seq.iter().enumerate() {
             let position = pos as u32;
@@ -394,8 +487,12 @@ impl RingTopologyManager {
                 (left, right)
             };
 
-            // Recalculate shard for updated total
-            let shard = self.assign_shard(position, total_workers);
+            // Use weighted shard if available, otherwise uniform
+            let shard = if let Some(ref shards) = weighted_shards {
+                shards[pos].clone()
+            } else {
+                self.assign_shard(position, total_workers)
+            };
 
             conn.execute(
                 r#"
@@ -711,6 +808,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: 0,
             ring_position: None,
             status: "online".to_string(),
         };
@@ -740,6 +838,7 @@ mod tests {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
                 contributed_memory: 8_000_000_000,
+                contributed_storage: 0,
                 ring_position: None,
                 status: "online".to_string(),
             };
@@ -779,6 +878,7 @@ mod tests {
             device_id: "nonexistent".to_string(),
             network_id: "test-network".to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: 0,
             ring_position: None,
             status: "online".to_string(),
         };
@@ -800,6 +900,7 @@ mod tests {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: 0,
             ring_position: None,
             status: "online".to_string(),
         };
@@ -825,6 +926,7 @@ mod tests {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
                 contributed_memory: 8_000_000_000,
+                contributed_storage: 0,
                 ring_position: None,
                 status: "online".to_string(),
             };
@@ -891,6 +993,7 @@ mod tests {
             device_id: "device-1".to_string(),
             network_id: network_id.to_string(),
             contributed_memory: 8_000_000_000,
+            contributed_storage: 0,
             ring_position: None,
             status: "online".to_string(),
         };
@@ -913,6 +1016,7 @@ mod tests {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
                 contributed_memory: 8_000_000_000,
+                contributed_storage: 0,
                 ring_position: None,
                 status: "online".to_string(),
             };
@@ -941,6 +1045,7 @@ mod tests {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
                 contributed_memory: 8_000_000_000,
+                contributed_storage: 0,
                 ring_position: None,
                 status: "online".to_string(),
             };

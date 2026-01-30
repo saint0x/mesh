@@ -18,6 +18,9 @@ pub struct RegisterDeviceRequest {
     /// If provided, device will automatically join the ring.
     #[serde(default)]
     pub contributed_memory: Option<u64>,
+    /// Optional: Storage to contribute to the pool (bytes).
+    #[serde(default)]
+    pub contributed_storage: Option<u64>,
 }
 
 /// Response to device registration
@@ -73,6 +76,9 @@ pub struct RingJoinRequest {
     pub network_id: String,
     /// Memory contributed to the pool (bytes)
     pub contributed_memory: u64,
+    /// Storage contributed to the pool (bytes)
+    #[serde(default)]
+    pub contributed_storage: Option<u64>,
 }
 
 /// Response to ring join request
