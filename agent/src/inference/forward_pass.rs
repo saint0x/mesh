@@ -545,4 +545,147 @@ mod tests {
         assert_eq!(output.rows, 3);
         assert_eq!(output.cols, 64);
     }
+
+    #[test]
+    fn test_two_stage_pipeline_matches_single_stage() {
+        // Verify: running 2 layers in a single stage produces the same result
+        // as running layer 0 in stage 0 and layer 1 in stage 1 with activation passing.
+        let config = ModelConfig {
+            hidden_dim: 32,
+            num_heads: 2,
+            num_kv_heads: 2,
+            num_layers: 2,
+            vocab_size: 50,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_base: 10000.0,
+        };
+        let full_weights = ModelWeights::placeholder(config.clone(), 32);
+        let tokens = vec![1, 5, 10];
+
+        // Single-stage: run all 2 layers together
+        let mut single = ForwardPass::new_pipeline_stage(full_weights.clone(), 0, 2, 0, 1);
+        let embedded = single.embed(&tokens).unwrap();
+        let single_output = single.forward_stage(&embedded).unwrap();
+
+        // Two-stage: split layers
+        let mut stage0_weights = full_weights.clone();
+        stage0_weights.layers = vec![full_weights.layers[0].clone()];
+        stage0_weights.config.num_layers = 1;
+
+        let mut stage1_weights = full_weights.clone();
+        stage1_weights.layers = vec![full_weights.layers[1].clone()];
+        stage1_weights.config.num_layers = 1;
+
+        let mut stage0 = ForwardPass::new_pipeline_stage(stage0_weights, 0, 1, 0, 2);
+        let mut stage1 = ForwardPass::new_pipeline_stage(stage1_weights, 1, 2, 1, 2);
+
+        let embedded = stage0.embed(&tokens).unwrap();
+        let activations = stage0.forward_stage(&embedded).unwrap();
+
+        // Pass activations to stage 1 (simulating network transfer)
+        let two_stage_output = stage1.forward_stage(&activations).unwrap();
+
+        // Outputs must be identical
+        assert_eq!(single_output.rows, two_stage_output.rows);
+        assert_eq!(single_output.cols, two_stage_output.cols);
+        assert_eq!(single_output.data.len(), two_stage_output.data.len());
+
+        for (i, (a, b)) in single_output.data.iter().zip(&two_stage_output.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "Divergence at index {}: single={}, two_stage={} (diff={})",
+                i, a, b, (a - b).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipeline_activation_dimensions_preserved() {
+        // Verify activation dimensions are preserved across stages
+        let config = ModelConfig {
+            hidden_dim: 32,
+            num_heads: 2,
+            num_kv_heads: 2,
+            num_layers: 4,
+            vocab_size: 50,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_base: 10000.0,
+        };
+        let full_weights = ModelWeights::placeholder(config.clone(), 32);
+        let tokens = vec![1, 2, 3, 4, 5];
+
+        // Split into 4 stages of 1 layer each
+        for stage_idx in 0..4 {
+            let mut stage_weights = full_weights.clone();
+            stage_weights.layers = vec![full_weights.layers[stage_idx].clone()];
+            stage_weights.config.num_layers = 1;
+
+            let mut stage = ForwardPass::new_pipeline_stage(
+                stage_weights, stage_idx, stage_idx + 1, stage_idx as u32, 4,
+            );
+
+            let input = if stage_idx == 0 {
+                stage.embed(&tokens).unwrap()
+            } else {
+                // Simulate receiving activations: [seq_len, hidden_dim]
+                Tensor2D::filled(tokens.len(), 32, 0.5)
+            };
+
+            let output = stage.forward_stage(&input).unwrap();
+
+            // Every stage must preserve [seq_len, hidden_dim]
+            assert_eq!(
+                output.rows, tokens.len(),
+                "Stage {} changed seq_len: expected {}, got {}",
+                stage_idx, tokens.len(), output.rows
+            );
+            assert_eq!(
+                output.cols, 32,
+                "Stage {} changed hidden_dim: expected 32, got {}",
+                stage_idx, output.cols
+            );
+        }
+    }
+
+    #[test]
+    fn test_logits_and_sampling_deterministic() {
+        // Verify that same inputs + same seed produce same token
+        let config = create_test_config();
+        let weights = ModelWeights::placeholder(config, 64);
+        let mut forward = ForwardPass::new_pipeline_stage(weights, 0, 2, 0, 1);
+
+        let tokens = vec![1, 2, 3];
+        let embedded = forward.embed(&tokens).unwrap();
+        let hidden = forward.forward_stage(&embedded).unwrap();
+        let logits = forward.compute_logits(&hidden).unwrap();
+
+        let seed = 12345u64;
+        let token1 = forward.sample(&logits, 1.0, 0.9, seed);
+        let token2 = forward.sample(&logits, 1.0, 0.9, seed);
+
+        assert_eq!(token1, token2, "Same seed must produce same token");
+        assert!(token1 < 100, "Token must be within vocab range");
+    }
+
+    #[test]
+    fn test_greedy_sampling_selects_max() {
+        // Verify greedy sampling picks the highest logit
+        let logits = Tensor1D::new(vec![0.0, 0.0, 10.0, 0.0, 0.0]);
+        let token = sample_greedy(&logits);
+        assert_eq!(token, 2, "Greedy should select index of max logit");
+    }
+
+    #[test]
+    fn test_embed_produces_correct_shape() {
+        let config = create_test_config();
+        let weights = ModelWeights::placeholder(config.clone(), 64);
+        let forward = ForwardPass::new_pipeline_stage(weights, 0, 2, 0, 1);
+
+        let tokens = vec![0, 50, 99];
+        let embedded = forward.embed(&tokens).unwrap();
+        assert_eq!(embedded.rows, 3);
+        assert_eq!(embedded.cols, config.hidden_dim);
+    }
 }

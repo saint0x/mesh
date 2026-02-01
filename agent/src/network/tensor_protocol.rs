@@ -435,6 +435,66 @@ mod tests {
     }
 
     #[test]
+    fn test_checksum_detects_single_bit_flip() {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let original_checksum = TensorMessage::compute_checksum(&data);
+
+        // Flip a single bit in one float
+        let mut corrupted = data.clone();
+        let bytes = corrupted[2].to_le_bytes();
+        let mut flipped = bytes;
+        flipped[0] ^= 0x01; // flip least significant bit
+        corrupted[2] = f32::from_le_bytes(flipped);
+
+        let corrupted_checksum = TensorMessage::compute_checksum(&corrupted);
+        assert_ne!(
+            original_checksum, corrupted_checksum,
+            "Checksum must detect single-bit corruption"
+        );
+    }
+
+    #[test]
+    fn test_checksum_empty_data() {
+        let cs = TensorMessage::compute_checksum(&[]);
+        // Should not panic and should be deterministic
+        let cs2 = TensorMessage::compute_checksum(&[]);
+        assert_eq!(cs, cs2);
+    }
+
+    #[test]
+    fn test_span_ids_are_unique() {
+        let msg1 = TensorMessage::new_activation(
+            Uuid::new_v4(), 0, 0, 0, 0, 0, vec![1.0], vec![1],
+        );
+        let msg2 = TensorMessage::new_activation(
+            Uuid::new_v4(), 0, 0, 0, 0, 0, vec![1.0], vec![1],
+        );
+        // With random XOR, collisions are astronomically unlikely
+        assert_ne!(msg1.span_id, msg2.span_id, "Span IDs should be unique");
+    }
+
+    #[test]
+    fn test_token_broadcast_extracts_correct_token() {
+        let job_id = Uuid::new_v4();
+        let token_id = 42u32;
+        let msg = TensorMessage::new_token_broadcast(job_id, 5, 3, 100, 0, token_id);
+
+        // The receiver extracts the token as: activation_data[0] as u32
+        let extracted = msg.activation_data[0] as u32;
+        assert_eq!(extracted, token_id, "Token roundtrip through f32 must be lossless for u32 tokens");
+    }
+
+    #[test]
+    fn test_token_broadcast_large_token_id() {
+        // Verify token IDs up to vocab_size (32000) survive f32 roundtrip
+        for token_id in [0u32, 1, 100, 31999, 32000, 65535] {
+            let msg = TensorMessage::new_token_broadcast(Uuid::new_v4(), 0, 0, 0, 0, token_id);
+            let extracted = msg.activation_data[0] as u32;
+            assert_eq!(extracted, token_id, "Token {} failed f32 roundtrip", token_id);
+        }
+    }
+
+    #[test]
     fn test_cbor_roundtrip() {
         let msg = TensorMessage::new_activation(
             Uuid::new_v4(),

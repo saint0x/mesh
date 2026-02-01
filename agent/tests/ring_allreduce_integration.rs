@@ -157,7 +157,7 @@ fn test_barrier_message_format() {
 
     assert!(msg.is_barrier());
     assert_eq!(msg.phase, AllReducePhase::Barrier);
-    assert_eq!(msg.chunk_data[0] as u32, 3);
+    assert_eq!(msg.chunk_data()[0] as u32, 3);
 }
 
 // Note: CBOR serialization tests are in agent/src/network/tensor_protocol.rs

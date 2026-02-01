@@ -293,6 +293,56 @@ mod tests {
     }
 
     #[test]
+    fn test_more_workers_than_layers() {
+        // Edge case: 100 workers for 80 layers means 20 workers get 0 layers
+        let total_layers = 80u32;
+        let total_workers = 100u32;
+        let mut total_assigned = 0u32;
+
+        for pos in 0..total_workers {
+            let s = ShardAssignment::with_layers("m".into(), pos, total_workers, total_layers);
+            total_assigned += s.num_layers();
+        }
+        assert_eq!(total_assigned, total_layers, "Total assigned layers must equal total layers");
+
+        // First 80 workers should each get exactly 1 layer
+        for pos in 0..80 {
+            let s = ShardAssignment::with_layers("m".into(), pos, total_workers, total_layers);
+            assert_eq!(s.num_layers(), 1, "Worker {} should get 1 layer", pos);
+        }
+        // Workers 80-99 should get 0 layers
+        for pos in 80..100 {
+            let s = ShardAssignment::with_layers("m".into(), pos, total_workers, total_layers);
+            assert_eq!(s.num_layers(), 0, "Worker {} should get 0 layers", pos);
+        }
+    }
+
+    #[test]
+    fn test_single_layer_model() {
+        let s = ShardAssignment::with_layers("m".into(), 0, 1, 1);
+        assert_eq!(s.layer_range(), (0, 1));
+        assert_eq!(s.num_layers(), 1);
+        assert!(s.is_first_stage());
+        assert!(s.is_last_stage());
+    }
+
+    #[test]
+    fn test_zero_workers_edge_case() {
+        // Should not panic
+        let s = ShardAssignment::with_layers("m".into(), 0, 0, 80);
+        assert_eq!(s.layer_range(), (0, 0));
+        assert_eq!(s.num_layers(), 0);
+    }
+
+    #[test]
+    fn test_display_format() {
+        let s = ShardAssignment::with_layers("llama-70b".into(), 2, 4, 80);
+        let display = format!("{}", s);
+        assert!(display.contains("llama-70b"), "Display should contain model name");
+        assert!(display.contains("2/4"), "Display should contain position");
+    }
+
+    #[test]
     fn test_shard_info_lifecycle() {
         let assignment = ShardAssignment::new("model".into(), 0, 10);
         let mut info = ShardInfo::new(assignment);

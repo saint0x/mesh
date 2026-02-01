@@ -54,8 +54,8 @@ async fn test_mock_weights_compatible_with_forward_pass() {
     // Create ForwardPass with MockShardLoader weights (NOT placeholder!)
     let _forward_pass = ForwardPass::new(
         weights.clone(),
-        assignment.column_start as usize,
-        assignment.column_end as usize,
+        assignment.layer_start as usize,
+        assignment.layer_end as usize,
         4,
     );
 
@@ -117,8 +117,8 @@ async fn test_simulated_distributed_inference() {
             let (a, _) = &all_weights[i];
             let (b, _) = &all_weights[j];
             assert!(
-                a.column_end <= b.column_start || b.column_end <= a.column_start,
-                "Workers {} and {} have overlapping columns",
+                a.layer_end <= b.layer_start || b.layer_end <= a.layer_start,
+                "Workers {} and {} have overlapping layers",
                 i,
                 j
             );
