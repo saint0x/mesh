@@ -465,8 +465,20 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
         .with_relay_addr(relay_addr.clone())
         .build()?;
 
-    let local_peer_id = swarm.local_peer_id();
+    let local_peer_id = *swarm.local_peer_id();
     println!("   Local PeerID: {}", local_peer_id);
+
+    // Listen on local TCP port for direct LAN connections
+    // Use a well-known port so peers can dial us from beacon discovery
+    let lan_tcp_port = 4101u16;
+    let lan_tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", lan_tcp_port).parse().unwrap();
+    match swarm.listen_on_addr(lan_tcp_addr) {
+        Ok(_) => println!("   ✓ Listening for direct LAN connections (TCP port {})", lan_tcp_port),
+        Err(e) => {
+            warn!(error = %e, "Failed to listen on TCP port {} - LAN direct connections may not work", lan_tcp_port);
+            println!("   ⚠️  Could not bind TCP port {} (another instance running?)", lan_tcp_port);
+        }
+    }
 
     // Connect to relay
     swarm.connect_to_relay()?;
@@ -556,6 +568,9 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
         }
     }
 
+    // Channel for LAN discovery → swarm dial requests
+    let (lan_dial_tx, lan_dial_rx) = tokio::sync::mpsc::channel::<agent::LanDialRequest>(50);
+
     // Start LAN beacon discovery (if pools configured)
     {
         use agent::pki::PoolConfig;
@@ -596,12 +611,14 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                             }
                         });
 
-                        // Spawn discovery handler task (save peers to cache)
+                        // Spawn discovery handler task (save peers to cache + trigger libp2p dial)
+                        let lan_dial_tx_clone = lan_dial_tx.clone();
                         tokio::spawn(async move {
                             while let Some(peer) = discovered_rx.recv().await {
                                 info!(
                                     pool_id = %peer.pool_id,
                                     node_id = %peer.node_id,
+                                    peer_id = ?peer.peer_id,
                                     lan_addr = %peer.lan_addr,
                                     "LAN peer discovered"
                                 );
@@ -611,6 +628,30 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                                     cache.upsert_peer(peer.clone());
                                     if let Err(e) = cache.save(&peer.pool_id) {
                                         error!(error = %e, "Failed to persist peer cache");
+                                    }
+                                }
+
+                                // If we have the peer's libp2p PeerId, send a dial request
+                                // so the swarm establishes a direct LAN connection
+                                if let Some(peer_id_str) = &peer.peer_id {
+                                    if let Ok(peer_id) = peer_id_str.parse::<libp2p::PeerId>() {
+                                        // Parse the LAN address into a multiaddr for TCP dialing
+                                        // lan_addr format is "ip:port" from beacon
+                                        if let Ok(sock_addr) = peer.lan_addr.parse::<std::net::SocketAddr>() {
+                                            let multiaddr: libp2p::Multiaddr = format!(
+                                                "/ip4/{}/tcp/{}",
+                                                sock_addr.ip(),
+                                                sock_addr.port()
+                                            ).parse().unwrap_or_else(|_| {
+                                                // Fallback: try the raw IP with a default port
+                                                format!("/ip4/{}/tcp/4001", sock_addr.ip()).parse().unwrap()
+                                            });
+
+                                            let _ = lan_dial_tx_clone.try_send(agent::LanDialRequest {
+                                                peer_id,
+                                                addr: multiaddr,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -676,8 +717,8 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                             match BeaconBroadcaster::new(
                                 pool_data,
                                 device_keypair,
-                                None,
-                                4001,
+                                Some(local_peer_id),
+                                lan_tcp_port, // TCP port for direct LAN connections
                                 ring_gossip_to_broadcaster_rx
                             ).await {
                                 Ok(broadcaster) => {
@@ -1000,7 +1041,8 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     println!("\n✅ Agent ready - waiting for jobs...");
     println!("   Press Ctrl+C to stop\n");
 
-    let runner = JobRunner::new(swarm, executor);
+    let runner = JobRunner::new(swarm, executor)
+        .with_lan_dial_rx(lan_dial_rx);
     runner.run().await?;
 
     Ok(())

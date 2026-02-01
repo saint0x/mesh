@@ -213,6 +213,38 @@ impl MeshSwarm {
         self.swarm.local_peer_id()
     }
 
+    /// Listen on a local address for direct LAN connections
+    ///
+    /// This enables peers on the same LAN to connect directly without
+    /// going through the relay server. Should be called with addresses like
+    /// `/ip4/0.0.0.0/tcp/0` or `/ip4/0.0.0.0/udp/0/quic-v1`.
+    pub fn listen_on_addr(&mut self, addr: Multiaddr) -> Result<()> {
+        info!(address = %addr, "Listening on local address for direct connections");
+        self.swarm.listen_on(addr)?;
+        Ok(())
+    }
+
+    /// Dial a peer directly by their multiaddr (for LAN connections)
+    ///
+    /// Unlike `dial_peer` which routes through the relay, this dials a peer
+    /// directly at their LAN address. The peer_id is used so libp2p can verify
+    /// the identity of the remote peer during the Noise handshake.
+    pub fn dial_direct(&mut self, peer_id: PeerId, addr: Multiaddr) -> Result<()> {
+        info!(peer_id = %peer_id, address = %addr, "Dialing peer directly (LAN)");
+
+        let dial_addr = addr.with(libp2p::multiaddr::Protocol::P2p(peer_id));
+        self.swarm.dial(dial_addr)?;
+        Ok(())
+    }
+
+    /// Add a known external address for a peer
+    ///
+    /// This tells libp2p about a peer's address so it can be used for dialing.
+    pub fn add_peer_address(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        debug!(peer_id = %peer_id, address = %addr, "Adding known peer address");
+        self.swarm.add_peer_address(peer_id, addr);
+    }
+
     /// Connect to the relay server
     #[instrument(skip(self), fields(peer_id = %self.local_peer_id(), relay = %self.config.relay_addr))]
     pub fn connect_to_relay(&mut self) -> Result<()> {

@@ -285,6 +285,7 @@ impl PoolConfig {
 pub struct DiscoveredPeer {
     pub pool_id: PoolId,
     pub node_id: NodeId,
+    pub peer_id: Option<String>,
     pub lan_addr: String,
     pub discovery_method: DiscoveryMethod,
     pub last_seen: u64,
@@ -436,6 +437,7 @@ mod tests {
         let peer = DiscoveredPeer {
             pool_id,
             node_id,
+            peer_id: None,
             lan_addr: "192.168.1.100:4001".to_string(),
             discovery_method: DiscoveryMethod::LAN,
             last_seen: 1234567890,

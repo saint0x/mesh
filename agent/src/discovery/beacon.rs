@@ -430,7 +430,7 @@ impl BeaconListener {
 
     /// Run beacon listener loop
     pub async fn run(mut self) -> Result<()> {
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 65535];
 
         // Spawn peer cache persistence task
         let peer_cache = self.peer_cache.clone();
@@ -542,6 +542,7 @@ impl BeaconListener {
         let peer = DiscoveredPeer {
             pool_id: beacon.pool_id,
             node_id: beacon.node_id,
+            peer_id: beacon.peer_id.map(|p| p.to_string()),
             lan_addr: lan_addr.clone(),
             discovery_method: DiscoveryMethod::LAN,
             last_seen: now,

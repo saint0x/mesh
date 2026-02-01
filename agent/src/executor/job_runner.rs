@@ -243,6 +243,13 @@ impl JobStats {
 /// Manages the event loop that receives jobs from the network, executes them,
 /// and sends results back. This is the main component that integrates the
 /// networking and execution layers.
+/// A discovered LAN peer that should be dialed directly
+#[derive(Debug, Clone)]
+pub struct LanDialRequest {
+    pub peer_id: libp2p::PeerId,
+    pub addr: libp2p::Multiaddr,
+}
+
 pub struct JobRunner {
     swarm: MeshSwarm,
     executor: EmbeddingsExecutor,
@@ -252,6 +259,7 @@ pub struct JobRunner {
     device_id: Option<uuid::Uuid>,
     network_id: Option<String>,
     tier: Option<crate::device::Tier>,
+    lan_dial_rx: Option<tokio::sync::mpsc::Receiver<LanDialRequest>>,
 }
 
 impl JobRunner {
@@ -284,7 +292,14 @@ impl JobRunner {
             device_id: None,
             network_id: None,
             tier: None,
+            lan_dial_rx: None,
         }
+    }
+
+    /// Set the channel for receiving LAN dial requests from beacon discovery
+    pub fn with_lan_dial_rx(mut self, rx: tokio::sync::mpsc::Receiver<LanDialRequest>) -> Self {
+        self.lan_dial_rx = Some(rx);
+        self
     }
 
     /// Enable shutdown when idle (for testing/ephemeral jobs)
@@ -352,7 +367,21 @@ impl JobRunner {
         let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Track already-dialed peers to avoid repeated dials
+        let mut dialed_peers: std::collections::HashSet<libp2p::PeerId> = std::collections::HashSet::new();
+
         loop {
+            // Create a future that resolves when a LAN dial request arrives,
+            // or never resolves if no channel is configured
+            let lan_dial_fut = async {
+                if let Some(ref mut rx) = self.lan_dial_rx {
+                    rx.recv().await
+                } else {
+                    // No channel - pend forever (won't be selected)
+                    std::future::pending::<Option<LanDialRequest>>().await
+                }
+            };
+
             tokio::select! {
                 // Handle network events
                 event = self.swarm.next_event() => {
@@ -363,6 +392,25 @@ impl JobRunner {
                     } else {
                         warn!("Event stream ended");
                         break;
+                    }
+                }
+
+                // Handle LAN peer discovery - dial discovered peers directly
+                dial_req = lan_dial_fut => {
+                    if let Some(req) = dial_req {
+                        if !dialed_peers.contains(&req.peer_id) && !self.swarm.is_connected(&req.peer_id) {
+                            info!(
+                                peer_id = %req.peer_id,
+                                addr = %req.addr,
+                                "Dialing LAN-discovered peer directly"
+                            );
+                            // Add the address to libp2p's address book first
+                            self.swarm.add_peer_address(req.peer_id, req.addr.clone());
+                            if let Err(e) = self.swarm.dial_direct(req.peer_id, req.addr) {
+                                warn!(error = %e, peer_id = %req.peer_id, "Failed to dial LAN peer");
+                            }
+                            dialed_peers.insert(req.peer_id);
+                        }
                     }
                 }
 
