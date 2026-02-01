@@ -453,4 +453,73 @@ mod tests {
         assert_eq!(loaded_cache.peers.len(), 1);
         assert_eq!(loaded_cache.peers[0].node_id, node_id);
     }
+
+    #[test]
+    fn test_discovered_peer_with_peer_id() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+        let node_id = device.node_id();
+
+        let peer = DiscoveredPeer {
+            pool_id,
+            node_id,
+            peer_id: Some("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string()),
+            lan_addr: "192.168.1.100:4101".to_string(),
+            discovery_method: DiscoveryMethod::LAN,
+            last_seen: 1234567890,
+        };
+
+        assert_eq!(peer.peer_id.as_deref(), Some("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"));
+        assert_eq!(peer.lan_addr, "192.168.1.100:4101");
+    }
+
+    #[test]
+    fn test_discovered_peer_without_peer_id() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+        let node_id = device.node_id();
+
+        let peer = DiscoveredPeer {
+            pool_id,
+            node_id,
+            peer_id: None,
+            lan_addr: "192.168.1.100:4001".to_string(),
+            discovery_method: DiscoveryMethod::LAN,
+            last_seen: 1234567890,
+        };
+
+        assert!(peer.peer_id.is_none());
+    }
+
+    #[test]
+    fn test_peer_cache_with_peer_id_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_dir.path());
+
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+        let node_id = device.node_id();
+
+        let mut cache = PeerCache::default();
+        let peer_id_str = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string();
+        cache.upsert_peer(DiscoveredPeer {
+            pool_id,
+            node_id,
+            peer_id: Some(peer_id_str.clone()),
+            lan_addr: "192.168.1.50:4101".to_string(),
+            discovery_method: DiscoveryMethod::LAN,
+            last_seen: 9999999999,
+        });
+
+        fs::create_dir_all(PoolConfig::pool_dir(&pool_id).unwrap()).unwrap();
+        cache.save(&pool_id).unwrap();
+        let loaded = PeerCache::load(&pool_id).unwrap();
+
+        assert_eq!(loaded.peers.len(), 1);
+        assert_eq!(loaded.peers[0].peer_id, Some(peer_id_str));
+        assert_eq!(loaded.peers[0].lan_addr, "192.168.1.50:4101");
+    }
 }

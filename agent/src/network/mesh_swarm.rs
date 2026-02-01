@@ -759,4 +759,50 @@ mod tests {
 
         assert_eq!(swarm.connected_peers().len(), 0);
     }
+
+    #[tokio::test]
+    async fn test_listen_on_addr() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let mut swarm = MeshSwarm::builder(keypair).build().unwrap();
+
+        // Listening on port 0 should succeed (OS assigns ephemeral port)
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let result = swarm.listen_on_addr(addr);
+        assert!(result.is_ok(), "listen_on_addr with port 0 should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_dial_direct_formats_address() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let mut swarm = MeshSwarm::builder(keypair).build().unwrap();
+
+        let target = PeerId::random();
+        let addr: Multiaddr = "/ip4/192.168.1.50/tcp/4101".parse().unwrap();
+
+        // dial_direct should not panic even though peer is unreachable
+        // (it queues the dial attempt in the swarm)
+        let result = swarm.dial_direct(target, addr);
+        assert!(result.is_ok(), "dial_direct should queue dial without error");
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_address() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let mut swarm = MeshSwarm::builder(keypair).build().unwrap();
+
+        let target = PeerId::random();
+        let addr: Multiaddr = "/ip4/192.168.1.50/tcp/4101".parse().unwrap();
+
+        // Should not panic
+        swarm.add_peer_address(target, addr);
+    }
+
+    #[test]
+    fn test_is_connected_false_for_unknown_peer() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().unwrap();
+
+        let unknown = PeerId::random();
+        assert!(!swarm.is_connected(&unknown));
+    }
 }

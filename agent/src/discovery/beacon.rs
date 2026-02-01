@@ -941,6 +941,115 @@ mod tests {
     }
 
     #[test]
+    fn test_beacon_with_peer_id() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Member,
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Member,
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Create with a real PeerId
+        let libp2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p_keypair.public().to_peer_id();
+
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, Some(peer_id), 4101);
+
+        assert_eq!(beacon.peer_id, Some(peer_id));
+        assert_eq!(beacon.quic_port, 4101);
+    }
+
+    #[test]
+    fn test_beacon_peer_id_serialization_roundtrip() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Member,
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Member,
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let libp2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p_keypair.public().to_peer_id();
+
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, Some(peer_id), 4101);
+
+        // Serialize to CBOR
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&beacon, &mut bytes).unwrap();
+
+        // Deserialize
+        let decoded: PoolBeacon = ciborium::de::from_reader(&bytes[..]).unwrap();
+
+        // Verify peer_id survived the round-trip
+        assert_eq!(decoded.peer_id, Some(peer_id), "PeerId should survive CBOR round-trip");
+        assert_eq!(decoded.quic_port, 4101);
+        assert_eq!(decoded.pool_id, pool_id);
+        assert_eq!(decoded.node_id, device.node_id());
+    }
+
+    #[test]
+    fn test_beacon_none_peer_id_serialization_roundtrip() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Member,
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Member,
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Create with None peer_id (backward compatibility)
+        let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&beacon, &mut bytes).unwrap();
+
+        let decoded: PoolBeacon = ciborium::de::from_reader(&bytes[..]).unwrap();
+
+        assert_eq!(decoded.peer_id, None, "None PeerId should survive CBOR round-trip");
+    }
+
+    #[test]
     fn test_beacon_capability_serialization() {
         let device = DeviceKeyPair::generate();
         let pool_root = PoolRootKeyPair::generate();

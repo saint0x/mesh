@@ -243,6 +243,7 @@ impl JobStats {
 /// Manages the event loop that receives jobs from the network, executes them,
 /// and sends results back. This is the main component that integrates the
 /// networking and execution layers.
+
 /// A discovered LAN peer that should be dialed directly
 #[derive(Debug, Clone)]
 pub struct LanDialRequest {
@@ -250,6 +251,10 @@ pub struct LanDialRequest {
     pub addr: libp2p::Multiaddr,
 }
 
+/// Job execution runner
+///
+/// Integrates the network swarm with job executors. Polls for network events,
+/// dispatches incoming jobs, and optionally dials LAN-discovered peers.
 pub struct JobRunner {
     swarm: MeshSwarm,
     executor: EmbeddingsExecutor,
@@ -785,5 +790,88 @@ mod tests {
 
         stats.finish_job();
         assert_eq!(stats.active_jobs(), 0);
+    }
+
+    #[test]
+    fn test_lan_dial_request_fields() {
+        let peer_id = libp2p::PeerId::random();
+        let addr: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4101".parse().unwrap();
+
+        let req = LanDialRequest {
+            peer_id,
+            addr: addr.clone(),
+        };
+
+        assert_eq!(req.peer_id, peer_id);
+        assert_eq!(req.addr, addr);
+
+        // Clone should work
+        let req2 = req.clone();
+        assert_eq!(req2.peer_id, peer_id);
+        assert_eq!(req2.addr, addr);
+    }
+
+    #[test]
+    fn test_lan_dial_request_debug() {
+        let peer_id = libp2p::PeerId::random();
+        let addr: libp2p::Multiaddr = "/ip4/10.0.0.5/tcp/4101".parse().unwrap();
+
+        let req = LanDialRequest { peer_id, addr };
+        let debug_str = format!("{:?}", req);
+
+        // Debug output should contain the peer_id and address
+        assert!(debug_str.contains("LanDialRequest"));
+        assert!(debug_str.contains("10.0.0.5"));
+    }
+
+    #[tokio::test]
+    async fn test_lan_dial_channel_send_receive() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LanDialRequest>(10);
+
+        let peer_id = libp2p::PeerId::random();
+        let addr: libp2p::Multiaddr = "/ip4/192.168.1.50/tcp/4101".parse().unwrap();
+
+        tx.send(LanDialRequest {
+            peer_id,
+            addr: addr.clone(),
+        })
+        .await
+        .unwrap();
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.peer_id, peer_id);
+        assert_eq!(received.addr, addr);
+    }
+
+    #[tokio::test]
+    async fn test_lan_dial_channel_try_send_backpressure() {
+        // Channel with capacity 2
+        let (tx, _rx) = tokio::sync::mpsc::channel::<LanDialRequest>(2);
+
+        let peer_id = libp2p::PeerId::random();
+        let addr: libp2p::Multiaddr = "/ip4/192.168.1.50/tcp/4101".parse().unwrap();
+
+        // First two should succeed
+        assert!(tx
+            .try_send(LanDialRequest {
+                peer_id,
+                addr: addr.clone()
+            })
+            .is_ok());
+        assert!(tx
+            .try_send(LanDialRequest {
+                peer_id,
+                addr: addr.clone()
+            })
+            .is_ok());
+
+        // Third should fail (channel full) - this is the expected behavior
+        // in main.rs where we use try_send to avoid blocking discovery
+        assert!(tx
+            .try_send(LanDialRequest {
+                peer_id,
+                addr: addr.clone()
+            })
+            .is_err());
     }
 }
