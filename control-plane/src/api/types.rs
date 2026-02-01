@@ -95,9 +95,9 @@ pub struct RingJoinResponse {
 pub struct ShardInfo {
     /// Model ID this shard belongs to
     pub model_id: String,
-    /// Column range start (inclusive)
+    /// Layer range start (inclusive)
     pub column_start: u32,
-    /// Column range end (exclusive)
+    /// Layer range end (exclusive)
     pub column_end: u32,
     /// Estimated memory requirement in bytes
     pub estimated_memory: u64,

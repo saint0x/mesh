@@ -150,7 +150,7 @@ pub struct ShardHandoff {
     /// Target device (receiving shard)
     pub target_device: String,
     /// Column range being transferred
-    pub column_range: (u32, u32),
+    pub layer_range: (u32, u32),
     /// Model ID
     pub model_id: String,
     /// Current status
@@ -172,7 +172,7 @@ impl ShardHandoff {
         network_id: String,
         source_device: String,
         target_device: String,
-        column_range: (u32, u32),
+        layer_range: (u32, u32),
         model_id: String,
     ) -> Self {
         Self {
@@ -180,7 +180,7 @@ impl ShardHandoff {
             network_id,
             source_device,
             target_device,
-            column_range,
+            layer_range,
             model_id,
             status: HandoffStatus::Pending,
             bytes_transferred: 0,
@@ -406,14 +406,14 @@ impl TopologyNotifier {
         network_id: String,
         source_device: String,
         target_device: String,
-        column_range: (u32, u32),
+        layer_range: (u32, u32),
         model_id: String,
     ) -> ApiResult<ShardHandoff> {
         let handoff = ShardHandoff::new(
             network_id,
             source_device,
             target_device,
-            column_range,
+            layer_range,
             model_id,
         );
 
@@ -429,7 +429,7 @@ impl TopologyNotifier {
             handoff_id = %handoff_id,
             source = %handoff.source_device,
             target = %handoff.target_device,
-            columns = ?handoff.column_range,
+            columns = ?handoff.layer_range,
             "Handoff created"
         );
 

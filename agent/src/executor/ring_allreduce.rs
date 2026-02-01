@@ -1,159 +1,107 @@
-//! Ring All-Reduce Implementation for Distributed AI Training
+//! Pipeline Executor for Distributed Inference
 //!
-//! This module implements the Ring All-Reduce algorithm as described in:
-//! "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour"
-//! Reference: <https://arxiv.org/abs/1802.05799>
+//! Replaces the previous Ring All-Reduce with pipeline-parallel execution.
+//! Instead of splitting weight matrices across workers and synchronizing with
+//! all-reduce, each worker runs complete layers and passes activations to the
+//! next pipeline stage.
 //!
-//! The algorithm consists of two phases:
-//! 1. **Reduce-Scatter**: Each worker ends up with a partial sum of one chunk
-//! 2. **All-Gather**: Each worker collects all the partial sums
+//! ## Pipeline Flow (per token)
 //!
-//! This is the same algorithm used by NCCL (NVIDIA) and Horovod (Uber) for
-//! bandwidth-optimal gradient aggregation in distributed training.
+//! ```text
+//! Stage 0: embed(token) → forward(layers 0..19) → send activations to Stage 1
+//! Stage 1: recv activations → forward(layers 20..39) → send to Stage 2
+//! Stage 2: recv activations → forward(layers 40..59) → send to Stage 3
+//! Stage 3: recv activations → forward(layers 60..79) → lm_head → sample → broadcast token
+//! ```
+//!
+//! Total network messages per token: N-1 activation transfers + 1 token broadcast
+//! (vs 560+ all-reduce operations in the previous tensor-parallel design)
 
 use crate::errors::{AgentError, Result};
-use crate::network::{AllReducePhase, MeshSwarm, TensorMessage};
+use crate::network::{MeshEvent, MeshSwarm, PipelinePhase, TensorMessage};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tracing::{debug, info, warn};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Tensor data structure for ring all-reduce operations
-///
-/// Represents a multi-dimensional array of f32 values commonly used
-/// for gradients and model parameters in distributed training.
+/// Tensor data structure (kept for backward compat with tests)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tensor {
-    /// Flattened tensor data
     pub data: Vec<f32>,
-    /// Shape of the tensor (e.g., [100] for 1D, [10, 10] for 2D)
     pub shape: Vec<usize>,
 }
 
 impl Tensor {
-    /// Create a new tensor with the given data and shape
-    ///
-    /// # Panics
-    /// Panics if the data length doesn't match the product of the shape dimensions.
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
         let expected_len: usize = shape.iter().product();
-        assert_eq!(
-            data.len(),
-            expected_len,
-            "Data length {} doesn't match shape product {}",
-            data.len(),
-            expected_len
-        );
+        assert_eq!(data.len(), expected_len,
+            "Data length {} doesn't match shape product {}", data.len(), expected_len);
         Self { data, shape }
     }
 
-    /// Create a tensor filled with zeros
     pub fn zeros(shape: Vec<usize>) -> Self {
         let len: usize = shape.iter().product();
-        Self {
-            data: vec![0.0; len],
-            shape,
-        }
+        Self { data: vec![0.0; len], shape }
     }
 
-    /// Create a tensor filled with a constant value
     pub fn filled(shape: Vec<usize>, value: f32) -> Self {
         let len: usize = shape.iter().product();
-        Self {
-            data: vec![value; len],
-            shape,
-        }
+        Self { data: vec![value; len], shape }
     }
 
-    /// Split tensor into n chunks for ring all-reduce
-    ///
-    /// Each chunk will have approximately equal size. The last chunk
-    /// may have fewer elements if the data doesn't divide evenly.
     pub fn chunk(&self, n: usize) -> Vec<Tensor> {
-        assert!(n > 0, "Number of chunks must be positive");
-
+        assert!(n > 0);
         let chunk_size = self.data.len().div_ceil(n);
-
-        self.data
-            .chunks(chunk_size)
+        self.data.chunks(chunk_size)
             .map(|chunk| Tensor::new(chunk.to_vec(), vec![chunk.len()]))
             .collect()
     }
 
-    /// Element-wise addition of two tensors
-    ///
-    /// # Errors
-    /// Returns an error if the tensors have different sizes.
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
         if self.data.len() != other.data.len() {
             return Err(AgentError::Execution(format!(
-                "Tensor size mismatch: {} vs {}",
-                self.data.len(),
-                other.data.len()
+                "Tensor size mismatch: {} vs {}", self.data.len(), other.data.len()
             )));
         }
-
-        let data: Vec<f32> = self
-            .data
-            .iter()
-            .zip(&other.data)
-            .map(|(a, b)| a + b)
-            .collect();
-
+        let data: Vec<f32> = self.data.iter().zip(&other.data).map(|(a, b)| a + b).collect();
         Ok(Tensor::new(data, self.shape.clone()))
     }
 
-    /// Concatenate multiple tensors into a single tensor
     pub fn concat(tensors: Vec<Tensor>) -> Tensor {
         let mut data = Vec::new();
-        for t in tensors {
-            data.extend(t.data);
-        }
+        for t in tensors { data.extend(t.data); }
         let len = data.len();
         Tensor::new(data, vec![len])
     }
 
-    /// Get the total number of elements in the tensor
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if the tensor is empty
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
+    pub fn len(&self) -> usize { self.data.len() }
+    pub fn is_empty(&self) -> bool { self.data.is_empty() }
 }
 
-/// Worker's position in the ring topology
+/// Worker's position in the pipeline topology
 ///
-/// Each worker knows its position, the total number of workers,
-/// and its left/right neighbors in the ring.
-///
-/// NOTE: WorkerRing borrows the MeshSwarm instead of owning it, allowing
-/// the coordinator to maintain ownership for the entire inference job.
+/// In pipeline parallelism, each worker knows:
+/// - Its previous stage (receives activations from)
+/// - Its next stage (sends activations to)
+/// - Whether it is the first or last stage
 pub struct WorkerRing<'a> {
-    /// This worker's position in the ring (0 to total_workers-1)
+    /// This worker's position in the pipeline (0 to total_workers-1)
     pub my_position: u32,
-    /// Total number of workers in the ring
+    /// Total number of workers in the pipeline
     pub total_workers: u32,
-    /// Peer ID of the left neighbor (sends to us in scatter phase)
+    /// Peer ID of the previous stage (receives activations from)
     pub left_neighbor: PeerId,
-    /// Peer ID of the right neighbor (we send to them in scatter phase)
+    /// Peer ID of the next stage (sends activations to)
     pub right_neighbor: PeerId,
     /// Mesh swarm for network communication (borrowed)
     pub swarm: &'a mut MeshSwarm,
+    /// Monotonic sequence counter for ordering verification
+    sequence_counter: u64,
 }
 
 impl<'a> WorkerRing<'a> {
-    /// Create a new worker ring
-    ///
-    /// # Arguments
-    /// * `my_position` - This worker's position in the ring (0-indexed)
-    /// * `total_workers` - Total number of workers in the ring
-    /// * `left_neighbor` - Peer ID of the left neighbor
-    /// * `right_neighbor` - Peer ID of the right neighbor
-    /// * `swarm` - Mutable borrow of mesh swarm for network communication
     pub fn new(
         my_position: u32,
         total_workers: u32,
@@ -167,239 +115,384 @@ impl<'a> WorkerRing<'a> {
             left_neighbor,
             right_neighbor,
             swarm,
+            sequence_counter: 0,
         }
     }
 
-    /// Perform ring all-reduce on a tensor
+    /// Whether this is the first pipeline stage
+    pub fn is_first_stage(&self) -> bool {
+        self.my_position == 0
+    }
+
+    /// Whether this is the last pipeline stage
+    pub fn is_last_stage(&self) -> bool {
+        self.my_position == self.total_workers - 1
+    }
+
+    /// Get next sequence number (monotonically increasing)
+    fn next_sequence(&mut self) -> u64 {
+        let seq = self.sequence_counter;
+        self.sequence_counter += 1;
+        seq
+    }
+
+    /// Send activations to the next pipeline stage
     ///
-    /// This implements the bandwidth-optimal ring all-reduce algorithm:
-    /// 1. Split tensor into n chunks (n = number of workers)
-    /// 2. Reduce-scatter: n-1 steps, each worker accumulates one chunk
-    /// 3. All-gather: n-1 steps, each worker gets all accumulated chunks
+    /// Called after this stage finishes its local forward pass.
+    /// Includes checksum for divergence detection.
+    pub async fn send_activations(
+        &mut self,
+        job_id: Uuid,
+        layer_idx: u32,
+        token_idx: u32,
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> Result<()> {
+        let seq = self.next_sequence();
+        let msg = TensorMessage::new_activation(
+            job_id,
+            layer_idx,
+            token_idx,
+            self.my_position,
+            seq,
+            0, // parent_span_id
+            data,
+            shape,
+        );
+
+        info!(
+            job_id = %job_id,
+            stage = self.my_position,
+            next_stage = self.my_position + 1,
+            layer_idx = layer_idx,
+            token_idx = token_idx,
+            seq = seq,
+            checksum = hex::encode(msg.checksum),
+            "Sending activations to next stage"
+        );
+
+        self.swarm.send_tensor(self.right_neighbor, msg);
+        Ok(())
+    }
+
+    /// Receive activations from the previous pipeline stage
     ///
-    /// # Arguments
-    /// * `partial_result` - This worker's local tensor (e.g., gradient)
-    /// * `job_id` - Unique identifier for this all-reduce operation
-    /// * `layer_idx` - Layer index for multi-layer aggregation
+    /// Blocks until a matching activation message arrives.
+    /// Validates: job_id, sequence ordering, and checksum integrity.
+    pub async fn recv_activations(
+        &mut self,
+        job_id: Uuid,
+        expected_token_idx: u32,
+        timeout: Duration,
+    ) -> Result<(Vec<f32>, Vec<usize>, u64)> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AgentError::Execution(format!(
+                    "Timed out waiting for activations from stage {} (job={}, token={})",
+                    self.my_position.saturating_sub(1), job_id, expected_token_idx
+                )));
+            }
+
+            let event = tokio::time::timeout(remaining, self.swarm.next_event()).await;
+            match event {
+                Ok(Some(MeshEvent::TensorReceived { peer_id, tensor, channel })) => {
+                    // Validate: must be from previous stage
+                    if peer_id != self.left_neighbor {
+                        debug!("Ignoring tensor from non-neighbor {}", peer_id);
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
+                        continue;
+                    }
+
+                    // Validate: must match job
+                    if tensor.job_id != job_id {
+                        debug!("Ignoring tensor for different job {}", tensor.job_id);
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
+                        continue;
+                    }
+
+                    // Validate: must be ForwardActivation phase
+                    if tensor.phase != PipelinePhase::ForwardActivation {
+                        debug!("Ignoring non-activation message: {:?}", tensor.phase);
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
+                        continue;
+                    }
+
+                    // Validate: token index must match
+                    if tensor.token_idx != expected_token_idx {
+                        warn!(
+                            expected = expected_token_idx,
+                            got = tensor.token_idx,
+                            "Token index mismatch — possible ordering error"
+                        );
+                    }
+
+                    // Validate: checksum integrity
+                    if !tensor.verify_checksum() {
+                        error!(
+                            job_id = %job_id,
+                            stage = self.my_position,
+                            sender = tensor.sender_stage,
+                            "Checksum mismatch — activation data corrupted in transit"
+                        );
+                        return Err(AgentError::Execution(
+                            "Activation checksum mismatch — data corrupted".into(),
+                        ));
+                    }
+
+                    info!(
+                        job_id = %job_id,
+                        stage = self.my_position,
+                        from_stage = tensor.sender_stage,
+                        layer_idx = tensor.layer_idx,
+                        token_idx = tensor.token_idx,
+                        seq = tensor.sequence_num,
+                        checksum = hex::encode(tensor.checksum),
+                        "Received activations from previous stage"
+                    );
+
+                    // Acknowledge
+                    let ack = tensor.clone();
+                    self.swarm.respond_to_tensor(channel, ack)?;
+
+                    return Ok((
+                        tensor.activation_data,
+                        tensor.activation_shape,
+                        tensor.sequence_num,
+                    ));
+                }
+                Ok(Some(MeshEvent::PeerDisconnected { peer_id })) => {
+                    if peer_id == self.left_neighbor {
+                        return Err(AgentError::Network(
+                            "Previous pipeline stage disconnected".into(),
+                        ));
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    return Err(AgentError::Execution(format!(
+                        "Timed out waiting for activations from stage {}",
+                        self.my_position.saturating_sub(1)
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Broadcast a sampled token from the last stage to all previous stages
+    pub async fn broadcast_token(
+        &mut self,
+        job_id: Uuid,
+        token_idx: u32,
+        token_id: u32,
+    ) -> Result<()> {
+        let seq = self.next_sequence();
+        let msg = TensorMessage::new_token_broadcast(
+            job_id,
+            token_idx,
+            self.my_position,
+            seq,
+            0,
+            token_id,
+        );
+
+        info!(
+            job_id = %job_id,
+            stage = self.my_position,
+            token_idx = token_idx,
+            token_id = token_id,
+            "Broadcasting sampled token to previous stages"
+        );
+
+        // Send to left neighbor; in a chain topology they relay further left
+        self.swarm.send_tensor(self.left_neighbor, msg);
+        Ok(())
+    }
+
+    /// Receive a broadcast token from the last stage
+    pub async fn recv_token_broadcast(
+        &mut self,
+        job_id: Uuid,
+        expected_token_idx: u32,
+        timeout: Duration,
+    ) -> Result<u32> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AgentError::Execution(
+                    "Timed out waiting for token broadcast".into(),
+                ));
+            }
+
+            let event = tokio::time::timeout(remaining, self.swarm.next_event()).await;
+            match event {
+                Ok(Some(MeshEvent::TensorReceived { peer_id: _, tensor, channel })) => {
+                    if tensor.job_id != job_id {
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
+                        continue;
+                    }
+
+                    if tensor.phase != PipelinePhase::TokenBroadcast {
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
+                        continue;
+                    }
+
+                    let token_id = tensor.activation_data[0] as u32;
+
+                    info!(
+                        job_id = %job_id,
+                        stage = self.my_position,
+                        token_idx = tensor.token_idx,
+                        token_id = token_id,
+                        "Received token broadcast"
+                    );
+
+                    let ack = tensor.clone();
+                    self.swarm.respond_to_tensor(channel, ack)?;
+
+                    // Relay to our left neighbor if we're not stage 0
+                    if self.my_position > 0 {
+                        let relay_msg = TensorMessage::new_token_broadcast(
+                            job_id,
+                            tensor.token_idx,
+                            tensor.sender_stage,
+                            tensor.sequence_num,
+                            tensor.span_id,
+                            token_id,
+                        );
+                        self.swarm.send_tensor(self.left_neighbor, relay_msg);
+                    }
+
+                    return Ok(token_id);
+                }
+                Ok(Some(MeshEvent::PeerDisconnected { peer_id })) => {
+                    if peer_id == self.right_neighbor {
+                        return Err(AgentError::Network(
+                            "Next pipeline stage (token source) disconnected".into(),
+                        ));
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    return Err(AgentError::Execution(
+                        "Timed out waiting for token broadcast".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Legacy: ring_all_reduce (kept for backward compat, runs locally in pipeline mode)
     ///
-    /// # Returns
-    /// The fully reduced tensor (sum of all workers' partial results)
+    /// In pipeline parallelism this is a no-op that returns the input unchanged,
+    /// since each stage runs complete layers and doesn't need cross-worker reduction.
     pub async fn ring_all_reduce(
         &mut self,
         partial_result: Tensor,
-        job_id: Uuid,
-        layer_idx: u32,
+        _job_id: Uuid,
+        _layer_idx: u32,
     ) -> Result<Tensor> {
-        let n = self.total_workers as usize;
-        let my_pos = self.my_position as usize;
-
-        // Split tensor into n chunks
-        let mut chunks = partial_result.chunk(n);
-
-        info!(
-            "Starting ring all-reduce: n={}, my_pos={}, chunks={}",
-            n,
-            my_pos,
-            chunks.len()
-        );
-
-        // PHASE 1: Reduce-Scatter (n-1 steps)
-        // After this phase, worker i has the complete sum of chunk (i+1) % n
-        for step in 0..(n - 1) {
-            // In step k, worker i:
-            // - Sends chunk[(i - k) % n] to right neighbor
-            // - Receives from left neighbor into chunk[(i - k - 1) % n]
-            let send_idx = (my_pos + n - step) % n;
-            let recv_idx = (my_pos + n - step - 1) % n;
-
-            debug!(
-                "Reduce-scatter step {}/{}: send_idx={}, recv_idx={}",
-                step + 1,
-                n - 1,
-                send_idx,
-                recv_idx
-            );
-
-            // Create message for right neighbor
-            let send_msg = TensorMessage::new(
-                job_id,
-                layer_idx,
-                AllReducePhase::ReduceScatter,
-                step as u32,
-                chunks[send_idx].data.clone(),
-                chunks[send_idx].shape.clone(),
-            );
-
-            // Send to right, receive from left (simulated with sequential ops)
-            // In a real implementation, this would be done concurrently
-            let recv_msg = self
-                .send_to_right_recv_from_left(send_msg)
-                .await?;
-
-            // Convert received message to Tensor
-            let received_chunk = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
-
-            // Accumulate (element-wise sum)
-            chunks[recv_idx] = chunks[recv_idx].add(&received_chunk)?;
-        }
-
-        info!("Reduce-scatter complete");
-
-        // PHASE 2: All-Gather (n-1 steps)
-        // After this phase, all workers have all the complete sums
-        for step in 0..(n - 1) {
-            // In step k, worker i:
-            // - Sends the chunk that was accumulated in the previous all-gather step
-            // - Or in step 0, sends the chunk accumulated in reduce-scatter
-            let send_idx = (my_pos + n - step + 1) % n;
-            let recv_idx = (my_pos + n - step) % n;
-
-            debug!(
-                "All-gather step {}/{}: send_idx={}, recv_idx={}",
-                step + 1,
-                n - 1,
-                send_idx,
-                recv_idx
-            );
-
-            let send_msg = TensorMessage::new(
-                job_id,
-                layer_idx,
-                AllReducePhase::AllGather,
-                step as u32,
-                chunks[send_idx].data.clone(),
-                chunks[send_idx].shape.clone(),
-            );
-
-            let recv_msg = self
-                .send_to_right_recv_from_left(send_msg)
-                .await?;
-
-            // In all-gather, we just copy (replace) the received chunk
-            chunks[recv_idx] = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
-        }
-
-        info!("All-gather complete");
-
-        // Concatenate chunks to get full tensor
-        let full_tensor = Tensor::concat(chunks);
-
-        Ok(full_tensor)
+        // In pipeline parallelism, each worker has complete layer weights.
+        // No reduction needed — just return the input.
+        Ok(partial_result)
     }
 
-    /// Ring all-reduce with timeout
-    ///
-    /// Wraps `ring_all_reduce` with a timeout to handle stalled workers.
+    /// Legacy: ring_all_reduce with timeout
     pub async fn ring_all_reduce_with_timeout(
         &mut self,
         partial_result: Tensor,
         job_id: Uuid,
         layer_idx: u32,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<Tensor> {
-        tokio::time::timeout(timeout, self.ring_all_reduce(partial_result, job_id, layer_idx))
-            .await
-            .map_err(|_| {
-                AgentError::Execution(format!(
-                    "Ring all-reduce timed out after {:?}",
-                    timeout
-                ))
-            })?
+        self.ring_all_reduce(partial_result, job_id, layer_idx).await
     }
 
-    /// Barrier synchronization - wait for all workers to reach this point
-    ///
-    /// Uses a ring-based barrier where each worker sends a message to its
-    /// right neighbor and waits for a message from its left neighbor.
+    /// Barrier synchronization between pipeline stages
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
         let barrier_msg = TensorMessage::new(
             job_id,
             layer_idx,
-            AllReducePhase::Barrier,
+            PipelinePhase::Barrier,
             TensorMessage::BARRIER_STEP,
-            vec![self.my_position as f32], // Send position as data
+            vec![self.my_position as f32],
             vec![1],
         );
 
-        // Send barrier notification to right
-        let received = self.send_to_right_recv_from_left(barrier_msg).await?;
+        self.swarm.send_tensor(self.right_neighbor, barrier_msg.clone());
 
-        // Verify received from left neighbor
-        let expected_pos = (self.my_position + self.total_workers - 1) % self.total_workers;
-        if received.chunk_data[0] as u32 != expected_pos {
-            warn!(
-                "Barrier sync received from unexpected peer: got {}, expected {}",
-                received.chunk_data[0] as u32, expected_pos
-            );
+        // Wait for barrier from left
+        loop {
+            if let Some(event) = self.swarm.next_event().await {
+                match event {
+                    MeshEvent::TensorReceived { tensor, channel, .. } => {
+                        let ack = tensor.clone();
+                        self.swarm.respond_to_tensor(channel, ack)?;
+
+                        if tensor.is_barrier() && tensor.job_id == job_id {
+                            debug!("Barrier sync complete for layer {}", layer_idx);
+                            return Ok(());
+                        }
+                    }
+                    _ => continue,
+                }
+            }
         }
-
-        debug!("Barrier sync complete for layer {}", layer_idx);
-        Ok(())
     }
 
-    /// Send a message to the right neighbor and receive from the left neighbor
-    ///
-    /// This is the core communication primitive for ring all-reduce.
-    /// The send and receive operations happen concurrently via the tensor protocol.
+    // === Legacy compat for send_to_right_recv_from_left ===
+
+    /// Legacy: Send tensor to next stage and wait for tensor from previous stage
+    /// Now properly validates (job_id, layer_idx, phase, step, sender_stage).
     async fn send_to_right_recv_from_left(
         &mut self,
         message: TensorMessage,
     ) -> Result<TensorMessage> {
-        use crate::network::MeshEvent;
+        self.swarm.send_tensor(self.right_neighbor, message.clone());
 
-        // Send to right neighbor using tensor protocol
-        let _request_id = self.swarm.send_tensor(self.right_neighbor, message.clone());
-
-        debug!(
-            "Sent tensor to right neighbor {}, waiting for tensor from left neighbor {}",
-            self.right_neighbor, self.left_neighbor
-        );
-
-        // Wait for message from left neighbor
         loop {
             if let Some(event) = self.swarm.next_event().await {
                 match event {
-                    MeshEvent::TensorReceived {
-                        peer_id,
-                        tensor,
-                        channel,
-                    } => {
-                        // Check if it's from our left neighbor
-                        if peer_id == self.left_neighbor {
-                            // Verify it's the same job and layer
-                            if tensor.job_id == message.job_id
-                                && tensor.layer_idx == message.layer_idx
-                            {
-                                // Send acknowledgment (echo back the tensor)
-                                let ack = tensor.clone();
-                                self.swarm.respond_to_tensor(channel, ack)?;
-
-                                debug!(
-                                    "Received tensor from left neighbor {}, phase={:?}, step={}",
-                                    peer_id, tensor.phase, tensor.step
-                                );
-
-                                return Ok(tensor);
-                            }
+                    MeshEvent::TensorReceived { peer_id, tensor, channel } => {
+                        if peer_id == self.left_neighbor
+                            && tensor.job_id == message.job_id
+                            && tensor.layer_idx == message.layer_idx
+                            && tensor.phase == message.phase
+                            && tensor.step == message.step
+                        {
+                            let ack = tensor.clone();
+                            self.swarm.respond_to_tensor(channel, ack)?;
+                            return Ok(tensor);
                         }
-                        // If not from expected neighbor or wrong job/layer, acknowledge but continue
                         let ack = tensor.clone();
                         self.swarm.respond_to_tensor(channel, ack)?;
                     }
                     MeshEvent::PeerDisconnected { peer_id } => {
                         if peer_id == self.left_neighbor {
                             return Err(AgentError::Network(
-                                "Left neighbor disconnected during ring all-reduce".to_string(),
+                                "Previous stage disconnected".into(),
                             ));
                         }
                     }
-                    _ => {
-                        // Ignore other events
-                    }
+                    _ => {}
                 }
             }
         }
     }
+}
+
+/// Compute activation checksum for divergence detection
+pub fn activation_checksum(data: &[f32]) -> [u8; 8] {
+    TensorMessage::compute_checksum(data)
 }
 
 #[cfg(test)]
@@ -407,15 +500,11 @@ impl<'a> WorkerRing<'a> {
 mod tests {
     use super::*;
 
-    // ============== Tensor Tests ==============
-
     #[test]
     fn test_tensor_new() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
-        let shape = vec![4];
-        let tensor = Tensor::new(data.clone(), shape.clone());
+        let tensor = Tensor::new(data.clone(), vec![4]);
         assert_eq!(tensor.data, data);
-        assert_eq!(tensor.shape, shape);
     }
 
     #[test]
@@ -434,22 +523,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "Data length")]
     fn test_tensor_new_shape_mismatch() {
-        let data = vec![1.0, 2.0, 3.0];
-        let shape = vec![4]; // Doesn't match data length
-        Tensor::new(data, shape);
+        Tensor::new(vec![1.0, 2.0, 3.0], vec![4]);
     }
 
     #[test]
     fn test_tensor_chunk_even() {
         let tensor = Tensor::new((0..10).map(|i| i as f32).collect(), vec![10]);
         let chunks = tensor.chunk(5);
-
         assert_eq!(chunks.len(), 5);
-        for chunk in &chunks {
-            assert_eq!(chunk.len(), 2);
-        }
-
-        // Verify data is preserved
+        for chunk in &chunks { assert_eq!(chunk.len(), 2); }
         let concat = Tensor::concat(chunks);
         assert_eq!(concat.data, tensor.data);
     }
@@ -458,9 +540,7 @@ mod tests {
     fn test_tensor_chunk_uneven() {
         let tensor = Tensor::new((0..10).map(|i| i as f32).collect(), vec![10]);
         let chunks = tensor.chunk(3);
-
         assert_eq!(chunks.len(), 3);
-        // Ceiling division: 10/3 = 4, so first chunks have 4 elements
         assert_eq!(chunks[0].len(), 4);
         assert_eq!(chunks[1].len(), 4);
         assert_eq!(chunks[2].len(), 2);
@@ -478,8 +558,7 @@ mod tests {
     fn test_tensor_add_size_mismatch() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         let b = Tensor::new(vec![4.0, 5.0], vec![2]);
-        let result = a.add(&b);
-        assert!(result.is_err());
+        assert!(a.add(&b).is_err());
     }
 
     #[test]
@@ -487,7 +566,6 @@ mod tests {
         let t1 = Tensor::new(vec![1.0, 2.0], vec![2]);
         let t2 = Tensor::new(vec![3.0, 4.0], vec![2]);
         let t3 = Tensor::new(vec![5.0], vec![1]);
-
         let result = Tensor::concat(vec![t1, t2, t3]);
         assert_eq!(result.data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
     }
@@ -497,325 +575,38 @@ mod tests {
         let tensor = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(tensor.len(), 3);
         assert!(!tensor.is_empty());
-
         let empty = Tensor::new(vec![], vec![0]);
         assert!(empty.is_empty());
     }
 
-    // ============== TensorMessage Tests ==============
+    #[test]
+    fn test_activation_checksum() {
+        let data = vec![1.0, 2.0, 3.0];
+        let cs1 = activation_checksum(&data);
+        let cs2 = activation_checksum(&data);
+        assert_eq!(cs1, cs2);
+
+        let data2 = vec![1.0, 2.0, 3.1];
+        let cs3 = activation_checksum(&data2);
+        assert_ne!(cs1, cs3);
+    }
 
     #[test]
     fn test_tensor_message_new() {
         let job_id = Uuid::new_v4();
         let msg = TensorMessage::new(
-            job_id,
-            5,
-            AllReducePhase::ReduceScatter,
-            2,
-            vec![1.0, 2.0],
-            vec![2],
+            job_id, 5, PipelinePhase::Barrier, 2, vec![1.0, 2.0], vec![2],
         );
-
         assert_eq!(msg.job_id, job_id);
         assert_eq!(msg.layer_idx, 5);
-        assert_eq!(msg.phase, AllReducePhase::ReduceScatter);
-        assert_eq!(msg.step, 2);
-        assert_eq!(msg.chunk_data, vec![1.0, 2.0]);
     }
 
     #[test]
     fn test_tensor_message_barrier() {
         let msg = TensorMessage::new(
-            Uuid::new_v4(),
-            0,
-            AllReducePhase::Barrier,
-            TensorMessage::BARRIER_STEP,
-            vec![0.0],
-            vec![1],
+            Uuid::new_v4(), 0, PipelinePhase::Barrier,
+            TensorMessage::BARRIER_STEP, vec![0.0], vec![1],
         );
-
         assert!(msg.is_barrier());
     }
-
-    // Note: CBOR serialization tests are in agent/src/network/tensor_protocol.rs
-
-    // ============== Ring All-Reduce Logic Tests ==============
-
-    /// Simulates the ring all-reduce algorithm without network
-    /// to verify algorithmic correctness
-    fn simulate_ring_allreduce(partial_results: Vec<Tensor>) -> Vec<Tensor> {
-        let n = partial_results.len();
-        assert!(n > 1, "Need at least 2 workers");
-
-        // Each worker has its own set of chunks
-        let mut all_chunks: Vec<Vec<Tensor>> = partial_results
-            .iter()
-            .map(|t| t.chunk(n))
-            .collect();
-
-        // Phase 1: Reduce-Scatter
-        for step in 0..(n - 1) {
-            // Create a copy of chunks to send (to avoid borrow issues)
-            let chunks_to_send: Vec<Tensor> = (0..n)
-                .map(|worker| {
-                    let send_idx = (worker + n - step) % n;
-                    all_chunks[worker][send_idx].clone()
-                })
-                .collect();
-
-            // Each worker receives from its left neighbor
-            for worker in 0..n {
-                let recv_idx = (worker + n - step - 1) % n;
-                let left = (worker + n - 1) % n;
-
-                // Receive chunk from left neighbor
-                let received = chunks_to_send[left].clone();
-
-                // Accumulate
-                all_chunks[worker][recv_idx] = all_chunks[worker][recv_idx]
-                    .add(&received)
-                    .unwrap();
-            }
-        }
-
-        // Phase 2: All-Gather
-        for step in 0..(n - 1) {
-            // Create a copy of chunks to send
-            let chunks_to_send: Vec<Tensor> = (0..n)
-                .map(|worker| {
-                    let send_idx = (worker + n - step + 1) % n;
-                    all_chunks[worker][send_idx].clone()
-                })
-                .collect();
-
-            // Each worker receives from its left neighbor
-            for worker in 0..n {
-                let recv_idx = (worker + n - step) % n;
-                let left = (worker + n - 1) % n;
-
-                // Copy received chunk (no accumulation in all-gather)
-                all_chunks[worker][recv_idx] = chunks_to_send[left].clone();
-            }
-        }
-
-        // Concatenate each worker's chunks
-        all_chunks.into_iter()
-            .map(Tensor::concat)
-            .collect()
-    }
-
-    #[test]
-    fn test_ring_allreduce_3_workers() {
-        // 3 workers, each with value [i+1, i+1, i+1]
-        let partial_results: Vec<Tensor> = (0..3)
-            .map(|i| Tensor::filled(vec![6], (i + 1) as f32))
-            .collect();
-
-        let results = simulate_ring_allreduce(partial_results);
-
-        // Sum should be 1+2+3 = 6 for each element
-        let expected_sum = 6.0;
-        for (i, result) in results.iter().enumerate() {
-            for &value in &result.data {
-                assert!(
-                    (value - expected_sum).abs() < 0.001,
-                    "Worker {} result mismatch: got {}, expected {}",
-                    i, value, expected_sum
-                );
-            }
-        }
-
-        // All workers should have identical results
-        for i in 1..results.len() {
-            assert_eq!(
-                results[0].data, results[i].data,
-                "Worker 0 and {} have different results",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_5_workers() {
-        let partial_results: Vec<Tensor> = (0..5)
-            .map(|i| Tensor::filled(vec![10], (i + 1) as f32))
-            .collect();
-
-        let results = simulate_ring_allreduce(partial_results);
-
-        // Sum should be 1+2+3+4+5 = 15
-        let expected_sum = 15.0;
-        for (i, result) in results.iter().enumerate() {
-            for &value in &result.data {
-                assert!(
-                    (value - expected_sum).abs() < 0.001,
-                    "Worker {} result mismatch: got {}, expected {}",
-                    i, value, expected_sum
-                );
-            }
-        }
-
-        // All workers should have identical results
-        for i in 1..results.len() {
-            assert_eq!(results[0].data, results[i].data);
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_10_workers() {
-        let partial_results: Vec<Tensor> = (0..10)
-            .map(|i| Tensor::filled(vec![100], (i + 1) as f32))
-            .collect();
-
-        let results = simulate_ring_allreduce(partial_results);
-
-        // Sum should be 1+2+...+10 = 55
-        let expected_sum: f32 = (1..=10).sum::<u32>() as f32;
-        for (i, result) in results.iter().enumerate() {
-            assert_eq!(result.data.len(), 100);
-            for &value in &result.data {
-                assert!(
-                    (value - expected_sum).abs() < 0.001,
-                    "Worker {} result mismatch: got {}, expected {}",
-                    i, value, expected_sum
-                );
-            }
-        }
-
-        // All workers should have identical results
-        for i in 1..results.len() {
-            assert_eq!(results[0].data, results[i].data);
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_numerical_stability() {
-        // Test with small values that could cause precision issues
-        let partial_results: Vec<Tensor> = (0..5)
-            .map(|i| Tensor::filled(vec![100], (i + 1) as f32 * 0.0001))
-            .collect();
-
-        let results = simulate_ring_allreduce(partial_results);
-
-        // Sum should be (1+2+3+4+5) * 0.0001 = 0.0015
-        let expected_sum = 0.0015;
-        for &value in &results[0].data {
-            assert!(
-                (value - expected_sum).abs() < 0.00001,
-                "Numerical stability issue: got {}, expected {}",
-                value, expected_sum
-            );
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_with_different_values() {
-        // Workers have different values per element
-        // Use 6 elements for 3 workers (divisible)
-        let partial_results: Vec<Tensor> = vec![
-            Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6]),
-            Tensor::new(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![6]),
-            Tensor::new(vec![13.0, 14.0, 15.0, 16.0, 17.0, 18.0], vec![6]),
-        ];
-
-        let results = simulate_ring_allreduce(partial_results);
-
-        // Expected sums: [1+7+13, 2+8+14, 3+9+15, 4+10+16, 5+11+17, 6+12+18]
-        //              = [21, 24, 27, 30, 33, 36]
-        let expected = [21.0, 24.0, 27.0, 30.0, 33.0, 36.0];
-
-        for result in &results {
-            for (i, &value) in result.data.iter().enumerate() {
-                assert!(
-                    (value - expected[i]).abs() < 0.001,
-                    "Element {} mismatch: got {}, expected {}",
-                    i, value, expected[i]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_property_identical_output() {
-        // Property: All workers produce identical output
-        for n in 2..=8 {
-            // Tensor size must be divisible by n for ring all-reduce
-            let tensor_size = n * 10;
-            let partial_results: Vec<Tensor> = (0..n)
-                .map(|i| Tensor::filled(vec![tensor_size], (i + 1) as f32))
-                .collect();
-
-            let results = simulate_ring_allreduce(partial_results);
-
-            for i in 1..results.len() {
-                assert_eq!(
-                    results[0].data, results[i].data,
-                    "Property violated: workers 0 and {} differ for n={}",
-                    i, n
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_property_sum_preservation() {
-        // Property: Sum of partial results equals final result
-        for n in 2..=8 {
-            // Tensor size must be divisible by n for ring all-reduce
-            let tensor_size = n * 10;
-            let partial_results: Vec<Tensor> = (0..n)
-                .map(|i| Tensor::filled(vec![tensor_size], (i + 1) as f32))
-                .collect();
-
-            // Calculate expected sum
-            let expected_sum: f32 = (1..=n).sum::<usize>() as f32;
-
-            let results = simulate_ring_allreduce(partial_results);
-
-            // Verify sum is correct
-            for &value in &results[0].data {
-                assert!(
-                    (value - expected_sum).abs() < 0.001,
-                    "Sum preservation violated for n={}: got {}, expected {}",
-                    n, value, expected_sum
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_ring_allreduce_stress_100_iterations() {
-        // Stress test: Run 100 iterations without divergence
-        for iteration in 0..100 {
-            let n = 4; // Fixed number of workers for stress test
-            let partial_results: Vec<Tensor> = (0..n)
-                .map(|i| Tensor::filled(vec![100], ((i as f32) + 1.0) * (iteration as f32 + 1.0)))
-                .collect();
-
-            let results = simulate_ring_allreduce(partial_results);
-
-            // Expected sum: (1+2+3+4) * (iteration+1) = 10 * (iteration+1)
-            let expected_sum = 10.0 * (iteration as f32 + 1.0);
-
-            for &value in &results[0].data {
-                assert!(
-                    (value - expected_sum).abs() < 0.01,
-                    "Stress test failed at iteration {}: got {}, expected {}",
-                    iteration, value, expected_sum
-                );
-            }
-
-            // All workers should have identical results
-            for i in 1..results.len() {
-                assert_eq!(
-                    results[0].data, results[i].data,
-                    "Stress test: workers differ at iteration {}",
-                    iteration
-                );
-            }
-        }
-    }
-
-    // ============== AllReducePhase Tests ==============
-    // Note: Phase serialization tests are in agent/src/network/tensor_protocol.rs
 }

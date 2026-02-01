@@ -16,7 +16,8 @@ pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnectio
 pub use ring_gossip::{MemberStatus, RingGossipMessage, RingMember, RingState, RingTopology};
 pub use ring_gossip_service::RingGossipService;
 pub use tensor_protocol::{
-    AllReducePhase, TensorMessage, TensorProtocol, TensorProtocolConfig, TENSOR_PROTOCOL_ID,
+    AllReducePhase, PipelinePhase, TensorMessage, TensorProtocol, TensorProtocolConfig,
+    new_tensor_protocol, TENSOR_PROTOCOL_ID,
 };
 
 // Re-export libp2p types needed for handling network events

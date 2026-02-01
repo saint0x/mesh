@@ -611,7 +611,7 @@ impl MeshSwarm {
     pub fn send_tensor(&mut self, peer_id: PeerId, tensor: TensorMessage) -> OutboundRequestId {
         debug!(
             phase = ?tensor.phase,
-            chunk_size = tensor.chunk_data.len(),
+            chunk_size = tensor.chunk_data().len(),
             "Sending tensor to peer"
         );
         self.swarm

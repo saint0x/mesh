@@ -6,17 +6,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
-/// Total number of columns in the model shard space (fixed at 8192)
-const TOTAL_SHARD_COLUMNS: u32 = 8192;
+/// Default total layers for pipeline partitioning (LLaMA 70B)
+const DEFAULT_TOTAL_LAYERS: u32 = 80;
 
 /// Unique identifier for a device in the ring
 pub type DeviceId = String;
 
-/// Model shard assignment for a worker
+/// Model shard assignment for a worker (layer-based pipeline parallelism)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelShard {
     pub model_id: String,
-    pub column_range: (u32, u32),
+    /// Layer range this worker is responsible for [start, end)
+    pub layer_range: (u32, u32),
     pub estimated_memory: u64,
 }
 
@@ -69,9 +70,12 @@ pub struct WorkerTopologyInfo {
 
 /// Ring Topology Manager for distributed worker coordination
 ///
-/// Manages the ring topology of workers in a distributed inference pool.
-/// Workers are assigned sequential positions in the ring, with each worker
-/// responsible for a contiguous range of model columns (shards).
+/// Manages the pipeline topology of workers in a distributed inference pool.
+/// Workers are assigned sequential positions in the pipeline, with each worker
+/// responsible for a contiguous range of model layers (pipeline parallelism).
+///
+/// Activations flow sequentially: Stage 0 → Stage 1 → ... → Stage N-1.
+/// The last stage samples the next token and broadcasts it back.
 pub struct RingTopologyManager {
     db: Arc<Database>,
     /// In-memory cache of workers by device_id
@@ -80,6 +84,8 @@ pub struct RingTopologyManager {
     ring_sequence: RwLock<Vec<DeviceId>>,
     /// Default model ID for shard assignment
     default_model_id: String,
+    /// Total layers in the model for partitioning
+    total_layers: u32,
 }
 
 impl RingTopologyManager {
@@ -90,6 +96,18 @@ impl RingTopologyManager {
             workers: RwLock::new(HashMap::new()),
             ring_sequence: RwLock::new(Vec::new()),
             default_model_id,
+            total_layers: DEFAULT_TOTAL_LAYERS,
+        }
+    }
+
+    /// Create with a custom layer count
+    pub fn with_layers(db: Arc<Database>, default_model_id: String, total_layers: u32) -> Self {
+        Self {
+            db,
+            workers: RwLock::new(HashMap::new()),
+            ring_sequence: RwLock::new(Vec::new()),
+            default_model_id,
+            total_layers,
         }
     }
 
@@ -148,7 +166,7 @@ impl RingTopologyManager {
 
     /// Add a worker to the ring topology
     ///
-    /// Assigns a sequential ring position, calculates shard column range,
+    /// Assigns a sequential pipeline position, calculates layer range,
     /// updates all neighbors, and persists to database atomically.
     pub fn add_worker(&self, worker: Worker) -> ApiResult<RingPosition> {
         // Validate worker
@@ -198,12 +216,11 @@ impl RingTopologyManager {
         let new_position = ring_seq.len() as u32;
         let total_workers = ring_seq.len() + 1;
 
-        // Calculate shard assignment
+        // Calculate shard assignment (layer-based)
         let shard = self.assign_shard(new_position, total_workers as u32);
 
         // Calculate neighbors (will be updated for all workers)
         let (left_neighbor, right_neighbor) = if total_workers == 1 {
-            // Single worker: neighbors are itself
             (worker.device_id.clone(), worker.device_id.clone())
         } else {
             let left_pos = if new_position == 0 {
@@ -231,8 +248,6 @@ impl RingTopologyManager {
         workers_map.insert(worker.device_id.clone(), updated_worker);
 
         // Persist to database atomically
-
-        // Begin transaction
         conn.execute("BEGIN TRANSACTION", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -250,8 +265,8 @@ impl RingTopologyManager {
             "#,
             params![
                 new_position,
-                shard.column_range.0,
-                shard.column_range.1,
+                shard.layer_range.0,
+                shard.layer_range.1,
                 worker.contributed_memory as i64,
                 &left_neighbor,
                 &right_neighbor,
@@ -278,9 +293,9 @@ impl RingTopologyManager {
             device_id = %worker.device_id,
             position = new_position,
             total_workers = total_workers,
-            shard_start = shard.column_range.0,
-            shard_end = shard.column_range.1,
-            "Worker added to ring"
+            layer_start = shard.layer_range.0,
+            layer_end = shard.layer_range.1,
+            "Worker added to pipeline"
         );
 
         Ok(RingPosition {
@@ -291,49 +306,45 @@ impl RingTopologyManager {
         })
     }
 
-    /// Calculate shard assignment for a given position
+    /// Calculate shard assignment for a given position (layer-based pipeline partitioning)
     ///
-    /// Formula: columns_per_worker = 8192 / total_workers
-    /// Worker N gets columns: [N * columns_per_worker, (N+1) * columns_per_worker)
+    /// Layers are distributed as evenly as possible. If the number of layers
+    /// doesn't divide evenly, earlier workers get one extra layer each.
     pub fn assign_shard(&self, position: u32, total_workers: u32) -> ModelShard {
         if total_workers == 0 {
             return ModelShard {
                 model_id: self.default_model_id.clone(),
-                column_range: (0, 0),
+                layer_range: (0, 0),
                 estimated_memory: 0,
             };
         }
 
-        let columns_per_worker = TOTAL_SHARD_COLUMNS / total_workers;
-        let remainder = TOTAL_SHARD_COLUMNS % total_workers;
+        let layers_per_worker = self.total_layers / total_workers;
+        let remainder = self.total_layers % total_workers;
 
-        // Distribute remainder columns to the first 'remainder' workers
         let start = if position < remainder {
-            position * (columns_per_worker + 1)
+            position * (layers_per_worker + 1)
         } else {
-            remainder * (columns_per_worker + 1) + (position - remainder) * columns_per_worker
+            remainder * (layers_per_worker + 1) + (position - remainder) * layers_per_worker
         };
 
         let end = if position < remainder {
-            start + columns_per_worker + 1
+            start + layers_per_worker + 1
         } else {
-            start + columns_per_worker
+            start + layers_per_worker
         };
 
-        // Estimate memory based on column count (rough estimate: 1MB per column)
-        let estimated_memory = (end - start) as u64 * 1_000_000;
+        // Estimate memory: ~1GB per layer for 70B model
+        let estimated_memory = (end - start) as u64 * 1_000_000_000;
 
         ModelShard {
             model_id: self.default_model_id.clone(),
-            column_range: (start, end),
+            layer_range: (start, end),
             estimated_memory,
         }
     }
 
     /// Update ring connections for all workers
-    ///
-    /// Updates left_neighbor and right_neighbor for all workers in the ring.
-    /// Handles wraparound: Worker 0's left = Worker N-1
     pub fn update_ring_connections(&self, network_id: &str) -> ApiResult<()> {
         let conn = self.db.get_conn()?;
 
@@ -343,7 +354,6 @@ impl RingTopologyManager {
 
         let total_workers = ring_seq.len() as u32;
 
-        // Begin transaction
         conn.execute("BEGIN TRANSACTION", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -352,7 +362,6 @@ impl RingTopologyManager {
             return Err(e);
         }
 
-        // Commit transaction
         conn.execute("COMMIT", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -394,7 +403,7 @@ impl RingTopologyManager {
                 (left, right)
             };
 
-            // Recalculate shard for updated total
+            // Recalculate shard for updated total (layer-based)
             let shard = self.assign_shard(position, total_workers);
 
             conn.execute(
@@ -409,8 +418,8 @@ impl RingTopologyManager {
                 "#,
                 params![
                     position,
-                    shard.column_range.0,
-                    shard.column_range.1,
+                    shard.layer_range.0,
+                    shard.layer_range.1,
                     &left_neighbor,
                     &right_neighbor,
                     device_id
@@ -424,7 +433,7 @@ impl RingTopologyManager {
 
     /// Handle worker failure (leave ring)
     ///
-    /// Marks worker as offline, removes from ring, and triggers redistribution.
+    /// Marks worker as offline, removes from pipeline, and triggers layer redistribution.
     pub fn handle_worker_failure(&self, failed_worker_id: DeviceId) -> ApiResult<()> {
         if failed_worker_id.is_empty() {
             return Err(ApiError::BadRequest("device_id cannot be empty".to_string()));
@@ -442,7 +451,6 @@ impl RingTopologyManager {
 
         // Check if worker exists in ring
         if !workers_map.contains_key(&failed_worker_id) {
-            // Worker not in ring, just mark as offline in DB
             let rows_affected = conn
                 .execute(
                     "UPDATE devices SET status = 'offline' WHERE device_id = ?",
@@ -465,7 +473,6 @@ impl RingTopologyManager {
 
         let remaining_workers = ring_seq.len() as u32;
 
-        // Begin transaction
         conn.execute("BEGIN TRANSACTION", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -489,26 +496,19 @@ impl RingTopologyManager {
             return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))));
         }
 
-        // Update ring connections for remaining workers
+        // Update ring connections for remaining workers (redistributes layers)
         if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq, remaining_workers) {
             conn.execute("ROLLBACK", []).ok();
             return Err(e);
         }
 
-        // Commit transaction
         conn.execute("COMMIT", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
         warn!(
             device_id = %failed_worker_id,
             remaining_workers = remaining_workers,
-            "Worker removed from ring due to failure"
-        );
-
-        // Log redistribution trigger (actual redistribution in Phase 2)
-        info!(
-            remaining_workers = remaining_workers,
-            "Shard redistribution triggered (logging only for Phase 1)"
+            "Worker removed from pipeline due to failure — layers redistributed"
         );
 
         Ok(())
@@ -534,8 +534,8 @@ impl RingTopologyManager {
             .query_map(params![network_id], |row| {
                 let device_id: String = row.get(0)?;
                 let position: u32 = row.get(1)?;
-                let shard_start: u32 = row.get(2)?;
-                let shard_end: u32 = row.get(3)?;
+                let layer_start: u32 = row.get(2)?;
+                let layer_end: u32 = row.get(3)?;
                 let left_neighbor: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
                 let right_neighbor: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
 
@@ -543,9 +543,9 @@ impl RingTopologyManager {
                     device_id,
                     position,
                     shard: ModelShard {
-                        model_id: String::new(), // Will be filled in
-                        column_range: (shard_start, shard_end),
-                        estimated_memory: (shard_end - shard_start) as u64 * 1_000_000,
+                        model_id: String::new(),
+                        layer_range: (layer_start, layer_end),
+                        estimated_memory: (layer_end - layer_start) as u64 * 1_000_000_000,
                     },
                     left_neighbor,
                     right_neighbor,
@@ -561,7 +561,6 @@ impl RingTopologyManager {
             workers.push(worker);
         }
 
-        // Ring is stable if there's at least one worker
         let ring_stable = !workers.is_empty();
 
         Ok(RingTopology {
@@ -606,7 +605,6 @@ mod tests {
 
     fn register_test_device(db: &Database, device_id: &str, network_id: &str) {
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
-        // Generate unique public key based on device_id hash
         let mut public_key = [0u8; 32];
         let hash = device_id.as_bytes();
         for (i, byte) in hash.iter().cycle().take(32).enumerate() {
@@ -629,7 +627,7 @@ mod tests {
         let (manager, _db) = create_test_ring_manager();
         let shard = manager.assign_shard(0, 1);
 
-        assert_eq!(shard.column_range, (0, TOTAL_SHARD_COLUMNS));
+        assert_eq!(shard.layer_range, (0, DEFAULT_TOTAL_LAYERS));
         assert_eq!(shard.model_id, "test-model");
     }
 
@@ -640,8 +638,8 @@ mod tests {
         let shard0 = manager.assign_shard(0, 2);
         let shard1 = manager.assign_shard(1, 2);
 
-        assert_eq!(shard0.column_range, (0, 4096));
-        assert_eq!(shard1.column_range, (4096, 8192));
+        assert_eq!(shard0.layer_range, (0, 40));
+        assert_eq!(shard1.layer_range, (40, 80));
     }
 
     #[test]
@@ -652,16 +650,16 @@ mod tests {
         let shard1 = manager.assign_shard(1, 3);
         let shard2 = manager.assign_shard(2, 3);
 
-        // 8192 / 3 = 2730 remainder 2
-        // Worker 0: 0-2731 (2731 columns)
-        // Worker 1: 2731-5462 (2731 columns)
-        // Worker 2: 5462-8192 (2730 columns)
-        assert_eq!(shard0.column_range.0, 0);
-        assert_eq!(shard2.column_range.1, TOTAL_SHARD_COLUMNS);
+        // 80 / 3 = 26 remainder 2
+        // Worker 0: 0-27 (27 layers)
+        // Worker 1: 27-54 (27 layers)
+        // Worker 2: 54-80 (26 layers)
+        assert_eq!(shard0.layer_range.0, 0);
+        assert_eq!(shard2.layer_range.1, DEFAULT_TOTAL_LAYERS);
 
         // Verify no gaps
-        assert_eq!(shard0.column_range.1, shard1.column_range.0);
-        assert_eq!(shard1.column_range.1, shard2.column_range.0);
+        assert_eq!(shard0.layer_range.1, shard1.layer_range.0);
+        assert_eq!(shard1.layer_range.1, shard2.layer_range.0);
     }
 
     #[test]
@@ -672,7 +670,7 @@ mod tests {
             let mut ranges: Vec<(u32, u32)> = Vec::new();
             for pos in 0..total {
                 let shard = manager.assign_shard(pos, total);
-                ranges.push(shard.column_range);
+                ranges.push(shard.layer_range);
             }
 
             // Verify no overlaps
@@ -692,9 +690,9 @@ mod tests {
             assert_eq!(ranges[0].0, 0, "First shard should start at 0");
             assert_eq!(
                 ranges.last().unwrap().1,
-                TOTAL_SHARD_COLUMNS,
+                DEFAULT_TOTAL_LAYERS,
                 "Last shard should end at {}",
-                TOTAL_SHARD_COLUMNS
+                DEFAULT_TOTAL_LAYERS
             );
         }
     }
@@ -720,7 +718,7 @@ mod tests {
         assert_eq!(position.position, 0);
         assert_eq!(position.left_neighbor, device_id);
         assert_eq!(position.right_neighbor, device_id);
-        assert_eq!(position.shard.column_range, (0, TOTAL_SHARD_COLUMNS));
+        assert_eq!(position.shard.layer_range, (0, DEFAULT_TOTAL_LAYERS));
     }
 
     #[test]
@@ -728,12 +726,10 @@ mod tests {
         let (manager, db) = create_test_ring_manager();
         let network_id = "test-network";
 
-        // Register 3 devices
         for i in 0..3 {
             register_test_device(&db, &format!("device-{}", i), network_id);
         }
 
-        // Add to ring
         let mut positions = Vec::new();
         for i in 0..3 {
             let worker = Worker {
@@ -746,16 +742,10 @@ mod tests {
             positions.push(manager.add_worker(worker).unwrap());
         }
 
-        // Verify positions
         assert_eq!(positions[0].position, 0);
         assert_eq!(positions[1].position, 1);
         assert_eq!(positions[2].position, 2);
 
-        // Verify final ring connections
-        // After all workers added, ring is: 0 -> 1 -> 2 -> 0
-        // Device 0: left=2, right=1
-        // Device 1: left=0, right=2
-        // Device 2: left=1, right=0
         let topology = manager.get_topology(network_id).unwrap();
         assert_eq!(topology.workers.len(), 3);
 
@@ -804,10 +794,8 @@ mod tests {
             status: "online".to_string(),
         };
 
-        // First add should succeed
         manager.add_worker(worker.clone()).unwrap();
 
-        // Second add should fail
         let result = manager.add_worker(worker);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::Conflict(_)));
@@ -818,7 +806,6 @@ mod tests {
         let (manager, db) = create_test_ring_manager();
         let network_id = "test-network";
 
-        // Register and add 3 devices
         for i in 0..3 {
             register_test_device(&db, &format!("device-{}", i), network_id);
             let worker = Worker {
@@ -831,14 +818,11 @@ mod tests {
             manager.add_worker(worker).unwrap();
         }
 
-        // Remove middle worker
         manager.handle_worker_failure("device-1".to_string()).unwrap();
 
-        // Verify remaining ring
         let topology = manager.get_topology(network_id).unwrap();
         assert_eq!(topology.workers.len(), 2);
 
-        // Check positions are 0 and 1 (renumbered)
         let positions: Vec<u32> = topology.workers.iter().map(|w| w.position).collect();
         assert!(positions.contains(&0));
         assert!(positions.contains(&1));
@@ -849,10 +833,8 @@ mod tests {
         let (manager, db) = create_test_ring_manager();
         let network_id = "test-network";
 
-        // Register but don't add to ring
         register_test_device(&db, "device-1", network_id);
 
-        // Should succeed (just marks as offline)
         let result = manager.handle_worker_failure("device-1".to_string());
         assert!(result.is_ok());
     }
@@ -882,11 +864,9 @@ mod tests {
 
         register_test_device(&db, "device-1", network_id);
 
-        // Empty ring should not be stable
         let topology = manager.get_topology(network_id).unwrap();
         assert!(!topology.ring_stable);
 
-        // Add worker
         let worker = Worker {
             device_id: "device-1".to_string(),
             network_id: network_id.to_string(),
@@ -896,7 +876,6 @@ mod tests {
         };
         manager.add_worker(worker).unwrap();
 
-        // Ring with worker should be stable
         let topology = manager.get_topology(network_id).unwrap();
         assert!(topology.ring_stable);
     }
@@ -906,7 +885,6 @@ mod tests {
         let (manager, db) = create_test_ring_manager();
         let network_id = "test-network";
 
-        // Register and add 2 devices
         for i in 0..2 {
             register_test_device(&db, &format!("device-{}", i), network_id);
             let worker = Worker {
@@ -919,11 +897,9 @@ mod tests {
             manager.add_worker(worker).unwrap();
         }
 
-        // Remove all workers
         manager.handle_worker_failure("device-0".to_string()).unwrap();
         manager.handle_worker_failure("device-1".to_string()).unwrap();
 
-        // Verify ring is empty
         let topology = manager.get_topology(network_id).unwrap();
         assert!(topology.workers.is_empty());
         assert!(!topology.ring_stable);
@@ -934,7 +910,6 @@ mod tests {
         let (manager, db) = create_test_ring_manager();
         let network_id = "test-network";
 
-        // Register and add 10 devices
         for i in 0..10 {
             register_test_device(&db, &format!("device-{}", i), network_id);
             let worker = Worker {
@@ -947,17 +922,15 @@ mod tests {
             manager.add_worker(worker).unwrap();
         }
 
-        // Verify ring correctness
         let topology = manager.get_topology(network_id).unwrap();
         assert_eq!(topology.workers.len(), 10);
         assert!(topology.ring_stable);
 
-        // Verify positions are 0-9
         let mut positions: Vec<u32> = topology.workers.iter().map(|w| w.position).collect();
         positions.sort();
         assert_eq!(positions, (0..10).collect::<Vec<_>>());
 
-        // Verify neighbor correctness for each worker
+        // Verify neighbor correctness
         for worker in &topology.workers {
             let left_pos = if worker.position == 0 { 9 } else { worker.position - 1 };
             let right_pos = (worker.position + 1) % 10;
@@ -969,17 +942,15 @@ mod tests {
             assert_eq!(worker.right_neighbor, expected_right);
         }
 
-        // Verify shard coverage
+        // Verify layer coverage
         let mut all_ranges: Vec<(u32, u32)> = topology.workers.iter()
-            .map(|w| w.shard.column_range)
+            .map(|w| w.shard.layer_range)
             .collect();
         all_ranges.sort_by_key(|r| r.0);
 
-        // First should start at 0, last should end at 8192
         assert_eq!(all_ranges[0].0, 0);
-        assert_eq!(all_ranges[9].1, TOTAL_SHARD_COLUMNS);
+        assert_eq!(all_ranges[9].1, DEFAULT_TOTAL_LAYERS);
 
-        // No gaps between ranges
         for i in 0..9 {
             assert_eq!(all_ranges[i].1, all_ranges[i + 1].0);
         }

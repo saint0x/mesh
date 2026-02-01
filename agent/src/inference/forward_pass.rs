@@ -1,83 +1,48 @@
-//! Tensor-Parallel Forward Pass Implementation
+//! Pipeline-Parallel Forward Pass Implementation
 //!
-//! This module implements the actual tensor-parallel forward pass for transformer inference.
-//! Each worker holds a column shard of the model weights and participates in ring all-reduce
-//! to produce identical activations across all workers.
-//!
-//! ## Forward Pass Flow (per layer)
+//! Each worker runs a contiguous range of complete transformer layers.
+//! Activations flow through the pipeline:
 //!
 //! ```text
-//! Input: hidden_states [seq_len, hidden_dim]
-//!        │
-//!        ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 1. Partial Attention (my columns only)              │
-//! │    Q_partial = hidden @ W_q[my_cols]                │
-//! │    K_partial = hidden @ W_k[my_cols]                │
-//! │    V_partial = hidden @ W_v[my_cols]                │
-//! └─────────────────────────────────────────────────────┘
-//!        │
-//!        ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 2. Ring All-Reduce (combine partials)               │
-//! │    Q_full = ring_allreduce(Q_partial)               │
-//! │    K_full = ring_allreduce(K_partial)               │
-//! │    V_full = ring_allreduce(V_partial)               │
-//! └─────────────────────────────────────────────────────┘
-//!        │
-//!        ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 3. Attention Computation (identical on all workers) │
-//! │    scores = softmax(Q @ K^T / sqrt(d))              │
-//! │    attn_output = scores @ V                         │
-//! └─────────────────────────────────────────────────────┘
-//!        │
-//!        ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 4. MLP (my columns only + all-reduce)               │
-//! │    mlp_partial = attn_output @ W_mlp[my_cols]       │
-//! │    mlp_full = ring_allreduce(mlp_partial)           │
-//! │    output = activation(mlp_full) @ W_down          │
-//! └─────────────────────────────────────────────────────┘
-//!        │
-//!        ▼
-//! Output: next_hidden_states [seq_len, hidden_dim]
+//! [Stage 0: embed + layers 0..19] → activations → [Stage 1: layers 20..39]
+//!     → activations → [Stage 2: layers 40..59] → activations →
+//!     [Stage 3: layers 60..79 + lm_head + sample] → token broadcast → all stages
 //! ```
+//!
+//! Only N-1 activation transfers per token (vs 560+ all-reduce ops in TP).
 
 use crate::errors::Result;
-use crate::executor::ring_allreduce::WorkerRing;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use super::kv_cache::KVCache;
 use super::tensor_ops::{
     embed_tokens, matmul, rms_norm, sample_greedy, sample_token, silu, softmax, Tensor1D, Tensor2D,
 };
 
-/// Weights for a single transformer layer (sharded)
+/// Weights for a single transformer layer (full — not sharded)
 ///
-/// Each worker holds only their column range of the weight matrices.
+/// In pipeline parallelism, each worker holds complete layer weights
+/// for the layers it owns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerWeights {
-    /// Layer index
     pub layer_idx: usize,
 
-    /// Query projection weights [hidden_dim, shard_cols]
+    /// Query projection weights [hidden_dim, hidden_dim]
     pub w_q: Tensor2D,
-    /// Key projection weights [hidden_dim, shard_cols]
+    /// Key projection weights [hidden_dim, hidden_dim]
     pub w_k: Tensor2D,
-    /// Value projection weights [hidden_dim, shard_cols]
+    /// Value projection weights [hidden_dim, hidden_dim]
     pub w_v: Tensor2D,
-    /// Output projection weights [shard_cols, hidden_dim]
+    /// Output projection weights [hidden_dim, hidden_dim]
     pub w_o: Tensor2D,
 
-    /// MLP up projection [hidden_dim, shard_cols]
+    /// MLP up projection [hidden_dim, intermediate_size]
     pub w_up: Tensor2D,
-    /// MLP gate projection (for SwiGLU) [hidden_dim, shard_cols]
+    /// MLP gate projection (for SwiGLU) [hidden_dim, intermediate_size]
     pub w_gate: Tensor2D,
-    /// MLP down projection [shard_cols, hidden_dim]
+    /// MLP down projection [intermediate_size, hidden_dim]
     pub w_down: Tensor2D,
 
     /// RMS norm weight for attention [hidden_dim]
@@ -103,7 +68,6 @@ impl LayerWeights {
         }
     }
 
-    /// Get memory usage in bytes
     pub fn memory_usage(&self) -> usize {
         (self.w_q.len()
             + self.w_k.len()
@@ -114,57 +78,45 @@ impl LayerWeights {
             + self.w_down.len()
             + self.attn_norm.len()
             + self.mlp_norm.len())
-            * 4 // f32 = 4 bytes
+            * 4
     }
 }
 
-/// Full model weights (sharded across workers)
+/// Full model weights for this pipeline stage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelWeights {
-    /// Model identifier
     pub model_id: String,
 
     /// Token embedding table [vocab_size, hidden_dim]
     pub embedding: Tensor2D,
 
-    /// Per-layer weights (sharded)
+    /// Layer weights for this stage's layer range
     pub layers: Vec<LayerWeights>,
 
     /// Final RMS norm weights [hidden_dim]
     pub final_norm: Tensor1D,
 
     /// Output projection (lm_head) [hidden_dim, vocab_size]
-    /// Note: Often tied to embedding.transpose()
     pub lm_head: Tensor2D,
 
-    /// Model configuration
     pub config: ModelConfig,
 }
 
 /// Model configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// Hidden dimension
     pub hidden_dim: usize,
-    /// Number of attention heads
     pub num_heads: usize,
-    /// Number of KV heads (for GQA)
     pub num_kv_heads: usize,
-    /// Number of layers
     pub num_layers: usize,
-    /// Vocabulary size
     pub vocab_size: usize,
-    /// Intermediate size for MLP
     pub intermediate_size: usize,
-    /// RMS norm epsilon
     pub rms_norm_eps: f32,
-    /// RoPE base frequency
     pub rope_base: f32,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        // LLaMA 70B configuration
         Self {
             hidden_dim: 8192,
             num_heads: 64,
@@ -179,7 +131,6 @@ impl Default for ModelConfig {
 }
 
 impl ModelWeights {
-    /// Create placeholder weights for testing
     pub fn placeholder(config: ModelConfig, shard_cols: usize) -> Self {
         let layers = (0..config.num_layers)
             .map(|i| LayerWeights::placeholder(i, config.hidden_dim, shard_cols))
@@ -195,7 +146,6 @@ impl ModelWeights {
         }
     }
 
-    /// Get total memory usage in bytes
     pub fn memory_usage(&self) -> usize {
         let layer_mem: usize = self.layers.iter().map(|l| l.memory_usage()).sum();
         let embed_mem = self.embedding.len() * 4;
@@ -205,35 +155,50 @@ impl ModelWeights {
     }
 }
 
-/// Forward pass state for tensor-parallel inference
+/// Pipeline-parallel forward pass state
+///
+/// Each stage runs its assigned layers locally with no network communication
+/// during the per-layer compute. The only network transfers are:
+/// 1. Receiving activations from the previous stage (or embedding locally)
+/// 2. Sending activations to the next stage (or computing logits locally)
 pub struct ForwardPass {
-    /// Model weights (sharded for this worker)
+    /// Model weights for this stage
     pub weights: ModelWeights,
 
-    /// KV cache for attention
+    /// KV cache for attention (scoped to this stage's layers)
     pub kv_cache: KVCache,
 
-    /// This worker's shard column range
-    pub shard_start: usize,
-    pub shard_end: usize,
+    /// First layer this stage owns (inclusive)
+    pub layer_start: usize,
 
-    /// Total workers in ring
+    /// Last layer this stage owns (exclusive)
+    pub layer_end: usize,
+
+    /// Total workers in pipeline
     pub total_workers: u32,
+
+    /// This stage's position in the pipeline
+    pub stage_position: u32,
 
     /// Current position in sequence
     pub position: usize,
+
+    // Legacy fields kept for API compat
+    pub shard_start: usize,
+    pub shard_end: usize,
 }
 
 impl ForwardPass {
-    /// Create a new forward pass state
+    /// Create a new forward pass (legacy API — interprets shard range as layers)
     pub fn new(
         weights: ModelWeights,
         shard_start: usize,
         shard_end: usize,
         total_workers: u32,
     ) -> Self {
+        let num_stage_layers = shard_end - shard_start;
         let kv_config = super::kv_cache::KVCacheConfig {
-            num_layers: weights.config.num_layers,
+            num_layers: num_stage_layers,
             num_heads: weights.config.num_heads,
             head_dim: weights.config.hidden_dim / weights.config.num_heads,
             max_seq_len: 4096,
@@ -242,133 +207,145 @@ impl ForwardPass {
         Self {
             weights,
             kv_cache: KVCache::new(kv_config),
+            layer_start: shard_start,
+            layer_end: shard_end,
+            total_workers,
+            stage_position: 0,
+            position: 0,
             shard_start,
             shard_end,
-            total_workers,
-            position: 0,
         }
     }
 
-    /// Embed input tokens
+    /// Create with explicit pipeline stage info
+    pub fn new_pipeline_stage(
+        weights: ModelWeights,
+        layer_start: usize,
+        layer_end: usize,
+        stage_position: u32,
+        total_workers: u32,
+    ) -> Self {
+        let num_stage_layers = layer_end - layer_start;
+        let kv_config = super::kv_cache::KVCacheConfig {
+            num_layers: num_stage_layers,
+            num_heads: weights.config.num_heads,
+            head_dim: weights.config.hidden_dim / weights.config.num_heads,
+            max_seq_len: 4096,
+        };
+
+        Self {
+            weights,
+            kv_cache: KVCache::new(kv_config),
+            layer_start,
+            layer_end,
+            total_workers,
+            stage_position,
+            position: 0,
+            shard_start: layer_start,
+            shard_end: layer_end,
+        }
+    }
+
+    pub fn is_first_stage(&self) -> bool {
+        self.stage_position == 0
+    }
+
+    pub fn is_last_stage(&self) -> bool {
+        self.stage_position == self.total_workers - 1
+    }
+
+    /// Embed input tokens (only called by first stage)
     pub fn embed(&self, tokens: &[u32]) -> Result<Tensor2D> {
         embed_tokens(&self.weights.embedding, tokens)
     }
 
-    /// Run forward pass for a single layer with ring all-reduce
+    /// Run a single layer forward pass locally (no network)
     ///
-    /// This is the core tensor-parallel operation:
-    /// 1. Compute partial attention/MLP with local shard
-    /// 2. Ring all-reduce to combine results
-    /// 3. Apply activation and normalization
-    pub async fn forward_layer(
+    /// `rel_layer_idx` is the index into `self.weights.layers` (0-based).
+    pub fn forward_layer_local(
         &mut self,
         hidden: &Tensor2D,
-        layer_idx: usize,
-        worker_ring: &mut WorkerRing<'_>,
-        job_id: Uuid,
+        rel_layer_idx: usize,
     ) -> Result<Tensor2D> {
-        let layer = &self.weights.layers[layer_idx];
+        let layer = &self.weights.layers[rel_layer_idx];
         let config = &self.weights.config;
-        let start = Instant::now();
 
         // 1. RMS Norm before attention
         let normed = rms_norm(hidden, &layer.attn_norm, config.rms_norm_eps)?;
 
-        // 2. Compute partial QKV projections (my columns only)
-        let q_partial = matmul(&normed, &layer.w_q)?;
-        let k_partial = matmul(&normed, &layer.w_k)?;
-        let v_partial = matmul(&normed, &layer.w_v)?;
+        // 2. Full QKV projections (complete — no sharding)
+        let q = matmul(&normed, &layer.w_q)?;
+        let k = matmul(&normed, &layer.w_k)?;
+        let v = matmul(&normed, &layer.w_v)?;
 
-        debug!(
-            "Layer {} QKV partial computed: {}x{} -> {}x{}",
-            layer_idx, normed.rows, normed.cols, q_partial.rows, q_partial.cols
-        );
+        // 3. Update KV cache
+        self.kv_cache.update_layer(rel_layer_idx, k.clone(), v.clone())?;
 
-        // 3. Ring all-reduce to get full QKV
-        let q_full = self
-            .ring_allreduce_tensor(&q_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-        let k_full = self
-            .ring_allreduce_tensor(&k_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-        let v_full = self
-            .ring_allreduce_tensor(&v_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-
-        // 4. Update KV cache
-        self.kv_cache.update_layer(layer_idx, k_full.clone(), v_full.clone())?;
-
-        // 5. Compute attention (simplified - no heads split for clarity)
-        // In production, this would properly handle multi-head attention
-        let attn_scores = matmul(&q_full, &k_full.transpose())?;
+        // 4. Compute attention
+        let attn_scores = matmul(&q, &k.transpose())?;
         let scale = 1.0 / (config.hidden_dim as f32 / config.num_heads as f32).sqrt();
         let scaled_scores = attn_scores.scale(scale);
         let attn_probs = softmax(&scaled_scores);
-        let attn_output = matmul(&attn_probs, &v_full)?;
+        let attn_output = matmul(&attn_probs, &v)?;
 
-        // 6. Output projection (partial)
-        let o_partial = matmul(&attn_output, &layer.w_o)?;
-        let o_full = self
-            .ring_allreduce_tensor(&o_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
+        // 5. Output projection
+        let o = matmul(&attn_output, &layer.w_o)?;
 
-        // 7. Residual connection
-        let post_attn = hidden.add(&o_full)?;
+        // 6. Residual connection
+        let post_attn = hidden.add(&o)?;
 
-        // 8. MLP with SwiGLU
+        // 7. MLP with SwiGLU
         let mlp_normed = rms_norm(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
+        let gate = matmul(&mlp_normed, &layer.w_gate)?;
+        let up = matmul(&mlp_normed, &layer.w_up)?;
+        let gate_activated = silu(&gate);
+        let mlp_hidden = gate_activated.mul(&up)?;
+        let down = matmul(&mlp_hidden, &layer.w_down)?;
 
-        // Gate and up projections (partial)
-        let gate_partial = matmul(&mlp_normed, &layer.w_gate)?;
-        let up_partial = matmul(&mlp_normed, &layer.w_up)?;
-
-        // All-reduce gate and up
-        let gate_full = self
-            .ring_allreduce_tensor(&gate_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-        let up_full = self
-            .ring_allreduce_tensor(&up_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-
-        // SwiGLU: silu(gate) * up
-        let gate_activated = silu(&gate_full);
-        let mlp_hidden = gate_activated.mul(&up_full)?;
-
-        // Down projection (partial)
-        let down_partial = matmul(&mlp_hidden, &layer.w_down)?;
-        let down_full = self
-            .ring_allreduce_tensor(&down_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-
-        // 9. Final residual
-        let output = post_attn.add(&down_full)?;
-
-        debug!(
-            "Layer {} forward complete in {:?}",
-            layer_idx,
-            start.elapsed()
-        );
+        // 8. Final residual
+        let output = post_attn.add(&down)?;
 
         Ok(output)
     }
 
-    /// Compute logits from final hidden states
-    pub fn compute_logits(&self, hidden: &Tensor2D) -> Result<Tensor1D> {
-        // Apply final RMS norm
-        let normed = rms_norm(hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
+    /// Run this stage's complete forward pass (all local layers, no network)
+    ///
+    /// Input: hidden states from previous stage (or embedded tokens for stage 0)
+    /// Output: hidden states to send to next stage (or to compute logits for last stage)
+    pub fn forward_stage(&mut self, input_hidden: &Tensor2D) -> Result<Tensor2D> {
+        let start = Instant::now();
+        let mut hidden = input_hidden.clone();
 
-        // Take last token's hidden state
+        for rel_idx in 0..self.weights.layers.len() {
+            let abs_layer_idx = self.layer_start + rel_idx;
+            hidden = self.forward_layer_local(&hidden, rel_idx)?;
+
+            debug!(
+                stage = self.stage_position,
+                layer = abs_layer_idx,
+                "Layer complete"
+            );
+        }
+
+        info!(
+            stage = self.stage_position,
+            layers = format!("{}-{}", self.layer_start, self.layer_end),
+            elapsed = ?start.elapsed(),
+            "Stage forward pass complete"
+        );
+
+        Ok(hidden)
+    }
+
+    /// Compute logits from final hidden states (only called by last stage)
+    pub fn compute_logits(&self, hidden: &Tensor2D) -> Result<Tensor1D> {
+        let normed = rms_norm(hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
         let last_row = normed.row(normed.rows - 1);
         let last_hidden = Tensor2D::new(last_row.to_vec(), 1, normed.cols)?;
-
-        // Project to vocabulary
         let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
-
-        // Flatten to 1D
         Ok(Tensor1D::new(logits_2d.data))
     }
 
-    /// Sample next token from logits
     pub fn sample(&self, logits: &Tensor1D, temperature: f32, top_p: f32, seed: u64) -> u32 {
         if temperature <= 0.0 || temperature == 1.0 && top_p >= 1.0 {
             sample_greedy(logits)
@@ -377,104 +354,54 @@ impl ForwardPass {
         }
     }
 
-    /// Run full forward pass for all layers
+    /// Run full forward pass for all layers (single-stage fallback, legacy API)
     pub async fn forward(
         &mut self,
         tokens: &[u32],
-        worker_ring: &mut WorkerRing<'_>,
-        job_id: Uuid,
+        _worker_ring: &mut crate::executor::ring_allreduce::WorkerRing<'_>,
+        _job_id: uuid::Uuid,
     ) -> Result<Tensor2D> {
-        let start = Instant::now();
-
-        // 1. Embed tokens
         let mut hidden = self.embed(tokens)?;
-        debug!("Embedded {} tokens -> {:?}", tokens.len(), (hidden.rows, hidden.cols));
-
-        // 2. Run through all layers
-        for layer_idx in 0..self.weights.config.num_layers {
-            hidden = self.forward_layer(&hidden, layer_idx, worker_ring, job_id).await?;
-        }
-
-        // 3. Apply final norm
+        hidden = self.forward_stage(&hidden)?;
         hidden = rms_norm(&hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
-
-        info!(
-            "Full forward pass complete: {} layers in {:?}",
-            self.weights.config.num_layers,
-            start.elapsed()
-        );
-
         Ok(hidden)
     }
 
-    /// Generate next token using full forward pass
+    /// Generate next token (single-stage fallback, legacy API)
     pub async fn generate_next_token(
         &mut self,
         tokens: &[u32],
-        worker_ring: &mut WorkerRing<'_>,
-        job_id: Uuid,
+        worker_ring: &mut crate::executor::ring_allreduce::WorkerRing<'_>,
+        job_id: uuid::Uuid,
         temperature: f32,
         top_p: f32,
     ) -> Result<u32> {
-        // Run forward pass
         let hidden = self.forward(tokens, worker_ring, job_id).await?;
-
-        // Compute logits
         let logits = self.compute_logits(&hidden)?;
-
-        // Sample
         let seed = job_id.as_u128() as u64 ^ self.position as u64;
         let next_token = self.sample(&logits, temperature, top_p, seed);
-
         self.position += 1;
-
         Ok(next_token)
     }
 
-    /// Helper: Convert Tensor2D to ring all-reduce format and back
-    async fn ring_allreduce_tensor(
-        &self,
-        tensor: &Tensor2D,
-        worker_ring: &mut WorkerRing<'_>,
-        job_id: Uuid,
-        layer_idx: u32,
-    ) -> Result<Tensor2D> {
-        // Convert to flat tensor for all-reduce
-        let flat = tensor.to_allreduce_tensor();
-
-        // Perform ring all-reduce
-        let reduced = worker_ring
-            .ring_all_reduce(flat, job_id, layer_idx)
-            .await?;
-
-        // Convert back to 2D
-        Tensor2D::from_allreduce_tensor(&reduced)
-    }
-
-    /// Clear KV cache (for new sequence)
     pub fn clear_cache(&mut self) {
         self.kv_cache.clear();
         self.position = 0;
     }
 
-    /// Get current KV cache memory usage
     pub fn cache_memory_usage(&self) -> usize {
         self.kv_cache.memory_usage()
     }
 }
 
-/// Simplified forward pass for testing without ring all-reduce
+/// Simplified forward pass for testing without network
 pub struct LocalForwardPass {
-    /// Model weights
     pub weights: ModelWeights,
-    /// KV cache
     pub kv_cache: KVCache,
-    /// Current position
     pub position: usize,
 }
 
 impl LocalForwardPass {
-    /// Create a new local forward pass
     pub fn new(weights: ModelWeights) -> Self {
         let kv_config = super::kv_cache::KVCacheConfig {
             num_layers: weights.config.num_layers,
@@ -490,49 +417,35 @@ impl LocalForwardPass {
         }
     }
 
-    /// Run forward pass without distribution (for testing)
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Tensor2D> {
-        // Embed tokens
         let mut hidden = embed_tokens(&self.weights.embedding, tokens)?;
 
-        // Run through all layers (simplified - no attention for demo)
         for layer_idx in 0..self.weights.config.num_layers {
             let layer = &self.weights.layers[layer_idx];
             let config = &self.weights.config;
 
-            // RMS Norm
             let normed = rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
 
-            // Simplified: just MLP (no real attention for testing)
             let gate = matmul(&normed, &layer.w_gate)?;
             let up = matmul(&normed, &layer.w_up)?;
             let gate_activated = silu(&gate);
             let mlp_hidden = gate_activated.mul(&up)?;
             let mlp_out = matmul(&mlp_hidden, &layer.w_down)?;
 
-            // Residual
             hidden = hidden.add(&mlp_out)?;
         }
 
-        // Final norm
         hidden = rms_norm(&hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
-
         Ok(hidden)
     }
 
-    /// Generate next token locally
     pub fn generate_next_token(&mut self, tokens: &[u32], temperature: f32, top_p: f32) -> Result<u32> {
         let hidden = self.forward(tokens)?;
-
-        // Get last hidden state
         let last_row = hidden.row(hidden.rows - 1);
         let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols)?;
-
-        // Project to logits
         let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
         let logits = Tensor1D::new(logits_2d.data);
 
-        // Sample
         let seed = self.position as u64;
         let next_token = if temperature <= 0.0 {
             sample_greedy(&logits)
@@ -565,32 +478,27 @@ mod tests {
     #[test]
     fn test_placeholder_weights() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config.clone(), 32);
-
+        let weights = ModelWeights::placeholder(config.clone(), 64);
         assert_eq!(weights.layers.len(), config.num_layers);
         assert!(weights.memory_usage() > 0);
     }
 
     #[test]
     fn test_layer_weights_memory() {
-        let layer = LayerWeights::placeholder(0, 64, 32);
-        let mem = layer.memory_usage();
-
-        // Should be roughly: 7 matrices * 64 * 32 * 4 + 2 norms * 64 * 4
-        assert!(mem > 0);
+        let layer = LayerWeights::placeholder(0, 64, 64);
+        assert!(layer.memory_usage() > 0);
     }
 
     #[test]
     fn test_local_forward_pass() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config, 64); // Full width for local
+        let weights = ModelWeights::placeholder(config, 64);
         let mut forward = LocalForwardPass::new(weights);
 
         let tokens = vec![1, 2, 3];
         let hidden = forward.forward(&tokens).unwrap();
-
-        assert_eq!(hidden.rows, 3); // seq_len
-        assert_eq!(hidden.cols, 64); // hidden_dim
+        assert_eq!(hidden.rows, 3);
+        assert_eq!(hidden.cols, 64);
     }
 
     #[test]
@@ -601,19 +509,40 @@ mod tests {
 
         let tokens = vec![1, 2, 3];
         let next_token = forward.generate_next_token(&tokens, 1.0, 0.9).unwrap();
-
-        // Token should be in vocab range
         assert!(next_token < 100);
     }
 
     #[test]
     fn test_forward_pass_creation() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config, 16);
-        let forward = ForwardPass::new(weights, 0, 16, 4);
+        let weights = ModelWeights::placeholder(config, 64);
+        let forward = ForwardPass::new(weights, 0, 2, 1);
 
-        assert_eq!(forward.shard_start, 0);
-        assert_eq!(forward.shard_end, 16);
-        assert_eq!(forward.total_workers, 4);
+        assert_eq!(forward.layer_start, 0);
+        assert_eq!(forward.layer_end, 2);
+        assert_eq!(forward.total_workers, 1);
+    }
+
+    #[test]
+    fn test_pipeline_stage_creation() {
+        let config = create_test_config();
+        let weights = ModelWeights::placeholder(config, 64);
+        let forward = ForwardPass::new_pipeline_stage(weights, 0, 2, 0, 4);
+
+        assert!(forward.is_first_stage());
+        assert!(!forward.is_last_stage());
+    }
+
+    #[test]
+    fn test_single_stage_forward() {
+        let config = create_test_config();
+        let weights = ModelWeights::placeholder(config, 64);
+        let mut forward = ForwardPass::new_pipeline_stage(weights, 0, 2, 0, 1);
+
+        let tokens = vec![1, 2, 3];
+        let embedded = forward.embed(&tokens).unwrap();
+        let output = forward.forward_stage(&embedded).unwrap();
+        assert_eq!(output.rows, 3);
+        assert_eq!(output.cols, 64);
     }
 }

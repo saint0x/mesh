@@ -322,7 +322,7 @@ impl ShardLoader for MockShardLoader {
         info!(
             model_id = %model_id,
             position = assignment.worker_position,
-            column_range = ?assignment.column_range(),
+            layer_range = ?assignment.layer_range(),
             "Loading shard"
         );
 

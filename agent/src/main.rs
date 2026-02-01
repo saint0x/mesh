@@ -829,13 +829,13 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                                 use agent::inference::coordinator::WorkerPosition;
 
                                 // Get shard info from state
-                                let (col_start, col_end) = if let Some(shard) = state.get("shard") {
+                                let (layer_start, layer_end) = if let Some(shard) = state.get("shard") {
                                     (
                                         shard.get("column_start").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                                        shard.get("column_end").and_then(|v| v.as_u64()).unwrap_or(8192) as u32,
+                                        shard.get("column_end").and_then(|v| v.as_u64()).unwrap_or(80) as u32,
                                     )
                                 } else {
-                                    (0, 8192)
+                                    (0, 80)
                                 };
 
                                 let position = WorkerPosition {
@@ -843,15 +843,15 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
                                     total_workers: total as u32,
                                     left_neighbor: left_peer,
                                     right_neighbor: right_peer,
-                                    shard_column_range: (col_start, col_end),
+                                    shard_layer_range: (layer_start, layer_end),
                                     shard_memory_bytes: 8_000_000_000, // 8GB default
                                 };
 
                                 info!(
                                     position = pos,
                                     total_workers = total,
-                                    shard_range = ?(col_start, col_end),
-                                    "Loaded ring position for inference"
+                                    layer_range = ?(layer_start, layer_end),
+                                    "Loaded pipeline position for inference"
                                 );
 
                                 // Join ring in coordinator
@@ -1494,8 +1494,8 @@ async fn cmd_shard_status() -> Result<()> {
             println!("\n  Model: {}", model_id.bold());
             println!("    Status:       {}", status_str);
             println!(
-                "    Columns:      {} - {}",
-                info.assignment.column_start, info.assignment.column_end
+                "    Layers:       {} - {}",
+                info.assignment.layer_start, info.assignment.layer_end
             );
             println!(
                 "    Worker Pos:   {}/{}",

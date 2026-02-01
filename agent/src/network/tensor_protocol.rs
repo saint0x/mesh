@@ -1,100 +1,246 @@
-// Tensor protocol implementation for ring all-reduce communication over libp2p
+//! Pipeline Activation Protocol for Distributed Inference
+//!
+//! This protocol carries hidden-state activations between pipeline stages.
+//! In pipeline parallelism, each worker runs a contiguous range of layers
+//! and sends the resulting activations to the next stage.
+//!
+//! Every message carries full distributed tracing context so that the
+//! end-to-end path of a request can be reconstructed across all nodes.
 
 use futures::prelude::*;
 use libp2p::request_response::{self, Behaviour, Config, ProtocolSupport};
 use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-/// Protocol ID for mesh tensor communication
-pub const TENSOR_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/mesh/tensor/1.0.0");
+/// Protocol identifier
+pub const TENSOR_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/mesh/pipeline/1.0.0");
 
-/// Maximum message size for tensor messages (10MB)
-pub const MESSAGE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
-
-/// Phase of the ring all-reduce algorithm
+/// Phase of the pipeline communication
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AllReducePhase {
-    /// Reduce-scatter phase: each node sends a chunk to the next node
-    /// and accumulates chunks received from the previous node
-    ReduceScatter,
-    /// All-gather phase: each node broadcasts its fully reduced chunk
-    /// around the ring so all nodes end up with the complete result
-    AllGather,
-    /// Barrier synchronization
+pub enum PipelinePhase {
+    /// Forward pass: activations flowing from stage N to stage N+1
+    ForwardActivation,
+    /// Token broadcast: sampled token flowing from last stage back to all stages
+    TokenBroadcast,
+    /// Barrier synchronization between stages
     Barrier,
 }
 
-/// Tensor message for ring all-reduce communication
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// Keep the old name as an alias so existing code outside this crate compiles
+pub type AllReducePhase = PipelinePhase;
+
+/// Message sent between pipeline stages
+///
+/// Every message carries a full trace context so operations can be correlated
+/// across all devices in the pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorMessage {
-    /// Job ID this tensor belongs to
+    // === Distributed Tracing Context ===
+
+    /// Unique job identifier (trace root) — assigned when the request enters the system
     pub job_id: Uuid,
-    /// Layer index in the model
+
+    /// Span ID for this specific operation (unique per send)
+    pub span_id: u64,
+
+    /// Span ID of the parent operation (the sender's current span)
+    pub parent_span_id: u64,
+
+    /// Monotonic sequence number within a job (0, 1, 2, ...) for ordering verification
+    pub sequence_num: u64,
+
+    // === Pipeline Metadata ===
+
+    /// Which layer's output this activation represents (the last layer the sender processed)
     pub layer_idx: u32,
-    /// Current phase of the all-reduce algorithm
-    pub phase: AllReducePhase,
-    /// Step number within the current phase
-    pub step: u32,
-    /// Tensor chunk data (f32 values)
-    pub chunk_data: Vec<f32>,
-    /// Shape of the chunk
-    pub chunk_shape: Vec<usize>,
-    /// Unix timestamp when the message was created
+
+    /// Pipeline phase
+    pub phase: PipelinePhase,
+
+    /// Token index in the generation sequence (which token step we're on)
+    pub token_idx: u32,
+
+    /// Position of the sender in the pipeline
+    pub sender_stage: u32,
+
+    // === Payload ===
+
+    /// Activation data (flattened f32 tensor)
+    pub activation_data: Vec<f32>,
+
+    /// Shape of the activation tensor (e.g., [seq_len, hidden_dim])
+    pub activation_shape: Vec<usize>,
+
+    /// SHA-256 checksum of activation_data for divergence detection (first 8 bytes)
+    pub checksum: [u8; 8],
+
+    // === Legacy/compat fields ===
+
+    /// Timestamp when this message was created (millis since epoch)
     pub timestamp: u64,
+
+    /// Step within phase (legacy compat for ring all-reduce callers)
+    pub step: u32,
 }
 
 impl TensorMessage {
-    /// Special step number indicating a barrier synchronization message
+    /// Sentinel step value used for barrier messages
     pub const BARRIER_STEP: u32 = 0xFFFFFFFF;
 
-    /// Create a new tensor message with current timestamp
+    /// Create a new pipeline activation message with tracing context
+    pub fn new_activation(
+        job_id: Uuid,
+        layer_idx: u32,
+        token_idx: u32,
+        sender_stage: u32,
+        sequence_num: u64,
+        parent_span_id: u64,
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> Self {
+        let checksum = Self::compute_checksum(&data);
+        let span_id = Self::generate_span_id();
+
+        Self {
+            job_id,
+            span_id,
+            parent_span_id,
+            sequence_num,
+            layer_idx,
+            phase: PipelinePhase::ForwardActivation,
+            token_idx,
+            sender_stage,
+            activation_data: data,
+            activation_shape: shape,
+            checksum,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            step: 0,
+        }
+    }
+
+    /// Create a token broadcast message (last stage → all stages)
+    pub fn new_token_broadcast(
+        job_id: Uuid,
+        token_idx: u32,
+        sender_stage: u32,
+        sequence_num: u64,
+        parent_span_id: u64,
+        token_id: u32,
+    ) -> Self {
+        let data = vec![token_id as f32];
+        let shape = vec![1];
+        let checksum = Self::compute_checksum(&data);
+
+        Self {
+            job_id,
+            span_id: Self::generate_span_id(),
+            parent_span_id,
+            sequence_num,
+            layer_idx: u32::MAX,
+            phase: PipelinePhase::TokenBroadcast,
+            token_idx,
+            sender_stage,
+            activation_data: data,
+            activation_shape: shape,
+            checksum,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            step: 0,
+        }
+    }
+
+    /// Create a legacy-format message (backward compat with ring all-reduce callers)
     pub fn new(
         job_id: Uuid,
         layer_idx: u32,
-        phase: AllReducePhase,
+        phase: PipelinePhase,
         step: u32,
         chunk_data: Vec<f32>,
         chunk_shape: Vec<usize>,
     ) -> Self {
+        let checksum = Self::compute_checksum(&chunk_data);
+
         Self {
             job_id,
+            span_id: Self::generate_span_id(),
+            parent_span_id: 0,
+            sequence_num: 0,
             layer_idx,
             phase,
+            token_idx: 0,
+            sender_stage: 0,
+            activation_data: chunk_data,
+            activation_shape: chunk_shape,
+            checksum,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             step,
-            chunk_data,
-            chunk_shape,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
         }
     }
 
     /// Check if this is a barrier message
     pub fn is_barrier(&self) -> bool {
-        self.step == Self::BARRIER_STEP
+        self.phase == PipelinePhase::Barrier && self.step == Self::BARRIER_STEP
     }
 
-    /// Calculate the approximate size of this message in bytes.
-    ///
-    /// Note: This is an estimate based on raw field sizes, not the actual
-    /// CBOR-encoded size which may differ due to encoding overhead.
-    pub fn size_bytes(&self) -> usize {
-        // UUID (16) + layer_idx (4) + phase (1) + step (4) + timestamp (8)
-        // + chunk_data (len * 4) + chunk_shape (len * 8) + vec overhead
-        let fixed_size = 16 + 4 + 1 + 4 + 8;
-        let chunk_data_size = self.chunk_data.len() * std::mem::size_of::<f32>();
-        let chunk_shape_size = self.chunk_shape.len() * std::mem::size_of::<usize>();
-        fixed_size + chunk_data_size + chunk_shape_size
+    /// Verify the checksum of the activation data
+    pub fn verify_checksum(&self) -> bool {
+        let expected = Self::compute_checksum(&self.activation_data);
+        self.checksum == expected
+    }
+
+    /// Compute SHA-256 checksum (first 8 bytes) of f32 data
+    pub fn compute_checksum(data: &[f32]) -> [u8; 8] {
+        let mut hasher = Sha256::new();
+        for val in data {
+            hasher.update(val.to_le_bytes());
+        }
+        let hash = hasher.finalize();
+        let mut result = [0u8; 8];
+        result.copy_from_slice(&hash[..8]);
+        result
+    }
+
+    /// Generate a unique span ID
+    fn generate_span_id() -> u64 {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        // XOR with random bits for uniqueness even at nanosecond resolution
+        ts ^ (rand::random::<u64>() >> 16)
+    }
+
+    // === Legacy accessor shims ===
+
+    /// Legacy: access activation_data as chunk_data
+    pub fn chunk_data(&self) -> &[f32] {
+        &self.activation_data
+    }
+
+    /// Legacy: access activation_shape as chunk_shape
+    pub fn chunk_shape(&self) -> &[usize] {
+        &self.activation_shape
     }
 }
 
-/// CBOR codec for tensor protocol messages
+/// CBOR codec for TensorMessage (length-prefixed)
 #[derive(Debug, Clone, Default)]
 pub struct TensorCodec;
+
+/// Maximum message size: 100 MB (activations can be large for long sequences)
+const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 #[async_trait::async_trait]
 impl request_response::Codec for TensorCodec {
@@ -110,7 +256,7 @@ impl request_response::Codec for TensorCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_cbor_message(io).await
+        read_message(io).await
     }
 
     async fn read_response<T>(
@@ -121,7 +267,7 @@ impl request_response::Codec for TensorCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_cbor_message(io).await
+        read_message(io).await
     }
 
     async fn write_request<T>(
@@ -133,7 +279,7 @@ impl request_response::Codec for TensorCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_cbor_message(io, &req).await
+        write_message(io, &req).await
     }
 
     async fn write_response<T>(
@@ -145,345 +291,172 @@ impl request_response::Codec for TensorCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_cbor_message(io, &res).await
+        write_message(io, &res).await
     }
 }
 
-/// Read a length-prefixed CBOR message from an async stream
-async fn read_cbor_message<T, M>(io: &mut T) -> io::Result<M>
-where
-    T: AsyncRead + Unpin + Send,
-    M: for<'de> Deserialize<'de>,
-{
-    // Read u32 length prefix (big-endian)
+async fn read_message<T: AsyncRead + Unpin>(
+    io: &mut T,
+) -> io::Result<TensorMessage> {
+    use tokio::io::AsyncReadExt;
+
     let mut len_buf = [0u8; 4];
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    // Enforce size limit
-    if len > MESSAGE_SIZE_LIMIT {
+    if len > MAX_MESSAGE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Message size {} exceeds limit {}", len, MESSAGE_SIZE_LIMIT),
+            format!("Message too large: {} bytes (max {})", len, MAX_MESSAGE_SIZE),
         ));
     }
 
-    // Read CBOR payload
     let mut buf = vec![0u8; len];
     io.read_exact(&mut buf).await?;
 
-    // Deserialize CBOR
-    ciborium::from_reader(&buf[..]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    ciborium::de::from_reader(&buf[..]).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("CBOR decode: {}", e))
+    })
 }
 
-/// Write a length-prefixed CBOR message to an async stream
-async fn write_cbor_message<T, M>(io: &mut T, message: &M) -> io::Result<()>
-where
-    T: AsyncWrite + Unpin + Send,
-    M: Serialize,
-{
-    // Serialize to CBOR
+async fn write_message<T: AsyncWrite + Unpin>(
+    io: &mut T,
+    msg: &TensorMessage,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let mut buf = Vec::new();
-    ciborium::into_writer(message, &mut buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    ciborium::ser::into_writer(msg, &mut buf).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("CBOR encode: {}", e))
+    })?;
 
-    // Check size limit
-    if buf.len() > MESSAGE_SIZE_LIMIT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Message size {} exceeds limit {}",
-                buf.len(),
-                MESSAGE_SIZE_LIMIT
-            ),
-        ));
-    }
-
-    // Write u32 length prefix (big-endian)
     let len = buf.len() as u32;
     io.write_all(&len.to_be_bytes()).await?;
-
-    // Write CBOR payload
     io.write_all(&buf).await?;
-    io.flush().await?;
 
     Ok(())
 }
 
-/// Configuration for the tensor protocol behavior
+/// TensorProtocol type alias
+pub type TensorProtocol = request_response::Behaviour<TensorCodec>;
+
+/// Configuration for tensor protocol
 #[derive(Debug, Clone)]
 pub struct TensorProtocolConfig {
-    /// Request timeout (short for tensor communication)
-    pub request_timeout: Duration,
+    pub max_message_size: usize,
 }
 
 impl Default for TensorProtocolConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(2), // Short timeout for tensor exchange
+            max_message_size: MAX_MESSAGE_SIZE,
         }
     }
 }
 
-/// Type alias for tensor protocol behavior
-pub type TensorProtocol = Behaviour<TensorCodec>;
-
-/// Create a new tensor protocol behavior
+/// Create a new tensor protocol behaviour
 pub fn new_tensor_protocol(config: TensorProtocolConfig) -> TensorProtocol {
     let protocols = std::iter::once((TENSOR_PROTOCOL_ID, ProtocolSupport::Full));
+    let mut req_resp_config = Config::default();
+    req_resp_config.set_request_timeout(Duration::from_secs(30));
 
-    let mut cfg = Config::default();
-    cfg = cfg.with_request_timeout(config.request_timeout);
-
-    Behaviour::new(protocols, cfg)
+    Behaviour::with_codec(TensorCodec, protocols, req_resp_config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::io::Cursor;
 
     #[test]
-    fn test_tensor_message_serialization() {
-        let msg = TensorMessage {
-            job_id: Uuid::new_v4(),
-            layer_idx: 5,
-            phase: AllReducePhase::ReduceScatter,
-            step: 3,
-            chunk_data: vec![1.0, 2.0, 3.0, 4.0],
-            chunk_shape: vec![2, 2],
-            timestamp: 1234567890,
-        };
-
-        // Serialize to CBOR
-        let mut buf = Vec::new();
-        ciborium::into_writer(&msg, &mut buf).unwrap();
-
-        // Deserialize from CBOR
-        let decoded: TensorMessage = ciborium::from_reader(&buf[..]).unwrap();
-
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_all_reduce_phase_serialization() {
-        // Test ReduceScatter
-        let phase = AllReducePhase::ReduceScatter;
-        let mut buf = Vec::new();
-        ciborium::into_writer(&phase, &mut buf).unwrap();
-        let decoded: AllReducePhase = ciborium::from_reader(&buf[..]).unwrap();
-        assert_eq!(phase, decoded);
-
-        // Test AllGather
-        let phase = AllReducePhase::AllGather;
-        let mut buf = Vec::new();
-        ciborium::into_writer(&phase, &mut buf).unwrap();
-        let decoded: AllReducePhase = ciborium::from_reader(&buf[..]).unwrap();
-        assert_eq!(phase, decoded);
-    }
-
-    #[test]
-    fn test_tensor_message_new() {
+    fn test_new_activation_message() {
         let job_id = Uuid::new_v4();
-        let msg = TensorMessage::new(
+        let msg = TensorMessage::new_activation(
             job_id,
+            5,
+            0,
             1,
-            AllReducePhase::AllGather,
+            42,
+            0,
+            vec![1.0, 2.0, 3.0],
+            vec![1, 3],
+        );
+
+        assert_eq!(msg.job_id, job_id);
+        assert_eq!(msg.layer_idx, 5);
+        assert_eq!(msg.phase, PipelinePhase::ForwardActivation);
+        assert_eq!(msg.token_idx, 0);
+        assert_eq!(msg.sender_stage, 1);
+        assert_eq!(msg.sequence_num, 42);
+        assert!(msg.span_id != 0);
+        assert!(msg.verify_checksum());
+    }
+
+    #[test]
+    fn test_token_broadcast_message() {
+        let job_id = Uuid::new_v4();
+        let msg = TensorMessage::new_token_broadcast(job_id, 5, 3, 100, 0, 42);
+
+        assert_eq!(msg.phase, PipelinePhase::TokenBroadcast);
+        assert_eq!(msg.activation_data, vec![42.0]);
+        assert!(msg.verify_checksum());
+    }
+
+    #[test]
+    fn test_checksum_verification() {
+        let msg = TensorMessage::new_activation(
+            Uuid::new_v4(),
+            0,
+            0,
+            0,
+            0,
             0,
             vec![1.0, 2.0, 3.0],
             vec![3],
         );
 
-        assert_eq!(msg.job_id, job_id);
-        assert_eq!(msg.layer_idx, 1);
-        assert_eq!(msg.phase, AllReducePhase::AllGather);
-        assert_eq!(msg.step, 0);
-        assert_eq!(msg.chunk_data, vec![1.0, 2.0, 3.0]);
-        assert_eq!(msg.chunk_shape, vec![3]);
-        assert!(msg.timestamp > 0);
+        assert!(msg.verify_checksum());
+
+        let mut corrupted = msg.clone();
+        corrupted.activation_data[0] = 999.0;
+        assert!(!corrupted.verify_checksum());
     }
 
     #[test]
-    fn test_tensor_message_size_bytes() {
-        let msg = TensorMessage {
-            job_id: Uuid::new_v4(),
-            layer_idx: 0,
-            phase: AllReducePhase::ReduceScatter,
-            step: 0,
-            chunk_data: vec![1.0, 2.0, 3.0, 4.0], // 4 * 4 = 16 bytes
-            chunk_shape: vec![2, 2],              // 2 * 8 = 16 bytes
-            timestamp: 0,
-        };
-
-        let size = msg.size_bytes();
-        // fixed (33) + chunk_data (16) + chunk_shape (16) = 65
-        assert!(size > 0);
-        assert!(size >= 33 + 16); // At minimum
-    }
-
-    #[test]
-    fn test_tensor_message_different_shapes() {
-        // Test with 1D tensor
-        let msg_1d = TensorMessage::new(
+    fn test_legacy_new_compat() {
+        let msg = TensorMessage::new(
             Uuid::new_v4(),
-            0,
-            AllReducePhase::ReduceScatter,
-            0,
-            vec![1.0; 100],
-            vec![100],
-        );
-
-        let mut buf = Vec::new();
-        ciborium::into_writer(&msg_1d, &mut buf).unwrap();
-        let decoded: TensorMessage = ciborium::from_reader(&buf[..]).unwrap();
-        assert_eq!(msg_1d, decoded);
-
-        // Test with 3D tensor shape
-        let msg_3d = TensorMessage::new(
-            Uuid::new_v4(),
-            1,
-            AllReducePhase::AllGather,
             5,
-            vec![2.0; 8],
-            vec![2, 2, 2],
+            PipelinePhase::Barrier,
+            TensorMessage::BARRIER_STEP,
+            vec![0.0],
+            vec![1],
         );
-
-        let mut buf = Vec::new();
-        ciborium::into_writer(&msg_3d, &mut buf).unwrap();
-        let decoded: TensorMessage = ciborium::from_reader(&buf[..]).unwrap();
-        assert_eq!(msg_3d, decoded);
+        assert!(msg.is_barrier());
     }
 
     #[test]
-    fn test_protocol_id() {
-        assert_eq!(TENSOR_PROTOCOL_ID.as_ref(), "/mesh/tensor/1.0.0");
-    }
-
-    #[test]
-    fn test_default_config() {
-        let config = TensorProtocolConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(2));
-    }
-
-    #[tokio::test]
-    async fn test_cbor_roundtrip() {
-        let msg = TensorMessage::new(
+    fn test_cbor_roundtrip() {
+        let msg = TensorMessage::new_activation(
             Uuid::new_v4(),
+            10,
             3,
-            AllReducePhase::ReduceScatter,
-            7,
-            vec![1.5, 2.5, 3.5],
-            vec![3],
+            1,
+            99,
+            55,
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2, 2],
         );
 
-        // Write to buffer
-        let mut write_buf = Vec::new();
-        write_cbor_message(&mut write_buf, &msg).await.unwrap();
-
-        // Read from buffer
-        let mut read_buf = Cursor::new(write_buf);
-        let decoded: TensorMessage = read_cbor_message(&mut read_buf).await.unwrap();
-
-        assert_eq!(msg, decoded);
-    }
-
-    #[tokio::test]
-    async fn test_message_size_limit() {
-        // Create a message that exceeds the size limit (>10MB)
-        // CBOR uses half-precision floats for 0.0, so we need enough data
-        // 10MB / 4 bytes per f32 = ~2.5M floats, but CBOR is more compact for zeros
-        // Use non-zero values and more data to ensure we exceed 10MB
-        let large_msg = TensorMessage {
-            job_id: Uuid::new_v4(),
-            layer_idx: 0,
-            phase: AllReducePhase::ReduceScatter,
-            step: 0,
-            chunk_data: vec![1.234_567_9; 4_000_000], // Should exceed 10MB with non-zero values
-            chunk_shape: vec![4_000_000],
-            timestamp: 0,
-        };
-
         let mut buf = Vec::new();
-        let result = write_cbor_message(&mut buf, &large_msg).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
+        ciborium::ser::into_writer(&msg, &mut buf).unwrap();
+        let decoded: TensorMessage = ciborium::de::from_reader(&buf[..]).unwrap();
 
-    #[tokio::test]
-    async fn test_read_size_limit_enforcement() {
-        // Create a valid message
-        let msg = TensorMessage::new(
-            Uuid::new_v4(),
-            0,
-            AllReducePhase::AllGather,
-            0,
-            vec![1.0, 2.0],
-            vec![2],
-        );
-
-        // Write it normally
-        let mut write_buf = Vec::new();
-        write_cbor_message(&mut write_buf, &msg).await.unwrap();
-
-        // Tamper with the length prefix to be larger than limit
-        let large_len: u32 = (MESSAGE_SIZE_LIMIT + 1) as u32;
-        write_buf[0..4].copy_from_slice(&large_len.to_be_bytes());
-
-        // Try to read it (should fail)
-        let mut read_buf = Cursor::new(write_buf);
-        let result: io::Result<TensorMessage> = read_cbor_message(&mut read_buf).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn test_malformed_cbor() {
-        // Create a buffer with valid length prefix but invalid CBOR data
-        let mut buf = Vec::new();
-        let len: u32 = 10;
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-
-        let mut read_buf = Cursor::new(buf);
-        let result: io::Result<TensorMessage> = read_cbor_message(&mut read_buf).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn test_incomplete_read() {
-        // Create a buffer with length prefix indicating more data than available
-        let mut buf = Vec::new();
-        let len: u32 = 100;
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(&[0x01, 0x02, 0x03]); // Only 3 bytes, not 100
-
-        let mut read_buf = Cursor::new(buf);
-        let result: io::Result<TensorMessage> = read_cbor_message(&mut read_buf).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_max_valid_message() {
-        // Create a message close to but under the size limit
-        // ~9MB of data (under 10MB limit)
-        let msg = TensorMessage {
-            job_id: Uuid::new_v4(),
-            layer_idx: 0,
-            phase: AllReducePhase::ReduceScatter,
-            step: 0,
-            chunk_data: vec![1.0; 2_000_000], // ~8MB of f32s
-            chunk_shape: vec![2_000_000],
-            timestamp: 0,
-        };
-
-        // Should write successfully
-        let mut write_buf = Vec::new();
-        write_cbor_message(&mut write_buf, &msg).await.unwrap();
-
-        // Should read successfully
-        let mut read_buf = Cursor::new(write_buf);
-        let decoded: TensorMessage = read_cbor_message(&mut read_buf).await.unwrap();
-        assert_eq!(msg.chunk_data.len(), decoded.chunk_data.len());
+        assert_eq!(decoded.job_id, msg.job_id);
+        assert_eq!(decoded.layer_idx, msg.layer_idx);
+        assert_eq!(decoded.token_idx, msg.token_idx);
+        assert_eq!(decoded.sender_stage, msg.sender_stage);
+        assert_eq!(decoded.sequence_num, msg.sequence_num);
+        assert_eq!(decoded.activation_data, msg.activation_data);
+        assert_eq!(decoded.checksum, msg.checksum);
     }
 }

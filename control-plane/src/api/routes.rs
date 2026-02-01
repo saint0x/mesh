@@ -80,8 +80,8 @@ pub async fn register_device(
             position: position.position,
             shard: ShardInfo {
                 model_id: position.shard.model_id,
-                column_start: position.shard.column_range.0,
-                column_end: position.shard.column_range.1,
+                column_start: position.shard.layer_range.0,
+                column_end: position.shard.layer_range.1,
                 estimated_memory: position.shard.estimated_memory,
             },
             left_neighbor: position.left_neighbor,
