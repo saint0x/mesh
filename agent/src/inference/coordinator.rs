@@ -115,6 +115,9 @@ pub struct InferenceCoordinator {
 
     /// Cached weights per model (model_id -> weights)
     weight_cache: RwLock<HashMap<String, Arc<ModelWeights>>>,
+
+    /// Active forward pass state for the currently executing job
+    active_forward_pass: Option<ForwardPass>,
 }
 
 impl InferenceCoordinator {
@@ -138,6 +141,7 @@ impl InferenceCoordinator {
             shard_registry,
             loader,
             weight_cache: RwLock::new(HashMap::new()),
+            active_forward_pass: None,
         }
     }
 
@@ -311,6 +315,7 @@ impl InferenceCoordinator {
         }
 
         let execution_time_ms = start.elapsed().as_millis() as u64;
+        self.active_forward_pass = None;
 
         match result {
             Ok(()) => {
@@ -427,25 +432,19 @@ impl InferenceCoordinator {
             .get_or_load_weights(&model_id, position)
             .await?;
 
-        // Create WorkerRing for this token generation
-        // NOTE: WorkerRing is lightweight (just metadata), so creating per-token is fine
-        let mut worker_ring = WorkerRing::new(
-            position.position,
-            position.total_workers,
-            position.left_neighbor,
-            position.right_neighbor,
-            self.swarm_mut(),
-        );
+        if self.active_forward_pass.is_none() {
+            self.active_forward_pass = Some(ForwardPass::new(
+                (*weights).clone(),
+                position.shard_column_range.0 as usize,
+                position.shard_column_range.1 as usize,
+                position.total_workers,
+            ));
+        }
 
-        // Create ForwardPass with loaded weights
-        // NOTE: ForwardPass is created per-token (KV cache/position changes)
-        // Weights are cached, so this is efficient
-        let mut forward_pass = ForwardPass::new(
-            (*weights).clone(), // Clone Arc's inner ModelWeights
-            position.shard_column_range.0 as usize,
-            position.shard_column_range.1 as usize,
-            position.total_workers,
-        );
+        let mut forward_pass = self
+            .active_forward_pass
+            .take()
+            .expect("active forward pass must be initialized");
 
         // Build full token sequence (prompt + generated so far)
         let mut all_tokens = job.request.prompt_tokens.clone();
@@ -459,15 +458,27 @@ impl InferenceCoordinator {
 
         // Run forward pass with ring all-reduce
         // WorkerRing created per-token (lightweight metadata structure)
-        let next_token = forward_pass
-            .generate_next_token(
-                &all_tokens,
-                &mut worker_ring,
-                job.request.job_id,
-                job.request.config.temperature,
-                job.request.config.top_p,
-            )
-            .await?;
+        let next_token = {
+            let mut worker_ring = WorkerRing::new(
+                position.position,
+                position.total_workers,
+                position.left_neighbor,
+                position.right_neighbor,
+                self.swarm_mut(),
+            );
+
+            forward_pass
+                .generate_next_token(
+                    &all_tokens,
+                    &mut worker_ring,
+                    job.request.job_id,
+                    job.request.config.temperature,
+                    job.request.config.top_p,
+                )
+                .await?
+        };
+
+        self.active_forward_pass = Some(forward_pass);
 
         let elapsed = start.elapsed().as_millis() as u64;
         debug!(
@@ -502,7 +513,8 @@ impl InferenceCoordinator {
                 "Creating checkpoint"
             );
 
-            manager.save_checkpoint(job).await?;
+            let kv_cache = self.active_forward_pass.as_ref().map(|pass| &pass.kv_cache);
+            manager.save_checkpoint(job, kv_cache).await?;
             self.stats.record_checkpoint();
         }
         Ok(())
@@ -514,8 +526,28 @@ impl InferenceCoordinator {
         &mut self,
         job_id: Uuid,
     ) -> Result<Option<InferenceJob>> {
-        if let Some(ref manager) = self.checkpoint_manager {
+        if let Some(manager) = self.checkpoint_manager.clone() {
             if let Some(job) = manager.load_checkpoint(job_id).await? {
+                if let Some(position) = self.position.clone() {
+                    let weights = self
+                        .get_or_load_weights(&job.request.model_id, &position)
+                        .await?;
+
+                    let mut forward_pass = ForwardPass::new(
+                        (*weights).clone(),
+                        position.shard_column_range.0 as usize,
+                        position.shard_column_range.1 as usize,
+                        position.total_workers,
+                    );
+
+                    if let Some(kv_cache) = manager.load_checkpoint_kv_cache(job_id).await? {
+                        forward_pass.kv_cache = kv_cache;
+                        forward_pass.position = job.current_token_idx as usize;
+                    }
+
+                    self.active_forward_pass = Some(forward_pass);
+                }
+
                 self.stats.record_recovery();
                 info!(
                     job_id = %job_id,

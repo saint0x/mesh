@@ -32,8 +32,8 @@ impl RegistrationClient {
 
     /// Register device with the control plane
     ///
-    /// Returns the certificate blob on success
-    pub async fn register(&self, config: &DeviceConfig) -> Result<Vec<u8>> {
+    /// Returns the certificate blob and relay addresses on success
+    pub async fn register(&self, config: &DeviceConfig) -> Result<RegisterDeviceResponse> {
         let request = RegisterDeviceRequest {
             device_id: config.device_id.to_string(),
             network_id: config.network_id.clone(),
@@ -55,13 +55,13 @@ impl RegistrationClient {
 
         for attempt in 1..=max_retries {
             match self.try_register(&request).await {
-                Ok(cert) => {
+                Ok(response) => {
                     info!(
                         device_id = %config.device_id,
                         attempt = attempt,
                         "Device registered successfully"
                     );
-                    return Ok(cert);
+                    return Ok(response);
                 }
                 Err(e) if attempt < max_retries => {
                     warn!(
@@ -90,7 +90,7 @@ impl RegistrationClient {
     }
 
     /// Try to register once (no retries)
-    async fn try_register(&self, request: &RegisterDeviceRequest) -> Result<Vec<u8>> {
+    async fn try_register(&self, request: &RegisterDeviceRequest) -> Result<RegisterDeviceResponse> {
         let url = format!("{}/api/devices/register", self.control_plane_url);
 
         let response = self
@@ -126,9 +126,13 @@ impl RegistrationClient {
             ));
         }
 
-        register_response
-            .certificate
-            .ok_or_else(|| AgentError::Registration("No certificate in response".to_string()))
+        if register_response.certificate.is_none() {
+            return Err(AgentError::Registration(
+                "No certificate in response".to_string(),
+            ));
+        }
+
+        Ok(register_response)
     }
 
     /// Send a single heartbeat

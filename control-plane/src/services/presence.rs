@@ -82,6 +82,7 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -137,6 +138,7 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 

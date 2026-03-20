@@ -8,6 +8,7 @@
 
 use crate::errors::{AgentError, Result};
 use crate::inference::job::InferenceJob;
+use crate::inference::kv_cache::KVCache;
 use std::path::Path;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -53,7 +54,11 @@ impl CheckpointManager {
     }
 
     /// Save a checkpoint for an inference job
-    pub async fn save_checkpoint(&self, job: &InferenceJob) -> Result<CheckpointMetadata> {
+    pub async fn save_checkpoint(
+        &self,
+        job: &InferenceJob,
+        kv_cache: Option<&KVCache>,
+    ) -> Result<CheckpointMetadata> {
         debug!(
             job_id = %job.request.job_id,
             token_index = job.current_token_idx,
@@ -61,7 +66,7 @@ impl CheckpointManager {
         );
 
         // Create checkpoint from job state
-        let checkpoint = self.create_checkpoint(job)?;
+        let checkpoint = self.create_checkpoint(job, kv_cache)?;
 
         // Serialize to CBOR
         let data = checkpoint.to_cbor().map_err(|e| {
@@ -156,6 +161,38 @@ impl CheckpointManager {
         }
 
         Ok(None)
+    }
+
+    pub async fn load_checkpoint_kv_cache(&self, job_id: Uuid) -> Result<Option<KVCache>> {
+        let job_dir = self.config.checkpoint_dir.join(job_id.to_string());
+        if !job_dir.exists() {
+            return Ok(None);
+        }
+
+        let mut checkpoints = Vec::new();
+        for entry in std::fs::read_dir(&job_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "ckpt").unwrap_or(false) {
+                checkpoints.push(path);
+            }
+        }
+
+        let mut latest: Option<Checkpoint> = None;
+        let mut latest_token_idx = 0;
+        for path in checkpoints {
+            if let Ok(checkpoint) = self.load_checkpoint_file(&path).await {
+                if checkpoint.metadata.token_index >= latest_token_idx {
+                    latest_token_idx = checkpoint.metadata.token_index;
+                    latest = Some(checkpoint);
+                }
+            }
+        }
+
+        Ok(latest
+            .and_then(|checkpoint| checkpoint.kv_cache_state)
+            .map(|bytes| KVCache::from_bytes(&bytes))
+            .transpose()?)
     }
 
     /// List all checkpoints for a job
@@ -285,7 +322,7 @@ impl CheckpointManager {
     // === Private Methods ===
 
     /// Create a checkpoint from job state
-    fn create_checkpoint(&self, job: &InferenceJob) -> Result<Checkpoint> {
+    fn create_checkpoint(&self, job: &InferenceJob, kv_cache: Option<&KVCache>) -> Result<Checkpoint> {
         let metadata = CheckpointMetadata::new(
             job.request.job_id,
             job.current_token_idx,
@@ -314,13 +351,15 @@ impl CheckpointManager {
             total_layers: job.total_layers,
         };
 
+        let rng_state = Some(job.request.job_id.as_u128().to_le_bytes().to_vec());
+
         let checkpoint = Checkpoint {
             metadata,
             request,
             generated_tokens: job.generated_tokens.clone(),
             config,
-            kv_cache_state: None, // TODO: Serialize KV cache
-            rng_state: None,      // TODO: Serialize RNG state
+            kv_cache_state: kv_cache.map(KVCache::to_bytes).transpose()?,
+            rng_state,
         };
 
         Ok(checkpoint)
@@ -388,6 +427,8 @@ impl CheckpointManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::kv_cache::{KVCache, KVCacheConfig};
+    use crate::inference::tensor_ops::Tensor2D;
     use tempfile::TempDir;
     use crate::inference::job::{GenerationConfig, InferenceRequest};
 
@@ -436,7 +477,7 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save checkpoint
-        let metadata = manager.save_checkpoint(&job).await.unwrap();
+        let metadata = manager.save_checkpoint(&job, None).await.unwrap();
         assert_eq!(metadata.job_id, job_id);
         assert_eq!(metadata.token_index, 3);
 
@@ -448,6 +489,42 @@ mod tests {
         assert_eq!(restored_job.request.job_id, job_id);
         assert_eq!(restored_job.generated_tokens, vec![100, 101, 102]);
         assert_eq!(restored_job.current_token_idx, 3);
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_checkpoint_kv_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = CheckpointConfig {
+            checkpoint_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let manager = CheckpointManager::new(config, "worker-1".to_string()).unwrap();
+        let job = create_test_job();
+
+        let mut kv_cache = KVCache::new(KVCacheConfig {
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 2,
+            max_seq_len: 16,
+        });
+        kv_cache
+            .update_layer(
+                0,
+                Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4).unwrap(),
+                Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 1, 4).unwrap(),
+            )
+            .unwrap();
+
+        manager.save_checkpoint(&job, Some(&kv_cache)).await.unwrap();
+        let restored = manager
+            .load_checkpoint_kv_cache(job.request.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(restored.seq_len(), 1);
+        assert_eq!(restored.layers[0].keys.as_ref().unwrap().data, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[tokio::test]
@@ -464,11 +541,11 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save multiple checkpoints
-        manager.save_checkpoint(&job).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
         job.add_token(103);
-        manager.save_checkpoint(&job).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
         job.add_token(104);
-        manager.save_checkpoint(&job).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
 
         // List checkpoints
         let checkpoints = manager.list_checkpoints(job_id).await.unwrap();
@@ -493,7 +570,7 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save and then delete
-        let metadata = manager.save_checkpoint(&job).await.unwrap();
+        let metadata = manager.save_checkpoint(&job, None).await.unwrap();
         manager.delete_checkpoint(job_id, metadata.checkpoint_id).await.unwrap();
 
         // Should be empty now
@@ -517,7 +594,7 @@ mod tests {
         // Save 4 checkpoints (should keep only 2)
         for i in 0..4 {
             job.add_token(200 + i);
-            manager.save_checkpoint(&job).await.unwrap();
+            manager.save_checkpoint(&job, None).await.unwrap();
         }
 
         // Should only have 2 checkpoints
@@ -545,7 +622,7 @@ mod tests {
 
         // Save a checkpoint
         let job = create_test_job();
-        manager.save_checkpoint(&job).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
 
         // Should have some usage now
         let usage = manager.storage_usage().await.unwrap();

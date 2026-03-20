@@ -53,6 +53,10 @@ pub struct DeviceConfig {
     /// Control plane API URL
     pub control_plane_url: String,
 
+    /// Relay addresses advertised by the control plane for this network
+    #[serde(default)]
+    pub relay_addresses: Vec<String>,
+
     /// Device hardware capabilities
     pub capabilities: DeviceCapabilities,
 }
@@ -91,6 +95,7 @@ impl DeviceConfig {
             keypair,
             network_id,
             control_plane_url,
+            relay_addresses: Vec::new(),
             capabilities,
         }
     }
@@ -317,6 +322,7 @@ mod tests {
         assert_eq!(config.name, "test-device");
         assert_eq!(config.network_id, "test-network");
         assert_eq!(config.control_plane_url, "http://localhost:8080");
+        assert!(config.relay_addresses.is_empty());
         assert!(config.capabilities.cpu_cores > 0);
     }
 
@@ -345,6 +351,7 @@ mod tests {
         assert_eq!(original.name, loaded.name);
         assert_eq!(original.network_id, loaded.network_id);
         assert_eq!(original.control_plane_url, loaded.control_plane_url);
+        assert_eq!(original.relay_addresses, loaded.relay_addresses);
 
         // CRITICAL: Verify keypair bytes are identical
         assert_eq!(

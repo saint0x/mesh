@@ -1,4 +1,5 @@
 use crate::device::DeviceCapabilities;
+use crate::db::models::Network;
 use serde::{Deserialize, Serialize};
 
 /// Request to register a new device
@@ -34,6 +35,27 @@ pub struct RegisterDeviceResponse {
     /// Ring position info (if device joined ring)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ring_position: Option<RingPositionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateNetworkRequest {
+    pub network_id: String,
+    pub name: String,
+    pub owner_user_id: String,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateNetworkResponse {
+    pub success: bool,
+    pub network: Network,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListNetworksResponse {
+    pub success: bool,
+    pub networks: Vec<Network>,
 }
 
 /// Ring position information in registration response

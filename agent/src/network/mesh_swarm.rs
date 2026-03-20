@@ -70,7 +70,7 @@ impl From<RequestResponseEvent<TensorMessage, TensorMessage>> for MeshBehaviourE
 /// Configuration for the mesh swarm
 #[derive(Debug, Clone)]
 pub struct MeshSwarmConfig {
-    /// Relay server multiaddress (e.g., "/ip4/127.0.0.1/tcp/4001")
+    /// Relay server multiaddress
     pub relay_addr: Multiaddr,
 
     /// Keep-alive interval for idle connections
@@ -86,11 +86,14 @@ pub struct MeshSwarmConfig {
 impl Default for MeshSwarmConfig {
     fn default() -> Self {
         Self {
-            relay_addr: "/ip4/127.0.0.1/tcp/4001".parse().unwrap_or_else(|e| {
-                tracing::error!("Failed to parse default relay address: {}", e);
-                // Fallback to any valid multiaddr - this should never happen
-                "/ip4/0.0.0.0/tcp/4001".parse().unwrap()
-            }),
+            relay_addr: std::env::var("MESHNET_RELAY_ADDR")
+                .ok()
+                .and_then(|addr| addr.parse().ok())
+                .unwrap_or_else(|| {
+                    "/dns4/relay.meshnet.invalid/tcp/4001"
+                        .parse()
+                        .expect("static default relay address must be valid")
+                }),
             keep_alive: Duration::from_secs(60),
             job_protocol: JobProtocolConfig::default(),
             tensor_protocol: TensorProtocolConfig::default(),
@@ -695,7 +698,7 @@ mod tests {
     fn test_default_config() {
         let config = MeshSwarmConfig::default();
         assert_eq!(config.keep_alive, Duration::from_secs(60));
-        assert!(config.relay_addr.to_string().contains("127.0.0.1"));
+        assert!(config.relay_addr.to_string().contains("relay.meshnet.invalid"));
     }
 
     #[test]

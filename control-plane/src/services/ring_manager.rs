@@ -620,6 +620,7 @@ mod tests {
             "Test Device".to_string(),
             public_key.to_vec(),
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
     }

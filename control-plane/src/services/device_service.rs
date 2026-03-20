@@ -2,6 +2,7 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::db::Database;
 use crate::device::DeviceCapabilities;
 use crate::services::certificate::ControlPlaneKeypair;
+use crate::services::network_service;
 use rusqlite::{params, OptionalExtension};
 use time::OffsetDateTime;
 use tracing::{debug, info};
@@ -15,6 +16,7 @@ pub fn register_device(
     name: String,
     public_key: Vec<u8>,
     capabilities: DeviceCapabilities,
+    relay_addresses: Vec<String>,
 ) -> ApiResult<(Vec<u8>, Vec<String>)> {
     // Validate inputs
     if device_id.is_empty() {
@@ -29,10 +31,9 @@ pub fn register_device(
         ));
     }
 
-    let conn = db.get_conn()?;
+    network_service::require_network_exists(db, &network_id)?;
 
-    // For MVP: Create default network if it doesn't exist
-    ensure_network_exists(&conn, &network_id)?;
+    let conn = db.get_conn()?;
 
     // Check if device already registered
     let existing: Option<String> = conn
@@ -93,11 +94,6 @@ pub fn register_device(
         "Device registered successfully"
     );
 
-    // Return certificate and relay addresses (hardcoded for MVP)
-    let relay_addresses = vec![
-        "/ip4/127.0.0.1/tcp/4001".to_string(), // Localhost relay for development
-    ];
-
     Ok((certificate, relay_addresses))
 }
 
@@ -139,47 +135,12 @@ pub fn update_heartbeat(db: &Database, device_id: String) -> ApiResult<String> {
     Ok(now_str)
 }
 
-/// Ensure network exists (create default if missing, for MVP)
-fn ensure_network_exists(
-    conn: &rusqlite::Connection,
-    network_id: &str,
-) -> Result<(), ApiError> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT network_id FROM networks WHERE network_id = ?",
-            params![network_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-    if existing.is_none() {
-        // Create default network (for MVP)
-        let now = OffsetDateTime::now_utc();
-        let now_str = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|e| ApiError::Internal(format!("Failed to format timestamp: {}", e)))?;
-
-        conn.execute(
-            r#"
-            INSERT INTO networks (network_id, name, owner_user_id, created_at, settings)
-            VALUES (?, ?, 'default-user', ?, '{}')
-            "#,
-            params![network_id, network_id, &now_str],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-        info!(network_id = %network_id, "Created default network");
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::create_test_db;
     use crate::device::Tier;
+    use crate::services::network_service;
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
@@ -196,6 +157,14 @@ mod tests {
     fn test_register_device() {
         let db = create_test_db();
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let device_id = "test-device-1";
         let network_id = "test-network";
@@ -209,6 +178,7 @@ mod tests {
             "Test Device".to_string(),
             public_key.clone(),
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -235,6 +205,14 @@ mod tests {
     fn test_register_duplicate_device() {
         let db = create_test_db();
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let device_id = "test-device-2";
         let network_id = "test-network";
@@ -248,6 +226,7 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -260,6 +239,7 @@ mod tests {
             "Test Device".to_string(),
             vec![43u8; 32],
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         );
 
         assert!(result.is_err());
@@ -270,6 +250,14 @@ mod tests {
     fn test_update_heartbeat() {
         let db = create_test_db();
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let device_id = "test-device-3";
 
@@ -282,6 +270,7 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -318,6 +307,14 @@ mod tests {
     fn test_invalid_public_key_length() {
         let db = create_test_db();
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let result = register_device(
             &db,
@@ -327,9 +324,29 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 16], // Wrong length
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         );
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn test_register_device_requires_existing_network() {
+        let db = create_test_db();
+        let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+
+        let result = register_device(
+            &db,
+            &keypair,
+            "test-device-missing-network".to_string(),
+            "missing-network".to_string(),
+            "Test Device".to_string(),
+            vec![42u8; 32],
+            test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
+        );
+
+        assert!(matches!(result, Err(ApiError::NotFound(_))));
     }
 }

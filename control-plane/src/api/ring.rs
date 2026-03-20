@@ -13,6 +13,7 @@ use crate::api::types::{
     RingLeaveResponse, RingTopologyResponse, ShardInfo, TopologyVersionRequest,
     TopologyVersionResponse, UpdateHandoffRequest, WorkerInfo,
 };
+use crate::services::network_service;
 use crate::services::ring_manager::Worker;
 use crate::services::topology_notifier::HandoffStatus;
 use crate::state::AppState;
@@ -41,6 +42,8 @@ pub async fn join_ring(
     if req.network_id.is_empty() {
         return Err(ApiError::BadRequest("network_id cannot be empty".to_string()));
     }
+
+    network_service::require_network_exists(&state.db, &req.network_id)?;
 
     // Get or create ring manager for this network
     let ring_manager = state.get_ring_manager(&req.network_id)?;
@@ -469,6 +472,7 @@ mod tests {
             "Test Device".to_string(),
             public_key.to_vec(),
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
     }

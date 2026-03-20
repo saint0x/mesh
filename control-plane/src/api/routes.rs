@@ -8,10 +8,11 @@ use tracing::{info, instrument};
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    HeartbeatRequest, HeartbeatResponse, RegisterDeviceRequest, RegisterDeviceResponse,
-    RingPositionInfo, ShardInfo,
+    CreateNetworkRequest, CreateNetworkResponse, HeartbeatRequest, HeartbeatResponse,
+    ListNetworksResponse, RegisterDeviceRequest, RegisterDeviceResponse, RingPositionInfo,
+    ShardInfo,
 };
-use crate::services::device_service;
+use crate::services::{device_service, network_service};
 use crate::services::ring_manager::Worker;
 use crate::state::AppState;
 
@@ -35,6 +36,7 @@ pub async fn register_device(
     // Execute blocking database operation in thread pool
     let db = state.db.clone();
     let keypair = state.keypair.clone();
+    let relay_addresses = (*state.relay_addresses).clone();
 
     let result = tokio::task::spawn_blocking(move || {
         device_service::register_device(
@@ -45,6 +47,7 @@ pub async fn register_device(
             req.name,
             req.public_key,
             req.capabilities,
+            relay_addresses,
         )
     })
     .await
@@ -100,6 +103,45 @@ pub async fn register_device(
     }))
 }
 
+#[instrument(skip(state, req))]
+pub async fn create_network(
+    State(state): State<AppState>,
+    Json(req): Json<CreateNetworkRequest>,
+) -> ApiResult<Json<CreateNetworkResponse>> {
+    let db = state.db.clone();
+    let network = tokio::task::spawn_blocking(move || {
+        network_service::create_network(
+            &db,
+            req.network_id,
+            req.name,
+            req.owner_user_id,
+            req.settings,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(CreateNetworkResponse {
+        success: true,
+        network,
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn list_networks(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ListNetworksResponse>> {
+    let db = state.db.clone();
+    let networks = tokio::task::spawn_blocking(move || network_service::list_networks(&db))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(ListNetworksResponse {
+        success: true,
+        networks,
+    }))
+}
+
 /// Update device heartbeat
 #[instrument(skip(state))]
 pub async fn heartbeat(
@@ -127,6 +169,7 @@ mod tests {
     use super::*;
     use crate::device::{DeviceCapabilities, Tier};
     use crate::services::certificate::ControlPlaneKeypair;
+    use crate::services::network_service;
     use std::sync::Arc;
 
     fn test_capabilities() -> DeviceCapabilities {
@@ -144,9 +187,21 @@ mod tests {
     async fn test_register_device_handler() {
         // Test using the handler function directly instead of full HTTP stack
         let db = crate::db::create_test_db();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
-        let state = AppState::new(db, keypair);
+        let state = AppState::with_relay_addresses(
+            db,
+            keypair,
+            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
+        );
 
         let request = RegisterDeviceRequest {
             device_id: "test-device-1".to_string(),
@@ -175,6 +230,14 @@ mod tests {
     async fn test_heartbeat_handler() {
         // Setup database with a registered device
         let db = crate::db::create_test_db();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
 
@@ -188,10 +251,15 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
+            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
-        let state = AppState::new(db, keypair);
+        let state = AppState::with_relay_addresses(
+            db,
+            keypair,
+            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
+        );
 
         // Send heartbeat
         let result = heartbeat(
@@ -212,7 +280,11 @@ mod tests {
         let db = crate::db::create_test_db();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
-        let state = AppState::new(db, keypair);
+        let state = AppState::with_relay_addresses(
+            db,
+            keypair,
+            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
+        );
 
         let result = heartbeat(
             axum::extract::State(state),
@@ -235,9 +307,21 @@ mod tests {
     async fn test_register_device_with_ring_join() {
         // Test registration with automatic ring joining
         let db = crate::db::create_test_db();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "Test Network".to_string(),
+            "owner-1".to_string(),
+            None,
+        )
+        .unwrap();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
-        let state = AppState::new(db, keypair);
+        let state = AppState::with_relay_addresses(
+            db,
+            keypair,
+            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
+        );
 
         let request = RegisterDeviceRequest {
             device_id: "test-device-ring".to_string(),
@@ -267,5 +351,34 @@ mod tests {
         assert_eq!(ring_pos.position, 0); // First worker
         assert_eq!(ring_pos.left_neighbor, "test-device-ring");
         assert_eq!(ring_pos.right_neighbor, "test-device-ring");
+    }
+
+    #[tokio::test]
+    async fn test_create_and_list_networks_handlers() {
+        let db = crate::db::create_test_db();
+        let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
+        let state = AppState::new(db, keypair);
+
+        let create_result = create_network(
+            axum::extract::State(state.clone()),
+            axum::Json(CreateNetworkRequest {
+                network_id: "test-network".to_string(),
+                name: "Test Network".to_string(),
+                owner_user_id: "owner-1".to_string(),
+                settings: Some(serde_json::json!({"region": "us-east-1"})),
+            }),
+        )
+        .await;
+
+        assert!(create_result.is_ok());
+        assert_eq!(create_result.unwrap().0.network.network_id, "test-network");
+
+        let list_result = list_networks(axum::extract::State(state)).await;
+        assert!(list_result.is_ok());
+
+        let response = list_result.unwrap().0;
+        assert!(response.success);
+        assert_eq!(response.networks.len(), 1);
+        assert_eq!(response.networks[0].network_id, "test-network");
     }
 }

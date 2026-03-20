@@ -19,6 +19,9 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         // Health check endpoint
         .route("/health", get(routes::health_check))
+        // Network management endpoints
+        .route("/api/networks", post(routes::create_network))
+        .route("/api/networks", get(routes::list_networks))
         // Device management endpoints
         .route("/api/devices/register", post(routes::register_device))
         .route("/api/devices/:id/heartbeat", post(routes::heartbeat))

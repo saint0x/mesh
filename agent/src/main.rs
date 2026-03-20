@@ -76,8 +76,8 @@ enum Commands {
     /// Run agent daemon to process jobs
     Start {
         /// Relay server address (multiaddr format)
-        #[arg(short, long, default_value = "/ip4/127.0.0.1/tcp/4001")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
 
         /// Control plane URL
         #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
@@ -107,8 +107,8 @@ enum Commands {
         timeout_ms: u64,
 
         /// Relay server address
-        #[arg(short, long, default_value = "/ip4/127.0.0.1/tcp/4001")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
 
         /// Log level
         #[arg(long, default_value = "info")]
@@ -161,8 +161,8 @@ enum Commands {
         control_plane_url: String,
 
         /// Relay server address
-        #[arg(short, long, default_value = "/ip4/127.0.0.1/tcp/4001")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
 
         /// Log level
         #[arg(short, long, default_value = "info")]
@@ -382,7 +382,7 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
 
     // Generate device configuration
     println!("📝 Generating device configuration...");
-    let config =
+    let mut config =
         DeviceConfig::generate(name.clone(), network_id.clone(), control_plane_url.clone());
 
     println!("   Device ID: {}", config.device_id);
@@ -404,13 +404,27 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     let client = RegistrationClient::new(control_plane_url.clone())?;
 
     match client.register(&config).await {
-        Ok(signed_cert) => {
+        Ok(register_response) => {
             // Save certificate
+            let signed_cert = register_response
+                .certificate
+                .as_ref()
+                .context("Registration response missing certificate")?;
             config.save_certificate(&signed_cert)?;
+            config.relay_addresses = register_response.relay_addresses.clone();
+            config.save(&config_path)?;
 
             let cert_path = DeviceConfig::default_certificate_path()?;
             println!("✓ Registration successful!");
             println!("   Certificate saved to: {}", cert_path.display());
+            if config.relay_addresses.is_empty() {
+                println!("   Relay addresses: none advertised by control plane");
+            } else {
+                println!("   Relay addresses:");
+                for relay_addr in &config.relay_addresses {
+                    println!("     - {}", relay_addr);
+                }
+            }
         }
         Err(e) => {
             error!(error = %e, "Registration failed");
@@ -433,8 +447,20 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     Ok(())
 }
 
+fn resolve_relay_addr(config: &DeviceConfig, relay_override: Option<String>) -> Result<Multiaddr> {
+    let relay = relay_override
+        .or_else(|| config.relay_addresses.first().cloned())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No relay address configured. Re-run `mesh init` against a configured control plane or pass `--relay`."
+            )
+        })?;
+
+    relay.parse().context("Invalid relay address")
+}
+
 /// Run agent daemon
-async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
+async fn cmd_start(relay: Option<String>, _control_plane_url: String) -> Result<()> {
     println!("🚀 Starting Mesh AI agent daemon...\n");
 
     // Load device configuration
@@ -453,8 +479,7 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
     println!("   Network: {}", config.network_id);
     println!("   Tier: {:?}", config.capabilities.tier);
 
-    // Parse relay address
-    let relay_addr: Multiaddr = relay.parse().context("Invalid relay address")?;
+    let relay_addr = resolve_relay_addr(&config, relay)?;
 
     println!("\n🌐 Connecting to relay server...");
     println!("   Relay: {}", relay_addr);
@@ -1021,7 +1046,7 @@ async fn cmd_job(
     target: String,
     workload: String,
     timeout_ms: u64,
-    relay: String,
+    relay: Option<String>,
 ) -> Result<()> {
     println!("📤 Submitting job to network...\n");
 
@@ -1039,8 +1064,7 @@ async fn cmd_job(
     println!("   Target: {}", target_peer);
     println!("   Timeout: {}ms", timeout_ms);
 
-    // Parse relay address
-    let relay_addr: Multiaddr = relay.parse().context("Invalid relay address")?;
+    let relay_addr = resolve_relay_addr(&config, relay)?;
 
     // Create ephemeral swarm for job submission
     let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
@@ -1715,7 +1739,11 @@ async fn cmd_pool_status(control_plane_url: String) -> Result<()> {
 }
 
 /// Join ring topology for distributed inference
-async fn cmd_join_ring(model_id: String, control_plane_url: String, _relay: String) -> Result<()> {
+async fn cmd_join_ring(
+    model_id: String,
+    control_plane_url: String,
+    relay: Option<String>,
+) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Joining Ring Topology".bold().cyan());
@@ -1725,10 +1753,12 @@ async fn cmd_join_ring(model_id: String, control_plane_url: String, _relay: Stri
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh init' first.")?;
+    let relay_addr = resolve_relay_addr(&config, relay)?;
 
     println!("\n{}", "Device Identity:".bold());
     println!("  Device ID:     {}", config.device_id);
     println!("  Model ID:      {}", model_id);
+    println!("  Relay:         {}", relay_addr);
 
     // Connect to control plane
     println!("\n{}", "Requesting ring join...".dimmed());
