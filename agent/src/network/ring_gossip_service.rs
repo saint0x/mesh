@@ -153,11 +153,10 @@ impl RingGossipService {
             return Ok(());
         }
 
-        // TODO: Verify signature in Phase 2
-        // if !gossip.verify(&sender_device_pubkey) {
-        //     tracing::warn!("Invalid gossip signature");
-        //     return Ok(());
-        // }
+        if !gossip.verify() {
+            tracing::warn!(sender = %gossip.sender_node_id, "Invalid ring gossip signature");
+            return Ok(());
+        }
 
         // Merge ring state
         let changed = {
@@ -763,6 +762,7 @@ mod tests {
             pool_id,
             ring_state: stale_state,
             sender_node_id: node_id,
+            sender_device_pubkey: device.public,
             version: 1,
             signature: [0u8; 64],
         };
@@ -771,6 +771,7 @@ mod tests {
         let device2 = DeviceKeyPair::generate();
         let mut stale_gossip_from_other = stale_gossip.clone();
         stale_gossip_from_other.sender_node_id = device2.node_id();
+        stale_gossip_from_other.sender_device_pubkey = device2.public;
 
         // Handle stale gossip (should not change ring)
         service.handle_gossip(stale_gossip_from_other).await.unwrap();

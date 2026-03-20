@@ -1,5 +1,6 @@
 use crate::pki::{DeviceKeyPair, NodeId, PoolId};
 use anyhow::{anyhow, Result};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +17,8 @@ pub struct RingGossipMessage {
     pub ring_state: RingState,
     /// Sender's node ID
     pub sender_node_id: NodeId,
+    /// Sender device public key
+    pub sender_device_pubkey: [u8; 32],
     /// Lamport timestamp for conflict resolution
     pub version: u64,
     /// Signature by device private key (hex encoded for serde)
@@ -53,12 +56,17 @@ impl RingGossipMessage {
         device_keypair: &DeviceKeyPair,
     ) -> Self {
         let sender_node_id = device_keypair.node_id();
+        let sender_device_pubkey = device_keypair.public;
         let version = ring_state.version;
 
-        // Sign the message
-        let mut payload = Vec::new();
-        payload.extend_from_slice(pool_id.as_bytes());
-        payload.extend_from_slice(&version.to_le_bytes());
+        let payload = Self::signing_payload(
+            pool_id,
+            &ring_state,
+            &sender_node_id,
+            &sender_device_pubkey,
+            version,
+        )
+        .expect("ring gossip payload serialization must succeed");
 
         let signature = device_keypair.sign(&payload);
 
@@ -66,15 +74,52 @@ impl RingGossipMessage {
             pool_id,
             ring_state,
             sender_node_id,
+            sender_device_pubkey,
             version,
             signature,
         }
     }
 
-    /// Verify gossip message signature (Phase 2 - TODO)
-    pub fn verify(&self, _sender_device_pubkey: &[u8; 32]) -> bool {
-        // TODO: Verify signature in Phase 2
-        true
+    fn signing_payload(
+        pool_id: PoolId,
+        ring_state: &RingState,
+        sender_node_id: &NodeId,
+        sender_device_pubkey: &[u8; 32],
+        version: u64,
+    ) -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(pool_id.as_bytes());
+        payload.extend_from_slice(sender_node_id.as_bytes());
+        payload.extend_from_slice(sender_device_pubkey);
+        payload.extend_from_slice(&version.to_le_bytes());
+        ciborium::into_writer(ring_state, &mut payload)?;
+        Ok(payload)
+    }
+
+    pub fn verify(&self) -> bool {
+        if self.sender_node_id != NodeId::from_pubkey(&self.sender_device_pubkey) {
+            return false;
+        }
+
+        let payload = match Self::signing_payload(
+            self.pool_id,
+            &self.ring_state,
+            &self.sender_node_id,
+            &self.sender_device_pubkey,
+            self.version,
+        ) {
+            Ok(payload) => payload,
+            Err(_) => return false,
+        };
+
+        let verifying_key = match VerifyingKey::from_bytes(&self.sender_device_pubkey) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+
+        verifying_key
+            .verify(&payload, &Signature::from_bytes(&self.signature))
+            .is_ok()
     }
 }
 
@@ -983,9 +1028,23 @@ mod tests {
         // Verify fields match
         assert_eq!(deserialized.pool_id, original.pool_id);
         assert_eq!(deserialized.sender_node_id, original.sender_node_id);
+        assert_eq!(deserialized.sender_device_pubkey, original.sender_device_pubkey);
         assert_eq!(deserialized.version, original.version);
         assert_eq!(deserialized.signature, original.signature);
         assert_eq!(deserialized.ring_state.members.len(), original.ring_state.members.len());
+        assert!(deserialized.verify());
+    }
+
+    #[test]
+    fn test_ring_gossip_verify_rejects_tampering() {
+        let pool_id = create_test_pool_id();
+        let (ring_state, _) = create_ring_with_members(pool_id, 3, 1000);
+        let device = DeviceKeyPair::generate();
+
+        let mut gossip = RingGossipMessage::new(pool_id, ring_state, &device);
+        gossip.version += 1;
+
+        assert!(!gossip.verify());
     }
 
     // =========================================================================

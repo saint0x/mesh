@@ -4,6 +4,7 @@ use crate::pki::{
     PoolConfig, PoolId, PoolMembershipCert,
 };
 use anyhow::Result;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,6 +49,8 @@ pub struct PoolBeacon {
     pub pool_id: PoolId,
     /// Node identifier
     pub node_id: NodeId,
+    /// Device public key used to sign this beacon
+    pub device_pubkey: [u8; 32],
     /// Libp2p PeerID (for P2P ring connections)
     #[serde(with = "peer_id_opt_serde")]
     pub peer_id: Option<PeerId>,
@@ -159,6 +162,7 @@ impl PoolBeacon {
         payload.push(1); // version
         payload.extend_from_slice(pool_config.pool_id.as_bytes());
         payload.extend_from_slice(node_id.as_bytes());
+        payload.extend_from_slice(&device_keypair.public);
         payload.extend_from_slice(&quic_port.to_le_bytes());
         payload.extend_from_slice(&fingerprint);
         payload.extend_from_slice(&cert_hash);
@@ -171,6 +175,7 @@ impl PoolBeacon {
             version: 1,
             pool_id: pool_config.pool_id,
             node_id,
+            device_pubkey: device_keypair.public,
             peer_id,
             quic_port,
             pubkey_fingerprint: fingerprint,
@@ -181,11 +186,34 @@ impl PoolBeacon {
         }
     }
 
-    /// Verify beacon signature (Phase 2)
-    pub fn verify(&self, _device_pubkey: &[u8; 32]) -> bool {
-        // TODO: Implement signature verification in Phase 2
-        // For Phase 1, trust LAN beacons
-        true
+    pub fn verify(&self) -> bool {
+        if self.node_id != NodeId::from_pubkey(&self.device_pubkey) {
+            return false;
+        }
+
+        if self.pubkey_fingerprint != self.device_pubkey[..8] {
+            return false;
+        }
+
+        let mut payload = Vec::new();
+        payload.push(self.version);
+        payload.extend_from_slice(self.pool_id.as_bytes());
+        payload.extend_from_slice(self.node_id.as_bytes());
+        payload.extend_from_slice(&self.device_pubkey);
+        payload.extend_from_slice(&self.quic_port.to_le_bytes());
+        payload.extend_from_slice(&self.pubkey_fingerprint);
+        payload.extend_from_slice(&self.membership_cert_hash);
+        payload.extend_from_slice(&self.capabilities_bitmap.to_le_bytes());
+        payload.extend_from_slice(&self.timestamp.to_le_bytes());
+
+        let verifying_key = match VerifyingKey::from_bytes(&self.device_pubkey) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+
+        verifying_key
+            .verify(&payload, &Signature::from_bytes(&self.signature))
+            .is_ok()
     }
 
     /// Check if this beacon advertises the capability to sign certificates (admin)
@@ -531,6 +559,16 @@ impl BeaconListener {
             return;
         }
 
+        if !beacon.verify() {
+            tracing::warn!(
+                pool_id = %beacon.pool_id,
+                node_id = %beacon.node_id,
+                sender = %sender_addr,
+                "Ignoring beacon with invalid signature"
+            );
+            return;
+        }
+
         // Create discovered peer
         let lan_addr = format!("{}:{}", sender_addr.ip(), beacon.quic_port);
 
@@ -833,7 +871,9 @@ mod tests {
         assert_eq!(beacon.version, 1);
         assert_eq!(beacon.pool_id, pool_id);
         assert_eq!(beacon.node_id, device.node_id());
+        assert_eq!(beacon.device_pubkey, device.public);
         assert_eq!(beacon.quic_port, 4001);
+        assert!(beacon.verify());
     }
 
     #[test]
@@ -870,7 +910,9 @@ mod tests {
 
         assert_eq!(decoded.pool_id, beacon.pool_id);
         assert_eq!(decoded.node_id, beacon.node_id);
+        assert_eq!(decoded.device_pubkey, beacon.device_pubkey);
         assert_eq!(decoded.quic_port, beacon.quic_port);
+        assert!(decoded.verify());
     }
 
     #[test]
@@ -978,5 +1020,35 @@ mod tests {
         assert_eq!(decoded.is_accepting_joins(), beacon.is_accepting_joins());
         assert!(decoded.can_sign_certs(), "Deserialized admin beacon should still have can_sign_certs=true");
         assert!(decoded.is_accepting_joins(), "Deserialized admin beacon should still have is_accepting_joins=true");
+        assert!(decoded.verify());
+    }
+
+    #[test]
+    fn test_beacon_verify_rejects_tampering() {
+        let device = DeviceKeyPair::generate();
+        let pool_root = PoolRootKeyPair::generate();
+        let pool_id = pool_root.pool_id();
+
+        let cert = crate::pki::PoolMembershipCert::new(
+            device.public,
+            &pool_root,
+            crate::pki::MembershipRole::Member,
+            u64::MAX,
+        );
+
+        let pool_config = PoolConfig {
+            pool_id,
+            name: "Test Pool".to_string(),
+            pool_root_pubkey: pool_root.public,
+            beacon_config: crate::pki::BeaconConfig::default(),
+            role: crate::pki::MembershipRole::Member,
+            expires_at: u64::MAX,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let mut beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
+        beacon.quic_port = 9999;
+
+        assert!(!beacon.verify());
     }
 }
