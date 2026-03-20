@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::forward_pass::{ForwardPass, ModelWeights};
 use super::job::{InferenceJob, InferenceRequest, InferenceResult};
-use super::mock_loader::{MockShardLoader, ShardLoader};
+use super::artifact_loader::{ArtifactShardLoader, ShardLoader};
 use super::stats::InferenceStats;
 
 /// Configuration for the inference coordinator
@@ -126,8 +126,7 @@ impl InferenceCoordinator {
                 .expect("Failed to create shard registry"),
         );
 
-        // Initialize mock loader (replace with real loader for production)
-        let loader: Arc<dyn ShardLoader> = Arc::new(MockShardLoader::with_defaults());
+                let loader: Arc<dyn ShardLoader> = Arc::new(ArtifactShardLoader::with_defaults());
 
         Self {
             swarm,
@@ -416,8 +415,7 @@ impl InferenceCoordinator {
         // Clone model_id to avoid borrow issues
         let model_id = self.config.model_id.clone();
 
-        // Load weights using mock loader (cached across tokens)
-        // TODO: Replace MockShardLoader with SafetensorsShardLoader for production
+        // Load weights using the verified artifact loader
         debug!(
             job_id = %job.request.job_id,
             position = position.position,

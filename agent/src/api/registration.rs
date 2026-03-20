@@ -1,5 +1,8 @@
 use crate::api::types::{
-    HeartbeatRequest, HeartbeatResponse, RegisterDeviceRequest, RegisterDeviceResponse,
+    AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
+    ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse,
+    InferenceAssignment, RegisterDeviceRequest, RegisterDeviceResponse,
+    ReportInferenceAssignmentRequest,
 };
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
@@ -194,6 +197,103 @@ impl RegistrationClient {
                 );
             }
         }
+    }
+
+    pub async fn claim_inference_assignment(
+        &self,
+        device_id: Uuid,
+        network_id: &str,
+    ) -> Result<Option<InferenceAssignment>> {
+        let url = format!("{}/api/inference/assignments/claim", self.control_plane_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&ClaimInferenceAssignmentRequest {
+                device_id: device_id.to_string(),
+                network_id: network_id.to_string(),
+            })
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("Assignment claim failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Assignment claim failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        let body: ClaimInferenceAssignmentResponse = response
+            .json()
+            .await
+            .map_err(|e| AgentError::Serialization(format!("Failed to parse assignment claim: {}", e)))?;
+
+        Ok(body.assignment)
+    }
+
+    pub async fn acknowledge_inference_assignment(
+        &self,
+        job_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<()> {
+        let url = format!("{}/api/inference/jobs/{}/ack", self.control_plane_url, job_id);
+        let response = self
+            .client
+            .post(&url)
+            .json(&AcknowledgeInferenceAssignmentRequest {
+                device_id: device_id.to_string(),
+            })
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("Assignment acknowledge failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Assignment acknowledge failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn report_inference_result(
+        &self,
+        job_id: Uuid,
+        request: ReportInferenceAssignmentRequest,
+    ) -> Result<()> {
+        let url = format!("{}/api/inference/jobs/{}/result", self.control_plane_url, job_id);
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("Inference result report failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Inference result report failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
     }
 }
 

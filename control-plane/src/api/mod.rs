@@ -40,7 +40,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ring/version", post(ring::check_topology_version))
         // Distributed inference endpoints
         .route("/api/inference/submit", post(inference::submit_inference))
-        .route("/api/inference/poll/:network_id", get(inference::poll_inference_job))
+        .route("/api/inference/assignments/claim", post(inference::claim_inference_assignment))
+        .route("/api/inference/jobs/:job_id/ack", post(inference::acknowledge_inference_assignment))
+        .route("/api/inference/jobs/:job_id/result", post(inference::report_inference_result))
+        .route("/api/inference/jobs/:job_id", get(inference::get_inference_job_status))
         // Attach application state
         .with_state(state)
         // Middleware

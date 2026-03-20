@@ -286,3 +286,74 @@ pub struct SubmitInferenceResponse {
     /// Error message if failed
     pub error: Option<String>,
 }
+
+/// Worker assignment for a distributed inference job
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceAssignment {
+    pub assignment_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub device_id: String,
+    pub ring_position: u32,
+    pub model_id: String,
+    pub prompt_tokens: Vec<u32>,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub lease_expires_at: String,
+}
+
+/// Request for a worker to claim its next assignment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimInferenceAssignmentRequest {
+    pub device_id: String,
+    pub network_id: String,
+}
+
+/// Response for claiming a worker assignment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimInferenceAssignmentResponse {
+    pub success: bool,
+    pub assignment: Option<InferenceAssignment>,
+}
+
+/// Request to acknowledge worker execution start
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcknowledgeInferenceAssignmentRequest {
+    pub device_id: String,
+}
+
+/// Request to record a worker result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportInferenceAssignmentRequest {
+    pub device_id: String,
+    pub success: bool,
+    pub completion: Option<String>,
+    pub completion_tokens: Option<u32>,
+    pub execution_time_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Response describing a submitted inference job
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceJobStatusResponse {
+    pub success: bool,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub status: String,
+    pub completion: Option<String>,
+    pub completion_tokens: u32,
+    pub execution_time_ms: u64,
+    pub error: Option<String>,
+    pub assignments: Vec<InferenceJobAssignmentStatus>,
+}
+
+/// Assignment status inside a job status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceJobAssignmentStatus {
+    pub device_id: String,
+    pub ring_position: u32,
+    pub status: String,
+    pub failure_reason: Option<String>,
+}

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "production-dispatch-gate",
+  "steps": [
+    {
+      "name": "scripted control-plane dispatch contract",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "api::inference",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "control-plane inference dispatch tests",
+      "type": "proc_spawn",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "api::inference",
+        "--",
+        "--nocapture"
+      ],
+      "expect_exit": 0,
+      "expect_stdout": "test result: ok.\n"
+    }
+  ]
+}

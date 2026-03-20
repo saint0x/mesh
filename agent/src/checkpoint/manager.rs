@@ -309,7 +309,9 @@ impl CheckpointManager {
             temperature: job.request.config.temperature,
             top_p: job.request.config.top_p,
             stop_sequences: job.request.config.stop_sequences.clone(),
+            stream: job.request.config.stream,
             checkpoint_interval: job.request.config.checkpoint_interval,
+            total_layers: job.total_layers,
         };
 
         let checkpoint = Checkpoint {
@@ -343,7 +345,7 @@ impl CheckpointManager {
             temperature: checkpoint.config.temperature,
             top_p: checkpoint.config.top_p,
             stop_sequences: checkpoint.config.stop_sequences,
-            stream: false,
+            stream: checkpoint.config.stream,
             checkpoint_interval: checkpoint.config.checkpoint_interval,
         };
 
@@ -358,7 +360,7 @@ impl CheckpointManager {
         };
 
         // Create job and restore state
-        let mut job = InferenceJob::new(request, 70); // TODO: Get actual layer count
+        let mut job = InferenceJob::new(request, checkpoint.config.total_layers);
         job.generated_tokens = checkpoint.generated_tokens;
         job.current_token_idx = checkpoint.metadata.token_index;
         job.current_layer = checkpoint.metadata.current_layer;

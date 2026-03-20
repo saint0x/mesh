@@ -3,6 +3,7 @@
 //! This module defines the types used for checkpointing inference state.
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use uuid::Uuid;
 use std::time::Duration;
 
@@ -169,22 +170,21 @@ pub struct CheckpointedConfig {
     /// Stop sequences
     pub stop_sequences: Vec<String>,
 
+    /// Whether the request streams tokens
+    pub stream: bool,
+
     /// Checkpoint interval
     pub checkpoint_interval: u32,
+
+    /// Total model layers required to resume execution
+    pub total_layers: u32,
 }
 
 impl Checkpoint {
     /// Calculate checkpoint data hash using BLAKE3
     pub fn compute_hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Simple hash for now - production would use BLAKE3
-        let mut hasher = DefaultHasher::new();
-        self.metadata.job_id.hash(&mut hasher);
-        self.metadata.token_index.hash(&mut hasher);
-        self.generated_tokens.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        let bytes = self.to_cbor().unwrap_or_default();
+        hex::encode({ let mut hasher = sha2::Sha256::new(); hasher.update(bytes); hasher.finalize() })
     }
 
     /// Serialize checkpoint to CBOR bytes
@@ -278,7 +278,9 @@ mod tests {
                 temperature: 0.7,
                 top_p: 0.9,
                 stop_sequences: vec![],
+                stream: false,
                 checkpoint_interval: 50,
+                total_layers: 70,
             },
             kv_cache_state: None,
             rng_state: None,
@@ -317,7 +319,9 @@ mod tests {
                 temperature: 0.7,
                 top_p: 0.9,
                 stop_sequences: vec![],
+                stream: false,
                 checkpoint_interval: 50,
+                total_layers: 70,
             },
             kv_cache_state: None,
             rng_state: None,
@@ -361,7 +365,9 @@ mod tests {
                 temperature: 0.7,
                 top_p: 0.9,
                 stop_sequences: vec![],
+                stream: false,
                 checkpoint_interval: 50,
+                total_layers: 70,
             },
             kv_cache_state: None,
             rng_state: None,

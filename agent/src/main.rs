@@ -761,10 +761,17 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
         use agent::inference::job::{InferenceRequest, GenerationConfig};
         use uuid::Uuid;
 
-        let control_plane_url = inference_config_task.control_plane_url.clone();
         let network_id = inference_config_task.network_id.clone();
-        let device_id = inference_config_task.device_id.to_string();
-        let http_client = reqwest::Client::new();
+        let device_id = inference_config_task.device_id;
+        let registration_client = match RegistrationClient::new(
+            inference_config_task.control_plane_url.clone(),
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                error!(error = %e, "Failed to create inference registration client");
+                return;
+            }
+        };
 
         info!("Initializing inference coordinator");
 
@@ -802,7 +809,7 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
         let inference_config = InferenceConfig::default();
         let mut coordinator = InferenceCoordinator::new(inference_swarm, inference_config);
 
-        info!("Inference coordinator initialized - starting job polling");
+        info!("Inference coordinator initialized - starting assignment loop");
 
         // Check if we have ring state
         let ring_state_path = dirs::home_dir()
@@ -879,112 +886,114 @@ async fn cmd_start(relay: String, _control_plane_url: String) -> Result<()> {
             warn!("Inference jobs will be logged but not executed");
         }
 
-        // Poll for inference jobs
+        // Claim and execute inference assignments
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let assignment = match registration_client
+                .claim_inference_assignment(device_id, &network_id)
+                .await
+            {
+                Ok(Some(assignment)) => assignment,
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!(error = %e, "Inference assignment claim failed");
+                    continue;
+                }
+            };
 
-            let poll_url = format!("{}/api/inference/poll/{}", control_plane_url, network_id);
-            match http_client.get(&poll_url).send().await {
-                Ok(response) => {
-                    if response.status() == 204 {
-                        continue; // No jobs
-                    }
+            let job_id = match Uuid::parse_str(&assignment.job_id) {
+                Ok(job_id) => job_id,
+                Err(e) => {
+                    error!(job_id = %assignment.job_id, error = %e, "Invalid assignment job id");
+                    continue;
+                }
+            };
 
-                    if !response.status().is_success() {
-                        warn!("Inference poll failed: {}", response.status());
-                        continue;
-                    }
+            info!(
+                job_id = %job_id,
+                assignment_id = %assignment.assignment_id,
+                model = %assignment.model_id,
+                prompt_len = assignment.prompt_tokens.len(),
+                max_tokens = assignment.max_tokens,
+                "Claimed distributed inference assignment"
+            );
 
-                    match response.json::<serde_json::Value>().await {
-                        Ok(job_data) => {
-                            let job_id = job_data.get("job_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| Uuid::parse_str(s).ok())
-                                .unwrap_or_else(Uuid::new_v4);
+            if ring_position.is_none() {
+                warn!(job_id = %job_id, "Cannot process assignment while not in ring");
+                let _ = registration_client.report_inference_result(
+                    job_id,
+                    agent::api::types::ReportInferenceAssignmentRequest {
+                        device_id: device_id.to_string(),
+                        success: false,
+                        completion: None,
+                        completion_tokens: None,
+                        execution_time_ms: 0,
+                        error: Some("worker not in ring topology".to_string()),
+                    },
+                ).await;
+                continue;
+            }
 
-                            let model_id = job_data.get("model_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("llama-70b")
-                                .to_string();
+            if let Err(e) = registration_client
+                .acknowledge_inference_assignment(job_id, device_id)
+                .await
+            {
+                error!(job_id = %job_id, error = %e, "Failed to acknowledge assignment");
+                continue;
+            }
 
-                            let prompt_tokens: Vec<u32> = job_data.get("prompt_tokens")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
-                                .unwrap_or_else(|| vec![1, 2, 3]);
+            let request = InferenceRequest {
+                job_id,
+                network_id: assignment.network_id.clone(),
+                model_id: assignment.model_id.clone(),
+                prompt_tokens: assignment.prompt_tokens.clone(),
+                config: GenerationConfig {
+                    max_tokens: assignment.max_tokens,
+                    temperature: assignment.temperature,
+                    top_p: assignment.top_p,
+                    ..Default::default()
+                },
+                executor_id: device_id.to_string(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            };
 
-                            let max_tokens = job_data.get("max_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(10) as u32;
+            match coordinator.process_inference(request).await {
+                Ok(result) => {
+                    let completion = result
+                        .generated_tokens
+                        .as_ref()
+                        .map(|tokens| format!("{:?}", tokens));
 
-                            let temperature = job_data.get("temperature")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(1.0) as f32;
-
-                            let top_p = job_data.get("top_p")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.9) as f32;
-
-                            info!(
-                                job_id = %job_id,
-                                model = %model_id,
-                                prompt_len = prompt_tokens.len(),
-                                max_tokens = max_tokens,
-                                "Received distributed inference job"
-                            );
-
-                            // Create inference request
-                            let request = InferenceRequest {
-                                job_id,
-                                network_id: network_id.clone(),
-                                model_id: model_id.clone(),
-                                prompt_tokens,
-                                config: GenerationConfig {
-                                    max_tokens,
-                                    temperature,
-                                    top_p,
-                                    ..Default::default()
-                                },
-                                executor_id: device_id.clone(),
-                                created_at: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                            };
-
-                            // Process inference job
-                            if ring_position.is_some() {
-                                info!(job_id = %job_id, "Processing inference job with coordinator");
-                                match coordinator.process_inference(request).await {
-                                    Ok(result) => {
-                                        info!(
-                                            job_id = %result.job_id,
-                                            success = result.success,
-                                            tokens = result.completion_tokens,
-                                            time_ms = result.execution_time_ms,
-                                            "Inference job completed"
-                                        );
-
-                                        // TODO: Send result back to control plane
-                                        // POST to /api/inference/result with InferenceResult
-                                    }
-                                    Err(e) => {
-                                        error!(job_id = %job_id, error = %e, "Inference job failed");
-                                    }
-                                }
-                            } else {
-                                warn!(
-                                    job_id = %job_id,
-                                    "Cannot process - worker not in ring. Run 'join-ring' first."
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse job response");
-                        }
+                    if let Err(e) = registration_client.report_inference_result(
+                        job_id,
+                        agent::api::types::ReportInferenceAssignmentRequest {
+                            device_id: device_id.to_string(),
+                            success: result.success,
+                            completion,
+                            completion_tokens: Some(result.completion_tokens),
+                            execution_time_ms: result.execution_time_ms,
+                            error: result.error.clone(),
+                        },
+                    ).await {
+                        error!(job_id = %job_id, error = %e, "Failed to report inference result");
                     }
                 }
                 Err(e) => {
-                    debug!(error = %e, "Inference poll failed");
+                    error!(job_id = %job_id, error = %e, "Inference job failed");
+                    let _ = registration_client.report_inference_result(
+                        job_id,
+                        agent::api::types::ReportInferenceAssignmentRequest {
+                            device_id: device_id.to_string(),
+                            success: false,
+                            completion: None,
+                            completion_tokens: None,
+                            execution_time_ms: 0,
+                            error: Some(e.to_string()),
+                        },
+                    ).await;
                 }
             }
         }
