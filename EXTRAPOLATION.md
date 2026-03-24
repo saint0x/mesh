@@ -101,6 +101,9 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Workload-quota rejection accounting is now separate from peer-quota and node-capacity rejection.
 - ✅ Peer trust is now explicitly governed by trusted/blocklisted `PeerId` policy instead of treating every reachable peer as equally trusted by default.
 - ✅ Trust-policy rejection accounting is now separate from invalid-job, quota, and overload rejection.
+- ✅ Runtime contention is now governed by an explicit bounded scheduler queue instead of letting request arrival order act as the hidden scheduler.
+- ✅ Peer and workload priority weights now give the node one deterministic production rule for weighted local fairness under contention.
+- ✅ Queued-job and scheduler-dispatch accounting are now persisted alongside the rest of the runtime metrics, so weighted governance behavior is observable.
 - ✅ Relay reservations now depend on explicit authoritative relay advertised addresses instead of implicit empty-address behavior.
 - ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
 - ✅ Coverage now includes a live multi-peer relay dialing runtime gate that exercises multiple reserved peers connecting through the same relay at once.

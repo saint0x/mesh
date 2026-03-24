@@ -26,6 +26,7 @@ use crate::errors::Result;
 use crate::executor::{EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput};
 use crate::network::{JobEnvelope, JobResult, MeshEvent, MeshSwarm};
 use libp2p::PeerId;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -101,6 +102,12 @@ pub struct JobStats {
 
     /// Number of jobs rejected by explicit peer trust policy
     pub trust_rejections: AtomicU64,
+
+    /// Number of jobs admitted into the local scheduler queue.
+    pub queued_jobs: AtomicU64,
+
+    /// Number of jobs dispatched from the scheduler queue into execution.
+    pub scheduler_dispatches: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -134,6 +141,8 @@ impl JobStats {
             peer_quota_rejections: AtomicU64::new(0),
             workload_quota_rejections: AtomicU64::new(0),
             trust_rejections: AtomicU64::new(0),
+            queued_jobs: AtomicU64::new(0),
+            scheduler_dispatches: AtomicU64::new(0),
         }
     }
 
@@ -230,6 +239,14 @@ impl JobStats {
 
     pub fn record_trust_rejection(&self) {
         self.trust_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_queued_job(&self) {
+        self.queued_jobs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_scheduler_dispatch(&self) {
+        self.scheduler_dispatches.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -350,6 +367,14 @@ impl JobStats {
             "  Trust Denied:     {}",
             self.trust_rejections.load(Ordering::Relaxed)
         );
+        println!(
+            "  Queued Jobs:      {}",
+            self.queued_jobs.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Scheduler Runs:   {}",
+            self.scheduler_dispatches.load(Ordering::Relaxed)
+        );
         println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
 
         println!("\n{}", "Performance:".bold());
@@ -436,6 +461,8 @@ impl JobStats {
             "peer_quota_rejected": self.peer_quota_rejections.load(Ordering::Relaxed),
             "workload_quota_rejected": self.workload_quota_rejections.load(Ordering::Relaxed),
             "trust_rejected": self.trust_rejections.load(Ordering::Relaxed),
+            "queued_jobs": self.queued_jobs.load(Ordering::Relaxed),
+            "scheduler_dispatches": self.scheduler_dispatches.load(Ordering::Relaxed),
             "success_rate": self.success_rate() * 100.0,
             "avg_execution_time_ms": self.avg_execution_time_ms(),
             "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
@@ -472,6 +499,7 @@ pub struct JobRunner {
     stats: Arc<JobStats>,
     shutdown_on_idle: bool,
     max_concurrent_jobs: usize,
+    max_pending_jobs: usize,
     admission_policy: AdmissionPolicy,
     ledger_client: Option<crate::telemetry::LedgerClient>,
     device_id: Option<uuid::Uuid>,
@@ -480,6 +508,9 @@ pub struct JobRunner {
     punch_attempt_state: HashMap<PeerId, bool>,
     active_jobs_by_peer: HashMap<PeerId, usize>,
     active_jobs_by_workload: HashMap<String, usize>,
+    pending_jobs: Vec<QueuedJob>,
+    peer_dispatch_counts: HashMap<PeerId, u64>,
+    workload_dispatch_counts: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +520,8 @@ pub struct AdmissionPolicy {
     max_concurrent_jobs_per_peer: usize,
     allowed_workloads: Vec<String>,
     workload_concurrency_limits: HashMap<String, usize>,
+    peer_priority_weights: HashMap<String, u32>,
+    workload_priority_weights: HashMap<String, u32>,
     trusted_peer_ids: Vec<String>,
     blocked_peer_ids: Vec<String>,
 }
@@ -504,6 +537,11 @@ impl Default for AdmissionPolicy {
                 ("embeddings".to_string(), 1usize),
                 ("embeddings-v1".to_string(), 1usize),
             ]),
+            peer_priority_weights: HashMap::new(),
+            workload_priority_weights: HashMap::from([
+                ("embeddings".to_string(), 100u32),
+                ("embeddings-v1".to_string(), 100u32),
+            ]),
             trusted_peer_ids: Vec::new(),
             blocked_peer_ids: Vec::new(),
         }
@@ -517,6 +555,8 @@ impl AdmissionPolicy {
         max_job_timeout_ms: u64,
         allowed_workloads: Vec<String>,
         workload_concurrency_limits: Vec<crate::device::WorkloadConcurrencyLimit>,
+        peer_priority_weights: Vec<crate::device::PeerPriorityWeight>,
+        workload_priority_weights: Vec<crate::device::WorkloadPriorityWeight>,
         trusted_peer_ids: Vec<String>,
         blocked_peer_ids: Vec<String>,
     ) -> Self {
@@ -540,6 +580,16 @@ impl AdmissionPolicy {
             .map(|peer_id| peer_id.trim().to_string())
             .filter(|peer_id| !peer_id.is_empty())
             .collect::<Vec<_>>();
+        let normalized_peer_priority_weights = peer_priority_weights
+            .into_iter()
+            .map(|entry| (entry.peer_id.trim().to_string(), entry.weight.max(1)))
+            .filter(|(peer_id, _)| !peer_id.is_empty())
+            .collect::<HashMap<_, _>>();
+        let normalized_workload_priority_weights = workload_priority_weights
+            .into_iter()
+            .map(|entry| (entry.workload_id.trim().to_string(), entry.weight.max(1)))
+            .filter(|(workload_id, _)| !workload_id.is_empty())
+            .collect::<HashMap<_, _>>();
         let normalized_blocked_peer_ids = blocked_peer_ids
             .into_iter()
             .map(|peer_id| peer_id.trim().to_string())
@@ -563,9 +613,32 @@ impl AdmissionPolicy {
             } else {
                 normalized_limits
             },
+            peer_priority_weights: normalized_peer_priority_weights,
+            workload_priority_weights: if normalized_workload_priority_weights.is_empty() {
+                HashMap::from([
+                    ("embeddings".to_string(), 100u32),
+                    ("embeddings-v1".to_string(), 100u32),
+                ])
+            } else {
+                normalized_workload_priority_weights
+            },
             trusted_peer_ids: normalized_trusted_peer_ids,
             blocked_peer_ids: normalized_blocked_peer_ids,
         }
+    }
+
+    fn peer_weight(&self, peer_id: PeerId) -> u32 {
+        self.peer_priority_weights
+            .get(&peer_id.to_string())
+            .copied()
+            .unwrap_or(100)
+    }
+
+    fn workload_weight(&self, workload_id: &str) -> u32 {
+        self.workload_priority_weights
+            .get(workload_id)
+            .copied()
+            .unwrap_or(100)
     }
 
     fn evaluate(
@@ -659,6 +732,7 @@ impl JobRunner {
             stats: Arc::new(JobStats::new()),
             shutdown_on_idle: false,
             max_concurrent_jobs: 2,
+            max_pending_jobs: 8,
             admission_policy: AdmissionPolicy::default(),
             ledger_client: None,
             device_id: None,
@@ -667,6 +741,9 @@ impl JobRunner {
             punch_attempt_state: HashMap::new(),
             active_jobs_by_peer: HashMap::new(),
             active_jobs_by_workload: HashMap::new(),
+            pending_jobs: Vec::new(),
+            peer_dispatch_counts: HashMap::new(),
+            workload_dispatch_counts: HashMap::new(),
         }
     }
 
@@ -678,6 +755,11 @@ impl JobRunner {
 
     pub fn with_max_concurrent_jobs(mut self, max_concurrent_jobs: usize) -> Self {
         self.max_concurrent_jobs = max_concurrent_jobs.max(1);
+        self
+    }
+
+    pub fn with_max_pending_jobs(mut self, max_pending_jobs: usize) -> Self {
+        self.max_pending_jobs = max_pending_jobs.max(1);
         self
     }
 
@@ -778,6 +860,7 @@ impl JobRunner {
                     match joined_job {
                         Ok(completed) => {
                             self.finish_completed_job(completed)?;
+                            self.dispatch_pending_jobs(&mut in_flight_jobs);
                         }
                         Err(e) => {
                             error!(error = %e, "Job task panicked");
@@ -1018,55 +1101,167 @@ impl JobRunner {
             return Ok(());
         }
 
-        if self.stats.active_jobs() as usize >= self.max_concurrent_jobs {
-            self.stats.record_backpressure_rejection();
-            warn!(
-                peer_id = %peer_id,
-                job_id = %job.job_id,
-                active_jobs = self.stats.active_jobs(),
-                max_concurrent_jobs = self.max_concurrent_jobs,
-                "Rejecting job because runner is at capacity"
-            );
-            self.swarm.respond_to_job(
-                channel,
-                JobResult {
-                    job_id: job.job_id,
-                    success: false,
-                    result: None,
-                    error: Some(format!(
-                        "agent at capacity: {} active jobs (limit {})",
-                        self.stats.active_jobs(),
-                        self.max_concurrent_jobs
-                    )),
-                    execution_time_ms: 0,
-                },
-            )?;
-            return Ok(());
+        if self.pending_jobs.len() >= self.max_pending_jobs {
+            let incoming_priority = self.pending_priority_key(peer_id, &job.workload_id);
+            if let Some(index_to_evict) = self.find_evictable_pending_job_index(&incoming_priority) {
+                let evicted = self.pending_jobs.remove(index_to_evict);
+                warn!(
+                    evicted_peer_id = %evicted.peer_id,
+                    evicted_job_id = %evicted.job.job_id,
+                    incoming_peer_id = %peer_id,
+                    incoming_job_id = %job.job_id,
+                    "Evicting lower-priority queued job to preserve weighted production fairness"
+                );
+                self.stats.record_backpressure_rejection();
+                self.swarm.respond_to_job(
+                    evicted.channel,
+                    rejection_result(
+                        evicted.job.job_id,
+                        "job superseded by higher-priority queued work".to_string(),
+                    ),
+                )?;
+            } else {
+                self.stats.record_backpressure_rejection();
+                warn!(
+                    peer_id = %peer_id,
+                    job_id = %job.job_id,
+                    pending_jobs = self.pending_jobs.len(),
+                    max_pending_jobs = self.max_pending_jobs,
+                    "Rejecting job because scheduler queue is at capacity"
+                );
+                self.swarm.respond_to_job(
+                    channel,
+                    rejection_result(
+                        job.job_id,
+                        format!(
+                            "agent scheduler queue at capacity: {} pending jobs (limit {})",
+                            self.pending_jobs.len(),
+                            self.max_pending_jobs
+                        ),
+                    ),
+                )?;
+                return Ok(());
+            }
         }
 
-        self.stats.start_job();
-        self.increment_active_jobs_for_peer(peer_id);
-        self.increment_active_jobs_for_workload(&job.workload_id);
-        let executor = self.executor.clone();
-        let ledger_client = self.ledger_client.clone();
-        let device_id = self.device_id;
-        let network_id = self.network_id.clone();
-        let tier = self.tier;
-        in_flight_jobs.spawn(async move {
-            execute_job_task(
-                executor,
-                ledger_client,
-                device_id,
-                network_id,
-                tier,
-                peer_id,
-                job,
-                channel,
-            )
-            .await
+        self.stats.record_queued_job();
+        self.pending_jobs.push(QueuedJob {
+            peer_id,
+            job,
+            channel,
+            enqueue_sequence: self.stats.queued_jobs.load(Ordering::Relaxed),
         });
+        self.dispatch_pending_jobs(in_flight_jobs);
 
         Ok(())
+    }
+
+    fn dispatch_pending_jobs(&mut self, in_flight_jobs: &mut JoinSet<CompletedJob>) {
+        while (self.stats.active_jobs() as usize) < self.max_concurrent_jobs {
+            let Some(index) = self.select_next_pending_job_index() else {
+                break;
+            };
+            let queued = self.pending_jobs.remove(index);
+            self.stats.start_job();
+            self.stats.record_scheduler_dispatch();
+            self.increment_active_jobs_for_peer(queued.peer_id);
+            self.increment_active_jobs_for_workload(&queued.job.workload_id);
+            *self.peer_dispatch_counts.entry(queued.peer_id).or_insert(0) += 1;
+            *self
+                .workload_dispatch_counts
+                .entry(queued.job.workload_id.clone())
+                .or_insert(0) += 1;
+            let executor = self.executor.clone();
+            let ledger_client = self.ledger_client.clone();
+            let device_id = self.device_id;
+            let network_id = self.network_id.clone();
+            let tier = self.tier;
+            in_flight_jobs.spawn(async move {
+                execute_job_task(
+                    executor,
+                    ledger_client,
+                    device_id,
+                    network_id,
+                    tier,
+                    queued.peer_id,
+                    queued.job,
+                    queued.channel,
+                )
+                .await
+            });
+        }
+    }
+
+    fn select_next_pending_job_index(&self) -> Option<usize> {
+        let mut selected_index = None;
+        let mut selected_key = None;
+        for (index, queued) in self.pending_jobs.iter().enumerate() {
+            let key = self.dispatch_fairness_key(queued.peer_id, &queued.job.workload_id, queued.enqueue_sequence);
+            match &selected_key {
+                None => {
+                    selected_index = Some(index);
+                    selected_key = Some(key);
+                }
+                Some(current) if key.cmp(current, &self.admission_policy) == CmpOrdering::Less => {
+                    selected_index = Some(index);
+                    selected_key = Some(key);
+                }
+                _ => {}
+            }
+        }
+        selected_index
+    }
+
+    fn dispatch_fairness_key(
+        &self,
+        peer_id: PeerId,
+        workload_id: &str,
+        enqueue_sequence: u64,
+    ) -> DispatchFairnessKey {
+        DispatchFairnessKey {
+            peer_id,
+            workload_id: workload_id.to_string(),
+            peer_dispatch_count: self.peer_dispatch_counts.get(&peer_id).copied().unwrap_or(0),
+            workload_dispatch_count: self
+                .workload_dispatch_counts
+                .get(workload_id)
+                .copied()
+                .unwrap_or(0),
+            enqueue_sequence,
+        }
+    }
+
+    fn pending_priority_key(&self, peer_id: PeerId, workload_id: &str) -> PendingPriorityKey {
+        PendingPriorityKey {
+            peer_id,
+            workload_id: workload_id.to_string(),
+        }
+    }
+
+    fn find_evictable_pending_job_index(&self, incoming: &PendingPriorityKey) -> Option<usize> {
+        let mut lowest_index = None;
+        let mut lowest_key = None;
+        for (index, queued) in self.pending_jobs.iter().enumerate() {
+            let key = self.pending_priority_key(queued.peer_id, &queued.job.workload_id);
+            match &lowest_key {
+                None => {
+                    lowest_index = Some(index);
+                    lowest_key = Some(key);
+                }
+                Some(current) if key.cmp(current, &self.admission_policy) == CmpOrdering::Less => {
+                    lowest_index = Some(index);
+                    lowest_key = Some(key);
+                }
+                _ => {}
+            }
+        }
+
+        match (lowest_index, lowest_key) {
+            (Some(index), Some(lowest)) if incoming.cmp(&lowest, &self.admission_policy) == CmpOrdering::Greater => {
+                Some(index)
+            }
+            _ => None,
+        }
     }
 
     fn finish_completed_job(&mut self, completed: CompletedJob) -> Result<()> {
@@ -1259,6 +1454,87 @@ struct CompletedJob {
     channel: libp2p::request_response::ResponseChannel<JobResult>,
     result: JobResult,
     execution_time_ms: u64,
+}
+
+struct QueuedJob {
+    peer_id: libp2p::PeerId,
+    job: JobEnvelope,
+    channel: libp2p::request_response::ResponseChannel<JobResult>,
+    enqueue_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPriorityKey {
+    peer_id: PeerId,
+    workload_id: String,
+}
+
+impl PendingPriorityKey {
+    fn cmp(&self, other: &Self, policy: &AdmissionPolicy) -> CmpOrdering {
+        let self_peer_weight = policy.peer_weight(self.peer_id);
+        let other_peer_weight = policy.peer_weight(other.peer_id);
+        match self_peer_weight.cmp(&other_peer_weight) {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+
+        let self_workload_weight = policy.workload_weight(&self.workload_id);
+        let other_workload_weight = policy.workload_weight(&other.workload_id);
+        self_workload_weight.cmp(&other_workload_weight)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DispatchFairnessKey {
+    peer_id: PeerId,
+    workload_id: String,
+    peer_dispatch_count: u64,
+    workload_dispatch_count: u64,
+    enqueue_sequence: u64,
+}
+
+impl DispatchFairnessKey {
+    fn cmp(&self, other: &Self, policy: &AdmissionPolicy) -> CmpOrdering {
+        let self_peer_weight = u64::from(policy.peer_weight(self.peer_id));
+        let other_peer_weight = u64::from(policy.peer_weight(other.peer_id));
+        match (self.peer_dispatch_count * other_peer_weight)
+            .cmp(&(other.peer_dispatch_count * self_peer_weight))
+        {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+
+        let self_workload_weight = u64::from(policy.workload_weight(&self.workload_id));
+        let other_workload_weight = u64::from(policy.workload_weight(&other.workload_id));
+        match (self.workload_dispatch_count * other_workload_weight)
+            .cmp(&(other.workload_dispatch_count * self_workload_weight))
+        {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+
+        match other_peer_weight.cmp(&self_peer_weight) {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+
+        match other_workload_weight.cmp(&self_workload_weight) {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+
+        self.enqueue_sequence.cmp(&other.enqueue_sequence)
+    }
+}
+
+fn rejection_result(job_id: uuid::Uuid, error: String) -> JobResult {
+    JobResult {
+        job_id,
+        success: false,
+        result: None,
+        error: Some(error),
+        execution_time_ms: 0,
+    }
 }
 
 async fn execute_job_task(
@@ -1479,6 +1755,128 @@ mod tests {
     }
 
     #[test]
+    fn test_with_max_pending_jobs_clamps_to_one() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().unwrap();
+        let executor = EmbeddingsExecutor::new_fast().unwrap();
+        let runner = JobRunner::new(swarm, executor).with_max_pending_jobs(0);
+
+        assert_eq!(runner.max_pending_jobs, 1);
+    }
+
+    #[test]
+    fn test_admission_policy_uses_priority_weights() {
+        let preferred_peer = libp2p::PeerId::random();
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            1,
+            30_000,
+            vec!["embeddings".to_string(), "embeddings-v1".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
+            vec![crate::device::PeerPriorityWeight {
+                peer_id: preferred_peer.to_string(),
+                weight: 500,
+            }],
+            vec![crate::device::WorkloadPriorityWeight {
+                workload_id: "embeddings".to_string(),
+                weight: 250,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(policy.peer_weight(preferred_peer), 500);
+        assert_eq!(policy.workload_weight("embeddings"), 250);
+        assert_eq!(policy.workload_weight("embeddings-v1"), 100);
+    }
+
+    #[test]
+    fn test_dispatch_fairness_prefers_higher_weighted_peer_under_equal_service() {
+        let preferred_peer = libp2p::PeerId::random();
+        let default_peer = libp2p::PeerId::random();
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            1,
+            30_000,
+            vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
+            vec![crate::device::PeerPriorityWeight {
+                peer_id: preferred_peer.to_string(),
+                weight: 300,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let preferred = DispatchFairnessKey {
+            peer_id: preferred_peer,
+            workload_id: "embeddings".to_string(),
+            peer_dispatch_count: 0,
+            workload_dispatch_count: 0,
+            enqueue_sequence: 2,
+        };
+        let default = DispatchFairnessKey {
+            peer_id: default_peer,
+            workload_id: "embeddings".to_string(),
+            peer_dispatch_count: 0,
+            workload_dispatch_count: 0,
+            enqueue_sequence: 1,
+        };
+
+        assert_eq!(preferred.cmp(&default, &policy), CmpOrdering::Less);
+    }
+
+    #[test]
+    fn test_dispatch_fairness_prefers_less_served_peer_after_weighting() {
+        let heavy_peer = libp2p::PeerId::random();
+        let light_peer = libp2p::PeerId::random();
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            1,
+            30_000,
+            vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
+            vec![crate::device::PeerPriorityWeight {
+                peer_id: heavy_peer.to_string(),
+                weight: 4,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let heavier_but_more_served = DispatchFairnessKey {
+            peer_id: heavy_peer,
+            workload_id: "embeddings".to_string(),
+            peer_dispatch_count: 4,
+            workload_dispatch_count: 0,
+            enqueue_sequence: 1,
+        };
+        let lighter_less_served = DispatchFairnessKey {
+            peer_id: light_peer,
+            workload_id: "embeddings".to_string(),
+            peer_dispatch_count: 1,
+            workload_dispatch_count: 0,
+            enqueue_sequence: 2,
+        };
+
+        assert_eq!(
+            lighter_less_served.cmp(&heavier_but_more_served, &policy),
+            CmpOrdering::Less
+        );
+    }
+
+    #[test]
     fn test_admission_policy_accepts_supported_job() {
         let policy = AdmissionPolicy::new(
             "test-network".to_string(),
@@ -1489,6 +1887,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -1518,6 +1918,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -1550,6 +1952,8 @@ mod tests {
             }],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1578,6 +1982,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -1610,6 +2016,8 @@ mod tests {
             }],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1638,6 +2046,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -1670,6 +2080,8 @@ mod tests {
                 max_concurrent_jobs: 1,
             }],
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             vec![blocked_peer_id.to_string()],
         );
         let job = JobEnvelope {
@@ -1701,6 +2113,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
             vec![trusted_peer_id.to_string()],
             Vec::new(),
         );

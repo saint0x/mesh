@@ -1275,12 +1275,15 @@ async fn cmd_start() -> Result<()> {
 
     let runner = JobRunner::new(swarm, executor)
         .with_max_concurrent_jobs(config.governance.max_concurrent_jobs)
+        .with_max_pending_jobs(config.governance.max_pending_jobs)
         .with_admission_policy(AdmissionPolicy::new(
             config.network_id.clone(),
             config.governance.max_concurrent_jobs_per_peer,
             config.governance.max_job_timeout_ms,
             config.governance.allowed_workloads.clone(),
             config.governance.workload_concurrency_limits.clone(),
+            config.governance.peer_priority_weights.clone(),
+            config.governance.workload_priority_weights.clone(),
             config.governance.trusted_peer_ids.clone(),
             config.governance.blocked_peer_ids.clone(),
         ));

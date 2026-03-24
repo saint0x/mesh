@@ -110,7 +110,7 @@ This is important for mature production behavior, but it should not define the h
 
 - ✅ Agent runtime governance now has an explicit config contract through `DeviceConfig.governance.max_concurrent_jobs` instead of relying on implicit event-loop serialization.
 - ✅ Job execution now uses bounded in-flight task management, so concurrent execution is explicit and controlled.
-- ✅ Over-capacity job submissions are now rejected immediately with a deterministic production error instead of silently queueing behind unbounded local pressure.
+- ✅ Over-capacity job submissions now enter an explicit bounded scheduler queue first, and only reject once governed queue capacity is actually exhausted instead of relying on implicit arrival-order pressure.
 - ✅ Job statistics now persist backpressure rejection counts alongside success/failure and connectivity metrics.
 - ✅ Admission control now enforces one explicit production policy for mesh jobs: matching network, supported workload, and bounded accepted timeout before execution starts.
 - ✅ Admission rejection counts are now persisted separately from pure capacity rejection so operators can distinguish invalid work from overload pressure.
@@ -120,14 +120,16 @@ This is important for mature production behavior, but it should not define the h
 - ✅ Workload-quota rejection counts are now persisted separately so workload saturation is visible independently from peer fairness and whole-node overload.
 - ✅ Peer trust policy now supports explicit trusted and blocked `PeerId` lists at admission time, so the runtime can enforce a real trust contract instead of treating every reachable peer as equally trusted.
 - ✅ Trust-policy rejection counts are now persisted separately so governance can distinguish trust denials from malformed jobs, quota denials, and node overload.
+- ✅ Job execution now has an explicit bounded pending scheduler queue instead of using request arrival order as the de facto slot allocator under contention.
+- ✅ Governance now supports explicit peer and workload priority weights, so scarce local executor slots are assigned deterministically instead of being won only by timing.
+- ✅ Scheduler dispatch counts and queued-job counts are now persisted alongside the existing rejection metrics, so weighted fairness behavior is operator-visible.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
 
 ### Governance Still Open
 
-- ⬜ Admission control beyond the current network/workload/timeout/per-peer/per-workload/trust gate, including trust weighting and broader pool-level fairness policy.
 - ⬜ Tensor-plane and bandwidth backpressure, not just executor-slot backpressure.
-- ⬜ Fairness and quota policy across peers, workloads, and pools.
+- ⬜ Pool-level fairness and quota policy above the single-agent scheduler, so contention can be governed coherently across multiple workers instead of only per node.
 - ⬜ Recovery-path governance so retries, reconnect storms, and degraded relay behavior cannot overwhelm a node.
 
 ## Non-Goals

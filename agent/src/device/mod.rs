@@ -71,6 +71,9 @@ pub struct GovernanceConfig {
     /// Maximum number of jobs that may execute concurrently on this agent.
     pub max_concurrent_jobs: usize,
 
+    /// Maximum number of admitted jobs allowed to wait in the local scheduler queue.
+    pub max_pending_jobs: usize,
+
     /// Maximum number of concurrent jobs a single peer may hold on this agent.
     pub max_concurrent_jobs_per_peer: usize,
 
@@ -82,6 +85,12 @@ pub struct GovernanceConfig {
 
     /// Workload-specific concurrency caps enforced within the local runner.
     pub workload_concurrency_limits: Vec<WorkloadConcurrencyLimit>,
+
+    /// Relative peer weights for deterministic scheduler fairness under contention.
+    pub peer_priority_weights: Vec<PeerPriorityWeight>,
+
+    /// Relative workload weights for deterministic scheduler fairness under contention.
+    pub workload_priority_weights: Vec<WorkloadPriorityWeight>,
 
     /// If non-empty, only these peers may submit mesh jobs to this agent.
     pub trusted_peer_ids: Vec<String>,
@@ -99,10 +108,29 @@ pub struct WorkloadConcurrencyLimit {
     pub max_concurrent_jobs: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerPriorityWeight {
+    /// Peer identifier this weight applies to.
+    pub peer_id: String,
+
+    /// Relative weight used by the scheduler. Higher means more preferred under contention.
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadPriorityWeight {
+    /// Workload identifier this weight applies to.
+    pub workload_id: String,
+
+    /// Relative weight used by the scheduler. Higher means more preferred under contention.
+    pub weight: u32,
+}
+
 impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
             max_concurrent_jobs: 2,
+            max_pending_jobs: 8,
             max_concurrent_jobs_per_peer: 1,
             max_job_timeout_ms: 300_000,
             allowed_workloads: vec!["embeddings".to_string(), "embeddings-v1".to_string()],
@@ -114,6 +142,17 @@ impl Default for GovernanceConfig {
                 WorkloadConcurrencyLimit {
                     workload_id: "embeddings-v1".to_string(),
                     max_concurrent_jobs: 1,
+                },
+            ],
+            peer_priority_weights: Vec::new(),
+            workload_priority_weights: vec![
+                WorkloadPriorityWeight {
+                    workload_id: "embeddings".to_string(),
+                    weight: 100,
+                },
+                WorkloadPriorityWeight {
+                    workload_id: "embeddings-v1".to_string(),
+                    weight: 100,
                 },
             ],
             trusted_peer_ids: Vec::new(),
@@ -390,6 +429,7 @@ mod tests {
         assert!(config.connectivity.attachments.is_empty());
         assert!(config.capabilities.cpu_cores > 0);
         assert_eq!(config.governance.max_concurrent_jobs, 2);
+        assert_eq!(config.governance.max_pending_jobs, 8);
         assert_eq!(config.governance.max_concurrent_jobs_per_peer, 1);
         assert_eq!(config.governance.max_job_timeout_ms, 300_000);
         assert_eq!(
@@ -406,6 +446,20 @@ mod tests {
                 WorkloadConcurrencyLimit {
                     workload_id: "embeddings-v1".to_string(),
                     max_concurrent_jobs: 1
+                }
+            ]
+        );
+        assert!(config.governance.peer_priority_weights.is_empty());
+        assert_eq!(
+            config.governance.workload_priority_weights,
+            vec![
+                WorkloadPriorityWeight {
+                    workload_id: "embeddings".to_string(),
+                    weight: 100
+                },
+                WorkloadPriorityWeight {
+                    workload_id: "embeddings-v1".to_string(),
+                    weight: 100
                 }
             ]
         );
@@ -442,6 +496,7 @@ arch = "x86_64"
 
         let loaded: DeviceConfig = toml::from_str(&legacy_toml).unwrap();
         assert_eq!(loaded.governance.max_concurrent_jobs, 2);
+        assert_eq!(loaded.governance.max_pending_jobs, 8);
         assert_eq!(loaded.governance.max_concurrent_jobs_per_peer, 1);
         assert_eq!(loaded.governance.max_job_timeout_ms, 300_000);
         assert_eq!(
@@ -458,6 +513,20 @@ arch = "x86_64"
                 WorkloadConcurrencyLimit {
                     workload_id: "embeddings-v1".to_string(),
                     max_concurrent_jobs: 1
+                }
+            ]
+        );
+        assert!(loaded.governance.peer_priority_weights.is_empty());
+        assert_eq!(
+            loaded.governance.workload_priority_weights,
+            vec![
+                WorkloadPriorityWeight {
+                    workload_id: "embeddings".to_string(),
+                    weight: 100
+                },
+                WorkloadPriorityWeight {
+                    workload_id: "embeddings-v1".to_string(),
+                    weight: 100
                 }
             ]
         );
@@ -496,6 +565,10 @@ arch = "x86_64"
             loaded.governance.max_concurrent_jobs
         );
         assert_eq!(
+            original.governance.max_pending_jobs,
+            loaded.governance.max_pending_jobs
+        );
+        assert_eq!(
             original.governance.max_job_timeout_ms,
             loaded.governance.max_job_timeout_ms
         );
@@ -510,6 +583,14 @@ arch = "x86_64"
         assert_eq!(
             original.governance.workload_concurrency_limits,
             loaded.governance.workload_concurrency_limits
+        );
+        assert_eq!(
+            original.governance.peer_priority_weights,
+            loaded.governance.peer_priority_weights
+        );
+        assert_eq!(
+            original.governance.workload_priority_weights,
+            loaded.governance.workload_priority_weights
         );
         assert_eq!(
             original.governance.trusted_peer_ids,
