@@ -89,6 +89,9 @@ pub struct JobStats {
 
     /// Number of jobs rejected because the runner was already at capacity
     pub backpressure_rejections: AtomicU64,
+
+    /// Number of jobs rejected by admission policy before execution started
+    pub admission_rejections: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -118,6 +121,7 @@ impl JobStats {
             punch_assisted_upgrade_successes: AtomicU64::new(0),
             punch_assisted_upgrade_failures: AtomicU64::new(0),
             backpressure_rejections: AtomicU64::new(0),
+            admission_rejections: AtomicU64::new(0),
         }
     }
 
@@ -197,6 +201,10 @@ impl JobStats {
 
     pub fn record_backpressure_rejection(&self) {
         self.backpressure_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_admission_rejection(&self) {
+        self.admission_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -301,6 +309,10 @@ impl JobStats {
             "  Rejected:         {}",
             self.backpressure_rejections.load(Ordering::Relaxed)
         );
+        println!(
+            "  Admission Denied: {}",
+            self.admission_rejections.load(Ordering::Relaxed)
+        );
         println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
 
         println!("\n{}", "Performance:".bold());
@@ -383,6 +395,7 @@ impl JobStats {
             "failed": self.jobs_failed.load(Ordering::Relaxed),
             "active": self.active_jobs(),
             "rejected": self.backpressure_rejections.load(Ordering::Relaxed),
+            "admission_rejected": self.admission_rejections.load(Ordering::Relaxed),
             "success_rate": self.success_rate() * 100.0,
             "avg_execution_time_ms": self.avg_execution_time_ms(),
             "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
@@ -419,11 +432,83 @@ pub struct JobRunner {
     stats: Arc<JobStats>,
     shutdown_on_idle: bool,
     max_concurrent_jobs: usize,
+    admission_policy: AdmissionPolicy,
     ledger_client: Option<crate::telemetry::LedgerClient>,
     device_id: Option<uuid::Uuid>,
     network_id: Option<String>,
     tier: Option<crate::device::Tier>,
     punch_attempt_state: HashMap<PeerId, bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdmissionPolicy {
+    local_network_id: String,
+    max_job_timeout_ms: u64,
+    allowed_workloads: Vec<String>,
+}
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            local_network_id: String::new(),
+            max_job_timeout_ms: 300_000,
+            allowed_workloads: vec!["embeddings".to_string(), "embeddings-v1".to_string()],
+        }
+    }
+}
+
+impl AdmissionPolicy {
+    pub fn new(
+        local_network_id: String,
+        max_job_timeout_ms: u64,
+        allowed_workloads: Vec<String>,
+    ) -> Self {
+        let normalized_workloads = allowed_workloads
+            .into_iter()
+            .map(|workload| workload.trim().to_string())
+            .filter(|workload| !workload.is_empty())
+            .collect::<Vec<_>>();
+
+        Self {
+            local_network_id,
+            max_job_timeout_ms: max_job_timeout_ms.max(1),
+            allowed_workloads: if normalized_workloads.is_empty() {
+                vec!["embeddings".to_string(), "embeddings-v1".to_string()]
+            } else {
+                normalized_workloads
+            },
+        }
+    }
+
+    fn evaluate(&self, job: &JobEnvelope) -> std::result::Result<(), String> {
+        if !self.local_network_id.is_empty() && job.network_id != self.local_network_id {
+            return Err(format!(
+                "job network mismatch: got {}, expected {}",
+                job.network_id, self.local_network_id
+            ));
+        }
+
+        if !self
+            .allowed_workloads
+            .iter()
+            .any(|workload| workload == &job.workload_id)
+        {
+            return Err(format!(
+                "unsupported workload: {} (allowed: {})",
+                job.workload_id,
+                self.allowed_workloads.join(", ")
+            ));
+        }
+
+        if job.timeout_ms > self.max_job_timeout_ms {
+            return Err(format!(
+                "job timeout {}ms exceeds admission limit {}ms",
+                job.timeout_ms, self.max_job_timeout_ms
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl JobRunner {
@@ -453,6 +538,7 @@ impl JobRunner {
             stats: Arc::new(JobStats::new()),
             shutdown_on_idle: false,
             max_concurrent_jobs: 2,
+            admission_policy: AdmissionPolicy::default(),
             ledger_client: None,
             device_id: None,
             network_id: None,
@@ -469,6 +555,11 @@ impl JobRunner {
 
     pub fn with_max_concurrent_jobs(mut self, max_concurrent_jobs: usize) -> Self {
         self.max_concurrent_jobs = max_concurrent_jobs.max(1);
+        self
+    }
+
+    pub fn with_admission_policy(mut self, admission_policy: AdmissionPolicy) -> Self {
+        self.admission_policy = admission_policy;
         self
     }
 
@@ -760,6 +851,30 @@ impl JobRunner {
         in_flight_jobs: &mut JoinSet<CompletedJob>,
     ) -> Result<()> {
         info!("Received job from peer");
+        if let Err(rejection_reason) = self.admission_policy.evaluate(&job) {
+            self.stats.record_admission_rejection();
+            warn!(
+                peer_id = %peer_id,
+                job_id = %job.job_id,
+                network_id = %job.network_id,
+                workload = %job.workload_id,
+                timeout_ms = job.timeout_ms,
+                rejection_reason = %rejection_reason,
+                "Rejecting job due to admission policy"
+            );
+            self.swarm.respond_to_job(
+                channel,
+                JobResult {
+                    job_id: job.job_id,
+                    success: false,
+                    result: None,
+                    error: Some(rejection_reason),
+                    execution_time_ms: 0,
+                },
+            )?;
+            return Ok(());
+        }
+
         if self.stats.active_jobs() as usize >= self.max_concurrent_jobs {
             self.stats.record_backpressure_rejection();
             warn!(
@@ -1132,6 +1247,14 @@ mod tests {
     }
 
     #[test]
+    fn test_job_stats_admission_rejection_metrics() {
+        let stats = JobStats::new();
+        stats.record_admission_rejection();
+        stats.record_admission_rejection();
+        assert_eq!(stats.admission_rejections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn test_with_max_concurrent_jobs_clamps_to_one() {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let swarm = MeshSwarm::builder(keypair).build().unwrap();
@@ -1139,6 +1262,95 @@ mod tests {
         let runner = JobRunner::new(swarm, executor).with_max_concurrent_jobs(0);
 
         assert_eq!(runner.max_concurrent_jobs, 1);
+    }
+
+    #[test]
+    fn test_admission_policy_accepts_supported_job() {
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            30_000,
+            vec!["embeddings".to_string()],
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "test-network".to_string(),
+            workload_id: "embeddings".to_string(),
+            payload: vec![],
+            timeout_ms: 5_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy.evaluate(&job).is_ok());
+    }
+
+    #[test]
+    fn test_admission_policy_rejects_wrong_network() {
+        let policy = AdmissionPolicy::new(
+            "prod-network".to_string(),
+            30_000,
+            vec!["embeddings".to_string()],
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "other-network".to_string(),
+            workload_id: "embeddings".to_string(),
+            payload: vec![],
+            timeout_ms: 5_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy
+            .evaluate(&job)
+            .unwrap_err()
+            .contains("job network mismatch"));
+    }
+
+    #[test]
+    fn test_admission_policy_rejects_unsupported_workload() {
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            30_000,
+            vec!["embeddings".to_string()],
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "test-network".to_string(),
+            workload_id: "ocr-v1".to_string(),
+            payload: vec![],
+            timeout_ms: 5_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy
+            .evaluate(&job)
+            .unwrap_err()
+            .contains("unsupported workload"));
+    }
+
+    #[test]
+    fn test_admission_policy_rejects_timeout_over_limit() {
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            10_000,
+            vec!["embeddings".to_string()],
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "test-network".to_string(),
+            workload_id: "embeddings".to_string(),
+            payload: vec![],
+            timeout_ms: 15_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy
+            .evaluate(&job)
+            .unwrap_err()
+            .contains("exceeds admission limit"));
     }
 
     #[tokio::test]

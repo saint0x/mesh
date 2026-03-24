@@ -39,10 +39,10 @@ use agent::{
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
     parse_data_plane_endpoint, parse_memory_string, persist_runtime_connectivity_state,
-    select_direct_dial_addrs_from_candidates, ConnectivityAttachmentKind, ConnectivityPath,
-    ConnectivityStatus, DeviceConfig, DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput,
-    EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
-    TensorPlane, TensorPlaneConfig,
+    select_direct_dial_addrs_from_candidates, AdmissionPolicy, ConnectivityAttachmentKind,
+    ConnectivityPath, ConnectivityStatus, DeviceConfig, DeviceConnectivityState,
+    EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner, MeshSwarmBuilder,
+    RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -1274,7 +1274,12 @@ async fn cmd_start() -> Result<()> {
     println!("   Press Ctrl+C to stop\n");
 
     let runner = JobRunner::new(swarm, executor)
-        .with_max_concurrent_jobs(config.governance.max_concurrent_jobs);
+        .with_max_concurrent_jobs(config.governance.max_concurrent_jobs)
+        .with_admission_policy(AdmissionPolicy::new(
+            config.network_id.clone(),
+            config.governance.max_job_timeout_ms,
+            config.governance.allowed_workloads.clone(),
+        ));
     runner.run().await?;
 
     Ok(())

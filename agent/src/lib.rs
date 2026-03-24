@@ -28,8 +28,8 @@ pub use connectivity::{
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
 pub use errors::{AgentError, Result};
 pub use executor::{
-    EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, ExecutorError, JobRunner, JobStats,
-    Tensor, WorkerRing,
+    AdmissionPolicy, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, ExecutorError,
+    JobRunner, JobStats, Tensor, WorkerRing,
 };
 pub use inference::{
     GenerationConfig, InferenceConfig, InferenceCoordinator, InferenceJob, InferenceRequest,
