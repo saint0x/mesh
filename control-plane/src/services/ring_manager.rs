@@ -62,6 +62,7 @@ pub struct RingTopology {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerTopologyInfo {
     pub device_id: DeviceId,
+    pub peer_id: String,
     pub position: u32,
     pub status: String,
     pub contributed_memory: u64,
@@ -69,6 +70,7 @@ pub struct WorkerTopologyInfo {
     pub left_neighbor: DeviceId,
     pub right_neighbor: DeviceId,
     pub connectivity_state: Option<DeviceConnectivityState>,
+    pub listen_addrs: Vec<String>,
 }
 
 /// Ring Topology Manager for distributed worker coordination
@@ -526,7 +528,8 @@ impl RingTopologyManager {
             .prepare(
                 r#"
                 SELECT device_id, ring_position, shard_column_start, shard_column_end,
-                       left_neighbor_id, right_neighbor_id, status, contributed_memory, connectivity_state
+                       left_neighbor_id, right_neighbor_id, status, contributed_memory, connectivity_state,
+                       peer_id, listen_addrs
                 FROM devices
                 WHERE network_id = ? AND ring_position IS NOT NULL
                 ORDER BY ring_position
@@ -555,9 +558,23 @@ impl RingTopologyManager {
                             Box::new(e),
                         )
                     })?;
+                let peer_id: String = row.get(9)?;
+                let listen_addrs = row
+                    .get::<_, Option<String>>(10)?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .unwrap_or_default();
 
                 Ok(WorkerTopologyInfo {
                     device_id,
+                    peer_id,
                     position,
                     status,
                     contributed_memory,
@@ -569,6 +586,7 @@ impl RingTopologyManager {
                     left_neighbor,
                     right_neighbor,
                     connectivity_state,
+                    listen_addrs,
                 })
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -660,6 +678,7 @@ mod tests {
             network_id.to_string(),
             "Test Device".to_string(),
             public_key.to_vec(),
+            format!("test-peer-manager-{}", device_id),
             test_capabilities(),
         )
         .unwrap();

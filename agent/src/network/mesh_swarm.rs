@@ -224,6 +224,15 @@ impl MeshSwarm {
         Ok(())
     }
 
+    /// Listen on default direct transports for inbound peer connections.
+    pub fn listen_on_direct_addrs(&mut self) -> Result<()> {
+        self.swarm
+            .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("static tcp addr must parse"))?;
+        self.swarm
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("static quic addr must parse"))?;
+        Ok(())
+    }
+
     /// Listen on the relay server (create a reservation)
     #[instrument(skip(self), fields(peer_id = %self.local_peer_id(), relay = %relay_peer_id))]
     pub fn listen_on_relay(&mut self, relay_peer_id: PeerId) -> Result<()> {
@@ -263,6 +272,37 @@ impl MeshSwarm {
         debug!("Relay circuit address: {}", relay_addr);
         self.swarm.dial(relay_addr)?;
         Ok(())
+    }
+
+    pub fn dial_direct_peer(&mut self, peer_id: PeerId, addrs: &[Multiaddr]) -> Result<()> {
+        let mut dialed = false;
+        for addr in addrs {
+            let dial_addr = if addr.iter().any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_))) {
+                addr.clone()
+            } else {
+                addr.clone()
+                    .with(libp2p::multiaddr::Protocol::P2p(peer_id))
+            };
+
+            match self.swarm.dial(dial_addr.clone()) {
+                Ok(()) => {
+                    dialed = true;
+                    debug!(peer_id = %peer_id, addr = %dial_addr, "Dialing peer directly");
+                }
+                Err(e) => {
+                    warn!(peer_id = %peer_id, addr = %dial_addr, error = %e, "Direct dial attempt failed");
+                }
+            }
+        }
+
+        if dialed {
+            Ok(())
+        } else {
+            Err(AgentError::Network(format!(
+                "Failed to dial peer {} on any advertised direct address",
+                peer_id
+            )))
+        }
     }
 
     /// Send a job request to a peer
@@ -570,7 +610,13 @@ impl MeshSwarm {
 
     /// Set the ring neighbors for all-reduce communication
     #[instrument(skip(self), fields(local = %self.local_peer_id(), left = %left, right = %right))]
-    pub fn set_ring_neighbors(&mut self, left: PeerId, right: PeerId) {
+    pub fn set_ring_neighbors(
+        &mut self,
+        left: PeerId,
+        left_addrs: &[Multiaddr],
+        right: PeerId,
+        right_addrs: &[Multiaddr],
+    ) {
         info!("Setting ring neighbors");
 
         self.ring_connections = Some(RingConnections {
@@ -579,11 +625,20 @@ impl MeshSwarm {
         });
 
         // Ensure connections are established to both neighbors
-        if let Err(e) = self.swarm.dial(left) {
-            warn!(peer_id = %left, error = %e, "Failed to dial left neighbor");
-        }
-        if let Err(e) = self.swarm.dial(right) {
-            warn!(peer_id = %right, error = %e, "Failed to dial right neighbor");
+        if self.relay_peer_id.is_some() {
+            if let Err(e) = self.dial_peer(left) {
+                warn!(peer_id = %left, error = %e, "Failed to dial left neighbor through relay");
+            }
+            if let Err(e) = self.dial_peer(right) {
+                warn!(peer_id = %right, error = %e, "Failed to dial right neighbor through relay");
+            }
+        } else {
+            if let Err(e) = self.dial_direct_peer(left, left_addrs) {
+                warn!(peer_id = %left, error = %e, "Failed to dial left neighbor directly");
+            }
+            if let Err(e) = self.dial_direct_peer(right, right_addrs) {
+                warn!(peer_id = %right, error = %e, "Failed to dial right neighbor directly");
+            }
         }
 
         info!("Ring neighbors set: left={}, right={}", left, right);

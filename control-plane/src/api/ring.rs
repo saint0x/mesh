@@ -147,6 +147,7 @@ pub async fn get_topology(
         .into_iter()
         .map(|w| WorkerInfo {
             device_id: w.device_id,
+            peer_id: w.peer_id,
             position: w.position,
             status: w.status,
             contributed_memory: w.contributed_memory,
@@ -159,6 +160,7 @@ pub async fn get_topology(
             left_neighbor: w.left_neighbor,
             right_neighbor: w.right_neighbor,
             connectivity_state: w.connectivity_state,
+            listen_addrs: w.listen_addrs,
         })
         .collect();
 
@@ -495,6 +497,7 @@ mod tests {
             network_id.to_string(),
             "Test Device".to_string(),
             public_key.to_vec(),
+            format!("test-peer-ring-{}", device_id),
             test_capabilities(),
         )
         .unwrap();

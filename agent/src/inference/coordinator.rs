@@ -14,7 +14,7 @@ use crate::executor::ring_allreduce::WorkerRing;
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
 use crate::network::MeshSwarm;
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -77,8 +77,14 @@ pub struct WorkerPosition {
     /// Left neighbor peer ID
     pub left_neighbor: PeerId,
 
+    /// Left neighbor direct listen addresses
+    pub left_neighbor_addrs: Vec<Multiaddr>,
+
     /// Right neighbor peer ID
     pub right_neighbor: PeerId,
+
+    /// Right neighbor direct listen addresses
+    pub right_neighbor_addrs: Vec<Multiaddr>,
 
     /// Column range this worker is responsible for
     pub shard_column_range: (u32, u32),
@@ -254,7 +260,12 @@ impl InferenceCoordinator {
 
         // Set ring neighbors on the swarm
         self.swarm
-            .set_ring_neighbors(position.left_neighbor, position.right_neighbor);
+            .set_ring_neighbors(
+                position.left_neighbor,
+                &position.left_neighbor_addrs,
+                position.right_neighbor,
+                &position.right_neighbor_addrs,
+            );
 
         self.position = Some(position);
 
@@ -684,7 +695,9 @@ mod tests {
             position: 3,
             total_workers: 10,
             left_neighbor: PeerId::random(),
+            left_neighbor_addrs: vec![],
             right_neighbor: PeerId::random(),
+            right_neighbor_addrs: vec![],
             shard_column_range: (2457, 3276),
             shard_memory_bytes: 7_000_000_000,
         };

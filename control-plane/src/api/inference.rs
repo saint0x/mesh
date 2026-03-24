@@ -637,6 +637,7 @@ mod tests {
             network_id.to_string(),
             "Test Device".to_string(),
             public_key.to_vec(),
+            format!("test-peer-inf-{}", device_id),
             test_capabilities(),
         )
         .unwrap();

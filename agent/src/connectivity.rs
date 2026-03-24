@@ -72,6 +72,15 @@ impl NetworkConnectivity {
         }
     }
 
+    pub fn runtime_endpoint(&self) -> Result<Option<Multiaddr>> {
+        match self.preferred_path {
+            ConnectivityPath::Direct => Ok(None),
+            ConnectivityPath::Relayed | ConnectivityPath::Overlay => {
+                Ok(Some(self.resolve_primary_endpoint()?))
+            }
+        }
+    }
+
     pub fn resolve_primary_endpoint(&self) -> Result<Multiaddr> {
         let expected_kind = match self.preferred_path {
             ConnectivityPath::Direct => {

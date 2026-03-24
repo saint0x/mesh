@@ -64,7 +64,7 @@ fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Erro
         conn.execute(
             r#"
             UPDATE devices
-            SET status = 'offline', connectivity_state = ?
+            SET status = 'offline', connectivity_state = ?, listen_addrs = '[]'
             WHERE device_id = ?
             "#,
             params![connectivity_state_json, device_id],
@@ -135,6 +135,7 @@ mod tests {
             "test-network".to_string(),
             "Test Device".to_string(),
             vec![42u8; 32],
+            "12D3KooWQ6presence1111111111111111111111111111111".to_string(),
             test_capabilities(),
         )
         .unwrap();
@@ -198,6 +199,7 @@ mod tests {
             "test-network".to_string(),
             "Test Device".to_string(),
             vec![42u8; 32],
+            "12D3KooWQ6presence2222222222222222222222222222222".to_string(),
             test_capabilities(),
         )
         .unwrap();

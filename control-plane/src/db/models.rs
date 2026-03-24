@@ -17,12 +17,14 @@ pub struct Device {
     pub network_id: String,
     pub name: String,
     pub public_key: Vec<u8>,          // Ed25519 public key bytes
+    pub peer_id: String,
     pub capabilities: String,         // JSON string
     pub certificate: Option<Vec<u8>>, // mTLS certificate (optional)
     pub created_at: String,           // ISO 8601 timestamp
     pub last_seen: Option<String>,
     pub status: String, // 'online', 'offline', 'revoked'
     pub connectivity_state: Option<String>, // JSON string
+    pub listen_addrs: Option<String>, // JSON string
 }
 
 /// Device status enum

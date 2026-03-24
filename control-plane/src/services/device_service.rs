@@ -16,6 +16,7 @@ pub fn register_device(
     network_id: String,
     name: String,
     public_key: Vec<u8>,
+    peer_id: String,
     capabilities: DeviceCapabilities,
 ) -> ApiResult<(Vec<u8>, NetworkConnectivity)> {
     // Validate inputs
@@ -29,6 +30,9 @@ pub fn register_device(
         return Err(ApiError::BadRequest(
             "public_key must be 32 bytes (Ed25519)".into(),
         ));
+    }
+    if peer_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("peer_id cannot be empty".into()));
     }
 
     network_service::require_network_exists(db, &network_id)?;
@@ -74,15 +78,16 @@ pub fn register_device(
     conn.execute(
         r#"
         INSERT INTO devices (
-            device_id, network_id, name, public_key, capabilities,
+            device_id, network_id, name, public_key, peer_id, capabilities,
             certificate, status, connectivity_state, created_at, last_seen
-        ) VALUES (?, ?, ?, ?, ?, ?, 'online', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?)
         "#,
         params![
             &device_id,
             &network_id,
             &name,
             &public_key,
+            &peer_id,
             &capabilities_json,
             &certificate,
             &connectivity_state_json,
@@ -107,15 +112,23 @@ pub fn update_heartbeat(
     db: &Database,
     device_id: String,
     connectivity_state: DeviceConnectivityState,
-) -> ApiResult<(String, DeviceConnectivityState)> {
+    listen_addrs: Vec<String>,
+) -> ApiResult<(String, DeviceConnectivityState, Vec<String>)> {
     // Validate device_id
     if device_id.is_empty() {
         return Err(ApiError::BadRequest("device_id cannot be empty".into()));
     }
     connectivity_state.validate()?;
+    if listen_addrs.iter().any(|addr| addr.trim().is_empty()) {
+        return Err(ApiError::BadRequest(
+            "listen_addrs must not contain empty entries".into(),
+        ));
+    }
 
     let connectivity_state_json = serde_json::to_string(&connectivity_state)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize connectivity state: {}", e)))?;
+    let listen_addrs_json = serde_json::to_string(&listen_addrs)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize listen addresses: {}", e)))?;
 
     let now = OffsetDateTime::now_utc();
     let now_str = now
@@ -129,10 +142,10 @@ pub fn update_heartbeat(
         .execute(
             r#"
         UPDATE devices
-        SET last_seen = ?, status = 'online', connectivity_state = ?
+        SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?
         WHERE device_id = ?
         "#,
-            params![&now_str, &connectivity_state_json, &device_id],
+            params![&now_str, &connectivity_state_json, &listen_addrs_json, &device_id],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -145,7 +158,7 @@ pub fn update_heartbeat(
 
     debug!(device_id = %device_id, last_seen = %now_str, "Heartbeat updated");
 
-    Ok((now_str, connectivity_state))
+    Ok((now_str, connectivity_state, listen_addrs))
 }
 
 #[cfg(test)]
@@ -213,6 +226,7 @@ mod tests {
             network_id.to_string(),
             "Test Device".to_string(),
             public_key.clone(),
+            "12D3KooWQ6testpeer11111111111111111111111111111111".to_string(),
             test_capabilities(),
         )
         .unwrap();
@@ -260,6 +274,7 @@ mod tests {
             network_id.to_string(),
             "Test Device".to_string(),
             vec![42u8; 32],
+            "12D3KooWQ6testpeer22222222222222222222222222222222".to_string(),
             test_capabilities(),
         )
         .unwrap();
@@ -272,6 +287,7 @@ mod tests {
             network_id.to_string(),
             "Test Device".to_string(),
             vec![43u8; 32],
+            "12D3KooWQ6testpeer33333333333333333333333333333333".to_string(),
             test_capabilities(),
         );
 
@@ -302,12 +318,19 @@ mod tests {
             "test-network".to_string(),
             "Test Device".to_string(),
             vec![42u8; 32],
+            "12D3KooWQ6testpeer44444444444444444444444444444444".to_string(),
             test_capabilities(),
         )
         .unwrap();
 
         // Update heartbeat
-        let heartbeat = update_heartbeat(&db, device_id.to_string(), test_connectivity_state()).unwrap();
+        let heartbeat = update_heartbeat(
+            &db,
+            device_id.to_string(),
+            test_connectivity_state(),
+            vec!["/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6testpeer44444444444444444444444444444444".to_string()],
+        )
+        .unwrap();
 
         assert!(!heartbeat.0.is_empty());
         assert_eq!(heartbeat.1.status, ConnectivityStatus::Connected);
@@ -330,7 +353,12 @@ mod tests {
     fn test_heartbeat_nonexistent_device() {
         let db = create_test_db();
 
-        let result = update_heartbeat(&db, "nonexistent-device".to_string(), test_connectivity_state());
+        let result = update_heartbeat(
+            &db,
+            "nonexistent-device".to_string(),
+            test_connectivity_state(),
+            vec![],
+        );
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
@@ -356,6 +384,7 @@ mod tests {
             "test-network".to_string(),
             "Test Device".to_string(),
             vec![42u8; 16], // Wrong length
+            "12D3KooWQ6testpeer55555555555555555555555555555555".to_string(),
             test_capabilities(),
         );
 
@@ -375,6 +404,7 @@ mod tests {
             "missing-network".to_string(),
             "Test Device".to_string(),
             vec![42u8; 32],
+            "12D3KooWQ6testpeer66666666666666666666666666666666".to_string(),
             test_capabilities(),
         );
 

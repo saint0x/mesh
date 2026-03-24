@@ -13,6 +13,8 @@ pub struct RegisterDeviceRequest {
     pub name: String,
     /// Ed25519 public key (32 bytes)
     pub public_key: Vec<u8>,
+    /// Libp2p peer ID derived from the device identity key
+    pub peer_id: String,
     /// Device hardware capabilities
     pub capabilities: DeviceCapabilities,
     /// Optional: Memory to contribute to the pool (bytes).
@@ -83,6 +85,8 @@ pub struct RingPositionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub connectivity_state: DeviceConnectivityState,
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
 }
 
 /// Response to heartbeat update
@@ -94,6 +98,8 @@ pub struct HeartbeatResponse {
     pub last_seen: String,
     /// Recorded connectivity state
     pub connectivity_state: DeviceConnectivityState,
+    /// Recorded listen addresses
+    pub listen_addrs: Vec<String>,
 }
 
 /// Request to join the ring topology
@@ -149,6 +155,8 @@ pub struct RingTopologyResponse {
 pub struct WorkerInfo {
     /// Device ID
     pub device_id: String,
+    /// Libp2p peer ID
+    pub peer_id: String,
     /// Ring position
     pub position: u32,
     /// Reported device status
@@ -164,6 +172,9 @@ pub struct WorkerInfo {
     /// Latest reported connectivity state
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connectivity_state: Option<DeviceConnectivityState>,
+    /// Latest reported direct listen addresses
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
 }
 
 /// Response to ring leave request

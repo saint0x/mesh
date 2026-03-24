@@ -416,6 +416,45 @@ fn resolve_primary_mesh_endpoint(config: &DeviceConfig) -> Result<Multiaddr> {
     config.connectivity.resolve_primary_endpoint().map_err(Into::into)
 }
 
+fn listen_addrs_path() -> Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+        .join(".meshnet")
+        .join("listen_addrs.json"))
+}
+
+fn persist_listen_addr(local_peer_id: libp2p::PeerId, address: &Multiaddr) -> Result<()> {
+    let path = listen_addrs_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let canonical = if address
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
+    {
+        address.clone()
+    } else {
+        address
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2p(local_peer_id))
+    };
+
+    let mut addrs: Vec<String> = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        Vec::new()
+    };
+
+    let canonical_str = canonical.to_string();
+    if !addrs.iter().any(|addr| addr == &canonical_str) {
+        addrs.push(canonical_str);
+        std::fs::write(path, serde_json::to_string_pretty(&addrs)?)?;
+    }
+
+    Ok(())
+}
+
 /// Run agent daemon
 async fn cmd_start() -> Result<()> {
     println!("🚀 Starting Mesh AI agent daemon...\n");
@@ -436,106 +475,120 @@ async fn cmd_start() -> Result<()> {
     println!("   Network: {}", config.network_id);
     println!("   Tier: {:?}", config.capabilities.tier);
 
-    let relay_addr = resolve_primary_mesh_endpoint(&config)?;
+    let runtime_endpoint = config.connectivity.runtime_endpoint()?;
 
-    println!("\n🌐 Connecting to relay server...");
-    println!("   Relay: {}", relay_addr);
+    println!("\n🌐 Initializing mesh transport...");
+    match &runtime_endpoint {
+        Some(endpoint) => println!("   Endpoint: {}", endpoint),
+        None => println!("   Mode: direct"),
+    }
 
     // Create swarm
     let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
-    let mut swarm = MeshSwarmBuilder::new(libp2p_keypair)
-        .with_relay_addr(relay_addr.clone())
-        .build()?;
-
-    let local_peer_id = swarm.local_peer_id();
-    println!("   Local PeerID: {}", local_peer_id);
-
-    // Connect to relay
-    swarm.connect_to_relay()?;
-
-    // Wait for relay connection event
-    println!("   Waiting for relay connection...");
-
-    // Try to get RelayConnected event with timeout
-    let relay_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        async {
-            loop {
-                if let Some(event) = swarm.next_event().await {
-                    match event {
-                        agent::MeshEvent::RelayConnected { .. } => {
-                            return Ok(());
-                        }
-                        agent::MeshEvent::RelayConnectionFailed { error, .. } => {
-                            anyhow::bail!("Relay connection failed: {}", error);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    ).await;
-
-    match relay_result {
-        Ok(Ok(())) => {
-            println!("   ✓ Connected to relay");
-        }
-        Ok(Err(e)) => {
-            return Err(e);
-        }
-        Err(_timeout) => {
-            // Event timeout - verify connection exists at libp2p level
-            warn!("RelayConnected event timeout - checking libp2p connection");
-            if !swarm.connected_peers().is_empty() {
-                println!("   ✓ Connected to relay (verified via libp2p)");
-            } else {
-                anyhow::bail!("Relay connection timeout - no connection established");
-            }
-        }
+    let mut swarm_builder = MeshSwarmBuilder::new(libp2p_keypair);
+    if let Some(endpoint) = runtime_endpoint.clone() {
+        swarm_builder = swarm_builder.with_relay_addr(endpoint);
     }
+    let mut swarm = swarm_builder.build()?;
 
-    // Listen on relay (create reservation)
-    let connected_peers = swarm.connected_peers();
-    let relay_peer_id = connected_peers
-        .first()
-        .copied()
-        .context("No relay peer connected")?;
+    let local_peer_id = swarm.local_peer_id().to_owned();
+    println!("   Local PeerID: {}", local_peer_id);
+    swarm.listen_on_direct_addrs()?;
+    if matches!(config.connectivity.preferred_path, agent::ConnectivityPath::Relayed) {
+        let relay_addr = runtime_endpoint.clone().context("relay endpoint missing")?;
 
-    println!("   Creating relay reservation...");
-    swarm.listen_on_relay(relay_peer_id)?;
+        // Connect to relay
+        swarm.connect_to_relay()?;
 
-    // Wait for reservation
-    let reservation_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        async {
-            loop {
-                if let Some(event) = swarm.next_event().await {
-                    match event {
-                        agent::MeshEvent::ReservationAccepted { .. } => {
-                            return Ok(());
+        // Wait for relay connection event
+        println!("   Waiting for relay connection...");
+
+        let local_peer_id_for_events = local_peer_id.clone();
+        let relay_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    if let Some(event) = swarm.next_event().await {
+                        match event {
+                            agent::MeshEvent::NewListenAddr { address } => {
+                                let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
+                            }
+                            agent::MeshEvent::RelayConnected { .. } => {
+                                return Ok(());
+                            }
+                            agent::MeshEvent::RelayConnectionFailed { error, .. } => {
+                                anyhow::bail!("Relay connection failed: {}", error);
+                            }
+                            _ => {}
                         }
-                        agent::MeshEvent::ReservationDenied { .. } => {
-                            anyhow::bail!("Relay reservation denied");
-                        }
-                        _ => {}
                     }
                 }
             }
-        }
-    ).await;
+        ).await;
 
-    match reservation_result {
-        Ok(Ok(())) => {
-            println!("   ✓ Relay reservation accepted");
+        match relay_result {
+            Ok(Ok(())) => {
+                println!("   ✓ Connected to relay {}", relay_addr);
+            }
+            Ok(Err(e)) => {
+                return Err(e);
+            }
+            Err(_timeout) => {
+                warn!("RelayConnected event timeout - checking libp2p connection");
+                if !swarm.connected_peers().is_empty() {
+                    println!("   ✓ Connected to relay (verified via libp2p)");
+                } else {
+                    anyhow::bail!("Relay connection timeout - no connection established");
+                }
+            }
         }
-        Ok(Err(e)) => {
-            return Err(e);
+
+        let connected_peers = swarm.connected_peers();
+        let relay_peer_id = connected_peers
+            .first()
+            .copied()
+            .context("No relay peer connected")?;
+
+        println!("   Creating relay reservation...");
+        swarm.listen_on_relay(relay_peer_id)?;
+
+        let local_peer_id_for_events = local_peer_id.clone();
+        let reservation_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    if let Some(event) = swarm.next_event().await {
+                        match event {
+                            agent::MeshEvent::NewListenAddr { address } => {
+                                let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
+                            }
+                            agent::MeshEvent::ReservationAccepted { .. } => {
+                                return Ok(());
+                            }
+                            agent::MeshEvent::ReservationDenied { .. } => {
+                                anyhow::bail!("Relay reservation denied");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        ).await;
+
+        match reservation_result {
+            Ok(Ok(())) => {
+                println!("   ✓ Relay reservation accepted");
+            }
+            Ok(Err(e)) => {
+                return Err(e);
+            }
+            Err(_timeout) => {
+                warn!("ReservationAccepted event timeout - proceeding anyway");
+                println!("   ⚠️  Relay reservation (event timeout, proceeding)");
+            }
         }
-        Err(_timeout) => {
-            warn!("ReservationAccepted event timeout - proceeding anyway");
-            println!("   ⚠️  Relay reservation (event timeout, proceeding)");
-            // Continue anyway - reservation might have succeeded despite event not firing
-        }
+    } else {
+        println!("   ✓ Direct listeners enabled");
     }
 
     // Start LAN beacon discovery (if pools configured)
@@ -737,7 +790,7 @@ async fn cmd_start() -> Result<()> {
 
     // Start inference coordinator (in background)
     let inference_config_task = config.clone();
-    let relay_addr_clone = relay_addr.clone();
+    let runtime_endpoint_clone = runtime_endpoint.clone();
     tokio::spawn(async move {
         use agent::inference::coordinator::{InferenceCoordinator, InferenceConfig};
         use agent::inference::job::{InferenceRequest, GenerationConfig};
@@ -759,30 +812,35 @@ async fn cmd_start() -> Result<()> {
 
         // Create separate swarm for inference coordination (P2P communication during all-reduce)
         let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&inference_config_task.keypair);
-        let mut inference_swarm = match MeshSwarmBuilder::new(libp2p_keypair)
-            .with_relay_addr(relay_addr_clone.clone())
-            .build()
-        {
+        let mut swarm_builder = MeshSwarmBuilder::new(libp2p_keypair);
+        if let Some(endpoint) = runtime_endpoint_clone.clone() {
+            swarm_builder = swarm_builder.with_relay_addr(endpoint);
+        }
+        let mut inference_swarm = match swarm_builder.build() {
             Ok(s) => s,
             Err(e) => {
                 error!(error = %e, "Failed to create inference swarm");
                 return;
             }
         };
-
-        // Connect to relay
-        if let Err(e) = inference_swarm.connect_to_relay() {
-            error!(error = %e, "Failed to connect inference swarm to relay");
+        if let Err(e) = inference_swarm.listen_on_direct_addrs() {
+            error!(error = %e, "Failed to enable direct listeners for inference swarm");
             return;
         }
 
-        // Wait for relay connection
-        let mut relay_connected = false;
-        while !relay_connected {
-            if let Some(event) = inference_swarm.next_event().await {
-                if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
-                    info!("Inference swarm connected to relay");
-                    relay_connected = true;
+        if matches!(inference_config_task.connectivity.preferred_path, agent::ConnectivityPath::Relayed) {
+            if let Err(e) = inference_swarm.connect_to_relay() {
+                error!(error = %e, "Failed to connect inference swarm to relay");
+                return;
+            }
+
+            let mut relay_connected = false;
+            while !relay_connected {
+                if let Some(event) = inference_swarm.next_event().await {
+                    if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
+                        info!("Inference swarm connected to relay");
+                        relay_connected = true;
+                    }
                 }
             }
         }
@@ -831,7 +889,23 @@ async fn cmd_start() -> Result<()> {
                                     position: pos as u32,
                                     total_workers: total as u32,
                                     left_neighbor: left_peer,
+                                    left_neighbor_addrs: state
+                                        .get("left_neighbor_listen_addrs")
+                                        .and_then(|v| v.as_array())
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|addr| addr.as_str())
+                                        .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
+                                        .collect(),
                                     right_neighbor: right_peer,
+                                    right_neighbor_addrs: state
+                                        .get("right_neighbor_listen_addrs")
+                                        .and_then(|v| v.as_array())
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|addr| addr.as_str())
+                                        .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
+                                        .collect(),
                                     shard_column_range: (col_start, col_end),
                                     shard_memory_bytes: 8_000_000_000, // 8GB default
                                 };
@@ -1781,20 +1855,65 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
                     let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
                     let local_peer_id = libp2p::PeerId::from_public_key(&libp2p_keypair.public());
 
-                    // Augment data with peer IDs
+                    let topology_url = format!(
+                        "{}/api/ring/topology?network_id={}",
+                        control_plane_url.trim_end_matches('/'),
+                        config.network_id
+                    );
+                    let topology = client
+                        .get(&topology_url)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<RingTopologyResponse>()
+                        .await?;
+
                     let mut enhanced_data = data.clone();
+                    let self_worker = topology
+                        .workers
+                        .iter()
+                        .find(|worker| worker.device_id == config.device_id.to_string());
+                    let left_worker = self_worker.and_then(|worker| {
+                        topology
+                            .workers
+                            .iter()
+                            .find(|candidate| candidate.device_id == worker.left_neighbor)
+                    });
+                    let right_worker = self_worker.and_then(|worker| {
+                        topology
+                            .workers
+                            .iter()
+                            .find(|candidate| candidate.device_id == worker.right_neighbor)
+                    });
+
                     if let Some(obj) = enhanced_data.as_object_mut() {
                         obj.insert("local_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
+                        obj.insert(
+                            "total_workers".to_string(),
+                            serde_json::Value::Number((topology.workers.len() as u64).into()),
+                        );
 
-                        // For MVP: Use local peer ID for neighbors (works for single-worker ring)
-                        // TODO: For multi-worker rings, implement peer discovery or get PeerIDs from control plane
-                        obj.insert("left_neighbor_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
-                        obj.insert("right_neighbor_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
+                        if let Some(left_worker) = left_worker {
+                            obj.insert(
+                                "left_neighbor_peer_id".to_string(),
+                                serde_json::Value::String(left_worker.peer_id.clone()),
+                            );
+                            obj.insert(
+                                "left_neighbor_listen_addrs".to_string(),
+                                serde_json::to_value(&left_worker.listen_addrs)?,
+                            );
+                        }
 
-                        // Calculate total_workers: for single worker ring, total is 1
-                        // For multi-worker, we'd get this from topology query
-                        // For now, assume single worker
-                        obj.insert("total_workers".to_string(), serde_json::Value::Number(1.into()));
+                        if let Some(right_worker) = right_worker {
+                            obj.insert(
+                                "right_neighbor_peer_id".to_string(),
+                                serde_json::Value::String(right_worker.peer_id.clone()),
+                            );
+                            obj.insert(
+                                "right_neighbor_listen_addrs".to_string(),
+                                serde_json::to_value(&right_worker.listen_addrs)?,
+                            );
+                        }
                     }
 
                     std::fs::write(&ring_state_path, serde_json::to_string_pretty(&enhanced_data)?)?;

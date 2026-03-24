@@ -39,6 +39,10 @@ impl RegistrationClient {
             network_id: config.network_id.clone(),
             name: config.name.clone(),
             public_key: config.keypair.verifying_key().to_bytes().to_vec(),
+            peer_id: crate::device::keypair::to_libp2p_keypair(&config.keypair)
+                .public()
+                .to_peer_id()
+                .to_string(),
             capabilities: config.capabilities.clone(),
         };
 
@@ -147,6 +151,7 @@ impl RegistrationClient {
             .post(&url)
             .json(&HeartbeatRequest {
                 connectivity_state: config.connectivity.current_state(),
+                listen_addrs: load_advertised_listen_addrs().unwrap_or_default(),
             })
             .send()
             .await
@@ -180,6 +185,7 @@ impl RegistrationClient {
             last_seen = %heartbeat_response.last_seen,
             active_path = ?heartbeat_response.connectivity_state.active_path,
             connectivity_status = ?heartbeat_response.connectivity_state.status,
+            listen_addr_count = heartbeat_response.listen_addrs.len(),
             "Heartbeat sent successfully"
         );
 
@@ -303,6 +309,14 @@ impl RegistrationClient {
 
         Ok(())
     }
+}
+
+fn load_advertised_listen_addrs() -> Option<Vec<String>> {
+    let path = dirs::home_dir()?
+        .join(".meshnet")
+        .join("listen_addrs.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@ pub async fn register_device(
             req.network_id,
             req.name,
             req.public_key,
+            req.peer_id,
             req.capabilities,
         )
     })
@@ -151,7 +152,7 @@ pub async fn heartbeat(
     let db = state.db.clone();
 
     let last_seen = tokio::task::spawn_blocking(move || {
-        device_service::update_heartbeat(&db, device_id, req.connectivity_state)
+        device_service::update_heartbeat(&db, device_id, req.connectivity_state, req.listen_addrs)
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -160,6 +161,7 @@ pub async fn heartbeat(
         success: true,
         last_seen: last_seen.0,
         connectivity_state: last_seen.1,
+        listen_addrs: last_seen.2,
     }))
 }
 
@@ -227,6 +229,7 @@ mod tests {
             network_id: "test-network".to_string(),
             name: "Test Device".to_string(),
             public_key: vec![42u8; 32],
+            peer_id: "12D3KooWQ6routepeer111111111111111111111111111111".to_string(),
             capabilities: test_capabilities(),
             contributed_memory: None,
         };
@@ -269,6 +272,7 @@ mod tests {
             "test-network".to_string(),
             "Test Device".to_string(),
             vec![42u8; 32],
+            "12D3KooWQ6routepeer222222222222222222222222222222".to_string(),
             test_capabilities(),
         )
         .unwrap();
@@ -281,6 +285,7 @@ mod tests {
             axum::extract::Path(device_id.to_string()),
             axum::Json(HeartbeatRequest {
                 connectivity_state: test_connectivity_state(),
+                listen_addrs: vec!["/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6routepeer222222222222222222222222222222".to_string()],
             }),
         )
         .await;
@@ -304,6 +309,7 @@ mod tests {
             axum::extract::Path("nonexistent-device".to_string()),
             axum::Json(HeartbeatRequest {
                 connectivity_state: test_connectivity_state(),
+                listen_addrs: vec![],
             }),
         )
         .await;
@@ -339,6 +345,7 @@ mod tests {
             network_id: "test-network".to_string(),
             name: "Test Device".to_string(),
             public_key: vec![43u8; 32], // Different key to avoid conflicts
+            peer_id: "12D3KooWQ6routepeer333333333333333333333333333333".to_string(),
             capabilities: test_capabilities(),
             contributed_memory: Some(8_000_000_000),
         };

@@ -9,6 +9,7 @@ pub struct RegisterDeviceRequest {
     pub network_id: String,
     pub name: String,
     pub public_key: Vec<u8>,
+    pub peer_id: String,
     pub capabilities: DeviceCapabilities,
 }
 
@@ -25,6 +26,7 @@ pub struct RegisterDeviceResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub connectivity_state: DeviceConnectivityState,
+    pub listen_addrs: Vec<String>,
 }
 
 /// Response to heartbeat update
@@ -33,6 +35,7 @@ pub struct HeartbeatResponse {
     pub success: bool,
     pub last_seen: String,
     pub connectivity_state: DeviceConnectivityState,
+    pub listen_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +49,7 @@ pub struct ShardInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInfo {
     pub device_id: String,
+    pub peer_id: String,
     pub position: u32,
     pub status: String,
     pub contributed_memory: u64,
@@ -53,6 +57,7 @@ pub struct WorkerInfo {
     pub left_neighbor: String,
     pub right_neighbor: String,
     pub connectivity_state: Option<DeviceConnectivityState>,
+    pub listen_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
