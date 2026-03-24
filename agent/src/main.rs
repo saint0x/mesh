@@ -1277,6 +1277,7 @@ async fn cmd_start() -> Result<()> {
         .with_max_concurrent_jobs(config.governance.max_concurrent_jobs)
         .with_admission_policy(AdmissionPolicy::new(
             config.network_id.clone(),
+            config.governance.max_concurrent_jobs_per_peer,
             config.governance.max_job_timeout_ms,
             config.governance.allowed_workloads.clone(),
         ));

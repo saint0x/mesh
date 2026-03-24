@@ -114,12 +114,14 @@ This is important for mature production behavior, but it should not define the h
 - ✅ Job statistics now persist backpressure rejection counts alongside success/failure and connectivity metrics.
 - ✅ Admission control now enforces one explicit production policy for mesh jobs: matching network, supported workload, and bounded accepted timeout before execution starts.
 - ✅ Admission rejection counts are now persisted separately from pure capacity rejection so operators can distinguish invalid work from overload pressure.
+- ✅ Peer-level quota policy now enforces a bounded per-peer share of concurrent jobs instead of letting a single valid peer monopolize the local executor.
+- ✅ Peer-quota rejection counts are now persisted separately so fairness pressure is visible independently from invalid-job and whole-node overload rejection.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
 
 ### Governance Still Open
 
-- ⬜ Admission control beyond the current network/workload/timeout gate, including peer-level trust, workload-class quotas, and pool-level fairness policy.
+- ⬜ Admission control beyond the current network/workload/timeout/per-peer gate, including peer trust weighting, workload-class quotas, and pool-level fairness policy.
 - ⬜ Tensor-plane and bandwidth backpressure, not just executor-slot backpressure.
 - ⬜ Fairness and quota policy across peers, workloads, and pools.
 - ⬜ Recovery-path governance so retries, reconnect storms, and degraded relay behavior cannot overwhelm a node.
@@ -206,12 +208,14 @@ After Phase 1:
 - ✅ `cargo test -p agent test_job_stats_connectivity_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_job_stats_backpressure_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_job_stats_admission_rejection_metrics -- --nocapture`
+- ✅ `cargo test -p agent test_job_stats_peer_quota_rejection_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_with_max_concurrent_jobs_clamps_to_one -- --nocapture`
 - ✅ `cargo test -p agent test_load_legacy_config_defaults_governance -- --nocapture`
 - ✅ `cargo test -p agent test_admission_policy_accepts_supported_job -- --nocapture`
 - ✅ `cargo test -p agent test_admission_policy_rejects_wrong_network -- --nocapture`
 - ✅ `cargo test -p agent test_admission_policy_rejects_unsupported_workload -- --nocapture`
 - ✅ `cargo test -p agent test_admission_policy_rejects_timeout_over_limit -- --nocapture`
+- ✅ `cargo test -p agent test_admission_policy_rejects_peer_quota_over_limit -- --nocapture`
 - ✅ `cargo test -p agent test_handle_event_records_connectivity_path_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_handle_event_records_upgrade_and_external_addr_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_worker_position -- --nocapture`
@@ -225,6 +229,10 @@ After Phase 1:
 - ✅ `fozzy --cwd . trace verify .fozzy/governance-admission-production-dispatch.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/governance-admission-production-dispatch.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/governance-admission-production-dispatch.trace.fozzy --json`
+- ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --proc-backend host --fs-backend host --http-backend host --record .fozzy/governance-peer-quota-production-dispatch.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/governance-peer-quota-production-dispatch.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/governance-peer-quota-production-dispatch.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/governance-peer-quota-production-dispatch.trace.fozzy --json`
 - ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --proc-backend host --fs-backend host --http-backend host --record .fozzy/governance-production-dispatch.trace.fozzy --json`
 - ✅ `fozzy --cwd . trace verify .fozzy/governance-production-dispatch.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/governance-production-dispatch.trace.fozzy --json`

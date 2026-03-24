@@ -71,6 +71,9 @@ pub struct GovernanceConfig {
     /// Maximum number of jobs that may execute concurrently on this agent.
     pub max_concurrent_jobs: usize,
 
+    /// Maximum number of concurrent jobs a single peer may hold on this agent.
+    pub max_concurrent_jobs_per_peer: usize,
+
     /// Maximum job timeout this agent will admit for execution.
     pub max_job_timeout_ms: u64,
 
@@ -82,6 +85,7 @@ impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
             max_concurrent_jobs: 2,
+            max_concurrent_jobs_per_peer: 1,
             max_job_timeout_ms: 300_000,
             allowed_workloads: vec!["embeddings".to_string(), "embeddings-v1".to_string()],
         }
@@ -356,6 +360,7 @@ mod tests {
         assert!(config.connectivity.attachments.is_empty());
         assert!(config.capabilities.cpu_cores > 0);
         assert_eq!(config.governance.max_concurrent_jobs, 2);
+        assert_eq!(config.governance.max_concurrent_jobs_per_peer, 1);
         assert_eq!(config.governance.max_job_timeout_ms, 300_000);
         assert_eq!(
             config.governance.allowed_workloads,
@@ -392,6 +397,7 @@ arch = "x86_64"
 
         let loaded: DeviceConfig = toml::from_str(&legacy_toml).unwrap();
         assert_eq!(loaded.governance.max_concurrent_jobs, 2);
+        assert_eq!(loaded.governance.max_concurrent_jobs_per_peer, 1);
         assert_eq!(loaded.governance.max_job_timeout_ms, 300_000);
         assert_eq!(
             loaded.governance.allowed_workloads,
@@ -432,6 +438,10 @@ arch = "x86_64"
         assert_eq!(
             original.governance.max_job_timeout_ms,
             loaded.governance.max_job_timeout_ms
+        );
+        assert_eq!(
+            original.governance.max_concurrent_jobs_per_peer,
+            loaded.governance.max_concurrent_jobs_per_peer
         );
         assert_eq!(
             original.governance.allowed_workloads,
