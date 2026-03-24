@@ -819,6 +819,8 @@ impl JobRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::{ConnectionInfo, ConnectionType};
+    use libp2p::Multiaddr;
 
     #[test]
     fn test_job_stats_creation() {
@@ -889,5 +891,112 @@ mod tests {
         assert_eq!(stats.direct_upgrade_failures.load(Ordering::Relaxed), 1);
         assert_eq!(stats.external_addr_candidates.load(Ordering::Relaxed), 1);
         assert_eq!(stats.external_addr_confirmed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_records_connectivity_path_metrics() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().unwrap();
+        let executor = EmbeddingsExecutor::new_fast().unwrap();
+        let mut runner = JobRunner::new(swarm, executor);
+
+        runner
+            .handle_event(MeshEvent::PeerConnected {
+                peer_id: libp2p::PeerId::random(),
+                connection_info: ConnectionInfo {
+                    connection_type: ConnectionType::Direct,
+                    remote_addr: "/ip4/34.120.0.10/tcp/4001"
+                        .parse::<Multiaddr>()
+                        .unwrap(),
+                    num_established: 1,
+                },
+            })
+            .await
+            .unwrap();
+
+        runner
+            .handle_event(MeshEvent::PeerConnected {
+                peer_id: libp2p::PeerId::random(),
+                connection_info: ConnectionInfo {
+                    connection_type: ConnectionType::Relayed,
+                    remote_addr: "/dns4/relay.mesh.example/tcp/4001/p2p-circuit"
+                        .parse::<Multiaddr>()
+                        .unwrap(),
+                    num_established: 1,
+                },
+            })
+            .await
+            .unwrap();
+
+        runner
+            .handle_event(MeshEvent::RelayFallbackToPeer {
+                peer_id: libp2p::PeerId::random(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runner.stats.direct_peer_connections.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            runner.stats.relayed_peer_connections.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(runner.stats.relay_fallbacks.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_records_upgrade_and_external_addr_metrics() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().unwrap();
+        let executor = EmbeddingsExecutor::new_fast().unwrap();
+        let mut runner = JobRunner::new(swarm, executor);
+
+        runner
+            .handle_event(MeshEvent::DirectConnectionUpgraded {
+                peer_id: libp2p::PeerId::random(),
+            })
+            .await
+            .unwrap();
+
+        runner
+            .handle_event(MeshEvent::DirectConnectionUpgradeFailed {
+                peer_id: libp2p::PeerId::random(),
+                error: "timeout".to_string(),
+            })
+            .await
+            .unwrap();
+
+        runner
+            .handle_event(MeshEvent::ExternalAddrCandidateDiscovered {
+                address: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+            })
+            .await
+            .unwrap();
+
+        runner
+            .handle_event(MeshEvent::ExternalAddrConfirmed {
+                address: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runner.stats.direct_upgrade_successes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            runner.stats.direct_upgrade_failures.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            runner.stats.external_addr_candidates.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            runner.stats.external_addr_confirmed.load(Ordering::Relaxed),
+            1
+        );
     }
 }

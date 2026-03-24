@@ -75,10 +75,10 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Live swarm-observed external address candidates are now persisted and folded into heartbeat candidate publication alongside local listen addresses.
 - ✅ Agent status and pool-status now expose local and remote direct-candidate quality so operators can inspect current reachability and best direct endpoints without digging through raw state files.
 - ✅ Agent metrics now persist and display direct-path quality signals including direct vs relayed peer connections, relay fallback usage, direct-upgrade success/failure, and external address discovery counts.
+- ✅ Direct-path event handling now has integration-style coverage through the live job-runner metrics path for direct connections, relay fallback, direct upgrades, and external-address discovery.
 
 ### NAT Traversal Still Open
 
-- ⬜ Add focused integration coverage for direct upgrade and relay fallback behavior under more realistic multi-peer networking scenarios.
 - ⬜ Extend candidate gathering beyond current local/observed addresses so hostile NAT cases can exchange richer hole-punch inputs and more durable public reachability hints.
 
 ### 3. Governance Third
@@ -173,6 +173,8 @@ After Phase 1:
 - ✅ `cargo test -p agent build_direct_peer_candidates_excludes_relay_and_sorts -- --nocapture`
 - ✅ `cargo test -p agent direct_candidate_seed_addrs_merge_listen_and_observed -- --nocapture`
 - ✅ `cargo test -p agent test_job_stats_connectivity_metrics -- --nocapture`
+- ✅ `cargo test -p agent test_handle_event_records_connectivity_path_metrics -- --nocapture`
+- ✅ `cargo test -p agent test_handle_event_records_upgrade_and_external_addr_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_worker_position -- --nocapture`
 - ✅ `cargo test -p control-plane test_update_heartbeat -- --nocapture`
 - ✅ `cargo test -p control-plane test_get_topology_handler -- --nocapture`
