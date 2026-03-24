@@ -3,6 +3,7 @@ pub mod keypair;
 
 pub use capabilities::{DeviceCapabilities, Tier};
 
+use crate::connectivity::NetworkConnectivity;
 use crate::errors::{AgentError, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -53,9 +54,8 @@ pub struct DeviceConfig {
     /// Control plane API URL
     pub control_plane_url: String,
 
-    /// Relay addresses advertised by the control plane for this network
-    #[serde(default)]
-    pub relay_addresses: Vec<String>,
+    /// Network connectivity profile advertised by the control plane
+    pub connectivity: NetworkConnectivity,
 
     /// Device hardware capabilities
     pub capabilities: DeviceCapabilities,
@@ -95,7 +95,10 @@ impl DeviceConfig {
             keypair,
             network_id,
             control_plane_url,
-            relay_addresses: Vec::new(),
+            connectivity: NetworkConnectivity {
+                preferred_path: crate::connectivity::ConnectivityPath::Direct,
+                attachments: Vec::new(),
+            },
             capabilities,
         }
     }
@@ -322,7 +325,7 @@ mod tests {
         assert_eq!(config.name, "test-device");
         assert_eq!(config.network_id, "test-network");
         assert_eq!(config.control_plane_url, "http://localhost:8080");
-        assert!(config.relay_addresses.is_empty());
+        assert!(config.connectivity.attachments.is_empty());
         assert!(config.capabilities.cpu_cores > 0);
     }
 
@@ -351,7 +354,7 @@ mod tests {
         assert_eq!(original.name, loaded.name);
         assert_eq!(original.network_id, loaded.network_id);
         assert_eq!(original.control_plane_url, loaded.control_plane_url);
-        assert_eq!(original.relay_addresses, loaded.relay_addresses);
+        assert_eq!(original.connectivity, loaded.connectivity);
 
         // CRITICAL: Verify keypair bytes are identical
         assert_eq!(

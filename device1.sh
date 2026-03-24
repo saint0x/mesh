@@ -198,8 +198,6 @@ trap cleanup INT TERM
 
 # Start agent in foreground
 "$BINARY_PATH/agent" start \
-    --relay "/ip4/127.0.0.1/tcp/$RELAY_PORT" \
-    --control-plane "http://localhost:$CONTROL_PLANE_PORT" \
     --log-level info
 
 cleanup

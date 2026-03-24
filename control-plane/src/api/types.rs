@@ -1,5 +1,5 @@
+use crate::connectivity::NetworkConnectivity;
 use crate::device::DeviceCapabilities;
-use crate::db::models::Network;
 use serde::{Deserialize, Serialize};
 
 /// Request to register a new device
@@ -28,8 +28,8 @@ pub struct RegisterDeviceResponse {
     pub success: bool,
     /// Self-signed certificate blob (CBOR-encoded)
     pub certificate: Option<Vec<u8>>,
-    /// List of relay server addresses
-    pub relay_addresses: Vec<String>,
+    /// Connectivity profile for this network
+    pub connectivity: NetworkConnectivity,
     /// Error or success message
     pub message: Option<String>,
     /// Ring position info (if device joined ring)
@@ -42,20 +42,28 @@ pub struct CreateNetworkRequest {
     pub network_id: String,
     pub name: String,
     pub owner_user_id: String,
-    #[serde(default)]
-    pub settings: Option<serde_json::Value>,
+    pub connectivity: NetworkConnectivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateNetworkResponse {
     pub success: bool,
-    pub network: Network,
+    pub network: NetworkInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListNetworksResponse {
     pub success: bool,
-    pub networks: Vec<Network>,
+    pub networks: Vec<NetworkInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    pub network_id: String,
+    pub name: String,
+    pub owner_user_id: String,
+    pub created_at: String,
+    pub connectivity: NetworkConnectivity,
 }
 
 /// Ring position information in registration response

@@ -163,6 +163,7 @@ CONTROL_PLANE_PORT=8081 \
 ### Device 2 (device2.sh)
 ```bash
 DEVICE_NAME="MacBook-Member" \
+CONTROL_PLANE_HOST="<device1-lan-ip>" \
 ./device2.sh
 ```
 
@@ -237,7 +238,7 @@ mesh start
 ### Device 2
 ```bash
 # Initialize
-mesh init --network-id test --name Device2
+mesh init --network-id test --name Device2 --control-plane http://<device1-lan-ip>:8080
 
 # Join pool (replace with actual values)
 mesh pool-join \

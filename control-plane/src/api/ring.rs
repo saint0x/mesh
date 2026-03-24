@@ -439,6 +439,9 @@ pub async fn check_topology_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectivity::{
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+    };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
     use crate::services::certificate::ControlPlaneKeypair;
@@ -456,7 +459,25 @@ mod tests {
         }
     }
 
+    fn test_connectivity() -> NetworkConnectivity {
+        NetworkConnectivity {
+            preferred_path: ConnectivityPath::Relayed,
+            attachments: vec![ConnectivityAttachment {
+                kind: ConnectivityAttachmentKind::Libp2pRelay,
+                endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
+                priority: 0,
+            }],
+        }
+    }
+
     fn register_test_device(db: &crate::db::Database, device_id: &str, network_id: &str) {
+        let _ = crate::services::network_service::create_network(
+            db,
+            network_id.to_string(),
+            network_id.to_string(),
+            "owner-1".to_string(),
+            test_connectivity(),
+        );
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
         // Generate unique public key based on device_id hash
         let mut public_key = [0u8; 32];
@@ -472,7 +493,6 @@ mod tests {
             "Test Device".to_string(),
             public_key.to_vec(),
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
     }

@@ -51,10 +51,13 @@ fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectivity::{
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+    };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
     use crate::services::certificate::ControlPlaneKeypair;
-    use crate::services::device_service::register_device;
+    use crate::services::{device_service::register_device, network_service};
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
@@ -67,10 +70,29 @@ mod tests {
         }
     }
 
+    fn test_connectivity() -> NetworkConnectivity {
+        NetworkConnectivity {
+            preferred_path: ConnectivityPath::Relayed,
+            attachments: vec![ConnectivityAttachment {
+                kind: ConnectivityAttachmentKind::Libp2pRelay,
+                endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
+                priority: 0,
+            }],
+        }
+    }
+
     #[test]
     fn test_mark_offline_devices() {
         let db = create_test_db();
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "test-network".to_string(),
+            "owner-1".to_string(),
+            test_connectivity(),
+        )
+        .unwrap();
 
         // Register a device
         let device_id = "test-device";
@@ -82,7 +104,6 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -127,6 +148,14 @@ mod tests {
     fn test_recent_heartbeat_stays_online() {
         let db = create_test_db();
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
+        network_service::create_network(
+            &db,
+            "test-network".to_string(),
+            "test-network".to_string(),
+            "owner-1".to_string(),
+            test_connectivity(),
+        )
+        .unwrap();
 
         // Register a device
         let device_id = "test-device-recent";
@@ -138,7 +167,6 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod checkpoint;
+pub mod connectivity;
 pub mod device;
 pub mod discovery;
 pub mod errors;
@@ -17,6 +18,9 @@ pub mod scheduler;
 
 pub use api::RegistrationClient;
 pub use checkpoint::{Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata};
+pub use connectivity::{
+    ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+};
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
 pub use errors::{AgentError, Result};
 pub use executor::{

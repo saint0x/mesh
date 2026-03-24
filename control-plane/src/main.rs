@@ -19,10 +19,6 @@ struct Cli {
     /// Override log level (trace, debug, info, warn, error)
     #[arg(short, long)]
     log_level: Option<String>,
-
-    /// Relay multiaddr to return during device registration
-    #[arg(long = "relay-address")]
-    relay_addresses: Vec<String>,
 }
 
 #[tokio::main]
@@ -63,24 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keypair = Arc::new(ControlPlaneKeypair::load_or_generate()?);
 
     // Create application state
-    let relay_addresses = if cli.relay_addresses.is_empty() {
-        std::env::var("MESHNET_RELAY_ADDRESSES")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|addresses| !addresses.is_empty())
-            .unwrap_or_default()
-    } else {
-        cli.relay_addresses.clone()
-    };
-
-    let state = AppState::with_relay_addresses(db.clone(), keypair, relay_addresses);
+    let state = AppState::new(db.clone(), keypair);
 
     // Create API router
     let app = api::create_router(state);

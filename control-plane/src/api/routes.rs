@@ -36,7 +36,6 @@ pub async fn register_device(
     // Execute blocking database operation in thread pool
     let db = state.db.clone();
     let keypair = state.keypair.clone();
-    let relay_addresses = (*state.relay_addresses).clone();
 
     let result = tokio::task::spawn_blocking(move || {
         device_service::register_device(
@@ -47,7 +46,6 @@ pub async fn register_device(
             req.name,
             req.public_key,
             req.capabilities,
-            relay_addresses,
         )
     })
     .await
@@ -97,7 +95,7 @@ pub async fn register_device(
     Ok(Json(RegisterDeviceResponse {
         success: true,
         certificate: Some(result.0),
-        relay_addresses: result.1,
+        connectivity: result.1,
         message: Some("Device registered successfully".to_string()),
         ring_position,
     }))
@@ -115,7 +113,7 @@ pub async fn create_network(
             req.network_id,
             req.name,
             req.owner_user_id,
-            req.settings,
+            req.connectivity,
         )
     })
     .await
@@ -167,7 +165,11 @@ pub async fn heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectivity::NetworkConnectivity;
     use crate::device::{DeviceCapabilities, Tier};
+    use crate::connectivity::{
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
+    };
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::network_service;
     use std::sync::Arc;
@@ -183,6 +185,17 @@ mod tests {
         }
     }
 
+    fn test_connectivity() -> NetworkConnectivity {
+        NetworkConnectivity {
+            preferred_path: ConnectivityPath::Relayed,
+            attachments: vec![ConnectivityAttachment {
+                kind: ConnectivityAttachmentKind::Libp2pRelay,
+                endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
+                priority: 0,
+            }],
+        }
+    }
+
     #[tokio::test]
     async fn test_register_device_handler() {
         // Test using the handler function directly instead of full HTTP stack
@@ -192,16 +205,12 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
-        let state = AppState::with_relay_addresses(
-            db,
-            keypair,
-            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
-        );
+        let state = AppState::new(db, keypair);
 
         let request = RegisterDeviceRequest {
             device_id: "test-device-1".to_string(),
@@ -223,7 +232,7 @@ mod tests {
         let response = result.unwrap().0;
         assert!(response.success);
         assert!(response.certificate.is_some());
-        assert!(!response.relay_addresses.is_empty());
+        assert_eq!(response.connectivity.preferred_path, ConnectivityPath::Relayed);
     }
 
     #[tokio::test]
@@ -235,7 +244,7 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
@@ -251,15 +260,10 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
-        let state = AppState::with_relay_addresses(
-            db,
-            keypair,
-            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
-        );
+        let state = AppState::new(db, keypair);
 
         // Send heartbeat
         let result = heartbeat(
@@ -280,11 +284,7 @@ mod tests {
         let db = crate::db::create_test_db();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
-        let state = AppState::with_relay_addresses(
-            db,
-            keypair,
-            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
-        );
+        let state = AppState::new(db, keypair);
 
         let result = heartbeat(
             axum::extract::State(state),
@@ -312,16 +312,12 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
-        let state = AppState::with_relay_addresses(
-            db,
-            keypair,
-            vec!["/dns4/relay.mesh.example/tcp/4001".to_string()],
-        );
+        let state = AppState::new(db, keypair);
 
         let request = RegisterDeviceRequest {
             device_id: "test-device-ring".to_string(),
@@ -343,7 +339,7 @@ mod tests {
         let response = result.unwrap().0;
         assert!(response.success);
         assert!(response.certificate.is_some());
-        assert!(!response.relay_addresses.is_empty());
+        assert_eq!(response.connectivity.preferred_path, ConnectivityPath::Relayed);
 
         // Should have ring position info
         assert!(response.ring_position.is_some());
@@ -365,7 +361,7 @@ mod tests {
                 network_id: "test-network".to_string(),
                 name: "Test Network".to_string(),
                 owner_user_id: "owner-1".to_string(),
-                settings: Some(serde_json::json!({"region": "us-east-1"})),
+                connectivity: test_connectivity(),
             }),
         )
         .await;

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod connectivity;
 pub mod db;
 pub mod device;
 pub mod services;

@@ -54,8 +54,7 @@ You can run distributed inference with mock weights across multiple devices righ
 ```bash
 # Join ring topology for distributed inference
 ./target/aarch64-apple-darwin/release/agent join-ring \
-  --model-id llama-70b \
-  --control-plane http://localhost:8080
+  --model-id llama-70b
 
 # Leave ring topology
 ./target/aarch64-apple-darwin/release/agent leave-ring

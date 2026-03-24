@@ -20,33 +20,17 @@ pub struct AppState {
     ring_managers: Arc<RwLock<HashMap<String, Arc<RingTopologyManager>>>>,
     /// Topology notifier for worker notifications
     pub topology_notifier: Arc<TopologyNotifier>,
-    /// Relay addresses returned to agents during registration
-    pub relay_addresses: Arc<Vec<String>>,
 }
 
 impl AppState {
     /// Create new application state
     pub fn new(db: Database, keypair: Arc<ControlPlaneKeypair>) -> Self {
-        Self::with_relay_addresses(
-            db,
-            keypair,
-            default_relay_addresses(),
-        )
-    }
-
-    /// Create new application state with explicit relay addresses
-    pub fn with_relay_addresses(
-        db: Database,
-        keypair: Arc<ControlPlaneKeypair>,
-        relay_addresses: Vec<String>,
-    ) -> Self {
         let topology_notifier = Arc::new(TopologyNotifier::new(Arc::new(db.clone())));
         Self {
             db,
             keypair,
             ring_managers: Arc::new(RwLock::new(HashMap::new())),
             topology_notifier,
-            relay_addresses: Arc::new(relay_addresses),
         }
     }
 
@@ -86,19 +70,4 @@ impl AppState {
 
         Ok(manager)
     }
-}
-
-fn default_relay_addresses() -> Vec<String> {
-    std::env::var("MESHNET_RELAY_ADDRESSES")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|addresses| !addresses.is_empty())
-        .unwrap_or_default()
 }

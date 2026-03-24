@@ -1,3 +1,4 @@
+use crate::connectivity::NetworkConnectivity;
 use crate::device::DeviceCapabilities;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +17,7 @@ pub struct RegisterDeviceRequest {
 pub struct RegisterDeviceResponse {
     pub success: bool,
     pub certificate: Option<Vec<u8>>,
-    pub relay_addresses: Vec<String>,
+    pub connectivity: NetworkConnectivity,
     pub message: Option<String>,
 }
 

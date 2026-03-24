@@ -24,7 +24,6 @@ NC='\033[0m' # No Color
 NUM_WORKERS=3
 RELAY_PORT=4001
 CONTROL_PLANE_PORT=8080
-BASE_WORKER_PORT=9000
 TEST_DIR="$(pwd)/.test_integration"
 LOG_DIR="$TEST_DIR/logs"
 
@@ -84,7 +83,7 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$TEST_DIR/relay"
 mkdir -p "$TEST_DIR/control-plane"
 for i in $(seq 0 $((NUM_WORKERS - 1))); do
-    mkdir -p "$TEST_DIR/worker-$i"
+    mkdir -p "$TEST_DIR/worker-$i/home"
 done
 
 print_section "Step 1: Building Binaries"
@@ -125,14 +124,22 @@ wait_for_service "http://localhost:$CONTROL_PLANE_PORT/health" "Control Plane"
 print_section "Step 4: Starting Worker Agents"
 WORKER_PIDS=()
 for i in $(seq 0 $((NUM_WORKERS - 1))); do
-    worker_port=$((BASE_WORKER_PORT + i))
-    echo -e "${YELLOW}Starting worker $i on port $worker_port...${NC}"
+    echo -e "${YELLOW}Initializing worker $i...${NC}"
+
+    worker_home="$TEST_DIR/worker-$i/home"
+    worker_name="integration-worker-$i"
+
+    HOME="$worker_home" ../../target/release/agent init \
+        --network-id test-network \
+        --name "$worker_name" \
+        --control-plane "http://localhost:$CONTROL_PLANE_PORT" \
+        > "$LOG_DIR/worker-$i-init.log" 2>&1
+
+    echo -e "${YELLOW}Starting worker $i...${NC}"
 
     cd "$TEST_DIR/worker-$i"
-    RUST_LOG=info ../../target/release/agent \
-        --port $worker_port \
-        --relay-addr "/ip4/127.0.0.1/tcp/$RELAY_PORT" \
-        --control-plane "http://localhost:$CONTROL_PLANE_PORT" \
+    HOME="$worker_home" RUST_LOG=info ../../target/release/agent start \
+        --log-level info \
         > "$LOG_DIR/worker-$i.log" 2>&1 &
 
     worker_pid=$!

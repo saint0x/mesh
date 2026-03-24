@@ -22,6 +22,7 @@ POOL_NAME="${POOL_NAME:-test-pool}"
 NETWORK_ID="${NETWORK_ID:-test-network}"
 RELAY_PORT="${RELAY_PORT:-4001}"
 CONTROL_PLANE_PORT="${CONTROL_PLANE_PORT:-8080}"
+CONTROL_PLANE_HOST="${CONTROL_PLANE_HOST:-localhost}"
 
 echo "  Pool ID:         $POOL_ID"
 echo "  Pool Root Pubkey: ${POOL_ROOT_PUBKEY:0:16}..."
@@ -54,7 +55,7 @@ if [ ! -f ~/.meshnet/device.toml ]; then
     "$BINARY_PATH/agent" init \
         --network-id "$NETWORK_ID" \
         --name "$DEVICE_NAME" \
-        --control-plane "http://localhost:$CONTROL_PLANE_PORT"
+        --control-plane "http://$CONTROL_PLANE_HOST:$CONTROL_PLANE_PORT"
     echo ""
 else
     echo "✓ Device already initialized (found ~/.meshnet/device.toml)"
@@ -83,30 +84,6 @@ else
     echo ""
 fi
 
-# Detect admin's relay and control plane addresses from saved info
-POOL_DIR="$HOME/.meshnet/pools/$POOL_ID"
-ADMIN_RELAY_INFO="$POOL_DIR/admin_relay.toml"
-
-if [ -f "$ADMIN_RELAY_INFO" ]; then
-    ADMIN_IP=$(grep "ip_address" "$ADMIN_RELAY_INFO" | cut -d'"' -f2)
-    if [ -n "$ADMIN_IP" ]; then
-        RELAY_ADDR="/ip4/$ADMIN_IP/tcp/$RELAY_PORT"
-        CONTROL_PLANE_ADDR="http://$ADMIN_IP:$CONTROL_PLANE_PORT"
-        echo "✓ Using admin's relay at $ADMIN_IP:$RELAY_PORT"
-        echo "✓ Using admin's control plane at $ADMIN_IP:$CONTROL_PLANE_PORT"
-    else
-        RELAY_ADDR="/ip4/127.0.0.1/tcp/$RELAY_PORT"
-        CONTROL_PLANE_ADDR="http://localhost:$CONTROL_PLANE_PORT"
-        echo "⚠️  Could not parse admin IP, using localhost"
-    fi
-else
-    # Fallback to localhost (single-machine setup or old pool)
-    RELAY_ADDR="/ip4/127.0.0.1/tcp/$RELAY_PORT"
-    CONTROL_PLANE_ADDR="http://localhost:$CONTROL_PLANE_PORT"
-    echo "ℹ️  No admin relay info found, using localhost"
-fi
-echo ""
-
 # Create log directory
 mkdir -p ~/.meshnet/logs
 
@@ -131,8 +108,6 @@ trap cleanup INT TERM
 
 # Start agent in foreground
 "$BINARY_PATH/agent" start \
-    --relay "$RELAY_ADDR" \
-    --control-plane "$CONTROL_PLANE_ADDR" \
     --log-level info
 
 cleanup

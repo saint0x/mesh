@@ -1,4 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
+use crate::connectivity::NetworkConnectivity;
 use crate::db::Database;
 use crate::device::DeviceCapabilities;
 use crate::services::certificate::ControlPlaneKeypair;
@@ -16,8 +17,7 @@ pub fn register_device(
     name: String,
     public_key: Vec<u8>,
     capabilities: DeviceCapabilities,
-    relay_addresses: Vec<String>,
-) -> ApiResult<(Vec<u8>, Vec<String>)> {
+) -> ApiResult<(Vec<u8>, NetworkConnectivity)> {
     // Validate inputs
     if device_id.is_empty() {
         return Err(ApiError::BadRequest("device_id cannot be empty".into()));
@@ -32,6 +32,7 @@ pub fn register_device(
     }
 
     network_service::require_network_exists(db, &network_id)?;
+    let connectivity = network_service::load_network_connectivity(db, &network_id)?;
 
     let conn = db.get_conn()?;
 
@@ -94,7 +95,7 @@ pub fn register_device(
         "Device registered successfully"
     );
 
-    Ok((certificate, relay_addresses))
+    Ok((certificate, connectivity))
 }
 
 /// Update device heartbeat
@@ -138,9 +139,23 @@ pub fn update_heartbeat(db: &Database, device_id: String) -> ApiResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectivity::{
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+    };
     use crate::db::create_test_db;
     use crate::device::Tier;
     use crate::services::network_service;
+
+    fn test_connectivity() -> NetworkConnectivity {
+        NetworkConnectivity {
+            preferred_path: ConnectivityPath::Relayed,
+            attachments: vec![ConnectivityAttachment {
+                kind: ConnectivityAttachmentKind::Libp2pRelay,
+                endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
+                priority: 0,
+            }],
+        }
+    }
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
@@ -162,7 +177,7 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
@@ -170,7 +185,7 @@ mod tests {
         let network_id = "test-network";
         let public_key = vec![42u8; 32];
 
-        let (certificate, relay_addrs) = register_device(
+        let (certificate, connectivity) = register_device(
             &db,
             &keypair,
             device_id.to_string(),
@@ -178,12 +193,11 @@ mod tests {
             "Test Device".to_string(),
             public_key.clone(),
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
         assert!(!certificate.is_empty());
-        assert!(!relay_addrs.is_empty());
+        assert_eq!(connectivity.preferred_path, ConnectivityPath::Relayed);
 
         // Verify device in database
         let conn = db.get_conn().unwrap();
@@ -210,7 +224,7 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
@@ -226,7 +240,6 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -239,7 +252,6 @@ mod tests {
             "Test Device".to_string(),
             vec![43u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         );
 
         assert!(result.is_err());
@@ -255,7 +267,7 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
@@ -270,7 +282,6 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         )
         .unwrap();
 
@@ -312,7 +323,7 @@ mod tests {
             "test-network".to_string(),
             "Test Network".to_string(),
             "owner-1".to_string(),
-            None,
+            test_connectivity(),
         )
         .unwrap();
 
@@ -324,7 +335,6 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 16], // Wrong length
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         );
 
         assert!(result.is_err());
@@ -344,7 +354,6 @@ mod tests {
             "Test Device".to_string(),
             vec![42u8; 32],
             test_capabilities(),
-            vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
         );
 
         assert!(matches!(result, Err(ApiError::NotFound(_))));

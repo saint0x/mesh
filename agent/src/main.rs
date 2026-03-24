@@ -33,8 +33,8 @@
 
 use agent::{
     format_bytes, init_production_logging, init_simple_logging, parse_memory_string,
-    DeviceConfig, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner,
-    MeshSwarmBuilder, RegistrationClient, ResourceManager,
+    ConnectivityAttachmentKind, DeviceConfig, EmbeddingsExecutor, EmbeddingsInput,
+    EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
 };
 use agent::pki::{DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert};
 use anyhow::{Context, Result};
@@ -75,14 +75,6 @@ enum Commands {
 
     /// Run agent daemon to process jobs
     Start {
-        /// Relay server address (multiaddr format)
-        #[arg(short, long)]
-        relay: Option<String>,
-
-        /// Control plane URL
-        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
-        control_plane_url: String,
-
         /// Log level (trace, debug, info, warn, error)
         #[arg(short, long, default_value = "info")]
         log_level: String,
@@ -105,10 +97,6 @@ enum Commands {
         /// Job timeout in milliseconds
         #[arg(long, default_value = "5000")]
         timeout_ms: u64,
-
-        /// Relay server address
-        #[arg(short, long)]
-        relay: Option<String>,
 
         /// Log level
         #[arg(long, default_value = "info")]
@@ -144,11 +132,7 @@ enum Commands {
     InferenceStats,
 
     /// Show pool status (all workers in the ring)
-    PoolStatus {
-        /// Control plane URL
-        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
-        control_plane_url: String,
-    },
+    PoolStatus,
 
     /// Join ring topology for distributed inference
     JoinRing {
@@ -156,25 +140,13 @@ enum Commands {
         #[arg(short, long)]
         model_id: String,
 
-        /// Control plane URL
-        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
-        control_plane_url: String,
-
-        /// Relay server address
-        #[arg(short, long)]
-        relay: Option<String>,
-
         /// Log level
         #[arg(short, long, default_value = "info")]
         log_level: String,
     },
 
     /// Leave ring topology
-    LeaveRing {
-        /// Control plane URL
-        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
-        control_plane_url: String,
-    },
+    LeaveRing,
 
     /// Submit distributed inference job
     Inference {
@@ -197,10 +169,6 @@ enum Commands {
         /// Top-p sampling threshold
         #[arg(long, default_value = "0.9")]
         top_p: f32,
-
-        /// Control plane URL
-        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
-        control_plane_url: String,
 
         /// Log level
         #[arg(short, long, default_value = "info")]
@@ -255,14 +223,10 @@ async fn main() -> Result<()> {
             cmd_init(network_id, name, control_plane_url).await?;
         }
 
-        Commands::Start {
-            relay,
-            control_plane_url,
-            log_level,
-        } => {
+        Commands::Start { log_level } => {
             // Production logging with file rotation for daemon
             init_production_logging(&log_level, None)?;
-            cmd_start(relay, control_plane_url).await?;
+            cmd_start().await?;
         }
 
         Commands::Job {
@@ -270,11 +234,10 @@ async fn main() -> Result<()> {
             target,
             workload,
             timeout_ms,
-            relay,
             log_level,
         } => {
             init_simple_logging(&log_level)?;
-            cmd_job(input, target, workload, timeout_ms, relay).await?;
+            cmd_job(input, target, workload, timeout_ms).await?;
         }
 
         Commands::Status => {
@@ -317,24 +280,22 @@ async fn main() -> Result<()> {
             cmd_inference_stats().await?;
         }
 
-        Commands::PoolStatus { control_plane_url } => {
+        Commands::PoolStatus => {
             init_simple_logging("info")?;
-            cmd_pool_status(control_plane_url).await?;
+            cmd_pool_status().await?;
         }
 
         Commands::JoinRing {
             model_id,
-            control_plane_url,
-            relay,
             log_level,
         } => {
             init_simple_logging(&log_level)?;
-            cmd_join_ring(model_id, control_plane_url, relay).await?;
+            cmd_join_ring(model_id).await?;
         }
 
-        Commands::LeaveRing { control_plane_url } => {
+        Commands::LeaveRing => {
             init_simple_logging("info")?;
-            cmd_leave_ring(control_plane_url).await?;
+            cmd_leave_ring().await?;
         }
 
         Commands::Inference {
@@ -343,11 +304,10 @@ async fn main() -> Result<()> {
             max_tokens,
             temperature,
             top_p,
-            control_plane_url,
             log_level,
         } => {
             init_simple_logging(&log_level)?;
-            cmd_inference(prompt, model_id, max_tokens, temperature, top_p, control_plane_url).await?;
+            cmd_inference(prompt, model_id, max_tokens, temperature, top_p).await?;
         }
 
         Commands::PoolCreate { name } => {
@@ -411,18 +371,22 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
                 .as_ref()
                 .context("Registration response missing certificate")?;
             config.save_certificate(&signed_cert)?;
-            config.relay_addresses = register_response.relay_addresses.clone();
+            config.connectivity = register_response.connectivity.clone();
             config.save(&config_path)?;
 
             let cert_path = DeviceConfig::default_certificate_path()?;
             println!("✓ Registration successful!");
             println!("   Certificate saved to: {}", cert_path.display());
-            if config.relay_addresses.is_empty() {
-                println!("   Relay addresses: none advertised by control plane");
+            if config.connectivity.attachments.is_empty() {
+                println!("   Connectivity attachments: none advertised by control plane");
             } else {
-                println!("   Relay addresses:");
-                for relay_addr in &config.relay_addresses {
-                    println!("     - {}", relay_addr);
+                println!("   Preferred path: {:?}", config.connectivity.preferred_path);
+                println!("   Connectivity attachments:");
+                for attachment in &config.connectivity.attachments {
+                    println!(
+                        "     - {:?} {} (priority {})",
+                        attachment.kind, attachment.endpoint, attachment.priority
+                    );
                 }
             }
         }
@@ -447,20 +411,12 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     Ok(())
 }
 
-fn resolve_relay_addr(config: &DeviceConfig, relay_override: Option<String>) -> Result<Multiaddr> {
-    let relay = relay_override
-        .or_else(|| config.relay_addresses.first().cloned())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No relay address configured. Re-run `mesh init` against a configured control plane or pass `--relay`."
-            )
-        })?;
-
-    relay.parse().context("Invalid relay address")
+fn resolve_primary_mesh_endpoint(config: &DeviceConfig) -> Result<Multiaddr> {
+    config.connectivity.resolve_primary_endpoint().map_err(Into::into)
 }
 
 /// Run agent daemon
-async fn cmd_start(relay: Option<String>, _control_plane_url: String) -> Result<()> {
+async fn cmd_start() -> Result<()> {
     println!("🚀 Starting Mesh AI agent daemon...\n");
 
     // Load device configuration
@@ -479,7 +435,7 @@ async fn cmd_start(relay: Option<String>, _control_plane_url: String) -> Result<
     println!("   Network: {}", config.network_id);
     println!("   Tier: {:?}", config.capabilities.tier);
 
-    let relay_addr = resolve_relay_addr(&config, relay)?;
+    let relay_addr = resolve_primary_mesh_endpoint(&config)?;
 
     println!("\n🌐 Connecting to relay server...");
     println!("   Relay: {}", relay_addr);
@@ -1046,7 +1002,6 @@ async fn cmd_job(
     target: String,
     workload: String,
     timeout_ms: u64,
-    relay: Option<String>,
 ) -> Result<()> {
     println!("📤 Submitting job to network...\n");
 
@@ -1064,7 +1019,7 @@ async fn cmd_job(
     println!("   Target: {}", target_peer);
     println!("   Timeout: {}ms", timeout_ms);
 
-    let relay_addr = resolve_relay_addr(&config, relay)?;
+    let relay_addr = resolve_primary_mesh_endpoint(&config)?;
 
     // Create ephemeral swarm for job submission
     let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
@@ -1191,6 +1146,21 @@ async fn cmd_status() -> Result<()> {
             }
 
             println!("\n📡 Control Plane: {}", config.control_plane_url);
+            println!("📡 Preferred Path: {:?}", config.connectivity.preferred_path);
+            if config.connectivity.attachments.is_empty() {
+                println!("   Connectivity Attachments: none");
+            } else {
+                for attachment in &config.connectivity.attachments {
+                    let label = match attachment.kind {
+                        ConnectivityAttachmentKind::Libp2pRelay => "libp2p_relay",
+                        ConnectivityAttachmentKind::UserspaceOverlay => "userspace_overlay",
+                    };
+                    println!(
+                        "   Connectivity Attachment: {} {} (priority {})",
+                        label, attachment.endpoint, attachment.priority
+                    );
+                }
+            }
         }
         Err(_) => {
             println!("⚠️  Device not initialized");
@@ -1635,7 +1605,7 @@ async fn cmd_inference_stats() -> Result<()> {
 }
 
 /// Show pool status (all workers from control plane)
-async fn cmd_pool_status(control_plane_url: String) -> Result<()> {
+async fn cmd_pool_status() -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Pool Status".bold().cyan());
@@ -1651,6 +1621,8 @@ async fn cmd_pool_status(control_plane_url: String) -> Result<()> {
             return Ok(());
         }
     };
+
+    let control_plane_url = config.control_plane_url.clone();
 
     println!("\n{}", "Fetching pool status...".dimmed());
 
@@ -1739,11 +1711,7 @@ async fn cmd_pool_status(control_plane_url: String) -> Result<()> {
 }
 
 /// Join ring topology for distributed inference
-async fn cmd_join_ring(
-    model_id: String,
-    control_plane_url: String,
-    relay: Option<String>,
-) -> Result<()> {
+async fn cmd_join_ring(model_id: String) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Joining Ring Topology".bold().cyan());
@@ -1753,7 +1721,8 @@ async fn cmd_join_ring(
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh init' first.")?;
-    let relay_addr = resolve_relay_addr(&config, relay)?;
+    let control_plane_url = config.control_plane_url.clone();
+    let relay_addr = resolve_primary_mesh_endpoint(&config)?;
 
     println!("\n{}", "Device Identity:".bold());
     println!("  Device ID:     {}", config.device_id);
@@ -1861,7 +1830,7 @@ async fn cmd_join_ring(
 }
 
 /// Leave ring topology
-async fn cmd_leave_ring(control_plane_url: String) -> Result<()> {
+async fn cmd_leave_ring() -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Leaving Ring Topology".bold().cyan());
@@ -1871,6 +1840,7 @@ async fn cmd_leave_ring(control_plane_url: String) -> Result<()> {
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh init' first.")?;
+    let control_plane_url = config.control_plane_url.clone();
 
     println!("\n{}", "Requesting ring leave...".dimmed());
     let client = reqwest::Client::new();
@@ -1920,7 +1890,6 @@ async fn cmd_inference(
     max_tokens: u32,
     temperature: f32,
     top_p: f32,
-    control_plane_url: String,
 ) -> Result<()> {
     use colored::Colorize;
 
@@ -1931,6 +1900,7 @@ async fn cmd_inference(
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh init' first.")?;
+    let control_plane_url = config.control_plane_url.clone();
 
     println!("\n{}", "Job Configuration:".bold());
     println!("  Model:           {}", model_id);
@@ -2163,17 +2133,6 @@ async fn request_certificate_with_retry(
 
                         if cert.verify(&pool_root_pubkey, current_time).is_ok() {
                             tracing::info!("Certificate received and verified from admin");
-
-                            // Save admin IP for relay/control plane discovery
-                            let admin_ip = sender_addr.ip().to_string();
-                            let pool_dir = PoolConfig::pool_dir(&pool_id)?;
-                            let admin_relay_file = pool_dir.join("admin_relay.toml");
-                            let admin_config = format!("[relay]\nip_address = \"{}\"\n", admin_ip);
-                            if let Err(e) = std::fs::write(&admin_relay_file, &admin_config) {
-                                tracing::warn!(error = ?e, "Failed to save admin relay info");
-                            } else {
-                                tracing::info!(admin_ip = %admin_ip, "Saved admin relay address");
-                            }
 
                             return Ok((cert, sender_addr));
                         } else {
