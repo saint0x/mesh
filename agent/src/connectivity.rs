@@ -1,6 +1,10 @@
 use crate::errors::{AgentError, Result};
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +51,16 @@ pub struct DeviceConnectivityState {
 }
 
 impl NetworkConnectivity {
+    fn configured_state(&self) -> DeviceConnectivityState {
+        DeviceConnectivityState {
+            active_path: self.preferred_path.clone(),
+            active_endpoint: self
+                .preferred_attachment()
+                .map(|attachment| attachment.endpoint.clone()),
+            status: ConnectivityStatus::Connected,
+        }
+    }
+
     pub fn preferred_attachment(&self) -> Option<&ConnectivityAttachment> {
         let expected_kind = match self.preferred_path {
             ConnectivityPath::Direct => return None,
@@ -60,13 +74,7 @@ impl NetworkConnectivity {
     }
 
     pub fn current_state(&self) -> DeviceConnectivityState {
-        DeviceConnectivityState {
-            active_path: self.preferred_path.clone(),
-            active_endpoint: self
-                .preferred_attachment()
-                .map(|attachment| attachment.endpoint.clone()),
-            status: ConnectivityStatus::Connected,
-        }
+        load_runtime_connectivity_state().unwrap_or_else(|| self.configured_state())
     }
 
     pub fn runtime_endpoint(&self) -> Result<Option<Multiaddr>> {
@@ -100,5 +108,221 @@ impl NetworkConnectivity {
             .endpoint
             .parse()
             .map_err(|e| AgentError::Config(format!("Invalid connectivity endpoint: {}", e)))
+    }
+}
+
+fn runtime_connectivity_state_path() -> Option<PathBuf> {
+    let base = std::env::var_os("MESHNET_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(base.join(".meshnet").join("connectivity_state.json"))
+}
+
+pub fn persist_runtime_connectivity_state(state: &DeviceConnectivityState) -> Result<()> {
+    let path = runtime_connectivity_state_path()
+        .ok_or_else(|| AgentError::Config("Could not determine home directory".to_string()))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| AgentError::Serialization(format!("Failed to serialize state: {}", e)))?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+pub fn load_runtime_connectivity_state() -> Option<DeviceConnectivityState> {
+    let path = runtime_connectivity_state_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub fn select_direct_dial_addrs(peer_id: PeerId, addrs: &[String]) -> Vec<Multiaddr> {
+    let parsed = addrs
+        .iter()
+        .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+        .collect::<Vec<_>>();
+    select_direct_dial_multiaddrs(peer_id, &parsed)
+}
+
+pub fn select_direct_dial_multiaddrs(peer_id: PeerId, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    let mut ranked = addrs
+        .iter()
+        .filter_map(|addr| {
+            rank_direct_addr(addr).map(|rank| (rank, canonical_direct_addr(addr, peer_id)))
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|(left_rank, left_addr), (right_rank, right_addr)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left_addr.to_string().cmp(&right_addr.to_string()))
+    });
+
+    let mut seen = HashSet::new();
+    ranked
+        .into_iter()
+        .map(|(_, addr)| addr)
+        .filter(|addr| seen.insert(addr.to_string()))
+        .collect()
+}
+
+fn canonical_direct_addr(addr: &Multiaddr, peer_id: PeerId) -> Multiaddr {
+    if addr
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
+    {
+        addr.clone()
+    } else {
+        addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id))
+    }
+}
+
+fn rank_direct_addr(addr: &Multiaddr) -> Option<u8> {
+    if addr
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
+    {
+        return None;
+    }
+
+    let mut ip_scope = AddrScope::Dns;
+    let mut transport_rank = None;
+
+    for protocol in addr.iter() {
+        match protocol {
+            libp2p::multiaddr::Protocol::Ip4(ip) => ip_scope = classify_ip_scope(IpAddr::V4(ip)),
+            libp2p::multiaddr::Protocol::Ip6(ip) => ip_scope = classify_ip_scope(IpAddr::V6(ip)),
+            libp2p::multiaddr::Protocol::Dns(_)
+            | libp2p::multiaddr::Protocol::Dns4(_)
+            | libp2p::multiaddr::Protocol::Dns6(_)
+            | libp2p::multiaddr::Protocol::Dnsaddr(_) => {
+                ip_scope = AddrScope::Dns;
+            }
+            libp2p::multiaddr::Protocol::Quic | libp2p::multiaddr::Protocol::QuicV1 => {
+                transport_rank = Some(0)
+            }
+            libp2p::multiaddr::Protocol::Tcp(_) => {
+                transport_rank.get_or_insert(1);
+            }
+            _ => {}
+        }
+    }
+
+    let transport_rank = transport_rank?;
+    let scope_rank = match ip_scope {
+        AddrScope::Public => 0,
+        AddrScope::Dns => 10,
+        AddrScope::Private => 20,
+        AddrScope::Loopback => 30,
+        AddrScope::Unsupported => return None,
+    };
+
+    Some(scope_rank + transport_rank)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddrScope {
+    Public,
+    Dns,
+    Private,
+    Loopback,
+    Unsupported,
+}
+
+fn classify_ip_scope(ip: IpAddr) -> AddrScope {
+    match ip {
+        IpAddr::V4(ip) => classify_ipv4_scope(ip),
+        IpAddr::V6(ip) => classify_ipv6_scope(ip),
+    }
+}
+
+fn classify_ipv4_scope(ip: Ipv4Addr) -> AddrScope {
+    if ip.is_loopback() {
+        return AddrScope::Loopback;
+    }
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_documentation() {
+        return AddrScope::Unsupported;
+    }
+    if ip.is_private() || ip.is_link_local() {
+        return AddrScope::Private;
+    }
+    AddrScope::Public
+}
+
+fn classify_ipv6_scope(ip: Ipv6Addr) -> AddrScope {
+    if ip.is_loopback() {
+        return AddrScope::Loopback;
+    }
+    if ip.is_unspecified() || ip.is_multicast() || ipv6_is_documentation(ip) {
+        return AddrScope::Unsupported;
+    }
+    if ip.is_unicast_link_local() || ipv6_is_unique_local(ip) {
+        return AddrScope::Private;
+    }
+    AddrScope::Public
+}
+
+fn ipv6_is_unique_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn ipv6_is_documentation(ip: Ipv6Addr) -> bool {
+    ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_direct_dial_addrs_prefers_public_quic_then_private_tcp() {
+        let peer_id = PeerId::random();
+        let addrs = vec![
+            "/ip4/192.168.1.44/tcp/4001".to_string(),
+            "/ip4/34.120.0.10/udp/4001/quic-v1".to_string(),
+            "/ip4/34.120.0.10/tcp/4001".to_string(),
+            "/ip4/127.0.0.1/tcp/4001".to_string(),
+            "/dns4/peer.mesh.example/udp/4001/quic-v1".to_string(),
+            "/dns4/relay.mesh.example/tcp/4001/p2p-circuit".to_string(),
+        ];
+
+        let selected = select_direct_dial_addrs(peer_id, &addrs);
+        let rendered = selected.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                format!("/ip4/34.120.0.10/udp/4001/quic-v1/p2p/{}", peer_id),
+                format!("/ip4/34.120.0.10/tcp/4001/p2p/{}", peer_id),
+                format!("/dns4/peer.mesh.example/udp/4001/quic-v1/p2p/{}", peer_id),
+                format!("/ip4/192.168.1.44/tcp/4001/p2p/{}", peer_id),
+                format!("/ip4/127.0.0.1/tcp/4001/p2p/{}", peer_id),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_state_prefers_runtime_state_when_present() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::env::set_var("MESHNET_HOME", tempdir.path());
+
+        let state = DeviceConnectivityState {
+            active_path: ConnectivityPath::Direct,
+            active_endpoint: Some("/ip4/10.0.0.8/tcp/4001".to_string()),
+            status: ConnectivityStatus::Connected,
+        };
+        persist_runtime_connectivity_state(&state).unwrap();
+
+        let connectivity = NetworkConnectivity {
+            preferred_path: ConnectivityPath::Relayed,
+            attachments: vec![ConnectivityAttachment {
+                kind: ConnectivityAttachmentKind::Libp2pRelay,
+                endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
+                priority: 0,
+            }],
+        };
+
+        assert_eq!(connectivity.current_state(), state);
+        std::env::remove_var("MESHNET_HOME");
     }
 }

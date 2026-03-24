@@ -16,7 +16,9 @@ pub mod telemetry;
 pub use api::RegistrationClient;
 pub use checkpoint::{Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata};
 pub use connectivity::{
-    ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+    load_runtime_connectivity_state, persist_runtime_connectivity_state, select_direct_dial_addrs,
+    ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
+    DeviceConnectivityState, NetworkConnectivity,
 };
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
 pub use errors::{AgentError, Result};

@@ -61,6 +61,22 @@ This improves:
 
 But it does not by itself make tensor traffic fundamentally faster.
 
+### NAT Traversal Status
+
+- ✅ Direct peer dialing is now deterministic and ranked instead of trusting arbitrary advertised address order.
+- ✅ Public direct candidates are preferred first, then DNS direct candidates, then private/LAN candidates, with relay addresses excluded from the direct dial set.
+- ✅ Ring neighbor connection setup now treats direct connectivity as the canonical path and only falls back to relay when direct dialing fails.
+- ✅ Ad hoc peer job submission now resolves and attempts viable direct addresses before using relay as a degraded fallback.
+- ✅ Runtime connectivity state is now persisted separately from static config so heartbeat/status can report the active path the agent most recently established.
+- ✅ DCUTR upgrade success and failure are now surfaced in the mesh event stream and reflected in runtime connectivity state.
+
+### NAT Traversal Still Open
+
+- ⬜ Introduce explicit punched-path candidate exchange beyond passive advertised listen addresses so hostile NAT cases do not depend only on static address advertisement.
+- ⬜ Add focused integration coverage for direct upgrade and relay fallback behavior under more realistic multi-peer networking scenarios.
+- ⬜ Add operator-visible path quality metrics for direct success rate, relay fallback rate, upgrade failure causes, and candidate selection outcomes.
+- ⬜ Tighten control-plane/operator surfaces so direct-candidate quality is visible instead of only exposing raw listen address lists.
+
 ### 3. Governance Third
 
 After the transport shape is right and connectivity is stronger, add:
@@ -148,11 +164,18 @@ After Phase 1:
 
 - ✅ `cargo test -p agent --no-run`
 - ✅ `cargo test -p control-plane --no-run`
+- ✅ `cargo test -p agent select_direct_dial_addrs_prefers_public_quic_then_private_tcp -- --nocapture`
+- ✅ `cargo test -p agent current_state_prefers_runtime_state_when_present -- --nocapture`
 - ✅ `cargo test -p agent test_worker_position -- --nocapture`
 - ✅ `cargo test -p control-plane test_get_topology_handler -- --nocapture`
 - ✅ `cargo test -p control-plane test_ring_stability -- --nocapture`
 - ✅ `fozzy --cwd . validate tests/production_dispatch.fozzy.json --json`
 - ✅ `fozzy --cwd . doctor --deep --scenario tests/production_dispatch.fozzy.json --runs 5 --seed 1 --json`
+- ✅ `fozzy --cwd . test --det --strict tests/production_dispatch.fozzy.json --json`
+- ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --record .fozzy/nat-direct.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/nat-direct.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/nat-direct.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/nat-direct.trace.fozzy --json`
 
 ### Still Open In Phase 1
 
@@ -226,10 +249,10 @@ Required outcome:
 
 The next production step is:
 
-1. Add focused dedicated-data-plane runtime tests that actually exercise tensor send/receive over the new hot path.
-2. Tighten endpoint advertisement and selection so tensor-plane endpoints are explicit, validated, and operator-visible.
-3. Add tensor-plane metrics/logging for connection establishment, send latency, receive latency, timeout causes, and payload size.
-4. Once the dedicated path is fully hardened and observable, begin NAT traversal phase work for punched/direct execution.
+1. Implement explicit punched-path candidate exchange so peers can attempt direct upgrades with richer candidate sets than passive listen-address advertisement alone.
+2. Add focused integration coverage for direct upgrade success, direct dial failure, and relay fallback behavior.
+3. Add operator-visible direct-path metrics and candidate-selection reporting.
+4. Once direct connectivity is explicitly exchanged, observable, and covered, move into governance/backpressure.
 
 ## Deferred PR Analysis
 

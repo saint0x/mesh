@@ -36,9 +36,11 @@ use agent::pki::{
 };
 use agent::{
     api::types::RingTopologyResponse, format_bytes, init_production_logging, init_simple_logging,
-    parse_data_plane_endpoint, parse_memory_string, ConnectivityAttachmentKind, DeviceConfig,
-    EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner, MeshSwarmBuilder,
-    RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
+    parse_data_plane_endpoint, parse_memory_string, persist_runtime_connectivity_state,
+    select_direct_dial_addrs, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
+    DeviceConfig, DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput,
+    JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager, TensorPlane,
+    TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -517,22 +519,26 @@ fn build_worker_position_from_topology(
             .peer_id
             .parse::<PeerId>()
             .context("Invalid left neighbor peer ID")?,
-        left_neighbor_addrs: left_worker
-            .listen_addrs
-            .iter()
-            .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
-            .collect(),
+        left_neighbor_addrs: select_direct_dial_addrs(
+            left_worker
+                .peer_id
+                .parse::<PeerId>()
+                .context("Invalid left neighbor peer ID")?,
+            &left_worker.listen_addrs,
+        ),
         left_neighbor_tensor_addr: extract_tensor_addr(&left_worker.listen_addrs)
             .context("Left neighbor has no dedicated tensor data-plane endpoint")?,
         right_neighbor: right_worker
             .peer_id
             .parse::<PeerId>()
             .context("Invalid right neighbor peer ID")?,
-        right_neighbor_addrs: right_worker
-            .listen_addrs
-            .iter()
-            .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
-            .collect(),
+        right_neighbor_addrs: select_direct_dial_addrs(
+            right_worker
+                .peer_id
+                .parse::<PeerId>()
+                .context("Invalid right neighbor peer ID")?,
+            &right_worker.listen_addrs,
+        ),
         right_neighbor_tensor_addr: extract_tensor_addr(&right_worker.listen_addrs)
             .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
         shard_column_range: (self_worker.shard.column_start, self_worker.shard.column_end),
@@ -598,7 +604,7 @@ async fn cmd_start() -> Result<()> {
     swarm.listen_on_direct_addrs()?;
     if matches!(
         config.connectivity.preferred_path,
-        agent::ConnectivityPath::Relayed
+        ConnectivityPath::Relayed
     ) {
         let relay_addr = runtime_endpoint.clone().context("relay endpoint missing")?;
 
@@ -689,6 +695,11 @@ async fn cmd_start() -> Result<()> {
             }
         }
     } else {
+        let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
+            active_path: ConnectivityPath::Direct,
+            active_endpoint: None,
+            status: ConnectivityStatus::Connected,
+        });
         println!("   ✓ Direct listeners enabled");
     }
 
@@ -948,7 +959,7 @@ async fn cmd_start() -> Result<()> {
 
         if matches!(
             inference_config_task.connectivity.preferred_path,
-            agent::ConnectivityPath::Relayed
+            ConnectivityPath::Relayed
         ) {
             if let Err(e) = inference_swarm.connect_to_relay() {
                 error!(error = %e, "Failed to connect inference swarm to relay");
@@ -1227,56 +1238,41 @@ async fn cmd_job(input: String, target: String, workload: String, timeout_ms: u6
     let mut swarm = swarm_builder.build()?;
     swarm.listen_on_direct_addrs()?;
 
-    match config.connectivity.preferred_path {
-        agent::ConnectivityPath::Relayed => {
-            println!("\n🌐 Connecting to relay...");
-            swarm.connect_to_relay()?;
+    println!("\n🌐 Resolving peer connectivity...");
+    let client = reqwest::Client::new();
+    let topology_url = format!(
+        "{}/api/ring/topology?network_id={}",
+        config.control_plane_url.trim_end_matches('/'),
+        config.network_id
+    );
+    let topology = client
+        .get(&topology_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RingTopologyResponse>()
+        .await?;
 
-            let mut relay_connected = false;
-            while !relay_connected {
-                if let Some(event) = swarm.next_event().await {
-                    if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
-                        println!("   ✓ Connected to relay");
-                        relay_connected = true;
-                    }
-                }
-            }
-        }
-        agent::ConnectivityPath::Direct => {
-            println!("\n🌐 Resolving direct target address...");
-            let client = reqwest::Client::new();
-            let topology_url = format!(
-                "{}/api/ring/topology?network_id={}",
-                config.control_plane_url.trim_end_matches('/'),
-                config.network_id
-            );
-            let topology = client
-                .get(&topology_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<RingTopologyResponse>()
-                .await?;
+    let worker = topology
+        .workers
+        .into_iter()
+        .find(|worker| worker.peer_id == target_peer.to_string())
+        .context("Target peer not found in topology")?;
 
-            let worker = topology
-                .workers
-                .into_iter()
-                .find(|worker| worker.peer_id == target_peer.to_string())
-                .context("Target peer not found in topology for direct mode")?;
-
-            let target_addrs = worker
-                .listen_addrs
-                .iter()
-                .filter_map(|addr| addr.parse::<Multiaddr>().ok())
-                .collect::<Vec<_>>();
-
-            if target_addrs.is_empty() {
-                anyhow::bail!("Target peer has no advertised direct listen addresses");
-            }
-
-            swarm.dial_direct_peer(target_peer, &target_addrs)?;
-            println!("   ✓ Dialing target directly");
-        }
+    let target_addrs = select_direct_dial_addrs(target_peer, &worker.listen_addrs);
+    if !target_addrs.is_empty() {
+        swarm.dial_direct_peer(target_peer, &target_addrs)?;
+        println!("   ✓ Dialing target directly");
+    } else if matches!(
+        config.connectivity.preferred_path,
+        ConnectivityPath::Relayed
+    ) {
+        println!("   ⚠️  No viable direct addresses advertised; falling back to relay");
+        swarm.connect_to_relay()?;
+        swarm.dial_peer(target_peer)?;
+        println!("   ✓ Dialing target through relay");
+    } else {
+        anyhow::bail!("Target peer has no viable direct addresses");
     }
 
     // Create job envelope

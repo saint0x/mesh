@@ -11,6 +11,10 @@ use tracing::{debug, info, instrument, warn};
 
 use super::events::{ConnectionInfo, ConnectionType, MeshEvent};
 use super::job_protocol::{self, JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
+use crate::connectivity::{
+    persist_runtime_connectivity_state, select_direct_dial_multiaddrs, ConnectivityPath,
+    ConnectivityStatus, DeviceConnectivityState,
+};
 use crate::errors::{AgentError, Result};
 
 /// Composed network behaviour for the mesh agent
@@ -261,17 +265,9 @@ impl MeshSwarm {
     }
 
     pub fn dial_direct_peer(&mut self, peer_id: PeerId, addrs: &[Multiaddr]) -> Result<()> {
+        let ranked_addrs = select_direct_dial_multiaddrs(peer_id, addrs);
         let mut dialed = false;
-        for addr in addrs {
-            let dial_addr = if addr
-                .iter()
-                .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
-            {
-                addr.clone()
-            } else {
-                addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id))
-            };
-
+        for dial_addr in ranked_addrs {
             match self.swarm.dial(dial_addr.clone()) {
                 Ok(()) => {
                     dialed = true;
@@ -290,6 +286,34 @@ impl MeshSwarm {
                 "Failed to dial peer {} on any advertised direct address",
                 peer_id
             )))
+        }
+    }
+
+    fn dial_neighbor(&mut self, peer_id: PeerId, addrs: &[Multiaddr]) {
+        match self.dial_direct_peer(peer_id, addrs) {
+            Ok(()) => {}
+            Err(direct_error) => {
+                if self.relay_peer_id.is_some() {
+                    warn!(
+                        peer_id = %peer_id,
+                        error = %direct_error,
+                        "Direct dial failed for neighbor, falling back to relay"
+                    );
+                    if let Err(relay_error) = self.dial_peer(peer_id) {
+                        warn!(
+                            peer_id = %peer_id,
+                            error = %relay_error,
+                            "Relay fallback failed for neighbor"
+                        );
+                    }
+                } else {
+                    warn!(
+                        peer_id = %peer_id,
+                        error = %direct_error,
+                        "Direct dial failed for neighbor and no relay fallback is available"
+                    );
+                }
+            }
         }
     }
 
@@ -374,6 +398,11 @@ impl MeshSwarm {
                             } else {
                                 info!(relay = %relay_peer_id, limit = ?limit, "Relay reservation accepted");
                             }
+                            let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
+                                active_path: ConnectivityPath::Relayed,
+                                active_endpoint: Some(self.config.relay_addr.to_string()),
+                                status: ConnectivityStatus::Connected,
+                            });
                             return Some(MeshEvent::ReservationAccepted {
                                 relay_peer_id,
                                 renewal_timeout: Duration::from_secs(30),
@@ -392,9 +421,30 @@ impl MeshSwarm {
                 }
 
                 // DCUTR events
-                SwarmEvent::Behaviour(MeshBehaviourEvent::Dcutr(event)) => {
-                    debug!("DCUTR event: {:?}", event);
-                }
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Dcutr(event)) => match event.result {
+                    Ok(_) => {
+                        info!(peer_id = %event.remote_peer_id, "Direct connection upgrade succeeded");
+                        let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
+                            active_path: ConnectivityPath::Direct,
+                            active_endpoint: None,
+                            status: ConnectivityStatus::Connected,
+                        });
+                        return Some(MeshEvent::DirectConnectionUpgraded {
+                            peer_id: event.remote_peer_id,
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            peer_id = %event.remote_peer_id,
+                            error = %error,
+                            "Direct connection upgrade failed"
+                        );
+                        return Some(MeshEvent::DirectConnectionUpgradeFailed {
+                            peer_id: event.remote_peer_id,
+                            error: error.to_string(),
+                        });
+                    }
+                },
 
                 // Job protocol events
                 SwarmEvent::Behaviour(MeshBehaviourEvent::JobProtocol(event)) => {
@@ -476,6 +526,16 @@ impl MeshSwarm {
                         num_established = num_connections,
                         "Connection established"
                     );
+                    let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
+                        active_path: match connection_type {
+                            ConnectionType::Direct => ConnectivityPath::Direct,
+                            ConnectionType::Relayed | ConnectionType::Unknown => {
+                                ConnectivityPath::Relayed
+                            }
+                        },
+                        active_endpoint: Some(endpoint.get_remote_address().to_string()),
+                        status: ConnectivityStatus::Connected,
+                    });
 
                     return Some(MeshEvent::PeerConnected {
                         peer_id,
@@ -498,6 +558,15 @@ impl MeshSwarm {
                     } else {
                         info!(peer_id = %peer_id, remaining = num_established, "Connection closed");
                     }
+                    let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
+                        active_path: if self.relay_peer_id.is_some() {
+                            ConnectivityPath::Relayed
+                        } else {
+                            ConnectivityPath::Direct
+                        },
+                        active_endpoint: None,
+                        status: ConnectivityStatus::Degraded,
+                    });
                     return Some(MeshEvent::PeerDisconnected { peer_id });
                 }
 
@@ -559,22 +628,9 @@ impl MeshSwarm {
             right_peer: right,
         });
 
-        // Ensure connections are established to both neighbors
-        if self.relay_peer_id.is_some() {
-            if let Err(e) = self.dial_peer(left) {
-                warn!(peer_id = %left, error = %e, "Failed to dial left neighbor through relay");
-            }
-            if let Err(e) = self.dial_peer(right) {
-                warn!(peer_id = %right, error = %e, "Failed to dial right neighbor through relay");
-            }
-        } else {
-            if let Err(e) = self.dial_direct_peer(left, left_addrs) {
-                warn!(peer_id = %left, error = %e, "Failed to dial left neighbor directly");
-            }
-            if let Err(e) = self.dial_direct_peer(right, right_addrs) {
-                warn!(peer_id = %right, error = %e, "Failed to dial right neighbor directly");
-            }
-        }
+        // Direct is the canonical neighbor path. Relay is only a degraded fallback.
+        self.dial_neighbor(left, left_addrs);
+        self.dial_neighbor(right, right_addrs);
 
         info!("Ring neighbors set: left={}, right={}", left, right);
     }
