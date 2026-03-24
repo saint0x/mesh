@@ -1,5 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
-use crate::connectivity::DeviceConnectivityState;
+use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate};
 use crate::db::Database;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,7 @@ pub struct WorkerTopologyInfo {
     pub right_neighbor: DeviceId,
     pub connectivity_state: Option<DeviceConnectivityState>,
     pub listen_addrs: Vec<String>,
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Ring Topology Manager for distributed worker coordination
@@ -550,7 +551,7 @@ impl RingTopologyManager {
                 r#"
                 SELECT device_id, ring_position, shard_column_start, shard_column_end,
                        left_neighbor_id, right_neighbor_id, status, contributed_memory, connectivity_state,
-                       peer_id, listen_addrs
+                       peer_id, listen_addrs, direct_candidates
                 FROM devices
                 WHERE network_id = ? AND ring_position IS NOT NULL
                 ORDER BY ring_position
@@ -592,6 +593,18 @@ impl RingTopologyManager {
                         )
                     })?
                     .unwrap_or_default();
+                let direct_candidates = row
+                    .get::<_, Option<String>>(11)?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            11,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .unwrap_or_default();
 
                 Ok(WorkerTopologyInfo {
                     device_id,
@@ -608,6 +621,7 @@ impl RingTopologyManager {
                     right_neighbor,
                     connectivity_state,
                     listen_addrs,
+                    direct_candidates,
                 })
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;

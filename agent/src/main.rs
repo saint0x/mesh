@@ -37,10 +37,10 @@ use agent::pki::{
 use agent::{
     api::types::RingTopologyResponse, format_bytes, init_production_logging, init_simple_logging,
     parse_data_plane_endpoint, parse_memory_string, persist_runtime_connectivity_state,
-    select_direct_dial_addrs, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
-    DeviceConfig, DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput,
-    JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager, TensorPlane,
-    TensorPlaneConfig,
+    select_direct_dial_addrs_from_candidates, ConnectivityAttachmentKind, ConnectivityPath,
+    ConnectivityStatus, DeviceConfig, DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput,
+    EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
+    TensorPlane, TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -512,32 +512,29 @@ fn build_worker_position_from_topology(
         .find(|candidate| candidate.device_id == self_worker.right_neighbor)
         .context("Right neighbor not found in ring topology")?;
 
+    let left_peer_id = left_worker
+        .peer_id
+        .parse::<PeerId>()
+        .context("Invalid left neighbor peer ID")?;
+    let right_peer_id = right_worker
+        .peer_id
+        .parse::<PeerId>()
+        .context("Invalid right neighbor peer ID")?;
+
     Ok(agent::inference::coordinator::WorkerPosition {
         position: self_worker.position,
         total_workers: topology.workers.len() as u32,
-        left_neighbor: left_worker
-            .peer_id
-            .parse::<PeerId>()
-            .context("Invalid left neighbor peer ID")?,
-        left_neighbor_addrs: select_direct_dial_addrs(
-            left_worker
-                .peer_id
-                .parse::<PeerId>()
-                .context("Invalid left neighbor peer ID")?,
-            &left_worker.listen_addrs,
+        left_neighbor: left_peer_id,
+        left_neighbor_addrs: select_direct_dial_addrs_from_candidates(
+            left_peer_id,
+            &left_worker.direct_candidates,
         ),
         left_neighbor_tensor_addr: extract_tensor_addr(&left_worker.listen_addrs)
             .context("Left neighbor has no dedicated tensor data-plane endpoint")?,
-        right_neighbor: right_worker
-            .peer_id
-            .parse::<PeerId>()
-            .context("Invalid right neighbor peer ID")?,
-        right_neighbor_addrs: select_direct_dial_addrs(
-            right_worker
-                .peer_id
-                .parse::<PeerId>()
-                .context("Invalid right neighbor peer ID")?,
-            &right_worker.listen_addrs,
+        right_neighbor: right_peer_id,
+        right_neighbor_addrs: select_direct_dial_addrs_from_candidates(
+            right_peer_id,
+            &right_worker.direct_candidates,
         ),
         right_neighbor_tensor_addr: extract_tensor_addr(&right_worker.listen_addrs)
             .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
@@ -1259,7 +1256,8 @@ async fn cmd_job(input: String, target: String, workload: String, timeout_ms: u6
         .find(|worker| worker.peer_id == target_peer.to_string())
         .context("Target peer not found in topology")?;
 
-    let target_addrs = select_direct_dial_addrs(target_peer, &worker.listen_addrs);
+    let target_addrs =
+        select_direct_dial_addrs_from_candidates(target_peer, &worker.direct_candidates);
     if !target_addrs.is_empty() {
         swarm.dial_direct_peer(target_peer, &target_addrs)?;
         println!("   ✓ Dialing target directly");

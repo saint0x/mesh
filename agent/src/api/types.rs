@@ -1,4 +1,4 @@
-use crate::connectivity::{DeviceConnectivityState, NetworkConnectivity};
+use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate, NetworkConnectivity};
 use crate::device::DeviceCapabilities;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,8 @@ pub struct RegisterDeviceResponse {
 pub struct HeartbeatRequest {
     pub connectivity_state: DeviceConnectivityState,
     pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Response to heartbeat update
@@ -36,6 +38,8 @@ pub struct HeartbeatResponse {
     pub last_seen: String,
     pub connectivity_state: DeviceConnectivityState,
     pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +62,8 @@ pub struct WorkerInfo {
     pub right_neighbor: String,
     pub connectivity_state: Option<DeviceConnectivityState>,
     pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

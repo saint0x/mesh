@@ -69,13 +69,16 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Ad hoc peer job submission now resolves and attempts viable direct addresses before using relay as a degraded fallback.
 - ✅ Runtime connectivity state is now persisted separately from static config so heartbeat/status can report the active path the agent most recently established.
 - ✅ DCUTR upgrade success and failure are now surfaced in the mesh event stream and reflected in runtime connectivity state.
+- ✅ Heartbeat now publishes an explicit ranked `direct_candidates` set instead of requiring peers to infer direct dialing intent from raw `listen_addrs`.
+- ✅ Control-plane device state and ring topology now persist and return structured direct-connect candidates as a first-class contract.
+- ✅ Ring workers now resolve direct peers from authoritative `direct_candidates` metadata rather than rebuilding dial order from generic listen-address lists.
 
 ### NAT Traversal Still Open
 
-- ⬜ Introduce explicit punched-path candidate exchange beyond passive advertised listen addresses so hostile NAT cases do not depend only on static address advertisement.
 - ⬜ Add focused integration coverage for direct upgrade and relay fallback behavior under more realistic multi-peer networking scenarios.
 - ⬜ Add operator-visible path quality metrics for direct success rate, relay fallback rate, upgrade failure causes, and candidate selection outcomes.
-- ⬜ Tighten control-plane/operator surfaces so direct-candidate quality is visible instead of only exposing raw listen address lists.
+- ⬜ Extend candidate gathering beyond currently advertised local listen addresses so hostile NAT cases can exchange richer hole-punch inputs and observed reachability hints.
+- ⬜ Tighten control-plane/operator surfaces so direct-candidate quality and selection outcomes are visible rather than only stored internally.
 
 ### 3. Governance Third
 
@@ -166,7 +169,9 @@ After Phase 1:
 - ✅ `cargo test -p control-plane --no-run`
 - ✅ `cargo test -p agent select_direct_dial_addrs_prefers_public_quic_then_private_tcp -- --nocapture`
 - ✅ `cargo test -p agent current_state_prefers_runtime_state_when_present -- --nocapture`
+- ✅ `cargo test -p agent build_direct_peer_candidates_excludes_relay_and_sorts -- --nocapture`
 - ✅ `cargo test -p agent test_worker_position -- --nocapture`
+- ✅ `cargo test -p control-plane test_update_heartbeat -- --nocapture`
 - ✅ `cargo test -p control-plane test_get_topology_handler -- --nocapture`
 - ✅ `cargo test -p control-plane test_ring_stability -- --nocapture`
 - ✅ `fozzy --cwd . validate tests/production_dispatch.fozzy.json --json`
@@ -176,6 +181,10 @@ After Phase 1:
 - ✅ `fozzy --cwd . trace verify .fozzy/nat-direct.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/nat-direct.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/nat-direct.trace.fozzy --json`
+- ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --record .fozzy/nat-candidates.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/nat-candidates.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/nat-candidates.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/nat-candidates.trace.fozzy --json`
 
 ### Still Open In Phase 1
 
@@ -252,7 +261,8 @@ The next production step is:
 1. Implement explicit punched-path candidate exchange so peers can attempt direct upgrades with richer candidate sets than passive listen-address advertisement alone.
 2. Add focused integration coverage for direct upgrade success, direct dial failure, and relay fallback behavior.
 3. Add operator-visible direct-path metrics and candidate-selection reporting.
-4. Once direct connectivity is explicitly exchanged, observable, and covered, move into governance/backpressure.
+4. Extend candidate gathering with observed/public reachability hints rather than relying only on current local advertisements.
+5. Once direct connectivity is observable, richly exchanged, and covered, move into governance/backpressure.
 
 ## Deferred PR Analysis
 

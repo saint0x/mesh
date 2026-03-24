@@ -47,6 +47,30 @@ pub struct DeviceConnectivityState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectCandidateTransport {
+    Quic,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectCandidateScope {
+    Public,
+    Dns,
+    Private,
+    Loopback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectPeerCandidate {
+    pub endpoint: String,
+    pub transport: DirectCandidateTransport,
+    pub scope: DirectCandidateScope,
+    pub priority: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkSettings {
     pub connectivity: NetworkConnectivity,
 }
@@ -144,6 +168,17 @@ impl DeviceConnectivityState {
             ));
         }
 
+        Ok(())
+    }
+}
+
+impl DirectPeerCandidate {
+    pub fn validate(&self) -> ApiResult<()> {
+        if self.endpoint.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "direct candidate endpoint must not be empty".to_string(),
+            ));
+        }
         Ok(())
     }
 }

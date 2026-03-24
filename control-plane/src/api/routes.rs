@@ -150,7 +150,13 @@ pub async fn heartbeat(
     let db = state.db.clone();
 
     let last_seen = tokio::task::spawn_blocking(move || {
-        device_service::update_heartbeat(&db, device_id, req.connectivity_state, req.listen_addrs)
+        device_service::update_heartbeat(
+            &db,
+            device_id,
+            req.connectivity_state,
+            req.listen_addrs,
+            req.direct_candidates,
+        )
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -160,6 +166,7 @@ pub async fn heartbeat(
         last_seen: last_seen.0,
         connectivity_state: last_seen.1,
         listen_addrs: last_seen.2,
+        direct_candidates: last_seen.3,
     }))
 }
 
@@ -283,6 +290,7 @@ mod tests {
             axum::Json(HeartbeatRequest {
                 connectivity_state: test_connectivity_state(),
                 listen_addrs: vec!["/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6routepeer222222222222222222222222222222".to_string()],
+                direct_candidates: vec![],
             }),
         )
         .await;
@@ -310,6 +318,7 @@ mod tests {
             axum::Json(HeartbeatRequest {
                 connectivity_state: test_connectivity_state(),
                 listen_addrs: vec![],
+                direct_candidates: vec![],
             }),
         )
         .await;

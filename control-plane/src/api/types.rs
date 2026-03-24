@@ -1,4 +1,4 @@
-use crate::connectivity::{DeviceConnectivityState, NetworkConnectivity};
+use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate, NetworkConnectivity};
 use crate::device::DeviceCapabilities;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,8 @@ pub struct HeartbeatRequest {
     pub connectivity_state: DeviceConnectivityState,
     #[serde(default)]
     pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Response to heartbeat update
@@ -100,6 +102,9 @@ pub struct HeartbeatResponse {
     pub connectivity_state: DeviceConnectivityState,
     /// Recorded listen addresses
     pub listen_addrs: Vec<String>,
+    /// Recorded direct-connect candidates
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Request to join the ring topology
@@ -175,6 +180,9 @@ pub struct WorkerInfo {
     /// Latest reported direct listen addresses
     #[serde(default)]
     pub listen_addrs: Vec<String>,
+    /// Ranked direct-connect candidates for peer dialing
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Response to ring leave request

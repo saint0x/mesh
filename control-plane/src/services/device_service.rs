@@ -1,5 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
-use crate::connectivity::{DeviceConnectivityState, NetworkConnectivity};
+use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate, NetworkConnectivity};
 use crate::db::Database;
 use crate::device::DeviceCapabilities;
 use crate::services::certificate::ControlPlaneKeypair;
@@ -115,7 +115,13 @@ pub fn update_heartbeat(
     device_id: String,
     connectivity_state: DeviceConnectivityState,
     listen_addrs: Vec<String>,
-) -> ApiResult<(String, DeviceConnectivityState, Vec<String>)> {
+    direct_candidates: Vec<DirectPeerCandidate>,
+) -> ApiResult<(
+    String,
+    DeviceConnectivityState,
+    Vec<String>,
+    Vec<DirectPeerCandidate>,
+)> {
     // Validate device_id
     if device_id.is_empty() {
         return Err(ApiError::BadRequest("device_id cannot be empty".into()));
@@ -126,12 +132,17 @@ pub fn update_heartbeat(
             "listen_addrs must not contain empty entries".into(),
         ));
     }
+    for candidate in &direct_candidates {
+        candidate.validate()?;
+    }
 
     let connectivity_state_json = serde_json::to_string(&connectivity_state).map_err(|e| {
         ApiError::Internal(format!("Failed to serialize connectivity state: {}", e))
     })?;
     let listen_addrs_json = serde_json::to_string(&listen_addrs)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize listen addresses: {}", e)))?;
+    let direct_candidates_json = serde_json::to_string(&direct_candidates)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize direct candidates: {}", e)))?;
 
     let now = OffsetDateTime::now_utc();
     let now_str = now
@@ -145,13 +156,14 @@ pub fn update_heartbeat(
         .execute(
             r#"
         UPDATE devices
-        SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?
+        SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?, direct_candidates = ?
         WHERE device_id = ?
         "#,
             params![
                 &now_str,
                 &connectivity_state_json,
                 &listen_addrs_json,
+                &direct_candidates_json,
                 &device_id
             ],
         )
@@ -166,7 +178,7 @@ pub fn update_heartbeat(
 
     debug!(device_id = %device_id, last_seen = %now_str, "Heartbeat updated");
 
-    Ok((now_str, connectivity_state, listen_addrs))
+    Ok((now_str, connectivity_state, listen_addrs, direct_candidates))
 }
 
 #[cfg(test)]
@@ -174,7 +186,8 @@ mod tests {
     use super::*;
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
-        DeviceConnectivityState, NetworkConnectivity,
+        DeviceConnectivityState, DirectCandidateScope, DirectCandidateTransport,
+        DirectPeerCandidate, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::Tier;
@@ -340,24 +353,36 @@ mod tests {
                 "/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6testpeer44444444444444444444444444444444"
                     .to_string(),
             ],
+            vec![DirectPeerCandidate {
+                endpoint:
+                    "/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6testpeer44444444444444444444444444444444"
+                        .to_string(),
+                transport: crate::connectivity::DirectCandidateTransport::Tcp,
+                scope: crate::connectivity::DirectCandidateScope::Private,
+                priority: 21,
+            }],
         )
         .unwrap();
 
         assert!(!heartbeat.0.is_empty());
         assert_eq!(heartbeat.1.status, ConnectivityStatus::Connected);
+        assert_eq!(heartbeat.3.len(), 1);
+        assert_eq!(heartbeat.3[0].scope, DirectCandidateScope::Private);
+        assert_eq!(heartbeat.3[0].transport, DirectCandidateTransport::Tcp);
 
         // Verify in database
         let conn = db.get_conn().unwrap();
-        let device: (String, String) = conn
+        let device: (String, String, String) = conn
             .query_row(
-                "SELECT last_seen, status FROM devices WHERE device_id = ?",
+                "SELECT last_seen, status, direct_candidates FROM devices WHERE device_id = ?",
                 params![device_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
 
         assert_eq!(device.1, "online");
         assert_eq!(device.0, heartbeat.0);
+        assert!(device.2.contains("192.168.1.2"));
     }
 
     #[test]
@@ -368,6 +393,7 @@ mod tests {
             &db,
             "nonexistent-device".to_string(),
             test_connectivity_state(),
+            vec![],
             vec![],
         );
 

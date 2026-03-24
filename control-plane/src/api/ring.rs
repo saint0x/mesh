@@ -167,6 +167,7 @@ pub async fn get_topology(
             right_neighbor: w.right_neighbor,
             connectivity_state: w.connectivity_state,
             listen_addrs: w.listen_addrs,
+            direct_candidates: w.direct_candidates,
         })
         .collect();
 
@@ -460,7 +461,9 @@ pub async fn check_topology_version(
 mod tests {
     use super::*;
     use crate::connectivity::{
-        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
+        DeviceConnectivityState, DirectCandidateScope, DirectCandidateTransport,
+        DirectPeerCandidate, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
@@ -516,6 +519,14 @@ mod tests {
             test_capabilities(),
         )
         .unwrap();
+    }
+
+    fn test_connectivity_state() -> DeviceConnectivityState {
+        DeviceConnectivityState {
+            active_path: ConnectivityPath::Direct,
+            active_endpoint: None,
+            status: ConnectivityStatus::Connected,
+        }
     }
 
     #[tokio::test]
@@ -576,6 +587,23 @@ mod tests {
         for i in 0..2 {
             let device_id = format!("device-{}", i);
             register_test_device(&db, &device_id, network_id);
+            device_service::update_heartbeat(
+                &db,
+                device_id.clone(),
+                test_connectivity_state(),
+                vec![format!("/ip4/192.168.1.{}/tcp/4100/p2p/test-peer-ring-device-{}", i + 2, i)],
+                vec![DirectPeerCandidate {
+                    endpoint: format!(
+                        "/ip4/192.168.1.{}/tcp/4100/p2p/test-peer-ring-device-{}",
+                        i + 2,
+                        i
+                    ),
+                    transport: DirectCandidateTransport::Tcp,
+                    scope: DirectCandidateScope::Private,
+                    priority: 21,
+                }],
+            )
+            .unwrap();
 
             let join_request = RingJoinRequest {
                 device_id,
@@ -604,6 +632,11 @@ mod tests {
         let response = result.unwrap().0;
         assert!(response.ring_stable);
         assert_eq!(response.workers.len(), 2);
+        assert_eq!(response.workers[0].direct_candidates.len(), 1);
+        assert_eq!(
+            response.workers[0].direct_candidates[0].scope,
+            DirectCandidateScope::Private
+        );
     }
 
     #[tokio::test]

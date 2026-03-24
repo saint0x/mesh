@@ -50,6 +50,30 @@ pub struct DeviceConnectivityState {
     pub status: ConnectivityStatus,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectCandidateTransport {
+    Quic,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectCandidateScope {
+    Public,
+    Dns,
+    Private,
+    Loopback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectPeerCandidate {
+    pub endpoint: String,
+    pub transport: DirectCandidateTransport,
+    pub scope: DirectCandidateScope,
+    pub priority: u32,
+}
+
 impl NetworkConnectivity {
     fn configured_state(&self) -> DeviceConnectivityState {
         DeviceConnectivityState {
@@ -148,7 +172,8 @@ pub fn select_direct_dial_multiaddrs(peer_id: PeerId, addrs: &[Multiaddr]) -> Ve
     let mut ranked = addrs
         .iter()
         .filter_map(|addr| {
-            rank_direct_addr(addr).map(|rank| (rank, canonical_direct_addr(addr, peer_id)))
+            classify_direct_addr(addr)
+                .map(|candidate| (candidate.priority, canonical_direct_addr(addr, peer_id)))
         })
         .collect::<Vec<_>>();
 
@@ -166,6 +191,44 @@ pub fn select_direct_dial_multiaddrs(peer_id: PeerId, addrs: &[Multiaddr]) -> Ve
         .collect()
 }
 
+pub fn build_direct_peer_candidates(peer_id: PeerId, addrs: &[String]) -> Vec<DirectPeerCandidate> {
+    let parsed = addrs
+        .iter()
+        .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+        .collect::<Vec<_>>();
+
+    let mut candidates = parsed
+        .iter()
+        .filter_map(|addr| classify_direct_addr(addr).map(|candidate| (candidate.priority, addr)))
+        .map(|(_, addr)| {
+            let mut candidate = classify_direct_addr(addr).expect("candidate already classified");
+            candidate.endpoint = canonical_direct_addr(addr, peer_id).to_string();
+            candidate
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
+    });
+    candidates.dedup_by(|left, right| left.endpoint == right.endpoint);
+    candidates
+}
+
+pub fn select_direct_dial_addrs_from_candidates(
+    peer_id: PeerId,
+    candidates: &[DirectPeerCandidate],
+) -> Vec<Multiaddr> {
+    let mut seen = HashSet::new();
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate.endpoint.parse::<Multiaddr>().ok())
+        .map(|addr| canonical_direct_addr(&addr, peer_id))
+        .filter(|addr| seen.insert(addr.to_string()))
+        .collect()
+}
+
 fn canonical_direct_addr(addr: &Multiaddr, peer_id: PeerId) -> Multiaddr {
     if addr
         .iter()
@@ -177,7 +240,7 @@ fn canonical_direct_addr(addr: &Multiaddr, peer_id: PeerId) -> Multiaddr {
     }
 }
 
-fn rank_direct_addr(addr: &Multiaddr) -> Option<u8> {
+fn classify_direct_addr(addr: &Multiaddr) -> Option<DirectPeerCandidate> {
     if addr
         .iter()
         .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
@@ -186,7 +249,7 @@ fn rank_direct_addr(addr: &Multiaddr) -> Option<u8> {
     }
 
     let mut ip_scope = AddrScope::Dns;
-    let mut transport_rank = None;
+    let mut transport = None;
 
     for protocol in addr.iter() {
         match protocol {
@@ -199,25 +262,41 @@ fn rank_direct_addr(addr: &Multiaddr) -> Option<u8> {
                 ip_scope = AddrScope::Dns;
             }
             libp2p::multiaddr::Protocol::Quic | libp2p::multiaddr::Protocol::QuicV1 => {
-                transport_rank = Some(0)
+                transport = Some(DirectCandidateTransport::Quic)
             }
             libp2p::multiaddr::Protocol::Tcp(_) => {
-                transport_rank.get_or_insert(1);
+                transport.get_or_insert(DirectCandidateTransport::Tcp);
             }
             _ => {}
         }
     }
 
-    let transport_rank = transport_rank?;
-    let scope_rank = match ip_scope {
-        AddrScope::Public => 0,
-        AddrScope::Dns => 10,
-        AddrScope::Private => 20,
-        AddrScope::Loopback => 30,
+    let transport = transport?;
+    let transport_rank = match transport {
+        DirectCandidateTransport::Quic => 0,
+        DirectCandidateTransport::Tcp => 1,
+    };
+    let scope = match ip_scope {
+        AddrScope::Public => DirectCandidateScope::Public,
+        AddrScope::Dns => DirectCandidateScope::Dns,
+        AddrScope::Private => DirectCandidateScope::Private,
+        AddrScope::Loopback => DirectCandidateScope::Loopback,
         AddrScope::Unsupported => return None,
     };
 
-    Some(scope_rank + transport_rank)
+    let scope_rank = match scope {
+        DirectCandidateScope::Public => 0,
+        DirectCandidateScope::Dns => 10,
+        DirectCandidateScope::Private => 20,
+        DirectCandidateScope::Loopback => 30,
+    };
+
+    Some(DirectPeerCandidate {
+        endpoint: addr.to_string(),
+        transport,
+        scope,
+        priority: (scope_rank + transport_rank) as u32,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,6 +378,23 @@ mod tests {
                 format!("/ip4/127.0.0.1/tcp/4001/p2p/{}", peer_id),
             ]
         );
+    }
+
+    #[test]
+    fn build_direct_peer_candidates_excludes_relay_and_sorts() {
+        let peer_id = PeerId::random();
+        let addrs = vec![
+            "/dns4/peer.mesh.example/udp/4001/quic-v1".to_string(),
+            "/ip4/10.0.0.2/tcp/4001".to_string(),
+            "/dns4/relay.mesh.example/tcp/4001/p2p-circuit".to_string(),
+        ];
+
+        let candidates = build_direct_peer_candidates(peer_id, &addrs);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].scope, DirectCandidateScope::Dns);
+        assert_eq!(candidates[0].transport, DirectCandidateTransport::Quic);
+        assert_eq!(candidates[1].scope, DirectCandidateScope::Private);
+        assert_eq!(candidates[1].transport, DirectCandidateTransport::Tcp);
     }
 
     #[test]
