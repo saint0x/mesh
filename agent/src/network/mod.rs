@@ -19,7 +19,7 @@ pub use ring_gossip_service::RingGossipService;
 pub use tensor_message::{AllReducePhase, TensorMessage};
 pub use tensor_plane::{
     parse_data_plane_endpoint, InboundTensorMessage, TensorPlane, TensorPlaneConfig,
-    DATA_PLANE_ENDPOINT_PREFIX,
+    TensorPlaneMetricsSnapshot, DATA_PLANE_ENDPOINT_PREFIX,
 };
 
 // Re-export libp2p types needed for handling network events

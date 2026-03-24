@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::info;
 
+use crate::network::TensorPlaneMetricsSnapshot;
+
 /// Statistics for inference operations
 #[derive(Debug)]
 pub struct InferenceStats {
@@ -41,6 +43,33 @@ pub struct InferenceStats {
 
     /// Total layers processed (for averaging)
     pub total_layers_processed: AtomicU64,
+
+    /// Total tensor-plane bytes sent across ring traffic.
+    pub tensor_bytes_sent: AtomicU64,
+
+    /// Total tensor-plane bytes received across ring traffic.
+    pub tensor_bytes_received: AtomicU64,
+
+    /// Number of outbound sends that had to wait for byte-budget permits.
+    pub tensor_outbound_backpressure_wait_count: AtomicU64,
+
+    /// Total time spent waiting on outbound tensor-plane byte-budget permits.
+    pub tensor_outbound_backpressure_wait_ms: AtomicU64,
+
+    /// Number of inbound tensor messages rejected because the bounded queue was full.
+    pub tensor_inbound_queue_full_rejections: AtomicU64,
+
+    /// Number of inbound tensor messages rejected because the queued-byte budget was exhausted.
+    pub tensor_inbound_byte_budget_rejections: AtomicU64,
+
+    /// Number of tensor messages rejected because they exceeded the message-size budget.
+    pub tensor_oversized_message_rejections: AtomicU64,
+
+    /// Current inbound queued tensor bytes waiting for consumption.
+    pub tensor_current_inbound_queued_bytes: AtomicU64,
+
+    /// Current outbound in-flight tensor bytes waiting to complete.
+    pub tensor_current_outbound_inflight_bytes: AtomicU64,
 }
 
 impl Default for InferenceStats {
@@ -64,6 +93,15 @@ impl InferenceStats {
             start_time: Instant::now(),
             allreduce_operations: AtomicU64::new(0),
             total_layers_processed: AtomicU64::new(0),
+            tensor_bytes_sent: AtomicU64::new(0),
+            tensor_bytes_received: AtomicU64::new(0),
+            tensor_outbound_backpressure_wait_count: AtomicU64::new(0),
+            tensor_outbound_backpressure_wait_ms: AtomicU64::new(0),
+            tensor_inbound_queue_full_rejections: AtomicU64::new(0),
+            tensor_inbound_byte_budget_rejections: AtomicU64::new(0),
+            tensor_oversized_message_rejections: AtomicU64::new(0),
+            tensor_current_inbound_queued_bytes: AtomicU64::new(0),
+            tensor_current_outbound_inflight_bytes: AtomicU64::new(0),
         }
     }
 
@@ -108,6 +146,41 @@ impl InferenceStats {
     /// Record a recovery from checkpoint
     pub fn record_recovery(&self) {
         self.checkpoint_recoveries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn update_tensor_plane_metrics(&self, snapshot: TensorPlaneMetricsSnapshot) {
+        self.tensor_bytes_sent
+            .store(snapshot.bytes_sent, Ordering::Relaxed);
+        self.tensor_bytes_received
+            .store(snapshot.bytes_received, Ordering::Relaxed);
+        self.tensor_outbound_backpressure_wait_count.store(
+            snapshot.outbound_backpressure_wait_count,
+            Ordering::Relaxed,
+        );
+        self.tensor_outbound_backpressure_wait_ms.store(
+            snapshot.outbound_backpressure_wait_ms,
+            Ordering::Relaxed,
+        );
+        self.tensor_inbound_queue_full_rejections.store(
+            snapshot.inbound_queue_full_rejections,
+            Ordering::Relaxed,
+        );
+        self.tensor_inbound_byte_budget_rejections.store(
+            snapshot.inbound_byte_budget_rejections,
+            Ordering::Relaxed,
+        );
+        self.tensor_oversized_message_rejections.store(
+            snapshot.oversized_message_rejections,
+            Ordering::Relaxed,
+        );
+        self.tensor_current_inbound_queued_bytes.store(
+            snapshot.current_inbound_queued_bytes,
+            Ordering::Relaxed,
+        );
+        self.tensor_current_outbound_inflight_bytes.store(
+            snapshot.current_outbound_inflight_bytes,
+            Ordering::Relaxed,
+        );
     }
 
     /// Get total jobs (completed + failed)
@@ -192,6 +265,17 @@ impl InferenceStats {
             avg_allreduce_latency_ms = format!("{:.2}", self.avg_allreduce_latency_ms()),
             checkpoints_created = checkpoints,
             checkpoint_recoveries = recoveries,
+            tensor_bytes_sent = self.tensor_bytes_sent.load(Ordering::Relaxed),
+            tensor_bytes_received = self.tensor_bytes_received.load(Ordering::Relaxed),
+            tensor_backpressure_waits = self
+                .tensor_outbound_backpressure_wait_count
+                .load(Ordering::Relaxed),
+            tensor_queue_rejections = self
+                .tensor_inbound_queue_full_rejections
+                .load(Ordering::Relaxed),
+            tensor_byte_budget_rejections = self
+                .tensor_inbound_byte_budget_rejections
+                .load(Ordering::Relaxed),
             uptime = %self.uptime_string(),
             "Inference statistics"
         );
@@ -242,6 +326,39 @@ impl InferenceStats {
             "  Layers Processed:    {}",
             self.total_layers_processed.load(Ordering::Relaxed)
         );
+        println!(
+            "  Tensor Bytes Sent:   {}",
+            self.tensor_bytes_sent.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Tensor Bytes Recv:   {}",
+            self.tensor_bytes_received.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Send Waits:          {}",
+            self.tensor_outbound_backpressure_wait_count
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Send Wait Time:      {}ms",
+            self.tensor_outbound_backpressure_wait_ms
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Inbound Queue Drops: {}",
+            self.tensor_inbound_queue_full_rejections
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Byte Budget Drops:   {}",
+            self.tensor_inbound_byte_budget_rejections
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Oversize Drops:      {}",
+            self.tensor_oversized_message_rejections
+                .load(Ordering::Relaxed)
+        );
 
         println!("\n{}", "Fault Tolerance:".bold());
         println!(
@@ -271,6 +388,15 @@ impl InferenceStats {
             "total_layers_processed": self.total_layers_processed.load(Ordering::Relaxed),
             "checkpoints_created": self.checkpoints_created.load(Ordering::Relaxed),
             "checkpoint_recoveries": self.checkpoint_recoveries.load(Ordering::Relaxed),
+            "tensor_bytes_sent": self.tensor_bytes_sent.load(Ordering::Relaxed),
+            "tensor_bytes_received": self.tensor_bytes_received.load(Ordering::Relaxed),
+            "tensor_outbound_backpressure_wait_count": self.tensor_outbound_backpressure_wait_count.load(Ordering::Relaxed),
+            "tensor_outbound_backpressure_wait_ms": self.tensor_outbound_backpressure_wait_ms.load(Ordering::Relaxed),
+            "tensor_inbound_queue_full_rejections": self.tensor_inbound_queue_full_rejections.load(Ordering::Relaxed),
+            "tensor_inbound_byte_budget_rejections": self.tensor_inbound_byte_budget_rejections.load(Ordering::Relaxed),
+            "tensor_oversized_message_rejections": self.tensor_oversized_message_rejections.load(Ordering::Relaxed),
+            "tensor_current_inbound_queued_bytes": self.tensor_current_inbound_queued_bytes.load(Ordering::Relaxed),
+            "tensor_current_outbound_inflight_bytes": self.tensor_current_outbound_inflight_bytes.load(Ordering::Relaxed),
             "success_rate": self.success_rate(),
             "avg_tokens_per_second": self.avg_tokens_per_second(),
             "avg_allreduce_latency_ms": self.avg_allreduce_latency_ms(),
@@ -368,5 +494,42 @@ mod tests {
 
         assert_eq!(json["jobs_completed"], 1);
         assert_eq!(json["total_tokens_generated"], 50);
+    }
+
+    #[test]
+    fn test_stats_update_tensor_plane_metrics() {
+        let stats = InferenceStats::new();
+        stats.update_tensor_plane_metrics(TensorPlaneMetricsSnapshot {
+            bytes_sent: 128,
+            bytes_received: 256,
+            outbound_backpressure_wait_count: 3,
+            outbound_backpressure_wait_ms: 42,
+            inbound_queue_full_rejections: 5,
+            inbound_byte_budget_rejections: 7,
+            oversized_message_rejections: 11,
+            current_inbound_queued_bytes: 13,
+            current_outbound_inflight_bytes: 17,
+        });
+
+        assert_eq!(stats.tensor_bytes_sent.load(Ordering::Relaxed), 128);
+        assert_eq!(stats.tensor_bytes_received.load(Ordering::Relaxed), 256);
+        assert_eq!(
+            stats
+                .tensor_outbound_backpressure_wait_count
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            stats
+                .tensor_inbound_queue_full_rejections
+                .load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            stats
+                .tensor_inbound_byte_budget_rejections
+                .load(Ordering::Relaxed),
+            7
+        );
     }
 }

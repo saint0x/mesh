@@ -1047,7 +1047,23 @@ async fn cmd_start() -> Result<()> {
             }
         }
 
-        let tensor_plane = match TensorPlane::bind(TensorPlaneConfig::default()).await {
+        let tensor_plane = match TensorPlane::bind(TensorPlaneConfig {
+            max_message_bytes: inference_config_task
+                .governance
+                .tensor_plane_max_message_bytes,
+            max_inbound_messages: inference_config_task
+                .governance
+                .tensor_plane_max_inbound_messages,
+            max_inbound_queued_bytes: inference_config_task
+                .governance
+                .tensor_plane_max_inbound_queued_bytes,
+            max_outbound_inflight_bytes: inference_config_task
+                .governance
+                .tensor_plane_max_outbound_inflight_bytes,
+            ..TensorPlaneConfig::default()
+        })
+        .await
+        {
             Ok(plane) => plane,
             Err(e) => {
                 error!(error = %e, "Failed to start dedicated tensor data plane");
@@ -2032,6 +2048,27 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(layers) = stats.get("total_layers_processed") {
         println!("  Layers Processed: {}", layers);
+    }
+    if let Some(bytes_sent) = stats.get("tensor_bytes_sent") {
+        println!("  Tensor Bytes Sent: {}", bytes_sent);
+    }
+    if let Some(bytes_received) = stats.get("tensor_bytes_received") {
+        println!("  Tensor Bytes Recv: {}", bytes_received);
+    }
+    if let Some(wait_count) = stats.get("tensor_outbound_backpressure_wait_count") {
+        println!("  Send Waits:        {}", wait_count);
+    }
+    if let Some(wait_ms) = stats.get("tensor_outbound_backpressure_wait_ms") {
+        println!("  Send Wait Time:    {}ms", wait_ms);
+    }
+    if let Some(queue_drops) = stats.get("tensor_inbound_queue_full_rejections") {
+        println!("  Queue Drops:       {}", queue_drops);
+    }
+    if let Some(byte_budget_drops) = stats.get("tensor_inbound_byte_budget_rejections") {
+        println!("  Byte Budget Drops: {}", byte_budget_drops);
+    }
+    if let Some(oversize_drops) = stats.get("tensor_oversized_message_rejections") {
+        println!("  Oversize Drops:    {}", oversize_drops);
     }
 
     println!("\n{}", "Fault Tolerance:".bold());

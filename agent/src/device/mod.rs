@@ -97,6 +97,18 @@ pub struct GovernanceConfig {
 
     /// These peers are always denied mesh job admission.
     pub blocked_peer_ids: Vec<String>,
+
+    /// Maximum serialized tensor message size admitted by the data plane.
+    pub tensor_plane_max_message_bytes: usize,
+
+    /// Maximum number of inbound tensor messages that may queue locally.
+    pub tensor_plane_max_inbound_messages: usize,
+
+    /// Maximum total inbound tensor bytes that may queue locally.
+    pub tensor_plane_max_inbound_queued_bytes: usize,
+
+    /// Maximum total outbound tensor bytes allowed in flight at once.
+    pub tensor_plane_max_outbound_inflight_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +169,10 @@ impl Default for GovernanceConfig {
             ],
             trusted_peer_ids: Vec::new(),
             blocked_peer_ids: Vec::new(),
+            tensor_plane_max_message_bytes: 10 * 1024 * 1024,
+            tensor_plane_max_inbound_messages: 64,
+            tensor_plane_max_inbound_queued_bytes: 64 * 1024 * 1024,
+            tensor_plane_max_outbound_inflight_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -465,6 +481,16 @@ mod tests {
         );
         assert!(config.governance.trusted_peer_ids.is_empty());
         assert!(config.governance.blocked_peer_ids.is_empty());
+        assert_eq!(config.governance.tensor_plane_max_message_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.governance.tensor_plane_max_inbound_messages, 64);
+        assert_eq!(
+            config.governance.tensor_plane_max_inbound_queued_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            config.governance.tensor_plane_max_outbound_inflight_bytes,
+            64 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -532,6 +558,16 @@ arch = "x86_64"
         );
         assert!(loaded.governance.trusted_peer_ids.is_empty());
         assert!(loaded.governance.blocked_peer_ids.is_empty());
+        assert_eq!(loaded.governance.tensor_plane_max_message_bytes, 10 * 1024 * 1024);
+        assert_eq!(loaded.governance.tensor_plane_max_inbound_messages, 64);
+        assert_eq!(
+            loaded.governance.tensor_plane_max_inbound_queued_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            loaded.governance.tensor_plane_max_outbound_inflight_bytes,
+            64 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -599,6 +635,22 @@ arch = "x86_64"
         assert_eq!(
             original.governance.blocked_peer_ids,
             loaded.governance.blocked_peer_ids
+        );
+        assert_eq!(
+            original.governance.tensor_plane_max_message_bytes,
+            loaded.governance.tensor_plane_max_message_bytes
+        );
+        assert_eq!(
+            original.governance.tensor_plane_max_inbound_messages,
+            loaded.governance.tensor_plane_max_inbound_messages
+        );
+        assert_eq!(
+            original.governance.tensor_plane_max_inbound_queued_bytes,
+            loaded.governance.tensor_plane_max_inbound_queued_bytes
+        );
+        assert_eq!(
+            original.governance.tensor_plane_max_outbound_inflight_bytes,
+            loaded.governance.tensor_plane_max_outbound_inflight_bytes
         );
 
         // CRITICAL: Verify keypair bytes are identical

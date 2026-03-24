@@ -195,6 +195,11 @@ impl InferenceCoordinator {
         &mut self.tensor_plane
     }
 
+    fn sync_tensor_plane_metrics(&self) {
+        self.stats
+            .update_tensor_plane_metrics(self.tensor_plane.metrics_snapshot());
+    }
+
     /// Check if this worker has joined a ring
     pub fn is_in_ring(&self) -> bool {
         self.position.is_some()
@@ -527,6 +532,7 @@ impl InferenceCoordinator {
         for _ in 0..weights.config.num_layers {
             self.stats.record_layer();
         }
+        self.sync_tensor_plane_metrics();
 
         Ok(next_token)
     }
@@ -621,6 +627,7 @@ impl InferenceCoordinator {
                 // Save stats periodically
                 _ = stats_interval.tick() => {
                     debug!("Saving inference stats");
+                    self.sync_tensor_plane_metrics();
                     if let Err(e) = self.stats.save_to_file() {
                         warn!(error = %e, "Failed to save stats");
                     }
@@ -636,6 +643,7 @@ impl InferenceCoordinator {
 
         // Final cleanup
         self.leave_ring();
+        self.sync_tensor_plane_metrics();
         self.stats.print_summary();
         let _ = self.stats.save_to_file();
 

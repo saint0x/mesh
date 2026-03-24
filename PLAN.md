@@ -128,12 +128,15 @@ This is important for mature production behavior, but it should not define the h
 - ✅ Pool claim ordering now applies an explicit submitter soft cap, so one submitter cannot open a second active job across the ring while another submitter still has uncapped work waiting.
 - ✅ Pool claim ordering now applies a model-aware soft cap that scales with live ring size, so one model/workload class cannot monopolize the pool when competing model work is waiting.
 - ✅ Pool scheduling policy is now an explicit network-owned settings contract, so submitter and model soft caps are configured durably with the network instead of hidden in claim-path constants.
+- ✅ The dedicated tensor plane now enforces one explicit bounded backpressure contract with configurable message-size limits, bounded inbound message depth, bounded queued-byte budget, and bounded outbound in-flight byte budget.
+- ✅ Inference stats now persist tensor-plane pressure and transport metrics including bytes sent/received, outbound wait counts/time, inbound queue drops, byte-budget drops, and oversize-message drops.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
+- ✅ Governance coverage now includes focused tensor-plane tests for bounded inbound-queue rejection and queued-byte-budget rejection on the dedicated data plane.
 
 ### Governance Still Open
 
-- ⬜ Tensor-plane and bandwidth backpressure, not just executor-slot backpressure.
+- ⬜ Broader bandwidth-aware backpressure above the current tensor-plane byte budgets, including ring-wide throughput governance rather than per-node queue and in-flight caps alone.
 - ⬜ Recovery-path governance so retries, reconnect storms, and degraded relay behavior cannot overwhelm a node.
 - ⬜ Pool-level quota policy beyond the current configurable submitter and model soft caps, including harder explicit ring-wide quota control tied to pool capacity classes.
 

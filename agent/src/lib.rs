@@ -39,7 +39,7 @@ pub use model::{ModelInfo, ShardAssignment, ShardInfo, ShardRegistry, ShardStatu
 pub use network::{
     parse_data_plane_endpoint, AllReducePhase, ConnectionInfo, ConnectionType, MeshEvent,
     MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections, TensorMessage, TensorPlane,
-    TensorPlaneConfig,
+    TensorPlaneConfig, TensorPlaneMetricsSnapshot,
 };
 pub use observability::{init_production_logging, init_simple_logging};
 pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
