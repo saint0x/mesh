@@ -1155,9 +1155,6 @@ async fn cmd_job(
             swarm.dial_direct_peer(target_peer, &target_addrs)?;
             println!("   ✓ Dialing target directly");
         }
-        agent::ConnectivityPath::Overlay => {
-            anyhow::bail!("ad hoc job submission does not yet support overlay connectivity");
-        }
     }
 
     // Create job envelope
@@ -1278,7 +1275,6 @@ async fn cmd_status() -> Result<()> {
                 for attachment in &config.connectivity.attachments {
                     let label = match attachment.kind {
                         ConnectivityAttachmentKind::Libp2pRelay => "libp2p_relay",
-                        ConnectivityAttachmentKind::UserspaceOverlay => "userspace_overlay",
                     };
                     println!(
                         "   Connectivity Attachment: {} {} (priority {})",

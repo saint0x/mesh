@@ -7,14 +7,12 @@ use serde::{Deserialize, Serialize};
 pub enum ConnectivityPath {
     Direct,
     Relayed,
-    Overlay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectivityAttachmentKind {
     Libp2pRelay,
-    UserspaceOverlay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,7 +51,6 @@ impl NetworkConnectivity {
         let expected_kind = match self.preferred_path {
             ConnectivityPath::Direct => return None,
             ConnectivityPath::Relayed => ConnectivityAttachmentKind::Libp2pRelay,
-            ConnectivityPath::Overlay => ConnectivityAttachmentKind::UserspaceOverlay,
         };
 
         self.attachments
@@ -75,9 +72,7 @@ impl NetworkConnectivity {
     pub fn runtime_endpoint(&self) -> Result<Option<Multiaddr>> {
         match self.preferred_path {
             ConnectivityPath::Direct => Ok(None),
-            ConnectivityPath::Relayed | ConnectivityPath::Overlay => {
-                Ok(Some(self.resolve_primary_endpoint()?))
-            }
+            ConnectivityPath::Relayed => Ok(Some(self.resolve_primary_endpoint()?)),
         }
     }
 
@@ -89,7 +84,6 @@ impl NetworkConnectivity {
                 ));
             }
             ConnectivityPath::Relayed => ConnectivityAttachmentKind::Libp2pRelay,
-            ConnectivityPath::Overlay => ConnectivityAttachmentKind::UserspaceOverlay,
         };
 
         let attachment = self

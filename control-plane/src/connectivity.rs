@@ -7,14 +7,12 @@ use crate::api::error::{ApiError, ApiResult};
 pub enum ConnectivityPath {
     Direct,
     Relayed,
-    Overlay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectivityAttachmentKind {
     Libp2pRelay,
-    UserspaceOverlay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,20 +81,6 @@ impl NetworkConnectivity {
                     ))
                 }
             }
-            ConnectivityPath::Overlay => {
-                if self
-                    .attachments
-                    .iter()
-                    .any(|attachment| attachment.kind == ConnectivityAttachmentKind::UserspaceOverlay)
-                {
-                    Ok(())
-                } else {
-                    Err(ApiError::BadRequest(
-                        "preferred_path=overlay requires at least one userspace_overlay attachment"
-                            .to_string(),
-                    ))
-                }
-            }
         }
     }
 
@@ -104,7 +88,6 @@ impl NetworkConnectivity {
         let expected_kind = match self.preferred_path {
             ConnectivityPath::Direct => return None,
             ConnectivityPath::Relayed => ConnectivityAttachmentKind::Libp2pRelay,
-            ConnectivityPath::Overlay => ConnectivityAttachmentKind::UserspaceOverlay,
         };
 
         self.attachments
@@ -134,7 +117,7 @@ impl DeviceConnectivityState {
     }
 
     pub fn validate(&self) -> ApiResult<()> {
-        if matches!(self.active_path, ConnectivityPath::Relayed | ConnectivityPath::Overlay)
+        if matches!(self.active_path, ConnectivityPath::Relayed)
             && self
                 .active_endpoint
                 .as_ref()
