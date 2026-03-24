@@ -82,11 +82,45 @@ pub struct DirectPeerCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkSettings {
     pub connectivity: NetworkConnectivity,
+    #[serde(default)]
+    pub scheduling_policy: InferenceSchedulingPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceSchedulingPolicy {
+    pub submitter_active_job_soft_cap: u32,
+    pub model_active_job_soft_cap_divisor: u32,
+}
+
+impl Default for InferenceSchedulingPolicy {
+    fn default() -> Self {
+        Self {
+            submitter_active_job_soft_cap: 1,
+            model_active_job_soft_cap_divisor: 2,
+        }
+    }
 }
 
 impl NetworkSettings {
     pub fn validate(&self) -> ApiResult<()> {
-        self.connectivity.validate()
+        self.connectivity.validate()?;
+        self.scheduling_policy.validate()
+    }
+}
+
+impl InferenceSchedulingPolicy {
+    pub fn validate(&self) -> ApiResult<()> {
+        if self.submitter_active_job_soft_cap == 0 {
+            return Err(ApiError::BadRequest(
+                "submitter_active_job_soft_cap must be at least 1".to_string(),
+            ));
+        }
+        if self.model_active_job_soft_cap_divisor == 0 {
+            return Err(ApiError::BadRequest(
+                "model_active_job_soft_cap_divisor must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

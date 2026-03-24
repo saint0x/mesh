@@ -1,6 +1,6 @@
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::NetworkInfo;
-use crate::connectivity::{NetworkConnectivity, NetworkSettings};
+use crate::connectivity::{InferenceSchedulingPolicy, NetworkConnectivity, NetworkSettings};
 use crate::db::Database;
 use rusqlite::{params, OptionalExtension};
 use time::OffsetDateTime;
@@ -11,6 +11,7 @@ pub fn create_network(
     name: String,
     owner_user_id: String,
     connectivity: NetworkConnectivity,
+    scheduling_policy: InferenceSchedulingPolicy,
 ) -> ApiResult<NetworkInfo> {
     if network_id.is_empty() {
         return Err(ApiError::BadRequest("network_id cannot be empty".into()));
@@ -22,7 +23,10 @@ pub fn create_network(
         return Err(ApiError::BadRequest("owner_user_id cannot be empty".into()));
     }
 
-    let settings = NetworkSettings { connectivity };
+    let settings = NetworkSettings {
+        connectivity,
+        scheduling_policy,
+    };
     settings.validate()?;
     let settings_json = serde_json::to_string(&settings)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize network settings: {}", e)))?;
@@ -62,6 +66,7 @@ pub fn create_network(
         owner_user_id,
         created_at: now_str,
         connectivity: settings.connectivity,
+        scheduling_policy: settings.scheduling_policy,
     })
 }
 
@@ -93,6 +98,7 @@ pub fn list_networks(db: &Database) -> ApiResult<Vec<NetworkInfo>> {
                 owner_user_id: row.get(2)?,
                 created_at: row.get(3)?,
                 connectivity: settings.connectivity,
+                scheduling_policy: settings.scheduling_policy,
             })
         })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -105,6 +111,10 @@ pub fn load_network_connectivity(
     db: &Database,
     network_id: &str,
 ) -> ApiResult<NetworkConnectivity> {
+    Ok(load_network_settings(db, network_id)?.connectivity)
+}
+
+pub fn load_network_settings(db: &Database, network_id: &str) -> ApiResult<NetworkSettings> {
     let conn = db.get_conn()?;
     let settings_json: Option<String> = conn
         .query_row(
@@ -120,7 +130,7 @@ pub fn load_network_connectivity(
     let settings: NetworkSettings = serde_json::from_str(&settings_json)
         .map_err(|e| ApiError::Internal(format!("Failed to parse network settings: {}", e)))?;
     settings.validate()?;
-    Ok(settings.connectivity)
+    Ok(settings)
 }
 
 pub fn require_network_exists(db: &Database, network_id: &str) -> ApiResult<()> {
@@ -148,7 +158,8 @@ pub fn require_network_exists(db: &Database, network_id: &str) -> ApiResult<()> 
 mod tests {
     use super::*;
     use crate::connectivity::{
-        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
+        InferenceSchedulingPolicy, NetworkConnectivity,
     };
     use crate::db::create_test_db;
 
@@ -172,6 +183,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -184,6 +196,10 @@ mod tests {
             networks[0].connectivity.preferred_path,
             ConnectivityPath::Relayed
         );
+        assert_eq!(
+            networks[0].scheduling_policy,
+            InferenceSchedulingPolicy::default()
+        );
     }
 
     #[test]
@@ -195,6 +211,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -208,6 +225,12 @@ mod tests {
                 .unwrap()
                 .preferred_path,
             ConnectivityPath::Relayed
+        );
+        assert_eq!(
+            load_network_settings(&db, "test-network")
+                .unwrap()
+                .scheduling_policy,
+            InferenceSchedulingPolicy::default()
         );
     }
 }

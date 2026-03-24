@@ -81,7 +81,8 @@ fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Erro
 mod tests {
     use super::*;
     use crate::connectivity::{
-        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
+        InferenceSchedulingPolicy, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
@@ -120,6 +121,7 @@ mod tests {
             "test-network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -184,6 +186,7 @@ mod tests {
             "test-network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 

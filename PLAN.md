@@ -127,6 +127,7 @@ This is important for mature production behavior, but it should not define the h
 - ✅ Pool scheduling now uses the existing durable dispatch tables as the single source of truth for fairness, rather than adding a second coordinator path beside claim/ack/result.
 - ✅ Pool claim ordering now applies an explicit submitter soft cap, so one submitter cannot open a second active job across the ring while another submitter still has uncapped work waiting.
 - ✅ Pool claim ordering now applies a model-aware soft cap that scales with live ring size, so one model/workload class cannot monopolize the pool when competing model work is waiting.
+- ✅ Pool scheduling policy is now an explicit network-owned settings contract, so submitter and model soft caps are configured durably with the network instead of hidden in claim-path constants.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
 
@@ -134,7 +135,7 @@ This is important for mature production behavior, but it should not define the h
 
 - ⬜ Tensor-plane and bandwidth backpressure, not just executor-slot backpressure.
 - ⬜ Recovery-path governance so retries, reconnect storms, and degraded relay behavior cannot overwhelm a node.
-- ⬜ Pool-level quota policy beyond the current submitter and model soft caps, including harder explicit ring-wide quota control and operator-configurable policy.
+- ⬜ Pool-level quota policy beyond the current configurable submitter and model soft caps, including harder explicit ring-wide quota control tied to pool capacity classes.
 
 ## Non-Goals
 

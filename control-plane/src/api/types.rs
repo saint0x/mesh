@@ -1,4 +1,6 @@
-use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate, NetworkConnectivity};
+use crate::connectivity::{
+    DeviceConnectivityState, DirectPeerCandidate, InferenceSchedulingPolicy, NetworkConnectivity,
+};
 use crate::device::DeviceCapabilities;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +47,8 @@ pub struct CreateNetworkRequest {
     pub name: String,
     pub owner_user_id: String,
     pub connectivity: NetworkConnectivity,
+    #[serde(default)]
+    pub scheduling_policy: InferenceSchedulingPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +70,8 @@ pub struct NetworkInfo {
     pub owner_user_id: String,
     pub created_at: String,
     pub connectivity: NetworkConnectivity,
+    #[serde(default)]
+    pub scheduling_policy: InferenceSchedulingPolicy,
 }
 
 /// Ring position information in registration response

@@ -8,7 +8,8 @@ pub mod topology_notifier;
 pub use certificate::ControlPlaneKeypair;
 pub use device_service::{register_device, update_heartbeat};
 pub use network_service::{
-    create_network, list_networks, load_network_connectivity, require_network_exists,
+    create_network, list_networks, load_network_connectivity, load_network_settings,
+    require_network_exists,
 };
 pub use presence::presence_monitor;
 pub use ring_manager::{

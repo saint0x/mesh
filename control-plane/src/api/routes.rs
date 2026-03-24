@@ -115,6 +115,7 @@ pub async fn create_network(
             req.name,
             req.owner_user_id,
             req.connectivity,
+            req.scheduling_policy,
         )
     })
     .await
@@ -173,7 +174,7 @@ pub async fn heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectivity::NetworkConnectivity;
+    use crate::connectivity::{InferenceSchedulingPolicy, NetworkConnectivity};
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState,
@@ -223,6 +224,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -262,6 +264,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -343,6 +346,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -392,12 +396,24 @@ mod tests {
                 name: "Test Network".to_string(),
                 owner_user_id: "owner-1".to_string(),
                 connectivity: test_connectivity(),
+                scheduling_policy: InferenceSchedulingPolicy {
+                    submitter_active_job_soft_cap: 2,
+                    model_active_job_soft_cap_divisor: 3,
+                },
             }),
         )
         .await;
 
         assert!(create_result.is_ok());
-        assert_eq!(create_result.unwrap().0.network.network_id, "test-network");
+        let created_network = create_result.unwrap().0.network;
+        assert_eq!(created_network.network_id, "test-network");
+        assert_eq!(
+            created_network.scheduling_policy,
+            InferenceSchedulingPolicy {
+                submitter_active_job_soft_cap: 2,
+                model_active_job_soft_cap_divisor: 3,
+            }
+        );
 
         let list_result = list_networks(axum::extract::State(state)).await;
         assert!(list_result.is_ok());
@@ -406,5 +422,12 @@ mod tests {
         assert!(response.success);
         assert_eq!(response.networks.len(), 1);
         assert_eq!(response.networks[0].network_id, "test-network");
+        assert_eq!(
+            response.networks[0].scheduling_policy,
+            InferenceSchedulingPolicy {
+                submitter_active_job_soft_cap: 2,
+                model_active_job_soft_cap_divisor: 3,
+            }
+        );
     }
 }

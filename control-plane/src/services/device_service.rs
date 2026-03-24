@@ -187,7 +187,7 @@ mod tests {
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState, DirectCandidateScope, DirectCandidateTransport,
-        DirectPeerCandidate, NetworkConnectivity,
+        DirectPeerCandidate, InferenceSchedulingPolicy, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::Tier;
@@ -233,6 +233,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -281,6 +282,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -326,6 +328,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 
@@ -413,6 +416,7 @@ mod tests {
             "Test Network".to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         )
         .unwrap();
 

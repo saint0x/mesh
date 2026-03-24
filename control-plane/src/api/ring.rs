@@ -492,7 +492,7 @@ mod tests {
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState, DirectCandidateScope, DirectCandidateTransport,
-        DirectPeerCandidate, NetworkConnectivity,
+        DirectPeerCandidate, InferenceSchedulingPolicy, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
@@ -529,6 +529,7 @@ mod tests {
             network_id.to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         );
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
         // Generate unique public key based on device_id hash

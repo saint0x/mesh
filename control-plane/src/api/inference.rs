@@ -14,11 +14,10 @@ use crate::api::types::{
     InferenceJobStatusResponse, ReportInferenceAssignmentRequest, SubmitInferenceRequest,
     SubmitInferenceResponse,
 };
+use crate::services::network_service;
 use crate::state::AppState;
 
 const ASSIGNMENT_LEASE_SECS: i64 = 60;
-const SUBMITTER_ACTIVE_JOB_SOFT_CAP: i64 = 1;
-const MODEL_ACTIVE_JOB_SOFT_CAP_DIVISOR: i64 = 2;
 
 #[derive(Clone)]
 struct PersistedAssignment {
@@ -300,6 +299,8 @@ fn claim_assignment(
     db: &crate::db::Database,
     req: &ClaimInferenceAssignmentRequest,
 ) -> ApiResult<Option<PersistedAssignment>> {
+    let scheduling_policy = network_service::load_network_settings(db, &req.network_id)?
+        .scheduling_policy;
     let mut conn = db.get_conn()?;
     let tx = conn
         .transaction()
@@ -392,8 +393,8 @@ fn claim_assignment(
                 &req.device_id,
                 &req.network_id,
                 &now_str,
-                SUBMITTER_ACTIVE_JOB_SOFT_CAP,
-                MODEL_ACTIVE_JOB_SOFT_CAP_DIVISOR
+                i64::from(scheduling_policy.submitter_active_job_soft_cap),
+                i64::from(scheduling_policy.model_active_job_soft_cap_divisor)
             ],
             |row| {
                 let prompt_tokens_json: String = row.get(6)?;
@@ -677,7 +678,8 @@ mod tests {
     use crate::api::ring::join_ring;
     use crate::api::types::RingJoinRequest;
     use crate::connectivity::{
-        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
+        InferenceSchedulingPolicy, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
@@ -714,6 +716,7 @@ mod tests {
             network_id.to_string(),
             "owner-1".to_string(),
             test_connectivity(),
+            InferenceSchedulingPolicy::default(),
         );
         let keypair = ControlPlaneKeypair::load_or_generate().unwrap();
         let mut public_key = [0u8; 32];
@@ -735,9 +738,31 @@ mod tests {
     }
 
     async fn joined_state(device_ids: &[&str], network_id: &str) -> AppState {
+        joined_state_with_policy(
+            device_ids,
+            network_id,
+            InferenceSchedulingPolicy::default(),
+        )
+        .await
+    }
+
+    async fn joined_state_with_policy(
+        device_ids: &[&str],
+        network_id: &str,
+        scheduling_policy: InferenceSchedulingPolicy,
+    ) -> AppState {
         let db = create_test_db();
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
         let state = AppState::new(db.clone(), keypair);
+
+        let _ = crate::services::network_service::create_network(
+            &db,
+            network_id.to_string(),
+            network_id.to_string(),
+            "owner-1".to_string(),
+            test_connectivity(),
+            scheduling_policy,
+        );
 
         for (idx, device_id) in device_ids.iter().enumerate() {
             register_test_device(&db, device_id, network_id);
@@ -1212,6 +1237,97 @@ mod tests {
         .assignment
         .expect("expected second assignment");
         assert_eq!(second_claim.job_id, model_x_second.job_id);
+    }
+
+    #[tokio::test]
+    async fn test_claim_assignment_respects_custom_model_soft_cap_divisor() {
+        let network_id = "test-network-custom-model-divisor";
+        let state = joined_state_with_policy(
+            &["worker-1", "worker-2", "worker-3"],
+            network_id,
+            InferenceSchedulingPolicy {
+                submitter_active_job_soft_cap: 1,
+                model_active_job_soft_cap_divisor: 1,
+            },
+        )
+        .await;
+
+        let model_x_first = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "model-x".into(),
+                prompt: "job-x1".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let model_x_second = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                model_id: "model-x".into(),
+                prompt: "job-x2".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let model_y = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-3".into(),
+                network_id: network_id.into(),
+                model_id: "model-y".into(),
+                prompt: "job-y1".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-3".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected first assignment");
+        assert_eq!(first_claim.job_id, model_x_first.job_id);
+
+        let second_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected second assignment");
+        assert_eq!(second_claim.job_id, model_x_second.job_id);
+        assert_ne!(second_claim.job_id, model_y.job_id);
     }
 
     #[tokio::test]

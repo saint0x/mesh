@@ -107,6 +107,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Durable pool assignment claims now prefer the least-served submitter and least-served job before falling back to age, so ring workers no longer lease work in naive per-device FIFO order.
 - ✅ Durable pool assignment claims now apply an explicit submitter soft cap, so a single submitter cannot open a second active ring job while another submitter still has uncapped work waiting.
 - ✅ Durable pool assignment claims now apply a model-aware soft cap tied to live ring size, so one model/workload class cannot consume the pool while competing model work is still waiting.
+- ✅ Those pool claim caps are now explicit network settings rather than hard-coded claim-path constants, so the quota contract is durable and operator-visible.
 - ✅ Relay reservations now depend on explicit authoritative relay advertised addresses instead of implicit empty-address behavior.
 - ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
 - ✅ Coverage now includes a live multi-peer relay dialing runtime gate that exercises multiple reserved peers connecting through the same relay at once.
