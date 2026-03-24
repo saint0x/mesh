@@ -59,6 +59,24 @@ pub struct DeviceConfig {
 
     /// Device hardware capabilities
     pub capabilities: DeviceCapabilities,
+
+    /// Runtime governance configuration
+    #[serde(default)]
+    pub governance: GovernanceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    /// Maximum number of jobs that may execute concurrently on this agent.
+    pub max_concurrent_jobs: usize,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_jobs: 2,
+        }
+    }
 }
 
 impl DeviceConfig {
@@ -100,6 +118,7 @@ impl DeviceConfig {
                 attachments: Vec::new(),
             },
             capabilities,
+            governance: GovernanceConfig::default(),
         }
     }
 
@@ -327,6 +346,38 @@ mod tests {
         assert_eq!(config.control_plane_url, "http://localhost:8080");
         assert!(config.connectivity.attachments.is_empty());
         assert!(config.capabilities.cpu_cores > 0);
+        assert_eq!(config.governance.max_concurrent_jobs, 2);
+    }
+
+    #[test]
+    fn test_load_legacy_config_defaults_governance() {
+        let keypair = keypair::generate_keypair();
+        let encoded_keypair = multibase::encode(multibase::Base::Base58Btc, keypair.to_bytes());
+        let legacy_toml = format!(
+            r#"
+device_id = "11111111-1111-1111-1111-111111111111"
+name = "legacy-device"
+keypair = "{encoded_keypair}"
+network_id = "test-network"
+control_plane_url = "http://localhost:8080"
+
+[connectivity]
+preferred_path = "direct"
+attachments = []
+
+[capabilities]
+tier = "tier2"
+cpu_cores = 8
+ram_mb = 16384
+gpu_present = false
+gpu_vram_mb = 0
+os = "linux"
+arch = "x86_64"
+"#
+        );
+
+        let loaded: DeviceConfig = toml::from_str(&legacy_toml).unwrap();
+        assert_eq!(loaded.governance.max_concurrent_jobs, 2);
     }
 
     #[test]
@@ -355,6 +406,10 @@ mod tests {
         assert_eq!(original.network_id, loaded.network_id);
         assert_eq!(original.control_plane_url, loaded.control_plane_url);
         assert_eq!(original.connectivity, loaded.connectivity);
+        assert_eq!(
+            original.governance.max_concurrent_jobs,
+            loaded.governance.max_concurrent_jobs
+        );
 
         // CRITICAL: Verify keypair bytes are identical
         assert_eq!(

@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Job execution statistics
@@ -85,6 +86,9 @@ pub struct JobStats {
 
     /// Number of failed direct upgrades after an explicit punch-path plan
     pub punch_assisted_upgrade_failures: AtomicU64,
+
+    /// Number of jobs rejected because the runner was already at capacity
+    pub backpressure_rejections: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -113,6 +117,7 @@ impl JobStats {
             punch_assisted_direct_peer_connections: AtomicU64::new(0),
             punch_assisted_upgrade_successes: AtomicU64::new(0),
             punch_assisted_upgrade_failures: AtomicU64::new(0),
+            backpressure_rejections: AtomicU64::new(0),
         }
     }
 
@@ -188,6 +193,10 @@ impl JobStats {
     pub fn record_punch_assisted_upgrade_failure(&self) {
         self.punch_assisted_upgrade_failures
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_backpressure_rejection(&self) {
+        self.backpressure_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -288,6 +297,10 @@ impl JobStats {
             self.jobs_failed.load(Ordering::Relaxed).to_string().red()
         );
         println!("  Active:           {}", self.active_jobs());
+        println!(
+            "  Rejected:         {}",
+            self.backpressure_rejections.load(Ordering::Relaxed)
+        );
         println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
 
         println!("\n{}", "Performance:".bold());
@@ -369,6 +382,7 @@ impl JobStats {
             "completed": self.jobs_completed.load(Ordering::Relaxed),
             "failed": self.jobs_failed.load(Ordering::Relaxed),
             "active": self.active_jobs(),
+            "rejected": self.backpressure_rejections.load(Ordering::Relaxed),
             "success_rate": self.success_rate() * 100.0,
             "avg_execution_time_ms": self.avg_execution_time_ms(),
             "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
@@ -404,6 +418,7 @@ pub struct JobRunner {
     executor: EmbeddingsExecutor,
     stats: Arc<JobStats>,
     shutdown_on_idle: bool,
+    max_concurrent_jobs: usize,
     ledger_client: Option<crate::telemetry::LedgerClient>,
     device_id: Option<uuid::Uuid>,
     network_id: Option<String>,
@@ -437,6 +452,7 @@ impl JobRunner {
             executor,
             stats: Arc::new(JobStats::new()),
             shutdown_on_idle: false,
+            max_concurrent_jobs: 2,
             ledger_client: None,
             device_id: None,
             network_id: None,
@@ -448,6 +464,11 @@ impl JobRunner {
     /// Enable shutdown when idle (for testing/ephemeral jobs)
     pub fn with_shutdown_on_idle(mut self) -> Self {
         self.shutdown_on_idle = true;
+        self
+    }
+
+    pub fn with_max_concurrent_jobs(mut self, max_concurrent_jobs: usize) -> Self {
+        self.max_concurrent_jobs = max_concurrent_jobs.max(1);
         self
     }
 
@@ -505,6 +526,7 @@ impl JobRunner {
     #[instrument(skip(self), fields(local_peer = %self.swarm.local_peer_id()))]
     pub async fn run(mut self) -> Result<()> {
         info!("Starting job execution loop");
+        let mut in_flight_jobs = JoinSet::new();
 
         // Periodic stats saver (every 30 seconds)
         let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
@@ -515,7 +537,7 @@ impl JobRunner {
                 // Handle network events
                 event = self.swarm.next_event() => {
                     if let Some(event) = event {
-                        if let Err(e) = self.handle_event(event).await {
+                        if let Err(e) = self.handle_event(event, &mut in_flight_jobs).await {
                             error!(error = %e, "Error handling event");
                         }
                     } else {
@@ -537,6 +559,18 @@ impl JobRunner {
                     info!("Received shutdown signal (Ctrl+C)");
                     break;
                 }
+
+                Some(joined_job) = in_flight_jobs.join_next() => {
+                    match joined_job {
+                        Ok(completed) => {
+                            self.finish_completed_job(completed)?;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Job task panicked");
+                            self.stats.finish_job();
+                        }
+                    }
+                }
             }
         }
 
@@ -553,14 +587,19 @@ impl JobRunner {
     /// Processes different types of network events, with special handling for
     /// job-related events (JobReceived, JobCompleted).
     #[instrument(skip(self, event), fields(event_type = std::any::type_name::<MeshEvent>()))]
-    async fn handle_event(&mut self, event: MeshEvent) -> Result<()> {
+    async fn handle_event(
+        &mut self,
+        event: MeshEvent,
+        in_flight_jobs: &mut JoinSet<CompletedJob>,
+    ) -> Result<()> {
         match event {
             MeshEvent::JobReceived {
                 peer_id,
                 job,
                 channel,
             } => {
-                self.handle_job_received(peer_id, job, channel).await?;
+                self.handle_job_received(peer_id, job, channel, in_flight_jobs)
+                    .await?;
             }
 
             MeshEvent::JobCompleted { peer_id, result } => {
@@ -718,63 +757,75 @@ impl JobRunner {
         peer_id: libp2p::PeerId,
         job: JobEnvelope,
         channel: libp2p::request_response::ResponseChannel<JobResult>,
+        in_flight_jobs: &mut JoinSet<CompletedJob>,
     ) -> Result<()> {
         info!("Received job from peer");
+        if self.stats.active_jobs() as usize >= self.max_concurrent_jobs {
+            self.stats.record_backpressure_rejection();
+            warn!(
+                peer_id = %peer_id,
+                job_id = %job.job_id,
+                active_jobs = self.stats.active_jobs(),
+                max_concurrent_jobs = self.max_concurrent_jobs,
+                "Rejecting job because runner is at capacity"
+            );
+            self.swarm.respond_to_job(
+                channel,
+                JobResult {
+                    job_id: job.job_id,
+                    success: false,
+                    result: None,
+                    error: Some(format!(
+                        "agent at capacity: {} active jobs (limit {})",
+                        self.stats.active_jobs(),
+                        self.max_concurrent_jobs
+                    )),
+                    execution_time_ms: 0,
+                },
+            )?;
+            return Ok(());
+        }
+
         self.stats.start_job();
+        let executor = self.executor.clone();
+        let ledger_client = self.ledger_client.clone();
+        let device_id = self.device_id;
+        let network_id = self.network_id.clone();
+        let tier = self.tier;
+        in_flight_jobs.spawn(async move {
+            execute_job_task(
+                executor,
+                ledger_client,
+                device_id,
+                network_id,
+                tier,
+                peer_id,
+                job,
+                channel,
+            )
+            .await
+        });
 
-        let start = Instant::now();
-        let job_id = job.job_id;
+        Ok(())
+    }
 
-        // Execute job and create result
-        let result = self.execute_job(job).await;
-
-        // Update statistics
-        let execution_time_ms = start.elapsed().as_millis() as u64;
-        if result.success {
-            self.stats.record_success(execution_time_ms);
+    fn finish_completed_job(&mut self, completed: CompletedJob) -> Result<()> {
+        if completed.result.success {
+            self.stats.record_success(completed.execution_time_ms);
         } else {
-            self.stats.record_failure(execution_time_ms);
+            self.stats.record_failure(completed.execution_time_ms);
         }
         self.stats.finish_job();
 
-        // Send ledger event if configured
-        if let (Some(client), Some(device_id), Some(network_id), Some(tier)) = (
-            &self.ledger_client,
-            &self.device_id,
-            &self.network_id,
-            &self.tier,
-        ) {
-            let credits = crate::telemetry::calculate_credits(execution_time_ms, tier);
-            let event = crate::telemetry::LedgerEvent {
-                network_id: network_id.clone(),
-                event_type: if result.success {
-                    "job_completed".to_string()
-                } else {
-                    "job_failed".to_string()
-                },
-                job_id: Some(job_id),
-                device_id: *device_id,
-                credits_amount: if result.success { Some(credits) } else { None },
-                metadata: serde_json::json!({
-                    "execution_time_ms": execution_time_ms,
-                    "workload": "embeddings",
-                }),
-            };
-
-            // Send asynchronously (don't block job result)
-            client.send_event_async(event);
-        }
-
-        // Send response
         debug!(
-            job_id = %job_id,
-            success = result.success,
-            execution_time_ms = execution_time_ms,
-            "Sending job result"
+            job_id = %completed.job_id,
+            peer_id = %completed.peer_id,
+            success = completed.result.success,
+            execution_time_ms = completed.execution_time_ms,
+            "Sending completed job result"
         );
-
-        self.swarm.respond_to_job(channel, result)?;
-
+        self.swarm
+            .respond_to_job(completed.channel, completed.result)?;
         Ok(())
     }
 
@@ -838,14 +889,19 @@ impl JobRunner {
     ///
     /// Deserializes the job payload, executes it using the executor,
     /// and serializes the result.
-    #[instrument(skip(self, job), fields(job_id = %job.job_id, workload = %job.workload_id))]
-    async fn execute_job(&self, job: JobEnvelope) -> JobResult {
+    #[instrument(skip(executor, job), fields(job_id = %job.job_id, workload = %job.workload_id))]
+    async fn execute_job_with_executor(
+        executor: &EmbeddingsExecutor,
+        job: JobEnvelope,
+    ) -> JobResult {
         let start = Instant::now();
         let job_id = job.job_id;
 
         // Route to appropriate executor based on workload_id
         let result = match job.workload_id.as_str() {
-            "embeddings-v1" | "embeddings" => self.execute_embeddings_job(job).await,
+            "embeddings-v1" | "embeddings" => {
+                execute_embeddings_job_with_executor(executor, job).await
+            }
             unknown => {
                 warn!(workload = unknown, "Unknown workload type");
                 Err(crate::errors::AgentError::Execution(format!(
@@ -892,25 +948,79 @@ impl JobRunner {
             }
         }
     }
+}
 
-    /// Execute an embeddings workload
-    async fn execute_embeddings_job(&self, job: JobEnvelope) -> Result<Vec<u8>> {
-        // Deserialize input
-        let input = EmbeddingsInput::from_cbor(&job.payload)?;
+struct CompletedJob {
+    peer_id: libp2p::PeerId,
+    job_id: uuid::Uuid,
+    channel: libp2p::request_response::ResponseChannel<JobResult>,
+    result: JobResult,
+    execution_time_ms: u64,
+}
 
-        debug!(text_len = input.text.len(), "Executing embeddings job");
+async fn execute_job_task(
+    executor: EmbeddingsExecutor,
+    ledger_client: Option<crate::telemetry::LedgerClient>,
+    device_id: Option<uuid::Uuid>,
+    network_id: Option<String>,
+    tier: Option<crate::device::Tier>,
+    peer_id: libp2p::PeerId,
+    job: JobEnvelope,
+    channel: libp2p::request_response::ResponseChannel<JobResult>,
+) -> CompletedJob {
+    let job_id = job.job_id;
+    let result = JobRunner::execute_job_with_executor(&executor, job).await;
+    let execution_time_ms = result.execution_time_ms;
 
-        // Execute with timeout
-        let output = self
-            .executor
-            .execute_with_timeout(&input, job.timeout_ms)
-            .await?;
-
-        // Serialize output
-        let output_bytes = output.to_cbor()?;
-
-        Ok(output_bytes)
+    if let (Some(client), Some(device_id), Some(network_id), Some(tier)) =
+        (ledger_client, device_id, network_id, tier)
+    {
+        let credits = crate::telemetry::calculate_credits(execution_time_ms, &tier);
+        let event = crate::telemetry::LedgerEvent {
+            network_id,
+            event_type: if result.success {
+                "job_completed".to_string()
+            } else {
+                "job_failed".to_string()
+            },
+            job_id: Some(job_id),
+            device_id,
+            credits_amount: if result.success { Some(credits) } else { None },
+            metadata: serde_json::json!({
+                "execution_time_ms": execution_time_ms,
+                "workload": "embeddings",
+            }),
+        };
+        client.send_event_async(event);
     }
+
+    CompletedJob {
+        peer_id,
+        job_id,
+        channel,
+        result,
+        execution_time_ms,
+    }
+}
+
+async fn execute_embeddings_job_with_executor(
+    executor: &EmbeddingsExecutor,
+    job: JobEnvelope,
+) -> Result<Vec<u8>> {
+    // Deserialize input
+    let input = EmbeddingsInput::from_cbor(&job.payload)?;
+
+    debug!(text_len = input.text.len(), "Executing embeddings job");
+
+    // Execute with timeout
+    let output = executor
+        .execute_with_timeout(&input, job.timeout_ms)
+        .await?;
+
+    // Serialize output
+    let output_bytes = output.to_cbor()?;
+
+    Ok(output_bytes)
 }
 
 #[cfg(test)]
@@ -1013,43 +1123,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_job_stats_backpressure_metrics() {
+        let stats = JobStats::new();
+        stats.record_backpressure_rejection();
+        stats.record_backpressure_rejection();
+        assert_eq!(stats.backpressure_rejections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_with_max_concurrent_jobs_clamps_to_one() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().unwrap();
+        let executor = EmbeddingsExecutor::new_fast().unwrap();
+        let runner = JobRunner::new(swarm, executor).with_max_concurrent_jobs(0);
+
+        assert_eq!(runner.max_concurrent_jobs, 1);
+    }
+
     #[tokio::test]
     async fn test_handle_event_records_connectivity_path_metrics() {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let swarm = MeshSwarm::builder(keypair).build().unwrap();
         let executor = EmbeddingsExecutor::new_fast().unwrap();
         let mut runner = JobRunner::new(swarm, executor);
+        let mut in_flight_jobs = JoinSet::new();
 
         runner
-            .handle_event(MeshEvent::PeerConnected {
-                peer_id: libp2p::PeerId::random(),
-                connection_info: ConnectionInfo {
-                    connection_type: ConnectionType::Direct,
-                    remote_addr: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
-                    num_established: 1,
+            .handle_event(
+                MeshEvent::PeerConnected {
+                    peer_id: libp2p::PeerId::random(),
+                    connection_info: ConnectionInfo {
+                        connection_type: ConnectionType::Direct,
+                        remote_addr: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+                        num_established: 1,
+                    },
                 },
-            })
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
         runner
-            .handle_event(MeshEvent::PeerConnected {
-                peer_id: libp2p::PeerId::random(),
-                connection_info: ConnectionInfo {
-                    connection_type: ConnectionType::Relayed,
-                    remote_addr: "/dns4/relay.mesh.example/tcp/4001/p2p-circuit"
-                        .parse::<Multiaddr>()
-                        .unwrap(),
-                    num_established: 1,
+            .handle_event(
+                MeshEvent::PeerConnected {
+                    peer_id: libp2p::PeerId::random(),
+                    connection_info: ConnectionInfo {
+                        connection_type: ConnectionType::Relayed,
+                        remote_addr: "/dns4/relay.mesh.example/tcp/4001/p2p-circuit"
+                            .parse::<Multiaddr>()
+                            .unwrap(),
+                        num_established: 1,
+                    },
                 },
-            })
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
         runner
-            .handle_event(MeshEvent::RelayFallbackToPeer {
-                peer_id: libp2p::PeerId::random(),
-            })
+            .handle_event(
+                MeshEvent::RelayFallbackToPeer {
+                    peer_id: libp2p::PeerId::random(),
+                },
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
@@ -1073,33 +1211,46 @@ mod tests {
         let swarm = MeshSwarm::builder(keypair).build().unwrap();
         let executor = EmbeddingsExecutor::new_fast().unwrap();
         let mut runner = JobRunner::new(swarm, executor);
+        let mut in_flight_jobs = JoinSet::new();
 
         runner
-            .handle_event(MeshEvent::DirectConnectionUpgraded {
-                peer_id: libp2p::PeerId::random(),
-            })
+            .handle_event(
+                MeshEvent::DirectConnectionUpgraded {
+                    peer_id: libp2p::PeerId::random(),
+                },
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
         runner
-            .handle_event(MeshEvent::DirectConnectionUpgradeFailed {
-                peer_id: libp2p::PeerId::random(),
-                error: "timeout".to_string(),
-            })
+            .handle_event(
+                MeshEvent::DirectConnectionUpgradeFailed {
+                    peer_id: libp2p::PeerId::random(),
+                    error: "timeout".to_string(),
+                },
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
         runner
-            .handle_event(MeshEvent::ExternalAddrCandidateDiscovered {
-                address: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
-            })
+            .handle_event(
+                MeshEvent::ExternalAddrCandidateDiscovered {
+                    address: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+                },
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
         runner
-            .handle_event(MeshEvent::ExternalAddrConfirmed {
-                address: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
-            })
+            .handle_event(
+                MeshEvent::ExternalAddrConfirmed {
+                    address: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+                },
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 
@@ -1134,29 +1285,39 @@ mod tests {
         let executor = EmbeddingsExecutor::new_fast().unwrap();
         let mut runner = JobRunner::new(swarm, executor);
         let peer_id = libp2p::PeerId::random();
+        let mut in_flight_jobs = JoinSet::new();
 
         runner
-            .handle_event(MeshEvent::PunchPathAttemptInitiated {
-                peer_id,
-                reason: "RelayPath".to_string(),
-                candidate_count: 2,
-                relay_rendezvous_required: true,
-            })
-            .await
-            .unwrap();
-        runner
-            .handle_event(MeshEvent::PeerConnected {
-                peer_id,
-                connection_info: ConnectionInfo {
-                    connection_type: ConnectionType::Direct,
-                    remote_addr: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
-                    num_established: 1,
+            .handle_event(
+                MeshEvent::PunchPathAttemptInitiated {
+                    peer_id,
+                    reason: "RelayPath".to_string(),
+                    candidate_count: 2,
+                    relay_rendezvous_required: true,
                 },
-            })
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
         runner
-            .handle_event(MeshEvent::DirectConnectionUpgraded { peer_id })
+            .handle_event(
+                MeshEvent::PeerConnected {
+                    peer_id,
+                    connection_info: ConnectionInfo {
+                        connection_type: ConnectionType::Direct,
+                        remote_addr: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+                        num_established: 1,
+                    },
+                },
+                &mut in_flight_jobs,
+            )
+            .await
+            .unwrap();
+        runner
+            .handle_event(
+                MeshEvent::DirectConnectionUpgraded { peer_id },
+                &mut in_flight_jobs,
+            )
             .await
             .unwrap();
 

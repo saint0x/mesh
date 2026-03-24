@@ -85,12 +85,14 @@ The following are now stale and should not be described as still-missing core pr
 These are the main remaining production-facing areas, but they are mostly new capability work rather than cleanup of the old path:
 
 - ⬜ A dedicated higher-performance data plane beyond libp2p request/response for tensor movement.
-- ⬜ Stronger NAT traversal, including explicit punched-path execution rather than only direct vs relayed selection.
-- ⬜ More complete runtime governance and backpressure controls across transport, execution, and recovery paths.
+- ✅ Stronger NAT traversal now includes explicit punched-path coordination, relay rendezvous, and direct-upgrade runtime coverage rather than only direct vs relayed selection.
+- ⬜ More complete runtime governance and backpressure controls still remain across transport, execution, fairness, and recovery paths.
 - ⬜ Any future overlay backend must be implemented for real before reintroduction.
 
 ### Still Worth Hardening Over Time
 
+- ✅ Agent runtime governance now has an explicit concurrency-cap contract and immediate overload rejection instead of implicit queue growth in the execution loop.
+- ✅ Backpressure rejection accounting is now part of persisted job metrics, so runtime pressure is no longer silent.
 - ✅ Relay reservations now depend on explicit authoritative relay advertised addresses instead of implicit empty-address behavior.
 - ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
 - ✅ Coverage now includes a live multi-peer relay dialing runtime gate that exercises multiple reserved peers connecting through the same relay at once.

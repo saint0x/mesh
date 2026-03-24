@@ -296,9 +296,18 @@ async fn test_multiple_live_peers_attach_to_same_relay_runtime() {
     swarm_b.listen_on_relay(relay_peer_b).unwrap();
     swarm_c.listen_on_relay(relay_peer_c).unwrap();
 
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_a).await,
+        relay_peer_a
+    );
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_b).await,
+        relay_peer_b
+    );
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_c).await,
+        relay_peer_c
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -339,20 +348,27 @@ async fn test_multiple_live_peers_connect_via_relay_runtime() {
     swarm_b.listen_on_relay(relay_peer_b).unwrap();
     swarm_c.listen_on_relay(relay_peer_c).unwrap();
 
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_a).await,
+        relay_peer_a
+    );
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_b).await,
+        relay_peer_b
+    );
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_c).await,
+        relay_peer_c
+    );
 
     swarm_b.dial_peer(peer_id_a).unwrap();
     swarm_c.dial_peer(peer_id_a).unwrap();
 
-    wait_for_runtime_connections(
-        &mut [
-            (&mut swarm_a, vec![peer_id_b, peer_id_c]),
-            (&mut swarm_b, vec![peer_id_a]),
-            (&mut swarm_c, vec![peer_id_a]),
-        ],
-    )
+    wait_for_runtime_connections(&mut [
+        (&mut swarm_a, vec![peer_id_b, peer_id_c]),
+        (&mut swarm_b, vec![peer_id_a]),
+        (&mut swarm_c, vec![peer_id_a]),
+    ])
     .await;
 }
 
@@ -384,8 +400,14 @@ async fn test_live_peers_upgrade_to_direct_after_relay_rendezvous() {
 
     swarm_a.listen_on_relay(relay_peer_a).unwrap();
     swarm_b.listen_on_relay(relay_peer_b).unwrap();
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_a).await,
+        relay_peer_a
+    );
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_b).await,
+        relay_peer_b
+    );
 
     swarm_b.dial_peer(peer_id_a).unwrap();
 
@@ -414,7 +436,10 @@ async fn test_live_peers_upgrade_with_staggered_relay_rendezvous_timing() {
     swarm_a.connect_to_relay().unwrap();
     let relay_peer_a = wait_for_peer_connected(&mut swarm_a).await;
     swarm_a.listen_on_relay(relay_peer_a).unwrap();
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_a).await,
+        relay_peer_a
+    );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -425,7 +450,10 @@ async fn test_live_peers_upgrade_with_staggered_relay_rendezvous_timing() {
     let relay_peer_b = wait_for_peer_connected(&mut swarm_b).await;
     assert_eq!(relay_peer_a, relay_peer_b);
     swarm_b.listen_on_relay(relay_peer_b).unwrap();
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_b).await,
+        relay_peer_b
+    );
     swarm_b.dial_peer(peer_id_a).unwrap();
 
     wait_for_relay_then_direct_upgrade(
@@ -444,7 +472,10 @@ async fn test_live_peers_upgrade_with_staggered_relay_rendezvous_timing() {
     let relay_peer_c = wait_for_peer_connected(&mut swarm_c).await;
     assert_eq!(relay_peer_a, relay_peer_c);
     swarm_c.listen_on_relay(relay_peer_c).unwrap();
-    assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
+    assert_eq!(
+        wait_for_reservation_accepted(&mut swarm_c).await,
+        relay_peer_c
+    );
     swarm_c.dial_peer(peer_id_a).unwrap();
 
     wait_for_relay_then_direct_upgrade(
@@ -514,7 +545,10 @@ async fn wait_for_runtime_connections(swarms: &mut [(&mut MeshSwarm, Vec<libp2p:
         }
     }
 
-    panic!("timed out waiting for expected live peer connections: {:?}", remaining);
+    panic!(
+        "timed out waiting for expected live peer connections: {:?}",
+        remaining
+    );
 }
 
 async fn wait_for_relay_then_direct_upgrade(

@@ -1,5 +1,7 @@
 use libp2p::{
-    identify, multiaddr::Protocol, noise, relay,
+    identify,
+    multiaddr::Protocol,
+    noise, relay,
     swarm::{NetworkBehaviour, Swarm},
     tcp, yamux, Multiaddr, SwarmBuilder,
 };
@@ -101,9 +103,8 @@ pub fn configured_advertised_addrs(config: &Config) -> Result<Vec<Multiaddr>> {
             .advertised_addrs
             .iter()
             .map(|addr| {
-                addr.parse::<Multiaddr>().map_err(|e| {
-                    RelayError::Config(format!("Invalid advertised address: {}", e))
-                })
+                addr.parse::<Multiaddr>()
+                    .map_err(|e| RelayError::Config(format!("Invalid advertised address: {}", e)))
             })
             .collect();
     }

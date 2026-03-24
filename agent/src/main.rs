@@ -1273,7 +1273,8 @@ async fn cmd_start() -> Result<()> {
     println!("\n✅ Agent ready - waiting for jobs...");
     println!("   Press Ctrl+C to stop\n");
 
-    let runner = JobRunner::new(swarm, executor);
+    let runner = JobRunner::new(swarm, executor)
+        .with_max_concurrent_jobs(config.governance.max_concurrent_jobs);
     runner.run().await?;
 
     Ok(())

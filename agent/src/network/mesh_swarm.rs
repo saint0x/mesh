@@ -653,7 +653,8 @@ impl MeshSwarm {
                 }
 
                 SwarmEvent::ListenerClosed { reason, .. } => {
-                    if let (Some(relay_peer_id), Err(error)) = (self.relay_peer_id, reason.as_ref()) {
+                    if let (Some(relay_peer_id), Err(error)) = (self.relay_peer_id, reason.as_ref())
+                    {
                         warn!(relay = %relay_peer_id, error = ?error, "Listener closed");
                         if error.to_string().contains("Reservation") {
                             return Some(MeshEvent::ReservationDenied { relay_peer_id });
