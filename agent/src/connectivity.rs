@@ -197,6 +197,11 @@ pub fn load_direct_candidate_seed_addrs() -> Option<Vec<String>> {
     Some(combined)
 }
 
+pub fn load_observed_reachability_addrs() -> Option<Vec<String>> {
+    let observed_path = meshnet_state_path("observed_addrs.json")?;
+    load_json_string_vec(&observed_path)
+}
+
 fn load_json_string_vec(path: &PathBuf) -> Option<Vec<String>> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()

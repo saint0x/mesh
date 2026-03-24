@@ -35,12 +35,13 @@ use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
 use agent::{
-    api::types::RingTopologyResponse, format_bytes, init_production_logging, init_simple_logging,
-    parse_data_plane_endpoint, parse_memory_string, persist_runtime_connectivity_state,
-    select_direct_dial_addrs_from_candidates, ConnectivityAttachmentKind, ConnectivityPath,
-    ConnectivityStatus, DeviceConfig, DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput,
-    EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
-    TensorPlane, TensorPlaneConfig,
+    api::types::RingTopologyResponse, build_direct_peer_candidates, format_bytes,
+    init_production_logging, init_simple_logging, load_direct_candidate_seed_addrs,
+    load_observed_reachability_addrs, parse_data_plane_endpoint, parse_memory_string,
+    persist_runtime_connectivity_state, select_direct_dial_addrs_from_candidates,
+    ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus, DeviceConfig,
+    DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner,
+    MeshSwarmBuilder, RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -490,6 +491,29 @@ fn extract_tensor_addr(addrs: &[String]) -> Option<SocketAddr> {
     addrs
         .iter()
         .find_map(|addr| parse_data_plane_endpoint(addr))
+}
+
+fn load_local_listen_addrs() -> Vec<String> {
+    let Some(path) = listen_addrs_path().ok() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn print_direct_candidates_block(label: &str, candidates: &[agent::DirectPeerCandidate]) {
+    println!("   {}: {}", label, candidates.len());
+    for candidate in candidates.iter().take(5) {
+        println!(
+            "     - {:?}/{:?} priority={} {}",
+            candidate.scope, candidate.transport, candidate.priority, candidate.endpoint
+        );
+    }
+    if candidates.len() > 5 {
+        println!("     - ... {} more", candidates.len() - 5);
+    }
 }
 
 fn build_worker_position_from_topology(
@@ -1401,6 +1425,35 @@ async fn cmd_status() -> Result<()> {
                     );
                 }
             }
+
+            let local_listen_addrs = load_local_listen_addrs();
+            let observed_addrs = load_observed_reachability_addrs().unwrap_or_default();
+            let candidate_seed_addrs =
+                load_direct_candidate_seed_addrs().unwrap_or_else(|| local_listen_addrs.clone());
+            let local_peer_id = agent::device::keypair::to_libp2p_keypair(&config.keypair)
+                .public()
+                .to_peer_id();
+            let direct_candidates =
+                build_direct_peer_candidates(local_peer_id, &candidate_seed_addrs);
+
+            println!("\n📡 Local Reachability:");
+            println!("   Listen Addresses: {}", local_listen_addrs.len());
+            for addr in local_listen_addrs.iter().take(3) {
+                println!("     - {}", addr);
+            }
+            if local_listen_addrs.len() > 3 {
+                println!("     - ... {} more", local_listen_addrs.len() - 3);
+            }
+
+            println!("   Observed External Addresses: {}", observed_addrs.len());
+            for addr in observed_addrs.iter().take(3) {
+                println!("     - {}", addr);
+            }
+            if observed_addrs.len() > 3 {
+                println!("     - ... {} more", observed_addrs.len() - 3);
+            }
+
+            print_direct_candidates_block("Ranked Direct Candidates", &direct_candidates);
         }
         Err(_) => {
             println!("⚠️  Device not initialized");
@@ -1949,6 +2002,15 @@ async fn cmd_pool_status() -> Result<()> {
                             format_bytes(worker.contributed_memory),
                             connectivity
                         );
+                        if let Some(best) = worker.direct_candidates.first() {
+                            println!(
+                                "    best direct: {:?}/{:?} priority={} {}",
+                                best.scope, best.transport, best.priority, best.endpoint
+                            );
+                            println!("    direct candidates: {}", worker.direct_candidates.len());
+                        } else {
+                            println!("    direct candidates: 0");
+                        }
                     }
 
                     if data.workers.is_empty() {

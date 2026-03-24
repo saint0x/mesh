@@ -17,11 +17,11 @@ pub use api::RegistrationClient;
 pub use checkpoint::{Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata};
 pub use connectivity::{
     build_direct_peer_candidates, load_direct_candidate_seed_addrs,
-    load_runtime_connectivity_state, persist_observed_reachability_addr,
-    persist_runtime_connectivity_state, select_direct_dial_addrs,
-    select_direct_dial_addrs_from_candidates, ConnectivityAttachment, ConnectivityAttachmentKind,
-    ConnectivityPath, ConnectivityStatus, DeviceConnectivityState, DirectCandidateScope,
-    DirectCandidateTransport, DirectPeerCandidate, NetworkConnectivity,
+    load_observed_reachability_addrs, load_runtime_connectivity_state,
+    persist_observed_reachability_addr, persist_runtime_connectivity_state,
+    select_direct_dial_addrs, select_direct_dial_addrs_from_candidates, ConnectivityAttachment,
+    ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus, DeviceConnectivityState,
+    DirectCandidateScope, DirectCandidateTransport, DirectPeerCandidate, NetworkConnectivity,
 };
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
 pub use errors::{AgentError, Result};

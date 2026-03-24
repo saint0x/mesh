@@ -73,13 +73,13 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Control-plane device state and ring topology now persist and return structured direct-connect candidates as a first-class contract.
 - ✅ Ring workers now resolve direct peers from authoritative `direct_candidates` metadata rather than rebuilding dial order from generic listen-address lists.
 - ✅ Live swarm-observed external address candidates are now persisted and folded into heartbeat candidate publication alongside local listen addresses.
+- ✅ Agent status and pool-status now expose local and remote direct-candidate quality so operators can inspect current reachability and best direct endpoints without digging through raw state files.
 
 ### NAT Traversal Still Open
 
 - ⬜ Add focused integration coverage for direct upgrade and relay fallback behavior under more realistic multi-peer networking scenarios.
 - ⬜ Add operator-visible path quality metrics for direct success rate, relay fallback rate, upgrade failure causes, and candidate selection outcomes.
 - ⬜ Extend candidate gathering beyond current local/observed addresses so hostile NAT cases can exchange richer hole-punch inputs and more durable public reachability hints.
-- ⬜ Tighten control-plane/operator surfaces so direct-candidate quality and selection outcomes are visible rather than only stored internally.
 
 ### 3. Governance Third
 

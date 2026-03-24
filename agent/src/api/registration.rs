@@ -199,6 +199,7 @@ impl RegistrationClient {
             active_path = ?heartbeat_response.connectivity_state.active_path,
             connectivity_status = ?heartbeat_response.connectivity_state.status,
             listen_addr_count = heartbeat_response.listen_addrs.len(),
+            direct_candidate_count = heartbeat_response.direct_candidates.len(),
             "Heartbeat sent successfully"
         );
 
