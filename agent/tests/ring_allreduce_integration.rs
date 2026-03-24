@@ -9,7 +9,11 @@
 #![allow(clippy::needless_range_loop)]
 
 use agent::executor::Tensor;
-use agent::network::{AllReducePhase, TensorMessage};
+use agent::network::{AllReducePhase, MeshEvent, MeshSwarm, TensorMessage};
+use futures::StreamExt;
+use relay_server::config::Config as RelayConfig;
+use relay_server::relay::build_swarm as build_relay_swarm;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Simulates the ring all-reduce algorithm with n workers
@@ -256,6 +260,86 @@ fn test_negative_values() {
     for &value in &results[0].data {
         assert!((value - 6.0).abs() < 0.001, "Expected 6.0, got {}", value);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiple_live_peers_attach_to_same_relay_runtime() {
+    let temp_home = tempfile::tempdir().unwrap();
+    let original_home = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", temp_home.path());
+    }
+
+    let relay_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/43111".parse().unwrap();
+    let mut relay_config = RelayConfig::default();
+    relay_config.network.tcp_listen_addr = relay_addr.to_string();
+    relay_config.network.quic_listen_addr = "/ip4/127.0.0.1/udp/43111/quic-v1".to_string();
+
+    let mut relay_swarm = build_relay_swarm(&relay_config).await.unwrap();
+    relay_swarm.listen_on(relay_addr.clone()).unwrap();
+
+    let relay_task = tokio::spawn(async move {
+        loop {
+            let _ = relay_swarm.select_next_some().await;
+        }
+    });
+
+    let build_agent = || {
+        MeshSwarm::builder(libp2p::identity::Keypair::generate_ed25519())
+            .with_relay_addr(relay_addr.clone())
+            .build()
+            .unwrap()
+    };
+
+    let mut swarm_a = build_agent();
+    let mut swarm_b = build_agent();
+    let mut swarm_c = build_agent();
+
+    swarm_a.listen_on_direct_addrs().unwrap();
+    swarm_b.listen_on_direct_addrs().unwrap();
+    swarm_c.listen_on_direct_addrs().unwrap();
+
+    swarm_a.connect_to_relay().unwrap();
+    swarm_b.connect_to_relay().unwrap();
+    swarm_c.connect_to_relay().unwrap();
+
+    let relay_peer_a = wait_for_peer_connected(&mut swarm_a).await;
+    let relay_peer_b = wait_for_peer_connected(&mut swarm_b).await;
+    let relay_peer_c = wait_for_peer_connected(&mut swarm_c).await;
+
+    assert_eq!(relay_peer_a, relay_peer_b);
+    assert_eq!(relay_peer_b, relay_peer_c);
+
+    swarm_a.listen_on_relay(relay_peer_a).unwrap();
+    swarm_b.listen_on_relay(relay_peer_b).unwrap();
+    swarm_c.listen_on_relay(relay_peer_c).unwrap();
+
+    // Give the relay setup a bounded window to progress on live swarms.
+    let _ = tokio::time::timeout(Duration::from_secs(2), swarm_a.next_event()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), swarm_b.next_event()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), swarm_c.next_event()).await;
+
+    relay_task.abort();
+    let _ = relay_task.await;
+
+    match original_home {
+        Some(home) => unsafe { std::env::set_var("HOME", home) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+async fn wait_for_peer_connected(swarm: &mut MeshSwarm) -> libp2p::PeerId {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(2), swarm.next_event()).await
+        {
+            if let MeshEvent::PeerConnected { peer_id, .. } = event {
+                return peer_id;
+            }
+        }
+    }
+    panic!("timed out waiting for peer connection");
 }
 
 /// Test with mixed positive/negative/zero

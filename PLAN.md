@@ -83,10 +83,11 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Agent metrics now distinguish punch-assisted attempts, punch-assisted direct connections, and punch-assisted upgrade outcomes from ordinary direct-path success.
 - ✅ NAT coverage now includes a dedicated `punch_path_coordination` Fozzy scenario plus host-backed trace validation for punch-plan topology and agent-side punch-plan consumption.
 - ✅ NAT coverage now also exercises multi-peer relay-worker punch-plan generation and swarm neighbor punch-attempt emission, so the gate covers more than a single peer-pair resolution path.
+- ✅ NAT coverage now includes a live concurrent relay-attachment runtime test with multiple in-process peers sharing the same relay, not just scripted or single-peer checks.
 
 ### NAT Traversal Still Open
 
-- ⬜ Extend from the current host-backed and multi-peer contract coverage into fuller concurrent runtime/NAT execution scenarios with real relay rendezvous timing behavior.
+- ⬜ Extend from the current host-backed and live relay-attachment coverage into fuller concurrent runtime/NAT execution scenarios that verify successful relay-mediated peer dialing and direct upgrade outcomes.
 
 ### 3. Governance Third
 
@@ -220,6 +221,8 @@ After Phase 1:
 - ✅ `fozzy --cwd . ci .fozzy/punch-path-coordination-host.trace.fozzy --json`
 - ✅ `cargo test -p control-plane test_get_topology_generates_peer_punch_plans_for_relayed_workers -- --nocapture`
 - ✅ `cargo test -p agent test_set_ring_neighbors_emits_punch_attempts_for_both_neighbors -- --nocapture`
+- ✅ `cargo test -p agent test_multiple_live_peers_attach_to_same_relay_runtime -- --nocapture`
+- ✅ `cargo test -p relay-server --no-run`
 
 ### Still Open In Phase 1
 

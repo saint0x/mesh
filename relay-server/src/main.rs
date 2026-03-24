@@ -1,16 +1,10 @@
 use clap::Parser;
 use futures::StreamExt;
+use relay_server::config::Config;
+use relay_server::errors::{RelayError, Result};
+use relay_server::{events, relay};
 use tokio::signal;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-mod auth;
-mod config;
-mod errors;
-mod events;
-mod relay;
-
-use config::Config;
-use errors::Result;
 
 /// Mesh Relay Server - libp2p Circuit Relay v2
 #[derive(Parser, Debug)]
@@ -118,18 +112,18 @@ async fn main() -> Result<()> {
         .network
         .tcp_listen_addr
         .parse()
-        .map_err(|e| errors::RelayError::Config(format!("Invalid TCP address: {}", e)))?;
+        .map_err(|e| RelayError::Config(format!("Invalid TCP address: {}", e)))?;
 
     let quic_addr: libp2p::Multiaddr = config
         .network
         .quic_listen_addr
         .parse()
-        .map_err(|e| errors::RelayError::Config(format!("Invalid QUIC address: {}", e)))?;
+        .map_err(|e| RelayError::Config(format!("Invalid QUIC address: {}", e)))?;
 
     // Start listening
     swarm
         .listen_on(tcp_addr)
-        .map_err(|e| errors::RelayError::Transport(format!("Failed to listen on TCP: {}", e)))?;
+        .map_err(|e| RelayError::Transport(format!("Failed to listen on TCP: {}", e)))?;
 
     // QUIC is optional - warn if it fails but don't exit
     if let Err(e) = swarm.listen_on(quic_addr) {

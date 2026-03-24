@@ -91,7 +91,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 
 ### Still Worth Hardening Over Time
 
-- ⬜ Broader concurrent multi-process and relay-rendezvous Fozzy coverage beyond the current `production_dispatch` and `punch_path_coordination` host-backed/runtime gates.
+- ⬜ Broader concurrent relay-rendezvous and successful peer-dial coverage beyond the current `production_dispatch` and `punch_path_coordination` host-backed/runtime gates.
 - ⬜ More explicit operator-facing visibility into path quality, fallback reasons, and degraded connectivity behavior.
 - ⬜ Continued work on production-grade model/data-plane performance once correctness is no longer the dominant concern.
 

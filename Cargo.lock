@@ -57,6 +57,7 @@ dependencies = [
  "quickcheck",
  "quickcheck_macros",
  "rand 0.8.5",
+ "relay-server",
  "reqwest",
  "serde",
  "serde_json",

@@ -58,3 +58,4 @@ tempfile = "3.8"
 serde_json.workspace = true
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
+relay-server = { path = "../relay-server" }
