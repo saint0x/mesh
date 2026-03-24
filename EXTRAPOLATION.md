@@ -92,7 +92,8 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Persisted inference stats now expose bandwidth-governor wait signals so transport shaping is operator-visible in the same metrics surface.
 - ✅ Checkpoint recovery now runs through one explicit bounded recovery contract with capped attempts, cooldown, and a node-level checkpoint-load budget instead of open-ended reload behavior.
 - ✅ Persisted inference stats now expose recovery-path throttling signals so degraded recovery behavior is visible in the same production metrics surface.
-- ⬜ More complete runtime governance and backpressure controls still remain across harder pool-capacity policy and deeper execution fairness.
+- ✅ Durable pool assignment claims now also enforce a capacity-class-aware ring-wide soft cap using explicit tier capacity units, so the pool can differentiate high-capacity and low-capacity model occupancy instead of treating all active model work as equal.
+- ⬜ More complete runtime governance and backpressure controls now mostly give way to broader runtime hardening outside the current governance contract.
 - ⬜ Any future overlay backend must be implemented for real before reintroduction.
 
 ### Still Worth Hardening Over Time
@@ -114,6 +115,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Tensor-plane metrics now persist bytes sent/received, outbound wait counts/time, inbound queue drops, byte-budget drops, and oversize drops.
 - ✅ Tensor-plane throughput shaping is now explicit too, with a governed sustained send-rate budget and persisted bandwidth-wait metrics.
 - ✅ Recovery-path throttling is now explicit too, with governed checkpoint-reload attempts, cooldown enforcement, and a rolling node-level recovery-load budget.
+- ✅ Pool-level quota policy is now explicit too, with durable tier-based capacity units and a configurable capacity-unit soft cap in the claim path.
 - ✅ Durable pool assignment claims now prefer the least-served submitter and least-served job before falling back to age, so ring workers no longer lease work in naive per-device FIFO order.
 - ✅ Durable pool assignment claims now apply an explicit submitter soft cap, so a single submitter cannot open a second active ring job while another submitter still has uncapped work waiting.
 - ✅ Durable pool assignment claims now apply a model-aware soft cap tied to live ring size, so one model/workload class cannot consume the pool while competing model work is still waiting.
@@ -124,7 +126,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Coverage now includes a live relay-rendezvous direct-upgrade runtime gate that proves peers can establish relay connectivity first and then upgrade off relay when direct reachability exists.
 - ✅ Coverage now includes a staggered relay-rendezvous direct-upgrade runtime gate that exercises later-arriving peers and non-synchronized upgrade timing.
 - ⬜ Broader asymmetric-reachability and harsher direct-upgrade coverage beyond the current `production_dispatch`, `punch_path_coordination`, `live_relay_runtime`, `multi_peer_live_relay_runtime`, `direct_upgrade_live_relay_runtime`, and `staggered_direct_upgrade_live_relay_runtime` host-backed/runtime gates.
-- ⬜ More explicit operator-facing visibility into fallback reasons, degraded connectivity behavior, and higher-level pool-capacity policy beyond the current tensor-plane and recovery counters.
+- ⬜ More explicit operator-facing visibility into fallback reasons and degraded connectivity behavior beyond the current governance, tensor-plane, and recovery counters.
 - ⬜ Continued work on production-grade model/data-plane performance once correctness is no longer the dominant concern.
 
 ## Recommended Next Phase

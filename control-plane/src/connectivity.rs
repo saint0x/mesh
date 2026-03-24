@@ -90,6 +90,31 @@ pub struct NetworkSettings {
 pub struct InferenceSchedulingPolicy {
     pub submitter_active_job_soft_cap: u32,
     pub model_active_job_soft_cap_divisor: u32,
+    #[serde(default)]
+    pub capacity_unit_soft_cap_divisor: u32,
+    #[serde(default)]
+    pub tier_capacity_units: TierCapacityUnits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TierCapacityUnits {
+    pub tier0: u32,
+    pub tier1: u32,
+    pub tier2: u32,
+    pub tier3: u32,
+    pub tier4: u32,
+}
+
+impl Default for TierCapacityUnits {
+    fn default() -> Self {
+        Self {
+            tier0: 1,
+            tier1: 2,
+            tier2: 4,
+            tier3: 8,
+            tier4: 16,
+        }
+    }
 }
 
 impl Default for InferenceSchedulingPolicy {
@@ -97,6 +122,8 @@ impl Default for InferenceSchedulingPolicy {
         Self {
             submitter_active_job_soft_cap: 1,
             model_active_job_soft_cap_divisor: 2,
+            capacity_unit_soft_cap_divisor: 2,
+            tier_capacity_units: TierCapacityUnits::default(),
         }
     }
 }
@@ -118,6 +145,28 @@ impl InferenceSchedulingPolicy {
         if self.model_active_job_soft_cap_divisor == 0 {
             return Err(ApiError::BadRequest(
                 "model_active_job_soft_cap_divisor must be at least 1".to_string(),
+            ));
+        }
+        if self.capacity_unit_soft_cap_divisor == 0 {
+            return Err(ApiError::BadRequest(
+                "capacity_unit_soft_cap_divisor must be at least 1".to_string(),
+            ));
+        }
+        self.tier_capacity_units.validate()?;
+        Ok(())
+    }
+}
+
+impl TierCapacityUnits {
+    pub fn validate(&self) -> ApiResult<()> {
+        if self.tier0 == 0
+            || self.tier1 == 0
+            || self.tier2 == 0
+            || self.tier3 == 0
+            || self.tier4 == 0
+        {
+            return Err(ApiError::BadRequest(
+                "tier capacity units must all be at least 1".to_string(),
             ));
         }
         Ok(())

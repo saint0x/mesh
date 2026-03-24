@@ -399,6 +399,8 @@ mod tests {
                 scheduling_policy: InferenceSchedulingPolicy {
                     submitter_active_job_soft_cap: 2,
                     model_active_job_soft_cap_divisor: 3,
+                    capacity_unit_soft_cap_divisor: 4,
+                    tier_capacity_units: crate::connectivity::TierCapacityUnits::default(),
                 },
             }),
         )
@@ -412,6 +414,8 @@ mod tests {
             InferenceSchedulingPolicy {
                 submitter_active_job_soft_cap: 2,
                 model_active_job_soft_cap_divisor: 3,
+                capacity_unit_soft_cap_divisor: 4,
+                tier_capacity_units: crate::connectivity::TierCapacityUnits::default(),
             }
         );
 
@@ -427,6 +431,8 @@ mod tests {
             InferenceSchedulingPolicy {
                 submitter_active_job_soft_cap: 2,
                 model_active_job_soft_cap_divisor: 3,
+                capacity_unit_soft_cap_divisor: 4,
+                tier_capacity_units: crate::connectivity::TierCapacityUnits::default(),
             }
         );
     }

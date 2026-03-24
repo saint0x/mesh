@@ -134,15 +134,17 @@ This is important for mature production behavior, but it should not define the h
 - ✅ Inference stats now also persist bandwidth-governor wait counts/time so throughput shaping is operator-visible rather than hidden in transport latency.
 - ✅ Inference execution now uses one explicit bounded checkpoint-recovery contract with capped attempts per job, cooldown between recovery attempts, and a node-level checkpoint-load budget.
 - ✅ Recovery-path governance metrics now persist recovery attempts, cooldown rejections, recovery-budget rejections, and checkpoint misses so degraded retry behavior is operator-visible.
+- ✅ Pool scheduling policy now also includes tier-based capacity units and a ring-wide capacity-unit soft cap, so durable assignment claims can prefer lower-capacity-consuming model work when simple model counts tie.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
 - ✅ Governance coverage now includes focused tensor-plane tests for bounded inbound-queue rejection and queued-byte-budget rejection on the dedicated data plane.
 - ✅ Governance coverage now includes focused tensor-plane limiter tests for sustained throughput shaping on the dedicated data plane.
 - ✅ Governance coverage now includes focused recovery-governor tests for cooldown enforcement and checkpoint-load budget exhaustion.
+- ✅ Governance coverage now includes focused control-plane tests showing capacity-class policy breaks ties that simple model-count soft caps cannot.
 
 ### Governance Still Open
 
-- ⬜ Pool-level quota policy beyond the current configurable submitter and model soft caps, including harder explicit ring-wide quota control tied to pool capacity classes.
+- ⬜ No additional must-ship governance branch is open right now; remaining production hardening is outside the local/pool governance contract.
 
 ## Non-Goals
 

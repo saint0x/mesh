@@ -369,6 +369,49 @@ fn claim_assignment(
                     THEN 1
                     ELSE 0
                 END ASC,
+                CASE
+                    WHEN (
+                        SELECT COALESCE(SUM(
+                            CASE json_extract(active_capacity_devices.capabilities, '$.tier')
+                                WHEN 'Tier0' THEN ?
+                                WHEN 'Tier1' THEN ?
+                                WHEN 'Tier2' THEN ?
+                                WHEN 'Tier3' THEN ?
+                                WHEN 'Tier4' THEN ?
+                                ELSE ?
+                            END
+                        ), 0)
+                        FROM inference_job_assignments active_capacity_assignments
+                        INNER JOIN inference_jobs active_capacity_jobs
+                            ON active_capacity_jobs.job_id = active_capacity_assignments.job_id
+                        INNER JOIN devices active_capacity_devices
+                            ON active_capacity_devices.device_id = active_capacity_assignments.device_id
+                           AND active_capacity_devices.network_id = active_capacity_assignments.network_id
+                        WHERE active_capacity_jobs.network_id = a.network_id
+                          AND active_capacity_jobs.model_id = j.model_id
+                          AND active_capacity_assignments.status IN ('leased', 'acknowledged')
+                    ) >= (
+                        SELECT MAX(
+                            1,
+                            COALESCE(SUM(
+                                CASE json_extract(pool_capacity_workers.capabilities, '$.tier')
+                                    WHEN 'Tier0' THEN ?
+                                    WHEN 'Tier1' THEN ?
+                                    WHEN 'Tier2' THEN ?
+                                    WHEN 'Tier3' THEN ?
+                                    WHEN 'Tier4' THEN ?
+                                    ELSE ?
+                                END
+                            ), 0) / ?
+                        )
+                        FROM devices pool_capacity_workers
+                        WHERE pool_capacity_workers.network_id = a.network_id
+                          AND pool_capacity_workers.ring_position IS NOT NULL
+                          AND pool_capacity_workers.status = 'online'
+                    )
+                    THEN 1
+                    ELSE 0
+                END ASC,
                 (
                     SELECT COUNT(*)
                     FROM inference_job_assignments submitter_assignments
@@ -394,7 +437,20 @@ fn claim_assignment(
                 &req.network_id,
                 &now_str,
                 i64::from(scheduling_policy.submitter_active_job_soft_cap),
-                i64::from(scheduling_policy.model_active_job_soft_cap_divisor)
+                i64::from(scheduling_policy.model_active_job_soft_cap_divisor),
+                i64::from(scheduling_policy.tier_capacity_units.tier0),
+                i64::from(scheduling_policy.tier_capacity_units.tier1),
+                i64::from(scheduling_policy.tier_capacity_units.tier2),
+                i64::from(scheduling_policy.tier_capacity_units.tier3),
+                i64::from(scheduling_policy.tier_capacity_units.tier4),
+                i64::from(scheduling_policy.tier_capacity_units.tier0),
+                i64::from(scheduling_policy.tier_capacity_units.tier0),
+                i64::from(scheduling_policy.tier_capacity_units.tier1),
+                i64::from(scheduling_policy.tier_capacity_units.tier2),
+                i64::from(scheduling_policy.tier_capacity_units.tier3),
+                i64::from(scheduling_policy.tier_capacity_units.tier4),
+                i64::from(scheduling_policy.tier_capacity_units.tier0),
+                i64::from(scheduling_policy.capacity_unit_soft_cap_divisor)
             ],
             |row| {
                 let prompt_tokens_json: String = row.get(6)?;
@@ -679,7 +735,7 @@ mod tests {
     use crate::api::types::RingJoinRequest;
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
-        InferenceSchedulingPolicy, NetworkConnectivity,
+        InferenceSchedulingPolicy, NetworkConnectivity, TierCapacityUnits,
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
@@ -710,6 +766,15 @@ mod tests {
     }
 
     fn register_test_device(db: &crate::db::Database, device_id: &str, network_id: &str) {
+        register_test_device_with_capabilities(db, device_id, network_id, test_capabilities());
+    }
+
+    fn register_test_device_with_capabilities(
+        db: &crate::db::Database,
+        device_id: &str,
+        network_id: &str,
+        capabilities: DeviceCapabilities,
+    ) {
         let _ = crate::services::network_service::create_network(
             db,
             network_id.to_string(),
@@ -732,7 +797,7 @@ mod tests {
             "Test Device".to_string(),
             public_key.to_vec(),
             format!("test-peer-inf-{}", device_id),
-            test_capabilities(),
+            capabilities,
         )
         .unwrap();
     }
@@ -766,6 +831,40 @@ mod tests {
 
         for (idx, device_id) in device_ids.iter().enumerate() {
             register_test_device(&db, device_id, network_id);
+            let join_request = RingJoinRequest {
+                device_id: (*device_id).to_string(),
+                network_id: network_id.to_string(),
+                contributed_memory: 8_000_000_000 + idx as u64,
+            };
+
+            let _ = join_ring(State(state.clone()), Json(join_request))
+                .await
+                .unwrap();
+        }
+
+        state
+    }
+
+    async fn joined_state_with_device_capabilities(
+        devices: &[(&str, DeviceCapabilities)],
+        network_id: &str,
+        scheduling_policy: InferenceSchedulingPolicy,
+    ) -> AppState {
+        let db = create_test_db();
+        let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
+        let state = AppState::new(db.clone(), keypair);
+
+        let _ = crate::services::network_service::create_network(
+            &db,
+            network_id.to_string(),
+            network_id.to_string(),
+            "owner-1".to_string(),
+            test_connectivity(),
+            scheduling_policy,
+        );
+
+        for (idx, (device_id, capabilities)) in devices.iter().enumerate() {
+            register_test_device_with_capabilities(&db, device_id, network_id, capabilities.clone());
             let join_request = RingJoinRequest {
                 device_id: (*device_id).to_string(),
                 network_id: network_id.to_string(),
@@ -1248,6 +1347,8 @@ mod tests {
             InferenceSchedulingPolicy {
                 submitter_active_job_soft_cap: 1,
                 model_active_job_soft_cap_divisor: 1,
+                capacity_unit_soft_cap_divisor: 2,
+                tier_capacity_units: TierCapacityUnits::default(),
             },
         )
         .await;
@@ -1328,6 +1429,178 @@ mod tests {
         .expect("expected second assignment");
         assert_eq!(second_claim.job_id, model_x_second.job_id);
         assert_ne!(second_claim.job_id, model_y.job_id);
+    }
+
+    #[tokio::test]
+    async fn test_claim_assignment_prefers_lower_capacity_model_when_model_counts_tie() {
+        let network_id = "test-network-capacity-units";
+        let scheduling_policy = InferenceSchedulingPolicy {
+            submitter_active_job_soft_cap: 8,
+            model_active_job_soft_cap_divisor: 1,
+            capacity_unit_soft_cap_divisor: 2,
+            tier_capacity_units: TierCapacityUnits {
+                tier0: 1,
+                tier1: 2,
+                tier2: 4,
+                tier3: 8,
+                tier4: 16,
+            },
+        };
+        let state = joined_state_with_device_capabilities(
+            &[
+                (
+                    "worker-1",
+                    DeviceCapabilities {
+                        tier: Tier::Tier4,
+                        ..test_capabilities()
+                    },
+                ),
+                (
+                    "worker-2",
+                    DeviceCapabilities {
+                        tier: Tier::Tier0,
+                        cpu_cores: 2,
+                        ram_mb: 2048,
+                        ..test_capabilities()
+                    },
+                ),
+                (
+                    "worker-3",
+                    DeviceCapabilities {
+                        tier: Tier::Tier0,
+                        cpu_cores: 2,
+                        ram_mb: 2048,
+                        ..test_capabilities()
+                    },
+                ),
+            ],
+            network_id,
+            scheduling_policy,
+        )
+        .await;
+
+        let model_x_first = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "model-x".into(),
+                prompt: "x1".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let claim_x_first = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .unwrap();
+        assert_eq!(claim_x_first.job_id, model_x_first.job_id);
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(model_x_first.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let model_y_first = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                model_id: "model-y".into(),
+                prompt: "y1".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let claim_y_first = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .unwrap();
+        assert_eq!(claim_y_first.job_id, model_y_first.job_id);
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(model_y_first.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let model_x_second = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "model-x".into(),
+                prompt: "x2".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let model_y_second = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                model_id: "model-y".into(),
+                prompt: "y2".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-3".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .unwrap();
+
+        assert_eq!(claim.job_id, model_y_second.job_id);
+        assert_ne!(claim.job_id, model_x_second.job_id);
     }
 
     #[tokio::test]
