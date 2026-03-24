@@ -87,10 +87,11 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Relay reservations now have an explicit authoritative address contract through `network.advertised_addrs`, so the relay returns real reservation endpoints instead of relying on implicit swarm state.
 - ✅ NAT coverage now includes an external-process live relay runtime gate that boots the real `relay-server` binary and requires a successful live peer connection through relay reservation flow.
 - ✅ NAT coverage now includes a live multi-peer relay dialing runtime gate where multiple reserved peers connect to the same target through the real relay path.
+- ✅ NAT coverage now includes a live relay-rendezvous direct-upgrade gate that requires peers to connect through relay first and then upgrade to a direct path when a direct route is available.
 
 ### NAT Traversal Still Open
 
-- ⬜ Extend from the current host-backed, in-process live reservation coverage, external-process live relay gate, and live multi-peer relay dial gate into fuller concurrent runtime/NAT execution scenarios that verify relay-mediated direct-upgrade outcomes and harsher relay-rendezvous timing behavior.
+- ⬜ Extend from the current host-backed, in-process live reservation coverage, external-process live relay gate, live multi-peer relay dial gate, and live direct-upgrade gate into harsher concurrent runtime/NAT execution scenarios with less favorable timing and more asymmetric reachability.
 
 ### 3. Governance Third
 
@@ -226,6 +227,7 @@ After Phase 1:
 - ✅ `cargo test -p agent test_set_ring_neighbors_emits_punch_attempts_for_both_neighbors -- --nocapture`
 - ✅ `cargo test -p agent test_multiple_live_peers_attach_to_same_relay_runtime -- --nocapture`
 - ✅ `cargo test -p agent test_multiple_live_peers_connect_via_relay_runtime -- --nocapture`
+- ✅ `cargo test -p agent test_live_peers_upgrade_to_direct_after_relay_rendezvous -- --nocapture`
 - ✅ `cargo test -p relay-server --no-run`
 - ✅ `fozzy --cwd . validate tests/live_relay_runtime.fozzy.json --json`
 - ✅ `fozzy --cwd . doctor --deep --scenario tests/live_relay_runtime.fozzy.json --runs 5 --seed 1 --json`
@@ -241,6 +243,13 @@ After Phase 1:
 - ✅ `fozzy --cwd . trace verify .fozzy/multi-peer-live-relay-runtime.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/multi-peer-live-relay-runtime.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/multi-peer-live-relay-runtime.trace.fozzy --json`
+- ✅ `fozzy --cwd . validate tests/direct_upgrade_live_relay_runtime.fozzy.json --json`
+- ✅ `fozzy --cwd . doctor --deep --scenario tests/direct_upgrade_live_relay_runtime.fozzy.json --runs 5 --seed 1 --json`
+- ✅ `fozzy --cwd . test --det --strict tests/direct_upgrade_live_relay_runtime.fozzy.json --json`
+- ✅ `fozzy --cwd . run tests/direct_upgrade_live_relay_runtime.fozzy.json --det --proc-backend host --fs-backend host --http-backend host --record .fozzy/direct-upgrade-live-relay-runtime.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/direct-upgrade-live-relay-runtime.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/direct-upgrade-live-relay-runtime.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/direct-upgrade-live-relay-runtime.trace.fozzy --json`
 
 ### Still Open In Phase 1
 

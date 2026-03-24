@@ -356,6 +356,47 @@ async fn test_multiple_live_peers_connect_via_relay_runtime() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_live_peers_upgrade_to_direct_after_relay_rendezvous() {
+    let relay_runtime = start_live_relay_runtime(43113).await;
+
+    let build_agent = || {
+        MeshSwarm::builder(libp2p::identity::Keypair::generate_ed25519())
+            .with_relay_addr(relay_runtime.relay_addr.clone())
+            .build()
+            .unwrap()
+    };
+
+    let mut swarm_a = build_agent();
+    let mut swarm_b = build_agent();
+    let peer_id_a = *swarm_a.local_peer_id();
+    let peer_id_b = *swarm_b.local_peer_id();
+
+    swarm_a.listen_on_direct_addrs().unwrap();
+    swarm_b.listen_on_direct_addrs().unwrap();
+
+    swarm_a.connect_to_relay().unwrap();
+    swarm_b.connect_to_relay().unwrap();
+
+    let relay_peer_a = wait_for_peer_connected(&mut swarm_a).await;
+    let relay_peer_b = wait_for_peer_connected(&mut swarm_b).await;
+    assert_eq!(relay_peer_a, relay_peer_b);
+
+    swarm_a.listen_on_relay(relay_peer_a).unwrap();
+    swarm_b.listen_on_relay(relay_peer_b).unwrap();
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
+
+    swarm_b.dial_peer(peer_id_a).unwrap();
+
+    wait_for_relay_then_direct_upgrade(
+        &mut [(&mut swarm_a, peer_id_b), (&mut swarm_b, peer_id_a)],
+        peer_id_a,
+        peer_id_b,
+    )
+    .await;
+}
+
 async fn wait_for_peer_connected(swarm: &mut MeshSwarm) -> libp2p::PeerId {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
@@ -416,6 +457,54 @@ async fn wait_for_runtime_connections(swarms: &mut [(&mut MeshSwarm, Vec<libp2p:
     }
 
     panic!("timed out waiting for expected live peer connections: {:?}", remaining);
+}
+
+async fn wait_for_relay_then_direct_upgrade(
+    swarms: &mut [(&mut MeshSwarm, libp2p::PeerId)],
+    peer_id_a: libp2p::PeerId,
+    peer_id_b: libp2p::PeerId,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut saw_relay_connection = false;
+    let mut saw_direct_upgrade = false;
+
+    while tokio::time::Instant::now() < deadline {
+        for (swarm, target_peer) in swarms.iter_mut() {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(250), swarm.next_event()).await
+            {
+                match event {
+                    MeshEvent::PeerConnected {
+                        peer_id,
+                        connection_info,
+                    } if peer_id == *target_peer && connection_info.is_relayed() => {
+                        saw_relay_connection = true;
+                    }
+                    MeshEvent::DirectConnectionUpgraded { peer_id }
+                        if peer_id == peer_id_a || peer_id == peer_id_b =>
+                    {
+                        saw_direct_upgrade = true;
+                    }
+                    MeshEvent::PeerConnected {
+                        peer_id,
+                        connection_info,
+                    } if peer_id == *target_peer && connection_info.is_direct() => {
+                        saw_direct_upgrade = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if saw_relay_connection && saw_direct_upgrade {
+            return;
+        }
+    }
+
+    panic!(
+        "timed out waiting for relay rendezvous and direct upgrade: saw_relay_connection={}, saw_direct_upgrade={}",
+        saw_relay_connection, saw_direct_upgrade
+    );
 }
 
 struct LiveRelayRuntime {
