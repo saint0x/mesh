@@ -13,9 +13,6 @@ pub mod pki;
 pub mod resource_manager;
 pub mod telemetry;
 
-// Workaround: re-export scheduler for now (stub module)
-pub mod scheduler;
-
 pub use api::RegistrationClient;
 pub use checkpoint::{Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata};
 pub use connectivity::{

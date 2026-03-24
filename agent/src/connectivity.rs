@@ -85,8 +85,7 @@ impl NetworkConnectivity {
         let expected_kind = match self.preferred_path {
             ConnectivityPath::Direct => {
                 return Err(AgentError::Config(
-                    "preferred_path=direct is not yet supported by the production mesh runtime"
-                        .to_string(),
+                    "direct connectivity does not use a static endpoint".to_string(),
                 ));
             }
             ConnectivityPath::Relayed => ConnectivityAttachmentKind::Libp2pRelay,
