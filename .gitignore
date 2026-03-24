@@ -24,6 +24,7 @@
 .claude/
 CLAUDE.md
 PLAN.md
+.fozzy/
 
 # Temporary files
 *.tmp
