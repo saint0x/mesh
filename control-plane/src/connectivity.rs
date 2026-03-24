@@ -63,11 +63,20 @@ pub enum DirectCandidateScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectCandidateSource {
+    LocalListen,
+    ObservedExternal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectPeerCandidate {
     pub endpoint: String,
     pub transport: DirectCandidateTransport,
     pub scope: DirectCandidateScope,
+    pub source: DirectCandidateSource,
     pub priority: u32,
+    pub last_updated_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +186,11 @@ impl DirectPeerCandidate {
         if self.endpoint.trim().is_empty() {
             return Err(ApiError::BadRequest(
                 "direct candidate endpoint must not be empty".to_string(),
+            ));
+        }
+        if self.last_updated_ms == 0 {
+            return Err(ApiError::BadRequest(
+                "direct candidate last_updated_ms must be non-zero".to_string(),
             ));
         }
         Ok(())

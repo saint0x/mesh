@@ -35,8 +35,8 @@ use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
 use agent::{
-    api::types::RingTopologyResponse, build_direct_peer_candidates, format_bytes,
-    init_production_logging, init_simple_logging, load_direct_candidate_seed_addrs,
+    api::types::RingTopologyResponse, build_direct_peer_candidates_from_records, format_bytes,
+    init_production_logging, init_simple_logging, load_direct_candidate_seed_records,
     load_observed_reachability_addrs, parse_data_plane_endpoint, parse_memory_string,
     persist_runtime_connectivity_state, select_direct_dial_addrs_from_candidates,
     ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus, DeviceConfig,
@@ -507,13 +507,26 @@ fn print_direct_candidates_block(label: &str, candidates: &[agent::DirectPeerCan
     println!("   {}: {}", label, candidates.len());
     for candidate in candidates.iter().take(5) {
         println!(
-            "     - {:?}/{:?} priority={} {}",
-            candidate.scope, candidate.transport, candidate.priority, candidate.endpoint
+            "     - {:?}/{:?}/{:?} priority={} age={}s {}",
+            candidate.scope,
+            candidate.transport,
+            candidate.source,
+            candidate.priority,
+            direct_candidate_age_seconds(candidate.last_updated_ms),
+            candidate.endpoint
         );
     }
     if candidates.len() > 5 {
         println!("     - ... {} more", candidates.len() - 5);
     }
+}
+
+fn direct_candidate_age_seconds(last_updated_ms: u64) -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    now_ms.saturating_sub(last_updated_ms) / 1000
 }
 
 fn build_worker_position_from_topology(
@@ -1428,13 +1441,12 @@ async fn cmd_status() -> Result<()> {
 
             let local_listen_addrs = load_local_listen_addrs();
             let observed_addrs = load_observed_reachability_addrs().unwrap_or_default();
-            let candidate_seed_addrs =
-                load_direct_candidate_seed_addrs().unwrap_or_else(|| local_listen_addrs.clone());
+            let candidate_seed_records = load_direct_candidate_seed_records().unwrap_or_default();
             let local_peer_id = agent::device::keypair::to_libp2p_keypair(&config.keypair)
                 .public()
                 .to_peer_id();
             let direct_candidates =
-                build_direct_peer_candidates(local_peer_id, &candidate_seed_addrs);
+                build_direct_peer_candidates_from_records(local_peer_id, &candidate_seed_records);
 
             println!("\n📡 Local Reachability:");
             println!("   Listen Addresses: {}", local_listen_addrs.len());

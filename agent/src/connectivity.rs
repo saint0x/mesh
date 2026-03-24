@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -67,11 +68,27 @@ pub enum DirectCandidateScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectCandidateSource {
+    LocalListen,
+    ObservedExternal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectPeerCandidate {
     pub endpoint: String,
     pub transport: DirectCandidateTransport,
     pub scope: DirectCandidateScope,
+    pub source: DirectCandidateSource,
     pub priority: u32,
+    pub last_updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectCandidateSeed {
+    pub endpoint: String,
+    pub source: DirectCandidateSource,
+    pub last_updated_ms: u64,
 }
 
 impl NetworkConnectivity {
@@ -174,35 +191,79 @@ pub fn persist_observed_reachability_addr(address: &Multiaddr) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let mut addrs = load_json_string_vec(&path).unwrap_or_default();
+    let mut records = load_observed_reachability_records().unwrap_or_default();
     let address = address.to_string();
-    if !addrs.iter().any(|existing| existing == &address) {
-        addrs.push(address);
-        fs::write(path, serde_json::to_string_pretty(&addrs)?)?;
+    if let Some(existing) = records.iter_mut().find(|record| record.endpoint == address) {
+        existing.last_updated_ms = now_epoch_ms();
+    } else {
+        records.push(DirectCandidateSeed {
+            endpoint: address,
+            source: DirectCandidateSource::ObservedExternal,
+            last_updated_ms: now_epoch_ms(),
+        });
     }
+    fs::write(path, serde_json::to_string_pretty(&records)?)?;
     Ok(())
 }
 
-pub fn load_direct_candidate_seed_addrs() -> Option<Vec<String>> {
+pub fn load_direct_candidate_seed_records() -> Option<Vec<DirectCandidateSeed>> {
     let listen_path = meshnet_state_path("listen_addrs.json")?;
-    let observed_path = meshnet_state_path("observed_addrs.json")?;
+    let mut combined = load_json_string_vec(&listen_path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|endpoint| DirectCandidateSeed {
+            endpoint,
+            source: DirectCandidateSource::LocalListen,
+            last_updated_ms: now_epoch_ms(),
+        })
+        .collect::<Vec<_>>();
 
-    let mut combined = load_json_string_vec(&listen_path).unwrap_or_default();
-    for addr in load_json_string_vec(&observed_path).unwrap_or_default() {
-        if !combined.iter().any(|existing| existing == &addr) {
-            combined.push(addr);
+    for record in load_observed_reachability_records().unwrap_or_default() {
+        if let Some(existing) = combined
+            .iter_mut()
+            .find(|candidate| candidate.endpoint == record.endpoint)
+        {
+            if record.last_updated_ms > existing.last_updated_ms {
+                existing.last_updated_ms = record.last_updated_ms;
+            }
+            existing.source = record.source.clone();
+        } else {
+            combined.push(record);
         }
     }
 
     Some(combined)
 }
 
-pub fn load_observed_reachability_addrs() -> Option<Vec<String>> {
+pub fn load_direct_candidate_seed_addrs() -> Option<Vec<String>> {
+    Some(
+        load_direct_candidate_seed_records()?
+            .into_iter()
+            .map(|record| record.endpoint)
+            .collect(),
+    )
+}
+
+pub fn load_observed_reachability_records() -> Option<Vec<DirectCandidateSeed>> {
     let observed_path = meshnet_state_path("observed_addrs.json")?;
-    load_json_string_vec(&observed_path)
+    load_json_seed_vec(&observed_path)
+}
+
+pub fn load_observed_reachability_addrs() -> Option<Vec<String>> {
+    Some(
+        load_observed_reachability_records()?
+            .into_iter()
+            .map(|record| record.endpoint)
+            .collect(),
+    )
 }
 
 fn load_json_string_vec(path: &PathBuf) -> Option<Vec<String>> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn load_json_seed_vec(path: &PathBuf) -> Option<Vec<DirectCandidateSeed>> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
@@ -239,24 +300,50 @@ pub fn select_direct_dial_multiaddrs(peer_id: PeerId, addrs: &[Multiaddr]) -> Ve
 }
 
 pub fn build_direct_peer_candidates(peer_id: PeerId, addrs: &[String]) -> Vec<DirectPeerCandidate> {
-    let parsed = addrs
+    let seeds = addrs
         .iter()
-        .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+        .map(|endpoint| DirectCandidateSeed {
+            endpoint: endpoint.clone(),
+            source: DirectCandidateSource::LocalListen,
+            last_updated_ms: now_epoch_ms(),
+        })
+        .collect::<Vec<_>>();
+    build_direct_peer_candidates_from_records(peer_id, &seeds)
+}
+
+pub fn build_direct_peer_candidates_from_records(
+    peer_id: PeerId,
+    seeds: &[DirectCandidateSeed],
+) -> Vec<DirectPeerCandidate> {
+    let parsed = seeds
+        .iter()
+        .filter_map(|seed| {
+            seed.endpoint
+                .parse::<Multiaddr>()
+                .ok()
+                .map(|addr| (seed, addr))
+        })
         .collect::<Vec<_>>();
 
     let mut candidates = parsed
         .iter()
-        .filter_map(|addr| classify_direct_addr(addr).map(|candidate| (candidate.priority, addr)))
-        .map(|(_, addr)| {
-            let mut candidate = classify_direct_addr(addr).expect("candidate already classified");
-            candidate.endpoint = canonical_direct_addr(addr, peer_id).to_string();
-            candidate
+        .filter_map(|(seed, addr)| {
+            classify_direct_addr(addr).map(|mut candidate| {
+                candidate.endpoint = canonical_direct_addr(addr, peer_id).to_string();
+                candidate.source = seed.source.clone();
+                candidate.last_updated_ms = seed.last_updated_ms;
+                candidate
+            })
         })
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
         left.priority
             .cmp(&right.priority)
+            .then_with(|| {
+                candidate_source_rank(&left.source).cmp(&candidate_source_rank(&right.source))
+            })
+            .then_with(|| right.last_updated_ms.cmp(&left.last_updated_ms))
             .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
     candidates.dedup_by(|left, right| left.endpoint == right.endpoint);
@@ -342,8 +429,24 @@ fn classify_direct_addr(addr: &Multiaddr) -> Option<DirectPeerCandidate> {
         endpoint: addr.to_string(),
         transport,
         scope,
+        source: DirectCandidateSource::LocalListen,
         priority: (scope_rank + transport_rank) as u32,
+        last_updated_ms: now_epoch_ms(),
     })
+}
+
+fn candidate_source_rank(source: &DirectCandidateSource) -> u8 {
+    match source {
+        DirectCandidateSource::ObservedExternal => 0,
+        DirectCandidateSource::LocalListen => 1,
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,6 +543,7 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].scope, DirectCandidateScope::Dns);
         assert_eq!(candidates[0].transport, DirectCandidateTransport::Quic);
+        assert_eq!(candidates[0].source, DirectCandidateSource::LocalListen);
         assert_eq!(candidates[1].scope, DirectCandidateScope::Private);
         assert_eq!(candidates[1].transport, DirectCandidateTransport::Tcp);
     }
@@ -491,10 +595,39 @@ mod tests {
         )
         .unwrap();
 
-        let merged = load_direct_candidate_seed_addrs().unwrap();
+        let merged = load_direct_candidate_seed_records().unwrap();
         assert_eq!(merged.len(), 3);
-        assert!(merged.iter().any(|addr| addr.contains("34.120.0.10")));
+        assert!(merged
+            .iter()
+            .any(|record| record.endpoint.contains("34.120.0.10")
+                && record.source == DirectCandidateSource::ObservedExternal));
 
         std::env::remove_var("MESHNET_HOME");
+    }
+
+    #[test]
+    fn build_direct_peer_candidates_prefers_observed_external_hints() {
+        let peer_id = PeerId::random();
+        let now = now_epoch_ms();
+        let seeds = vec![
+            DirectCandidateSeed {
+                endpoint: "/ip4/34.120.0.10/tcp/4001".to_string(),
+                source: DirectCandidateSource::LocalListen,
+                last_updated_ms: now - 10_000,
+            },
+            DirectCandidateSeed {
+                endpoint: "/ip4/34.120.0.10/tcp/4001".to_string(),
+                source: DirectCandidateSource::ObservedExternal,
+                last_updated_ms: now,
+            },
+        ];
+
+        let candidates = build_direct_peer_candidates_from_records(peer_id, &seeds);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].source,
+            DirectCandidateSource::ObservedExternal
+        );
+        assert_eq!(candidates[0].last_updated_ms, now);
     }
 }

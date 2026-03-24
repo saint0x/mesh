@@ -905,9 +905,7 @@ mod tests {
                 peer_id: libp2p::PeerId::random(),
                 connection_info: ConnectionInfo {
                     connection_type: ConnectionType::Direct,
-                    remote_addr: "/ip4/34.120.0.10/tcp/4001"
-                        .parse::<Multiaddr>()
-                        .unwrap(),
+                    remote_addr: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
                     num_established: 1,
                 },
             })
@@ -940,7 +938,10 @@ mod tests {
             1
         );
         assert_eq!(
-            runner.stats.relayed_peer_connections.load(Ordering::Relaxed),
+            runner
+                .stats
+                .relayed_peer_connections
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(runner.stats.relay_fallbacks.load(Ordering::Relaxed), 1);
@@ -983,7 +984,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            runner.stats.direct_upgrade_successes.load(Ordering::Relaxed),
+            runner
+                .stats
+                .direct_upgrade_successes
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
@@ -991,7 +995,10 @@ mod tests {
             1
         );
         assert_eq!(
-            runner.stats.external_addr_candidates.load(Ordering::Relaxed),
+            runner
+                .stats
+                .external_addr_candidates
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(

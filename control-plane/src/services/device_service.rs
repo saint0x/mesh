@@ -359,7 +359,9 @@ mod tests {
                         .to_string(),
                 transport: crate::connectivity::DirectCandidateTransport::Tcp,
                 scope: crate::connectivity::DirectCandidateScope::Private,
+                source: crate::connectivity::DirectCandidateSource::LocalListen,
                 priority: 21,
+                last_updated_ms: 1_700_000_000_000,
             }],
         )
         .unwrap();

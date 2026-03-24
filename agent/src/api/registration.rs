@@ -3,11 +3,14 @@ use crate::api::types::{
     ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse, InferenceAssignment,
     RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentRequest,
 };
-use crate::connectivity::{build_direct_peer_candidates, load_direct_candidate_seed_addrs};
+use crate::connectivity::{
+    build_direct_peer_candidates_from_records, load_direct_candidate_seed_records,
+};
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
 use reqwest::Client;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -154,8 +157,18 @@ impl RegistrationClient {
             .post(&url)
             .json(&{
                 let listen_addrs = load_advertised_listen_addrs().unwrap_or_default();
-                let candidate_seed_addrs =
-                    load_direct_candidate_seed_addrs().unwrap_or_else(|| listen_addrs.clone());
+                let candidate_seed_records =
+                    load_direct_candidate_seed_records().unwrap_or_else(|| {
+                        let now_ms = current_epoch_ms();
+                        listen_addrs
+                            .iter()
+                            .map(|endpoint| crate::connectivity::DirectCandidateSeed {
+                                endpoint: endpoint.clone(),
+                                source: crate::connectivity::DirectCandidateSource::LocalListen,
+                                last_updated_ms: now_ms,
+                            })
+                            .collect()
+                    });
                 let peer_id = crate::device::keypair::to_libp2p_keypair(&config.keypair)
                     .public()
                     .to_peer_id();
@@ -163,7 +176,10 @@ impl RegistrationClient {
                 HeartbeatRequest {
                     connectivity_state: config.connectivity.current_state(),
                     listen_addrs,
-                    direct_candidates: build_direct_peer_candidates(peer_id, &candidate_seed_addrs),
+                    direct_candidates: build_direct_peer_candidates_from_records(
+                        peer_id,
+                        &candidate_seed_records,
+                    ),
                 }
             })
             .send()
@@ -328,6 +344,13 @@ impl RegistrationClient {
 
         Ok(())
     }
+}
+
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn load_advertised_listen_addrs() -> Option<Vec<String>> {

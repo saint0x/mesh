@@ -604,7 +604,9 @@ mod tests {
                     ),
                     transport: DirectCandidateTransport::Tcp,
                     scope: DirectCandidateScope::Private,
+                    source: crate::connectivity::DirectCandidateSource::LocalListen,
                     priority: 21,
+                    last_updated_ms: 1_700_000_000_000,
                 }],
             )
             .unwrap();

@@ -76,10 +76,13 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Agent status and pool-status now expose local and remote direct-candidate quality so operators can inspect current reachability and best direct endpoints without digging through raw state files.
 - ✅ Agent metrics now persist and display direct-path quality signals including direct vs relayed peer connections, relay fallback usage, direct-upgrade success/failure, and external address discovery counts.
 - ✅ Direct-path event handling now has integration-style coverage through the live job-runner metrics path for direct connections, relay fallback, direct upgrades, and external-address discovery.
+- ✅ Direct candidate publication now carries explicit source and freshness metadata so observed public reachability hints can outrank stale local-only advertisements deterministically.
+- ✅ Control-plane validation and topology persistence now treat candidate recency as part of the production reachability contract instead of an implicit local detail.
 
 ### NAT Traversal Still Open
 
-- ⬜ Extend candidate gathering beyond current local/observed addresses so hostile NAT cases can exchange richer hole-punch inputs and more durable public reachability hints.
+- ⬜ Exchange explicit punched-path coordination inputs for hostile NAT pairs instead of relying only on ranked endpoint advertisement.
+- ⬜ Add direct-upgrade quality metrics that distinguish pre-punch direct success from punched-path success once explicit punch coordination lands.
 
 ### 3. Governance Third
 
@@ -162,7 +165,7 @@ After Phase 1:
 - ✅ `ring_state.json` was removed from the active runtime/CLI path as a second source of truth.
 - ✅ The active tensor path is now single-path by construction in the production inference flow.
 - ✅ The production plan and extrapolation docs were updated to reflect shipped vs remaining work.
-- ✅ Work was pushed to `origin/codex/data-plane-phase1`.
+- ✅ Production work has been consolidated onto `main`.
 
 ### Validated
 
@@ -190,6 +193,11 @@ After Phase 1:
 - ✅ `fozzy --cwd . trace verify .fozzy/nat-candidates.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/nat-candidates.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/nat-candidates.trace.fozzy --json`
+- ✅ `cargo test -p agent build_direct_peer_candidates_prefers_observed_external_hints -- --nocapture`
+- ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --record .fozzy/reachability-hints.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/reachability-hints.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/reachability-hints.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/reachability-hints.trace.fozzy --json`
 
 ### Still Open In Phase 1
 
