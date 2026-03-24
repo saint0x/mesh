@@ -227,10 +227,7 @@ impl InferenceStats {
             "  Prompt Tokens:       {}",
             self.total_prompt_tokens.load(Ordering::Relaxed)
         );
-        println!(
-            "  Avg Tokens/sec:      {:.2}",
-            self.avg_tokens_per_second()
-        );
+        println!("  Avg Tokens/sec:      {:.2}", self.avg_tokens_per_second());
 
         println!("\n{}", "Ring Performance:".bold());
         println!(

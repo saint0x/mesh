@@ -37,10 +37,14 @@ pub async fn join_ring(
 ) -> ApiResult<Json<RingJoinResponse>> {
     // Validate request
     if req.device_id.is_empty() {
-        return Err(ApiError::BadRequest("device_id cannot be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "device_id cannot be empty".to_string(),
+        ));
     }
     if req.network_id.is_empty() {
-        return Err(ApiError::BadRequest("network_id cannot be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "network_id cannot be empty".to_string(),
+        ));
     }
 
     network_service::require_network_exists(&state.db, &req.network_id)?;
@@ -103,7 +107,9 @@ pub async fn get_topology(
 ) -> ApiResult<Json<RingTopologyResponse>> {
     // Validate request
     if query.network_id.is_empty() {
-        return Err(ApiError::BadRequest("network_id cannot be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "network_id cannot be empty".to_string(),
+        ));
     }
 
     // Check if network exists
@@ -181,7 +187,9 @@ pub async fn leave_ring(
 ) -> ApiResult<Json<RingLeaveResponse>> {
     // Validate request
     if device_id.is_empty() {
-        return Err(ApiError::BadRequest("device_id cannot be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "device_id cannot be empty".to_string(),
+        ));
     }
 
     // First, find which network this device belongs to
@@ -203,9 +211,8 @@ pub async fn leave_ring(
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
-    let network_id = network_id.ok_or_else(|| {
-        ApiError::NotFound(format!("Device {} not found", device_id))
-    })?;
+    let network_id =
+        network_id.ok_or_else(|| ApiError::NotFound(format!("Device {} not found", device_id)))?;
 
     // Get ring manager for this network
     let ring_manager = state.get_ring_manager(&network_id)?;
@@ -315,7 +322,12 @@ pub async fn update_handoff(
         "completed" => HandoffStatus::Completed,
         "failed" => HandoffStatus::Failed,
         "cancelled" => HandoffStatus::Cancelled,
-        _ => return Err(ApiError::BadRequest(format!("Invalid status: {}", req.status))),
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid status: {}",
+                req.status
+            )))
+        }
     };
 
     // Update handoff with bytes if provided
@@ -326,9 +338,12 @@ pub async fn update_handoff(
         }
     }
 
-    state
-        .topology_notifier
-        .update_handoff_status(&handoff_id, status, req.bytes_transferred, req.error)?;
+    state.topology_notifier.update_handoff_status(
+        &handoff_id,
+        status,
+        req.bytes_transferred,
+        req.error,
+    )?;
 
     // Return updated handoff
     get_handoff(State(state), Path(handoff_id)).await
@@ -521,11 +536,7 @@ mod tests {
             contributed_memory: 8_000_000_000,
         };
 
-        let result = join_ring(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let result = join_ring(axum::extract::State(state), axum::Json(request)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
@@ -547,11 +558,7 @@ mod tests {
             contributed_memory: 8_000_000_000,
         };
 
-        let result = join_ring(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let result = join_ring(axum::extract::State(state), axum::Json(request)).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));

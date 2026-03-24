@@ -4,9 +4,9 @@
 //! The KV cache stores computed key and value tensors from previous positions,
 //! allowing efficient autoregressive generation without recomputing past states.
 
+use super::tensor_ops::Tensor2D;
 use crate::errors::{AgentError, Result};
 use serde::{Deserialize, Serialize};
-use super::tensor_ops::Tensor2D;
 
 /// Configuration for KV cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,8 @@ impl LayerKVCache {
             (Some(existing_keys), Some(existing_values)) => {
                 // Concatenate with existing cache
                 let new_k_data = [existing_keys.data.as_slice(), new_keys.data.as_slice()].concat();
-                let new_v_data = [existing_values.data.as_slice(), new_values.data.as_slice()].concat();
+                let new_v_data =
+                    [existing_values.data.as_slice(), new_values.data.as_slice()].concat();
 
                 let new_rows = existing_keys.rows + new_keys.rows;
 
@@ -155,9 +156,7 @@ pub struct KVCache {
 impl KVCache {
     /// Create a new KV cache
     pub fn new(config: KVCacheConfig) -> Self {
-        let layers = (0..config.num_layers)
-            .map(LayerKVCache::new)
-            .collect();
+        let layers = (0..config.num_layers).map(LayerKVCache::new).collect();
 
         Self { layers, config }
     }
@@ -184,9 +183,10 @@ impl KVCache {
         keys: Tensor2D,
         values: Tensor2D,
     ) -> Result<()> {
-        let layer = self.layers.get_mut(layer_idx).ok_or_else(|| {
-            AgentError::Execution(format!("Invalid layer index: {}", layer_idx))
-        })?;
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
         layer.update(keys, values)
     }
 

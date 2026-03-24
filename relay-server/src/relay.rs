@@ -69,7 +69,7 @@ pub async fn build_swarm(config: &Config) -> Result<Swarm<RelayBehaviour>> {
                     max_circuits: config.relay.max_circuits_per_peer,
                     max_circuits_per_peer: config.relay.max_circuits_per_peer,
                     max_circuit_duration: Duration::from_secs(
-                        config.relay.max_circuit_duration_secs
+                        config.relay.max_circuit_duration_secs,
                     ),
                     max_circuit_bytes: config.relay.max_circuit_bytes,
                     ..Default::default()
@@ -79,9 +79,7 @@ pub async fn build_swarm(config: &Config) -> Result<Swarm<RelayBehaviour>> {
             Ok(RelayBehaviour { identify, relay })
         })
         .map_err(|e| RelayError::Transport(format!("Failed to build behaviour: {:?}", e)))?
-        .with_swarm_config(|c| {
-            c.with_idle_connection_timeout(Duration::from_secs(60))
-        })
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
     tracing::info!(
@@ -134,7 +132,8 @@ fn load_or_generate_keypair() -> Result<libp2p::identity::Keypair> {
         }
 
         // Save keypair to file
-        let bytes = keypair.to_protobuf_encoding()
+        let bytes = keypair
+            .to_protobuf_encoding()
             .map_err(|e| RelayError::Config(format!("Failed to encode keypair: {:?}", e)))?;
 
         std::fs::write(&keypair_path, bytes).map_err(|e| {
@@ -193,7 +192,10 @@ mod tests {
         let keypair2 = load_or_generate_keypair().unwrap();
         let peer_id2 = keypair2.public().to_peer_id();
 
-        assert_eq!(peer_id1, peer_id2, "PeerID should be consistent across loads");
+        assert_eq!(
+            peer_id1, peer_id2,
+            "PeerID should be consistent across loads"
+        );
 
         // Clean up after test
         let _ = std::fs::remove_file(&keypair_path);

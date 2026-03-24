@@ -101,7 +101,10 @@ pub fn list_networks(db: &Database) -> ApiResult<Vec<NetworkInfo>> {
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
-pub fn load_network_connectivity(db: &Database, network_id: &str) -> ApiResult<NetworkConnectivity> {
+pub fn load_network_connectivity(
+    db: &Database,
+    network_id: &str,
+) -> ApiResult<NetworkConnectivity> {
     let conn = db.get_conn()?;
     let settings_json: Option<String> = conn
         .query_row(
@@ -112,9 +115,8 @@ pub fn load_network_connectivity(db: &Database, network_id: &str) -> ApiResult<N
         .optional()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    let settings_json = settings_json.ok_or_else(|| {
-        ApiError::NotFound(format!("Network {} not found", network_id))
-    })?;
+    let settings_json = settings_json
+        .ok_or_else(|| ApiError::NotFound(format!("Network {} not found", network_id)))?;
     let settings: NetworkSettings = serde_json::from_str(&settings_json)
         .map_err(|e| ApiError::Internal(format!("Failed to parse network settings: {}", e)))?;
     settings.validate()?;
@@ -178,7 +180,10 @@ mod tests {
         let networks = list_networks(&db).unwrap();
         assert_eq!(networks.len(), 1);
         assert_eq!(networks[0].name, "Test Network");
-        assert_eq!(networks[0].connectivity.preferred_path, ConnectivityPath::Relayed);
+        assert_eq!(
+            networks[0].connectivity.preferred_path,
+            ConnectivityPath::Relayed
+        );
     }
 
     #[test]

@@ -99,11 +99,7 @@ pub struct ShardAssignment {
 
 impl ShardAssignment {
     /// Create a new shard assignment
-    pub fn new(
-        model_id: String,
-        worker_position: u32,
-        total_workers: u32,
-    ) -> Self {
+    pub fn new(model_id: String, worker_position: u32, total_workers: u32) -> Self {
         // Calculate column range for this worker
         let cols_per_worker = TOTAL_COLUMNS / total_workers;
         let column_start = worker_position * cols_per_worker;

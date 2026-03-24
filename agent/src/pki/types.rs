@@ -237,7 +237,10 @@ pub struct PoolMembershipCert {
     /// Expiration timestamp (Unix seconds)
     pub expires_at: u64,
     /// Signature by pool root keypair (hex encoded for serde)
-    #[serde(serialize_with = "hex_64_serialize", deserialize_with = "hex_64_deserialize")]
+    #[serde(
+        serialize_with = "hex_64_serialize",
+        deserialize_with = "hex_64_deserialize"
+    )]
     pub signature: [u8; 64],
 }
 
@@ -256,7 +259,10 @@ where
     let s = String::deserialize(deserializer)?;
     let bytes = hex::decode(&s).map_err(D::Error::custom)?;
     if bytes.len() != 64 {
-        return Err(D::Error::custom(format!("expected 64 bytes, got {}", bytes.len())));
+        return Err(D::Error::custom(format!(
+            "expected 64 bytes, got {}",
+            bytes.len()
+        )));
     }
     let mut array = [0u8; 64];
     array.copy_from_slice(&bytes);
@@ -368,7 +374,10 @@ pub struct CertSigningRequest {
     /// Request timestamp (Unix seconds)
     pub timestamp: u64,
     /// Self-signature to prove key ownership (hex encoded for serde)
-    #[serde(serialize_with = "hex_64_serialize", deserialize_with = "hex_64_deserialize")]
+    #[serde(
+        serialize_with = "hex_64_serialize",
+        deserialize_with = "hex_64_deserialize"
+    )]
     pub signature: [u8; 64],
 }
 

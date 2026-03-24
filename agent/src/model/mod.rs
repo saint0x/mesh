@@ -24,8 +24,8 @@
 //! when we integrate with safetensors/GGML. This provides the metadata
 //! and coordination layer.
 
-pub mod shard;
 pub mod registry;
+pub mod shard;
 
-pub use shard::{ShardInfo, ShardAssignment, ModelInfo};
 pub use registry::{ShardRegistry, ShardStatus};
+pub use shard::{ModelInfo, ShardAssignment, ShardInfo};

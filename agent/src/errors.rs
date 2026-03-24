@@ -187,11 +187,20 @@ pub mod display {
             }
             AgentError::Resource(_) => {
                 eprintln!("{}", "  → Check system memory availability".yellow());
-                eprintln!("{}", "  → Ensure sufficient privileges for memory locking".yellow());
+                eprintln!(
+                    "{}",
+                    "  → Ensure sufficient privileges for memory locking".yellow()
+                );
             }
             AgentError::CooldownActive { remaining_hours } => {
-                eprintln!("{}", format!("  → Unlock will be available in {} hours", remaining_hours).yellow());
-                eprintln!("{}", "  → Use 'mesh resource-status' to check lock status".yellow());
+                eprintln!(
+                    "{}",
+                    format!("  → Unlock will be available in {} hours", remaining_hours).yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "  → Use 'mesh resource-status' to check lock status".yellow()
+                );
             }
             _ => {}
         }

@@ -142,7 +142,11 @@ impl ShardLoader for ArtifactShardLoader {
         registry: &ShardRegistry,
     ) -> Result<ModelWeights> {
         registry
-            .update_status(model_id, crate::model::registry::ShardStatus::Downloading, None)
+            .update_status(
+                model_id,
+                crate::model::registry::ShardStatus::Downloading,
+                None,
+            )
             .await?;
 
         let manifest = self.load_manifest(assignment)?;
@@ -151,7 +155,11 @@ impl ShardLoader for ArtifactShardLoader {
         let weights_path = self.weights_path(assignment);
         let bytes = self.read_and_verify_weights(assignment, &manifest)?;
         registry
-            .mark_downloaded(model_id, weights_path.clone(), manifest.expected_sha256.clone())
+            .mark_downloaded(
+                model_id,
+                weights_path.clone(),
+                manifest.expected_sha256.clone(),
+            )
             .await?;
 
         let weights: ModelWeights = ciborium::from_reader(bytes.as_slice()).map_err(|e| {
@@ -183,17 +191,17 @@ impl ShardLoader for ArtifactShardLoader {
 
     fn estimate_memory(&self, assignment: &ShardAssignment) -> u64 {
         let artifact_path = self.weights_path(assignment);
-        fs::metadata(artifact_path).map(|meta| meta.len()).unwrap_or(0)
+        fs::metadata(artifact_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0)
     }
 }
 
 pub fn artifact_exists(base_dir: &Path, assignment: &ShardAssignment) -> bool {
-    let path = base_dir
-        .join(&assignment.model_id)
-        .join(format!(
-            "shard-{}-of-{}.cbor",
-            assignment.worker_position, assignment.total_workers
-        ));
+    let path = base_dir.join(&assignment.model_id).join(format!(
+        "shard-{}-of-{}.cbor",
+        assignment.worker_position, assignment.total_workers
+    ));
     debug!(artifact = %path.display(), exists = path.exists(), "Checked shard artifact");
     path.exists()
 }

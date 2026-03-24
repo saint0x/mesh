@@ -1,8 +1,7 @@
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
-    identify, noise,
-    relay,
+    identify, noise, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, SwarmBuilder,
 };
@@ -106,11 +105,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                tracing::info!(
-                    "Connected to peer: {} (endpoint: {:?})",
-                    peer_id,
-                    endpoint
-                );
+                tracing::info!("Connected to peer: {} (endpoint: {:?})", peer_id, endpoint);
 
                 // After connecting to relay, make a reservation
                 if !reservation_made {

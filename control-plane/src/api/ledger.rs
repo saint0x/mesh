@@ -1,11 +1,8 @@
-use axum::{
-    extract::State,
-    Json,
-};
+use crate::api::error::ApiError;
+use crate::state::AppState;
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::state::AppState;
-use crate::api::error::ApiError;
 
 /// Request to create a ledger event
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -47,11 +44,13 @@ pub async fn create_ledger_event(
         let db = state.db.clone();
         let event = event.clone();
         move || -> Result<i64, ApiError> {
-            let conn = db.get_conn()
+            let conn = db
+                .get_conn()
                 .map_err(|e| ApiError::Internal(format!("Failed to get connection: {}", e)))?;
 
-            let event_id: i64 = conn.query_row(
-                "INSERT INTO ledger_events (
+            let event_id: i64 = conn
+                .query_row(
+                    "INSERT INTO ledger_events (
                     network_id,
                     event_type,
                     job_id,
@@ -61,17 +60,17 @@ pub async fn create_ledger_event(
                     created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
                 RETURNING id",
-                rusqlite::params![
-                    event.network_id,
-                    event.event_type,
-                    event.job_id.map(|id: Uuid| id.to_string()),
-                    event.device_id.to_string(),
-                    event.credits_amount,
-                    event.metadata.to_string(),
-                ],
-                |row: &rusqlite::Row| row.get(0),
-            )
-            .map_err(|e| ApiError::Internal(format!("Failed to insert ledger event: {}", e)))?;
+                    rusqlite::params![
+                        event.network_id,
+                        event.event_type,
+                        event.job_id.map(|id: Uuid| id.to_string()),
+                        event.device_id.to_string(),
+                        event.credits_amount,
+                        event.metadata.to_string(),
+                    ],
+                    |row: &rusqlite::Row| row.get(0),
+                )
+                .map_err(|e| ApiError::Internal(format!("Failed to insert ledger event: {}", e)))?;
 
             Ok(event_id)
         }

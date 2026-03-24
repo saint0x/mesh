@@ -1,8 +1,7 @@
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
-    ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse,
-    InferenceAssignment, RegisterDeviceRequest, RegisterDeviceResponse,
-    ReportInferenceAssignmentRequest,
+    ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse, InferenceAssignment,
+    RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentRequest,
 };
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
@@ -94,7 +93,10 @@ impl RegistrationClient {
     }
 
     /// Try to register once (no retries)
-    async fn try_register(&self, request: &RegisterDeviceRequest) -> Result<RegisterDeviceResponse> {
+    async fn try_register(
+        &self,
+        request: &RegisterDeviceRequest,
+    ) -> Result<RegisterDeviceResponse> {
         let url = format!("{}/api/devices/register", self.control_plane_url);
 
         let response = self
@@ -242,10 +244,9 @@ impl RegistrationClient {
             )));
         }
 
-        let body: ClaimInferenceAssignmentResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::Serialization(format!("Failed to parse assignment claim: {}", e)))?;
+        let body: ClaimInferenceAssignmentResponse = response.json().await.map_err(|e| {
+            AgentError::Serialization(format!("Failed to parse assignment claim: {}", e))
+        })?;
 
         Ok(body.assignment)
     }
@@ -255,7 +256,10 @@ impl RegistrationClient {
         job_id: Uuid,
         device_id: Uuid,
     ) -> Result<()> {
-        let url = format!("{}/api/inference/jobs/{}/ack", self.control_plane_url, job_id);
+        let url = format!(
+            "{}/api/inference/jobs/{}/ack",
+            self.control_plane_url, job_id
+        );
         let response = self
             .client
             .post(&url)
@@ -286,7 +290,10 @@ impl RegistrationClient {
         job_id: Uuid,
         request: ReportInferenceAssignmentRequest,
     ) -> Result<()> {
-        let url = format!("{}/api/inference/jobs/{}/result", self.control_plane_url, job_id);
+        let url = format!(
+            "{}/api/inference/jobs/{}/result",
+            self.control_plane_url, job_id
+        );
         let response = self
             .client
             .post(&url)
@@ -312,9 +319,7 @@ impl RegistrationClient {
 }
 
 fn load_advertised_listen_addrs() -> Option<Vec<String>> {
-    let path = dirs::home_dir()?
-        .join(".meshnet")
-        .join("listen_addrs.json");
+    let path = dirs::home_dir()?.join(".meshnet").join("listen_addrs.json");
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }

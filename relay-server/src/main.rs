@@ -63,8 +63,14 @@ async fn main() -> Result<()> {
         let config = Config::default();
         config.save(config_path)?;
 
-        println!("First run detected - created default configuration at: {}", config_path.display());
-        println!("Edit {} to customize relay settings\n", config_path.display());
+        println!(
+            "First run detected - created default configuration at: {}",
+            config_path.display()
+        );
+        println!(
+            "Edit {} to customize relay settings\n",
+            config_path.display()
+        );
 
         config
     };
@@ -108,14 +114,21 @@ async fn main() -> Result<()> {
     let mut swarm = relay::build_swarm(&config).await?;
 
     // Parse listen addresses
-    let tcp_addr: libp2p::Multiaddr = config.network.tcp_listen_addr.parse()
+    let tcp_addr: libp2p::Multiaddr = config
+        .network
+        .tcp_listen_addr
+        .parse()
         .map_err(|e| errors::RelayError::Config(format!("Invalid TCP address: {}", e)))?;
 
-    let quic_addr: libp2p::Multiaddr = config.network.quic_listen_addr.parse()
+    let quic_addr: libp2p::Multiaddr = config
+        .network
+        .quic_listen_addr
+        .parse()
         .map_err(|e| errors::RelayError::Config(format!("Invalid QUIC address: {}", e)))?;
 
     // Start listening
-    swarm.listen_on(tcp_addr)
+    swarm
+        .listen_on(tcp_addr)
         .map_err(|e| errors::RelayError::Transport(format!("Failed to listen on TCP: {}", e)))?;
 
     // QUIC is optional - warn if it fails but don't exit
@@ -152,8 +165,7 @@ async fn main() -> Result<()> {
 fn setup_logging(config: &Config, log_level_override: Option<&str>) -> Result<()> {
     let log_level = log_level_override.unwrap_or(&config.logging.level);
 
-    let env_filter = EnvFilter::try_new(log_level)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
     if config.logging.log_format == "json" {
         tracing_subscriber::registry()

@@ -191,11 +191,7 @@ impl ShardRegistry {
     }
 
     /// Update shard download progress
-    pub async fn update_download_progress(
-        &self,
-        model_id: &str,
-        progress: f32,
-    ) -> Result<()> {
+    pub async fn update_download_progress(&self, model_id: &str, progress: f32) -> Result<()> {
         let mut shards = self.shards.write().await;
 
         if let Some(entry) = shards.get_mut(model_id) {
@@ -209,12 +205,7 @@ impl ShardRegistry {
     }
 
     /// Mark shard as downloaded
-    pub async fn mark_downloaded(
-        &self,
-        model_id: &str,
-        path: PathBuf,
-        hash: String,
-    ) -> Result<()> {
+    pub async fn mark_downloaded(&self, model_id: &str, path: PathBuf, hash: String) -> Result<()> {
         let mut shards = self.shards.write().await;
 
         if let Some(entry) = shards.get_mut(model_id) {
@@ -360,30 +351,45 @@ mod tests {
         // Assign
         let assignment = ShardAssignment::new("model".to_string(), 0, 10);
         registry.assign_shard(assignment).await.unwrap();
-        assert_eq!(registry.get_shard_status("model").await, Some(ShardStatus::Pending));
+        assert_eq!(
+            registry.get_shard_status("model").await,
+            Some(ShardStatus::Pending)
+        );
 
         // Download
         registry
             .update_status("model", ShardStatus::Downloading, None)
             .await
             .unwrap();
-        assert_eq!(registry.get_shard_status("model").await, Some(ShardStatus::Downloading));
+        assert_eq!(
+            registry.get_shard_status("model").await,
+            Some(ShardStatus::Downloading)
+        );
 
         // Mark downloaded
         registry
             .mark_downloaded("model", PathBuf::from("/tmp/shard"), "hash123".to_string())
             .await
             .unwrap();
-        assert_eq!(registry.get_shard_status("model").await, Some(ShardStatus::Downloaded));
+        assert_eq!(
+            registry.get_shard_status("model").await,
+            Some(ShardStatus::Downloaded)
+        );
 
         // Load
         registry.mark_loaded("model", 7_000_000_000).await.unwrap();
-        assert_eq!(registry.get_shard_status("model").await, Some(ShardStatus::Ready));
+        assert_eq!(
+            registry.get_shard_status("model").await,
+            Some(ShardStatus::Ready)
+        );
         assert!(registry.is_ready("model").await);
 
         // Unload
         registry.mark_unloaded("model").await.unwrap();
-        assert_eq!(registry.get_shard_status("model").await, Some(ShardStatus::Downloaded));
+        assert_eq!(
+            registry.get_shard_status("model").await,
+            Some(ShardStatus::Downloaded)
+        );
         assert!(!registry.is_ready("model").await);
     }
 

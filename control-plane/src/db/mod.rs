@@ -53,21 +53,18 @@ impl Database {
         };
 
         // Create connection manager
-        let manager = SqliteConnectionManager::file(connection_string)
-            .with_init(move |conn| {
-                // Enable foreign keys
-                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-                // Enable WAL mode for better concurrency (not applicable to :memory:)
-                if !is_memory {
-                    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-                }
-                Ok(())
-            });
+        let manager = SqliteConnectionManager::file(connection_string).with_init(move |conn| {
+            // Enable foreign keys
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            // Enable WAL mode for better concurrency (not applicable to :memory:)
+            if !is_memory {
+                conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+            }
+            Ok(())
+        });
 
         // Create connection pool
-        let pool = Pool::builder()
-            .max_size(10)
-            .build(manager)?;
+        let pool = Pool::builder().max_size(10).build(manager)?;
 
         tracing::info!("Database connected successfully");
 
@@ -82,8 +79,7 @@ impl Database {
 
         // Read migration files and execute
         // Use CARGO_MANIFEST_DIR to find migrations relative to crate root
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .unwrap_or_else(|_| ".".to_string());
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let migrations_dir = std::path::Path::new(&manifest_dir).join("migrations");
 
         if !migrations_dir.exists() {
@@ -97,9 +93,7 @@ impl Database {
         let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)
             .map_err(|e| DbError::Config(format!("Failed to read migrations directory: {}", e)))?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.path().extension().and_then(|s| s.to_str()) == Some("sql")
-            })
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
             .collect();
 
         // Sort by filename (assumes numeric prefix like 001_, 002_, etc.)

@@ -66,8 +66,10 @@ pub fn register_device(
     // Serialize capabilities to JSON
     let capabilities_json = serde_json::to_string(&capabilities)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize capabilities: {}", e)))?;
-    let connectivity_state_json = serde_json::to_string(&initial_connectivity_state)
-        .map_err(|e| ApiError::Internal(format!("Failed to serialize connectivity state: {}", e)))?;
+    let connectivity_state_json =
+        serde_json::to_string(&initial_connectivity_state).map_err(|e| {
+            ApiError::Internal(format!("Failed to serialize connectivity state: {}", e))
+        })?;
 
     // Insert device into database
     let now = OffsetDateTime::now_utc();
@@ -125,8 +127,9 @@ pub fn update_heartbeat(
         ));
     }
 
-    let connectivity_state_json = serde_json::to_string(&connectivity_state)
-        .map_err(|e| ApiError::Internal(format!("Failed to serialize connectivity state: {}", e)))?;
+    let connectivity_state_json = serde_json::to_string(&connectivity_state).map_err(|e| {
+        ApiError::Internal(format!("Failed to serialize connectivity state: {}", e))
+    })?;
     let listen_addrs_json = serde_json::to_string(&listen_addrs)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize listen addresses: {}", e)))?;
 
@@ -145,7 +148,12 @@ pub fn update_heartbeat(
         SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?
         WHERE device_id = ?
         "#,
-            params![&now_str, &connectivity_state_json, &listen_addrs_json, &device_id],
+            params![
+                &now_str,
+                &connectivity_state_json,
+                &listen_addrs_json,
+                &device_id
+            ],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -328,7 +336,10 @@ mod tests {
             &db,
             device_id.to_string(),
             test_connectivity_state(),
-            vec!["/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6testpeer44444444444444444444444444444444".to_string()],
+            vec![
+                "/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6testpeer44444444444444444444444444444444"
+                    .to_string(),
+            ],
         )
         .unwrap();
 

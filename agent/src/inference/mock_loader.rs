@@ -198,7 +198,11 @@ impl MockShardLoader {
     ) -> Result<()> {
         // Mark as Downloading
         registry
-            .update_status(model_id, crate::model::registry::ShardStatus::Downloading, None)
+            .update_status(
+                model_id,
+                crate::model::registry::ShardStatus::Downloading,
+                None,
+            )
             .await?;
 
         // Calculate shard size based on column range
@@ -266,9 +270,9 @@ impl MockShardLoader {
     ) -> Result<()> {
         // Check cache
         let mut cache = self.cache.write().await;
-        let cached = cache.get_mut(model_id).ok_or_else(|| {
-            AgentError::Config(format!("Shard not downloaded: {}", model_id))
-        })?;
+        let cached = cache
+            .get_mut(model_id)
+            .ok_or_else(|| AgentError::Config(format!("Shard not downloaded: {}", model_id)))?;
 
         if cached.is_loaded {
             // Already loaded, return early
@@ -575,7 +579,10 @@ mod tests {
         let mem2 = loader.estimate_memory(&assignment2);
 
         // More columns should use more memory
-        assert!(mem2 > mem1, "Fewer workers (more columns) should use more memory");
+        assert!(
+            mem2 > mem1,
+            "Fewer workers (more columns) should use more memory"
+        );
 
         // Memory should be reasonable (not 0, not absurdly large)
         assert!(mem1 > 1_000_000, "Memory should be > 1MB");
@@ -738,11 +745,17 @@ mod tests {
         let duration = start.elapsed();
 
         println!("Production-scale load completed in {:?}", duration);
-        println!("Weights memory usage: {} MB", weights.memory_usage() / 1_000_000);
+        println!(
+            "Weights memory usage: {} MB",
+            weights.memory_usage() / 1_000_000
+        );
 
         // Verify structure is correct
         assert_eq!(weights.layers.len(), 80, "Should have 80 layers");
-        assert_eq!(weights.config.hidden_dim, 8192, "Should have 8192 hidden dim");
+        assert_eq!(
+            weights.config.hidden_dim, 8192,
+            "Should have 8192 hidden dim"
+        );
         assert_eq!(weights.config.vocab_size, 32000, "Should have 32k vocab");
 
         // Verify cache works

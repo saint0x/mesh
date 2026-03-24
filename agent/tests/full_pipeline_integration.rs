@@ -21,7 +21,7 @@ fn test_config() -> ModelConfig {
         hidden_dim: 128,
         num_heads: 4,
         num_kv_heads: 4,
-        num_layers: 2,  // Small for fast tests
+        num_layers: 2, // Small for fast tests
         vocab_size: 1000,
         intermediate_size: 512,
         rms_norm_eps: 1e-5,
@@ -70,10 +70,19 @@ async fn test_mock_weights_compatible_with_forward_pass() {
 
     // Xavier weights should have mean ~0 and some variance
     let mean: f32 = values.iter().sum::<f32>() / values.len() as f32;
-    let variance: f32 = values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32;
+    let variance: f32 =
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32;
 
-    assert!(mean.abs() < 0.1, "Xavier weights should have mean near 0, got {}", mean);
-    assert!(variance > 0.001, "Xavier weights should have non-zero variance, got {}", variance);
+    assert!(
+        mean.abs() < 0.1,
+        "Xavier weights should have mean near 0, got {}",
+        mean
+    );
+    assert!(
+        variance > 0.001,
+        "Xavier weights should have non-zero variance, got {}",
+        variance
+    );
 
     println!("✅ MockShardLoader weights are compatible with ForwardPass");
     println!("   Mean: {:.6}, Variance: {:.6}", mean, variance);
@@ -100,15 +109,15 @@ async fn test_simulated_distributed_inference() {
         let registry = ShardRegistry::new(temp_dir.path().to_path_buf()).unwrap();
         let assignment = ShardAssignment::new(model_id.to_string(), worker_pos, NUM_WORKERS);
         let loader = MockShardLoader::new(SEED, config.clone(), false);
-        let weights = loader.load_shard(model_id, &assignment, &registry).await.unwrap();
+        let weights = loader
+            .load_shard(model_id, &assignment, &registry)
+            .await
+            .unwrap();
         all_weights.push((assignment, weights));
     }
 
     // Verify all workers have correct column ranges
-    let total_cols: u32 = all_weights
-        .iter()
-        .map(|(a, _)| a.num_columns())
-        .sum();
+    let total_cols: u32 = all_weights.iter().map(|(a, _)| a.num_columns()).sum();
     assert_eq!(total_cols, 8192, "Workers should cover all 8192 columns");
 
     // Verify no overlaps
@@ -146,28 +155,31 @@ async fn test_deterministic_weight_generation() {
     let registry1 = ShardRegistry::new(temp_dir1.path().to_path_buf()).unwrap();
     let assignment1 = ShardAssignment::new(model_id.to_string(), 0, 5);
     let loader1 = MockShardLoader::new(SEED, config.clone(), false);
-    let weights1 = loader1.load_shard(model_id, &assignment1, &registry1).await.unwrap();
+    let weights1 = loader1
+        .load_shard(model_id, &assignment1, &registry1)
+        .await
+        .unwrap();
 
     let temp_dir2 = TempDir::new().unwrap();
     let registry2 = ShardRegistry::new(temp_dir2.path().to_path_buf()).unwrap();
     let assignment2 = ShardAssignment::new(model_id.to_string(), 0, 5);
     let loader2 = MockShardLoader::new(SEED, config.clone(), false);
-    let weights2 = loader2.load_shard(model_id, &assignment2, &registry2).await.unwrap();
+    let weights2 = loader2
+        .load_shard(model_id, &assignment2, &registry2)
+        .await
+        .unwrap();
 
     // Weights should be EXACTLY identical
     assert_eq!(
-        weights1.embedding.data,
-        weights2.embedding.data,
+        weights1.embedding.data, weights2.embedding.data,
         "Embedding weights must be deterministic"
     );
     assert_eq!(
-        weights1.layers[0].w_q.data,
-        weights2.layers[0].w_q.data,
+        weights1.layers[0].w_q.data, weights2.layers[0].w_q.data,
         "Layer weights must be deterministic"
     );
     assert_eq!(
-        weights1.lm_head.data,
-        weights2.lm_head.data,
+        weights1.lm_head.data, weights2.lm_head.data,
         "LM head weights must be deterministic"
     );
 
@@ -190,7 +202,10 @@ async fn test_weight_shapes_for_tensor_parallel() {
         let registry = ShardRegistry::new(temp_dir.path().to_path_buf()).unwrap();
         let assignment = ShardAssignment::new(model_id.to_string(), worker_pos, NUM_WORKERS);
         let loader = MockShardLoader::new(SEED, config.clone(), false);
-        let weights = loader.load_shard(model_id, &assignment, &registry).await.unwrap();
+        let weights = loader
+            .load_shard(model_id, &assignment, &registry)
+            .await
+            .unwrap();
 
         let shard_cols = assignment.num_columns() as usize;
 
@@ -233,7 +248,10 @@ async fn test_weight_shapes_for_tensor_parallel() {
     }
 
     println!("✅ Weight shapes verified for tensor-parallel computation");
-    println!("   All {} workers have correct matrix dimensions", NUM_WORKERS);
+    println!(
+        "   All {} workers have correct matrix dimensions",
+        NUM_WORKERS
+    );
 }
 
 /// Test 5: Memory usage is reasonable
@@ -247,14 +265,25 @@ async fn test_memory_usage_reasonable() {
     let registry = ShardRegistry::new(temp_dir.path().to_path_buf()).unwrap();
     let assignment = ShardAssignment::new(model_id.to_string(), 0, 10);
     let loader = MockShardLoader::new(SEED, config.clone(), false);
-    let weights = loader.load_shard(model_id, &assignment, &registry).await.unwrap();
+    let weights = loader
+        .load_shard(model_id, &assignment, &registry)
+        .await
+        .unwrap();
 
     let memory_bytes = weights.memory_usage();
     let memory_mb = memory_bytes as f64 / 1_000_000.0;
 
     // Should be reasonable for test config (128 hidden, 2 layers, 1000 vocab)
-    assert!(memory_mb > 0.1, "Memory usage too small: {:.2} MB", memory_mb);
-    assert!(memory_mb < 100.0, "Memory usage too large: {:.2} MB", memory_mb);
+    assert!(
+        memory_mb > 0.1,
+        "Memory usage too small: {:.2} MB",
+        memory_mb
+    );
+    assert!(
+        memory_mb < 100.0,
+        "Memory usage too large: {:.2} MB",
+        memory_mb
+    );
 
     println!("✅ Memory usage is reasonable: {:.2} MB", memory_mb);
 }

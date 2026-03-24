@@ -1,0 +1,1364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MeshNet - 3D Network Visualization</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0f1a;
+            color: #e0e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            overflow: hidden;
+        }
+
+        #canvas-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Header */
+        #header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            padding: 20px 24px;
+            background: linear-gradient(180deg, rgba(10, 15, 26, 0.95) 0%, transparent 100%);
+            z-index: 100;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            pointer-events: none;
+        }
+
+        #header > * { pointer-events: auto; }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo-icon {
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: #fff;
+            font-size: 16px;
+        }
+
+        .logo h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #f0f9ff;
+        }
+
+        .logo span {
+            font-size: 11px;
+            color: #64748b;
+            display: block;
+            margin-top: 2px;
+        }
+
+        /* View Controls */
+        #view-controls {
+            display: flex;
+            gap: 6px;
+            background: rgba(15, 23, 42, 0.9);
+            padding: 6px;
+            border-radius: 10px;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        .view-btn {
+            padding: 8px 14px;
+            background: transparent;
+            border: none;
+            color: #64748b;
+            font-size: 12px;
+            font-weight: 500;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .view-btn:hover {
+            color: #94a3b8;
+            background: rgba(99, 102, 241, 0.1);
+        }
+
+        .view-btn.active {
+            background: rgba(99, 102, 241, 0.2);
+            color: #a5b4fc;
+        }
+
+        /* Info Panel */
+        #info-panel {
+            position: fixed;
+            top: 80px;
+            right: 24px;
+            width: 280px;
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 12px;
+            padding: 18px;
+            backdrop-filter: blur(20px);
+            z-index: 100;
+        }
+
+        #info-panel h2 {
+            font-size: 13px;
+            color: #f0f9ff;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        #info-panel p {
+            font-size: 12px;
+            line-height: 1.6;
+            color: #94a3b8;
+            margin-bottom: 14px;
+        }
+
+        .stats-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .stat {
+            flex: 1;
+            background: rgba(99, 102, 241, 0.1);
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+        }
+
+        .stat .num {
+            font-size: 18px;
+            font-weight: 600;
+            color: #818cf8;
+        }
+
+        .stat .lbl {
+            font-size: 9px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 2px;
+        }
+
+        /* Legend */
+        #legend {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 10px;
+            padding: 14px 18px;
+            backdrop-filter: blur(20px);
+            z-index: 100;
+        }
+
+        #legend h3 {
+            font-size: 9px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+
+        .leg-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 6px;
+            font-size: 11px;
+            color: #94a3b8;
+        }
+
+        .leg-item:last-child { margin-bottom: 0; }
+
+        .leg-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        .leg-line {
+            width: 16px;
+            height: 2px;
+            border-radius: 1px;
+        }
+
+        /* Tooltip */
+        #tooltip {
+            position: fixed;
+            background: rgba(15, 23, 42, 0.98);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 10px;
+            padding: 12px 14px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s ease-out;
+            z-index: 200;
+            min-width: 160px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        #tooltip.visible { opacity: 1; }
+
+        #tooltip h4 {
+            font-size: 12px;
+            font-weight: 600;
+            color: #f0f9ff;
+            margin-bottom: 8px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        #tooltip .row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            margin-bottom: 3px;
+        }
+
+        #tooltip .row .k { color: #64748b; }
+        #tooltip .row .v { color: #a5b4fc; font-weight: 500; }
+
+        /* Status */
+        #status {
+            position: fixed;
+            bottom: 24px;
+            left: 24px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11px;
+            color: #64748b;
+            z-index: 100;
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            background: #22c55e;
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Controls hint */
+        #hint {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(99, 102, 241, 0.15);
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-size: 11px;
+            color: #64748b;
+            z-index: 100;
+        }
+
+        #hint kbd {
+            background: rgba(99, 102, 241, 0.15);
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin: 0 3px;
+            color: #a5b4fc;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="header">
+        <div class="logo">
+            <div class="logo-icon">M</div>
+            <div>
+                <h1>MeshNet</h1>
+                <span>3D Network Topology</span>
+            </div>
+        </div>
+        <div id="view-controls">
+            <button class="view-btn active" data-view="network">Network</button>
+            <button class="view-btn" data-view="dataflow">Data Flow</button>
+            <button class="view-btn" data-view="workload">Workload</button>
+        </div>
+    </div>
+
+    <div id="info-panel">
+        <h2>Distributed Inference Network</h2>
+        <p>Nodes within each pool form a fully-connected mesh. Each node handles 1/N of the model columns, enabling distributed compute across devices.</p>
+        <div class="stats-row">
+            <div class="stat">
+                <div class="num">3</div>
+                <div class="lbl">Pools</div>
+            </div>
+            <div class="stat">
+                <div class="num">24</div>
+                <div class="lbl">Nodes</div>
+            </div>
+            <div class="stat">
+                <div class="num">8192</div>
+                <div class="lbl">Columns</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="legend">
+        <h3>Network</h3>
+        <div class="leg-item">
+            <div class="leg-dot" style="background: #3b82f6;"></div>
+            <span>Control Plane</span>
+        </div>
+        <div class="leg-item">
+            <div class="leg-dot" style="background: #8b5cf6;"></div>
+            <span>Pool Hub</span>
+        </div>
+        <div class="leg-item">
+            <div class="leg-dot" style="background: #06b6d4;"></div>
+            <span>Compute Node</span>
+        </div>
+        <div class="leg-item">
+            <div class="leg-line" style="background: #6366f1;"></div>
+            <span>HTTP</span>
+        </div>
+        <div class="leg-item">
+            <div class="leg-line" style="background: rgba(6, 182, 212, 0.5);"></div>
+            <span>P2P Mesh</span>
+        </div>
+    </div>
+
+    <div id="status">
+        <div class="status-dot"></div>
+        <span id="status-text">Network Active</span>
+    </div>
+
+    <div id="hint">
+        <kbd>Drag</kbd> Rotate <kbd>Scroll</kbd> Zoom <kbd>1-3</kbd> Views
+    </div>
+
+    <div id="tooltip"></div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        // @ts-check
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // ============================================
+        // TYPE DEFINITIONS (JSDoc)
+        // ============================================
+
+        /**
+         * @typedef {'network' | 'dataflow' | 'workload'} ViewMode
+         */
+
+        /**
+         * @typedef {'control' | 'pool' | 'node'} NodeType
+         */
+
+        /**
+         * @typedef {'http' | 'pool-node' | 'mesh'} EdgeType
+         */
+
+        /**
+         * @typedef {Object} PoolConfig
+         * @property {string} id
+         * @property {string} name
+         * @property {number} nodes
+         * @property {number} angle
+         */
+
+        /**
+         * @typedef {Object} NodeData
+         * @property {NodeType} type
+         * @property {string} name
+         * @property {string} [poolId]
+         * @property {string} [poolName]
+         * @property {number} [nodeIndex]
+         * @property {number} [totalNodes]
+         * @property {THREE.Vector3} position
+         * @property {number} radius
+         * @property {number} color
+         * @property {Record<string, string>} info
+         * @property {THREE.Mesh} [glow]
+         * @property {THREE.Mesh} [ring]
+         * @property {THREE.Mesh} [workloadArc]
+         */
+
+        /**
+         * @typedef {Object} EdgeData
+         * @property {THREE.Group} from
+         * @property {THREE.Group} to
+         * @property {EdgeType} type
+         * @property {number} baseOpacity
+         */
+
+        /**
+         * @typedef {Object} Packet
+         * @property {THREE.Mesh} mesh
+         * @property {THREE.Vector3} from
+         * @property {THREE.Vector3} to
+         * @property {number} progress
+         * @property {number} speed
+         */
+
+        // ============================================
+        // CONFIG (Frozen for immutability)
+        // ============================================
+
+        /** @type {Readonly<{pools: readonly PoolConfig[], colors: Readonly<Record<string, number>>, layout: Readonly<Record<string, number>>}>} */
+        const CONFIG = Object.freeze({
+            pools: Object.freeze([
+                Object.freeze({ id: 'alpha', name: 'Pool Alpha', nodes: 8, angle: 0 }),
+                Object.freeze({ id: 'beta', name: 'Pool Beta', nodes: 6, angle: (2 * Math.PI) / 3 }),
+                Object.freeze({ id: 'gamma', name: 'Pool Gamma', nodes: 10, angle: (4 * Math.PI) / 3 })
+            ]),
+            colors: Object.freeze({
+                bg: 0x0a0f1a,
+                controlPlane: 0x3b82f6,
+                poolHub: 0x8b5cf6,
+                node: 0x06b6d4,
+                httpLine: 0x6366f1,
+                meshLine: 0x06b6d4,
+                packet: 0xf59e0b
+            }),
+            layout: Object.freeze({
+                controlY: 40,
+                poolY: 10,
+                nodeY: -25,
+                poolRadius: 45,
+                nodeSpread: 25
+            })
+        });
+
+        // Animation timing constants
+        const ANIMATION = Object.freeze({
+            NODE_PULSE_SPEED: 1.5,
+            RING_ROTATION_SPEED: 0.003,
+            EDGE_PULSE_SPEED: 2,
+            WORKLOAD_LERP_FACTOR: 0.08,
+            PACKET_BASE_SPEED: 0.012,
+            PACKET_SPEED_VARIANCE: 0.006,
+            PACKET_SPAWN_CHANCE: 0.03,
+            HOVER_SCALE: 1.2,
+            HOVER_LERP_FACTOR: 0.15
+        });
+
+        // ============================================
+        // STATE
+        // ============================================
+
+        /** @type {THREE.Scene | null} */
+        let scene = null;
+
+        /** @type {THREE.PerspectiveCamera | null} */
+        let camera = null;
+
+        /** @type {THREE.WebGLRenderer | null} */
+        let renderer = null;
+
+        /** @type {EffectComposer | null} */
+        let composer = null;
+
+        /** @type {OrbitControls | null} */
+        let controls = null;
+
+        /** @type {THREE.Group[]} */
+        const networkNodes = [];
+
+        /** @type {THREE.Line[]} */
+        const networkEdges = [];
+
+        /** @type {Packet[]} */
+        let packets = [];
+
+        /** @type {THREE.Group | null} */
+        let hoveredNode = null;
+
+        /** @type {ViewMode} */
+        let currentView = 'network';
+
+        /** @type {THREE.Clock} */
+        const clock = new THREE.Clock();
+
+        /** @type {THREE.Raycaster} */
+        const raycaster = new THREE.Raycaster();
+        raycaster.params.Points = { threshold: 0.1 };
+
+        /** @type {THREE.Vector2} */
+        const mouse = new THREE.Vector2(-999, -999);
+
+        /** @type {boolean} */
+        let isInitialized = false;
+
+        /** @type {number} */
+        let animationFrameId = 0;
+
+        // ============================================
+        // DOM ELEMENT CACHE
+        // ============================================
+
+        /** @type {HTMLElement | null} */
+        let tooltipEl = null;
+
+        /** @type {HTMLElement | null} */
+        let statusTextEl = null;
+
+        /** @type {HTMLElement | null} */
+        let containerEl = null;
+
+        /**
+         * Cache DOM elements for performance
+         * @returns {boolean} Whether all elements were found
+         */
+        function cacheDOMElements() {
+            tooltipEl = document.getElementById('tooltip');
+            statusTextEl = document.getElementById('status-text');
+            containerEl = document.getElementById('canvas-container');
+            return !!(tooltipEl && statusTextEl && containerEl);
+        }
+
+        // ============================================
+        // INIT
+        // ============================================
+
+        /**
+         * Initialize the 3D visualization
+         * @returns {void}
+         */
+        function init() {
+            if (isInitialized) return;
+
+            if (!cacheDOMElements() || !containerEl) {
+                console.error('Required DOM elements not found');
+                return;
+            }
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(CONFIG.colors.bg);
+            scene.fog = new THREE.FogExp2(CONFIG.colors.bg, 0.006);
+
+            // Camera
+            const aspect = window.innerWidth / window.innerHeight;
+            camera = new THREE.PerspectiveCamera(50, aspect, 1, 500);
+            camera.position.set(0, 50, 120);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({
+                antialias: true,
+                powerPreference: 'high-performance',
+                stencil: false
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            containerEl.appendChild(renderer.domElement);
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.08;
+            controls.minDistance = 50;
+            controls.maxDistance = 200;
+            controls.maxPolarAngle = Math.PI * 0.85;
+            controls.target.set(0, 5, 0);
+            controls.update();
+
+            // Post-processing
+            composer = new EffectComposer(renderer);
+            const renderPass = new RenderPass(scene, camera);
+            composer.addPass(renderPass);
+
+            const bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                0.5,   // strength
+                0.4,   // radius
+                0.9    // threshold
+            );
+            composer.addPass(bloomPass);
+
+            // Build scene
+            createLighting();
+            createGrid();
+            createNetwork();
+
+            // Events
+            setupEvents();
+
+            isInitialized = true;
+            animate();
+        }
+
+        // ============================================
+        // LIGHTING
+        // ============================================
+
+        /**
+         * Create scene lighting
+         * @returns {void}
+         */
+        function createLighting() {
+            if (!scene) return;
+
+            // Ambient
+            const ambient = new THREE.AmbientLight(0x404060, 0.6);
+            scene.add(ambient);
+
+            // Main overhead light
+            const mainLight = new THREE.PointLight(0x6366f1, 1.2, 250);
+            mainLight.position.set(0, 80, 0);
+            scene.add(mainLight);
+
+            // Fill lights for depth
+            const fillLight1 = new THREE.PointLight(0x3b82f6, 0.4, 180);
+            fillLight1.position.set(-70, 30, 50);
+            scene.add(fillLight1);
+
+            const fillLight2 = new THREE.PointLight(0x8b5cf6, 0.4, 180);
+            fillLight2.position.set(70, 30, -50);
+            scene.add(fillLight2);
+
+            // Bottom fill
+            const bottomLight = new THREE.PointLight(0x06b6d4, 0.3, 150);
+            bottomLight.position.set(0, -50, 0);
+            scene.add(bottomLight);
+        }
+
+        // ============================================
+        // GRID
+        // ============================================
+
+        /**
+         * Create background grid and layer planes
+         * @returns {void}
+         */
+        function createGrid() {
+            if (!scene) return;
+
+            // Subtle grid on floor
+            const grid = new THREE.GridHelper(200, 40, 0x1a1a3a, 0x0f0f2a);
+            grid.position.y = -45;
+            scene.add(grid);
+
+            // Layer indicator planes (very subtle)
+            const planeGeo = new THREE.PlaneGeometry(180, 180);
+            const layers = [
+                { y: CONFIG.layout.controlY, color: 0x3b82f6 },
+                { y: CONFIG.layout.poolY, color: 0x8b5cf6 },
+                { y: CONFIG.layout.nodeY, color: 0x06b6d4 }
+            ];
+
+            layers.forEach(({ y, color }) => {
+                const planeMat = new THREE.MeshBasicMaterial({
+                    color,
+                    transparent: true,
+                    opacity: 0.015,
+                    side: THREE.DoubleSide,
+                    depthWrite: false
+                });
+                const plane = new THREE.Mesh(planeGeo, planeMat);
+                plane.rotation.x = -Math.PI / 2;
+                plane.position.y = y;
+                scene.add(plane);
+            });
+        }
+
+        // ============================================
+        // NETWORK
+        // ============================================
+
+        /**
+         * Create the network structure
+         * @returns {void}
+         */
+        function createNetwork() {
+            if (!scene) return;
+
+            // Control Plane
+            const controlPlane = createNode({
+                type: 'control',
+                name: 'Control Plane',
+                position: new THREE.Vector3(0, CONFIG.layout.controlY, 0),
+                radius: 3.5,
+                color: CONFIG.colors.controlPlane,
+                info: {
+                    Protocol: 'HTTP REST',
+                    Role: 'Orchestrator',
+                    Pools: String(CONFIG.pools.length)
+                }
+            });
+            networkNodes.push(controlPlane);
+
+            // Pools and their nodes
+            CONFIG.pools.forEach((poolConfig) => {
+                const poolX = Math.cos(poolConfig.angle) * CONFIG.layout.poolRadius;
+                const poolZ = Math.sin(poolConfig.angle) * CONFIG.layout.poolRadius;
+
+                // Pool Hub
+                const poolHub = createNode({
+                    type: 'pool',
+                    name: poolConfig.name,
+                    poolId: poolConfig.id,
+                    position: new THREE.Vector3(poolX, CONFIG.layout.poolY, poolZ),
+                    radius: 2.2,
+                    color: CONFIG.colors.poolHub,
+                    info: {
+                        Nodes: String(poolConfig.nodes),
+                        Connection: 'LAN P2P',
+                        Topology: 'Full Mesh'
+                    }
+                });
+                networkNodes.push(poolHub);
+
+                // HTTP Edge: Control -> Pool
+                createEdge(controlPlane, poolHub, 'http', CONFIG.colors.httpLine, 0.7);
+
+                // Compute Nodes
+                /** @type {THREE.Group[]} */
+                const poolNodes = [];
+                const angleStep = (Math.PI * 2) / poolConfig.nodes;
+                const nodeRadius = CONFIG.layout.nodeSpread;
+
+                for (let i = 0; i < poolConfig.nodes; i++) {
+                    const nodeAngle = poolConfig.angle + angleStep * i;
+                    const nx = poolX + Math.cos(nodeAngle) * nodeRadius;
+                    const nz = poolZ + Math.sin(nodeAngle) * nodeRadius;
+                    // Gentle wave pattern for Y variation
+                    const ny = CONFIG.layout.nodeY + Math.sin(nodeAngle * 2) * 2.5;
+
+                    const cols = Math.floor(8192 / poolConfig.nodes);
+                    const start = i * cols;
+                    const end = i === poolConfig.nodes - 1 ? 8192 : (i + 1) * cols;
+
+                    const node = createNode({
+                        type: 'node',
+                        name: `Node ${i + 1}`,
+                        poolName: poolConfig.name,
+                        poolId: poolConfig.id,
+                        nodeIndex: i,
+                        totalNodes: poolConfig.nodes,
+                        position: new THREE.Vector3(nx, ny, nz),
+                        radius: 1.3,
+                        color: CONFIG.colors.node,
+                        info: {
+                            Position: `${i + 1}/${poolConfig.nodes}`,
+                            Shard: `${start}-${end}`,
+                            Work: `1/${poolConfig.nodes}`,
+                            Credits: `1/${poolConfig.nodes}`
+                        }
+                    });
+                    networkNodes.push(node);
+                    poolNodes.push(node);
+
+                    // Pool -> Node edge
+                    createEdge(poolHub, node, 'pool-node', CONFIG.colors.poolHub, 0.25);
+                }
+
+                // Full mesh: every node connects to every other node
+                for (let i = 0; i < poolNodes.length; i++) {
+                    for (let j = i + 1; j < poolNodes.length; j++) {
+                        createEdge(poolNodes[i], poolNodes[j], 'mesh', CONFIG.colors.meshLine, 0.12);
+                    }
+                }
+            });
+        }
+
+        /**
+         * Create a network node
+         * @param {NodeData} config - Node configuration
+         * @returns {THREE.Group} The created node group
+         */
+        function createNode(config) {
+            const group = new THREE.Group();
+            group.position.copy(config.position);
+            group.userData = { ...config, targetScale: 1, currentScale: 1 };
+
+            // Core sphere
+            const coreGeo = new THREE.SphereGeometry(config.radius, 32, 32);
+            const coreMat = new THREE.MeshStandardMaterial({
+                color: config.color,
+                emissive: config.color,
+                emissiveIntensity: 0.5,
+                metalness: 0.2,
+                roughness: 0.4
+            });
+            const core = new THREE.Mesh(coreGeo, coreMat);
+            core.name = 'core';
+            group.add(core);
+
+            // Outer glow sphere
+            const glowGeo = new THREE.SphereGeometry(config.radius * 2, 24, 24);
+            const glowMat = new THREE.MeshBasicMaterial({
+                color: config.color,
+                transparent: true,
+                opacity: 0.1,
+                depthWrite: false
+            });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            glow.name = 'glow';
+            group.add(glow);
+            group.userData.glow = glow;
+
+            // Compute nodes get extra visuals
+            if (config.type === 'node' && config.totalNodes) {
+                // Orbital ring
+                const ringGeo = new THREE.TorusGeometry(config.radius * 1.8, 0.08, 8, 48);
+                const ringMat = new THREE.MeshBasicMaterial({
+                    color: config.color,
+                    transparent: true,
+                    opacity: 0.4,
+                    depthWrite: false
+                });
+                const ring = new THREE.Mesh(ringGeo, ringMat);
+                ring.rotation.x = Math.PI / 2;
+                group.add(ring);
+                group.userData.ring = ring;
+
+                // Workload arc (visible in workload view)
+                const arcAngle = (1 / config.totalNodes) * Math.PI * 2;
+                const arcGeo = new THREE.RingGeometry(
+                    config.radius * 2.2,
+                    config.radius * 2.6,
+                    32, 1, 0, arcAngle
+                );
+                const arcMat = new THREE.MeshBasicMaterial({
+                    color: 0xf59e0b,
+                    transparent: true,
+                    opacity: 0,
+                    side: THREE.DoubleSide,
+                    depthWrite: false
+                });
+                const arc = new THREE.Mesh(arcGeo, arcMat);
+                arc.rotation.x = Math.PI / 2;
+                arc.rotation.z = -Math.PI / 2 + (config.nodeIndex || 0) * 0.1;
+                group.add(arc);
+                group.userData.workloadArc = arc;
+            }
+
+            if (scene) {
+                scene.add(group);
+            }
+            return group;
+        }
+
+        /**
+         * Create an edge between two nodes
+         * @param {THREE.Group} from - Source node
+         * @param {THREE.Group} to - Target node
+         * @param {EdgeType} type - Edge type
+         * @param {number} color - Edge color
+         * @param {number} opacity - Base opacity
+         * @returns {THREE.Line} The created edge
+         */
+        function createEdge(from, to, type, color, opacity) {
+            const points = [from.position.clone(), to.position.clone()];
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+            const material = new THREE.LineBasicMaterial({
+                color,
+                transparent: true,
+                opacity,
+                depthWrite: false
+            });
+
+            const line = new THREE.Line(geometry, material);
+            line.userData = { from, to, type, baseOpacity: opacity };
+            line.frustumCulled = false;
+
+            if (scene) {
+                scene.add(line);
+            }
+            networkEdges.push(line);
+
+            return line;
+        }
+
+        // ============================================
+        // PACKETS
+        // ============================================
+
+        /**
+         * Create a data packet traveling between nodes
+         * @param {THREE.Group} from - Source node
+         * @param {THREE.Group} to - Target node
+         * @returns {void}
+         */
+        function createPacket(from, to) {
+            if (!scene) return;
+
+            const packetGeo = new THREE.SphereGeometry(0.5, 12, 12);
+            const packetMat = new THREE.MeshBasicMaterial({
+                color: CONFIG.colors.packet,
+                transparent: true,
+                opacity: 0.95
+            });
+            const mesh = new THREE.Mesh(packetGeo, packetMat);
+            mesh.position.copy(from.position);
+
+            // Glow trail
+            const glowGeo = new THREE.SphereGeometry(1.2, 8, 8);
+            const glowMat = new THREE.MeshBasicMaterial({
+                color: CONFIG.colors.packet,
+                transparent: true,
+                opacity: 0.25,
+                depthWrite: false
+            });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            mesh.add(glow);
+
+            scene.add(mesh);
+
+            packets.push({
+                mesh,
+                from: from.position.clone(),
+                to: to.position.clone(),
+                progress: 0,
+                speed: ANIMATION.PACKET_BASE_SPEED + Math.random() * ANIMATION.PACKET_SPEED_VARIANCE
+            });
+        }
+
+        /**
+         * Update all active packets
+         * @param {number} delta - Time delta
+         * @returns {void}
+         */
+        function updatePackets(delta) {
+            if (!scene) return;
+
+            // Update existing packets
+            packets = packets.filter(packet => {
+                packet.progress += packet.speed;
+
+                if (packet.progress >= 1) {
+                    scene.remove(packet.mesh);
+                    packet.mesh.geometry.dispose();
+                    if (packet.mesh.material instanceof THREE.Material) {
+                        packet.mesh.material.dispose();
+                    }
+                    return false;
+                }
+
+                // Smooth easing
+                const t = packet.progress;
+                const eased = t < 0.5
+                    ? 2 * t * t
+                    : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+                packet.mesh.position.lerpVectors(packet.from, packet.to, eased);
+
+                // Fade out near end
+                if (packet.mesh.material instanceof THREE.MeshBasicMaterial) {
+                    packet.mesh.material.opacity = Math.min(0.95, (1 - packet.progress) * 2);
+                }
+
+                return true;
+            });
+
+            // Spawn new packets in dataflow view
+            if (currentView === 'dataflow' && Math.random() < ANIMATION.PACKET_SPAWN_CHANCE) {
+                const meshEdges = networkEdges.filter(e => e.userData.type === 'mesh');
+                if (meshEdges.length > 0) {
+                    const edge = meshEdges[Math.floor(Math.random() * meshEdges.length)];
+                    const reverse = Math.random() > 0.5;
+                    createPacket(
+                        reverse ? edge.userData.to : edge.userData.from,
+                        reverse ? edge.userData.from : edge.userData.to
+                    );
+                }
+            }
+        }
+
+        // ============================================
+        // ANIMATION LOOP
+        // ============================================
+
+        /**
+         * Main animation loop
+         * @returns {void}
+         */
+        function animate() {
+            animationFrameId = requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            if (controls) {
+                controls.update();
+            }
+
+            // Animate nodes
+            networkNodes.forEach((node, i) => {
+                const data = node.userData;
+
+                // Smooth scale interpolation for hover effect
+                if (typeof data.currentScale === 'number' && typeof data.targetScale === 'number') {
+                    data.currentScale += (data.targetScale - data.currentScale) * ANIMATION.HOVER_LERP_FACTOR;
+                    node.scale.setScalar(data.currentScale);
+                }
+
+                // Glow pulsing
+                if (data.glow instanceof THREE.Mesh && data.glow.material instanceof THREE.MeshBasicMaterial) {
+                    const pulse = 0.08 + Math.sin(time * ANIMATION.NODE_PULSE_SPEED + i * 0.7) * 0.04;
+                    data.glow.material.opacity = pulse;
+                }
+
+                // Ring rotation
+                if (data.ring instanceof THREE.Mesh) {
+                    data.ring.rotation.z += ANIMATION.RING_ROTATION_SPEED;
+                }
+
+                // Workload arc visibility
+                if (data.workloadArc instanceof THREE.Mesh && data.workloadArc.material instanceof THREE.MeshBasicMaterial) {
+                    const targetOpacity = currentView === 'workload' ? 0.8 : 0;
+                    data.workloadArc.material.opacity +=
+                        (targetOpacity - data.workloadArc.material.opacity) * ANIMATION.WORKLOAD_LERP_FACTOR;
+                }
+            });
+
+            // Animate edges in dataflow mode
+            if (currentView === 'dataflow') {
+                networkEdges.forEach((edge, i) => {
+                    if (edge.userData.type === 'mesh' && edge.material instanceof THREE.LineBasicMaterial) {
+                        const pulse = edge.userData.baseOpacity + Math.sin(time * ANIMATION.EDGE_PULSE_SPEED + i * 0.15) * 0.06;
+                        edge.material.opacity = Math.max(0.05, pulse);
+                    }
+                });
+            }
+
+            updatePackets(delta);
+            updateHover();
+
+            if (composer) {
+                composer.render();
+            }
+        }
+
+        // ============================================
+        // HOVER DETECTION
+        // ============================================
+
+        /**
+         * Update hover state
+         * @returns {void}
+         */
+        function updateHover() {
+            if (!camera || !tooltipEl) return;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            // Get core spheres only
+            /** @type {THREE.Mesh[]} */
+            const coreMeshes = networkNodes
+                .map(n => n.children.find(c => c.name === 'core'))
+                .filter(c => c instanceof THREE.Mesh);
+
+            const intersects = raycaster.intersectObjects(coreMeshes, false);
+
+            if (intersects.length > 0) {
+                const hitMesh = intersects[0].object;
+                const node = hitMesh.parent;
+
+                if (node instanceof THREE.Group && node !== hoveredNode) {
+                    // Unhighlight previous
+                    if (hoveredNode) {
+                        setNodeHighlight(hoveredNode, false);
+                    }
+
+                    hoveredNode = node;
+                    setNodeHighlight(node, true);
+                    showTooltip(node);
+                }
+            } else if (hoveredNode) {
+                setNodeHighlight(hoveredNode, false);
+                hoveredNode = null;
+                tooltipEl.classList.remove('visible');
+            }
+        }
+
+        /**
+         * Set node highlight state
+         * @param {THREE.Group} node - The node to highlight
+         * @param {boolean} active - Whether to highlight
+         * @returns {void}
+         */
+        function setNodeHighlight(node, active) {
+            // Update target scale for smooth transition
+            node.userData.targetScale = active ? ANIMATION.HOVER_SCALE : 1;
+
+            // Highlight connected edges
+            networkEdges.forEach(edge => {
+                const connected = edge.userData.from === node || edge.userData.to === node;
+                if (connected && edge.material instanceof THREE.LineBasicMaterial) {
+                    edge.material.opacity = active ? 0.9 : edge.userData.baseOpacity;
+                }
+            });
+        }
+
+        /**
+         * Show tooltip for a node
+         * @param {THREE.Group} node - The node to show tooltip for
+         * @returns {void}
+         */
+        function showTooltip(node) {
+            if (!tooltipEl || !camera) return;
+
+            const data = node.userData;
+            if (!data || typeof data.info !== 'object') return;
+
+            // Build tooltip HTML
+            const poolPrefix = data.poolName ? `${data.poolName} - ` : '';
+            let html = `<h4>${poolPrefix}${data.name || 'Node'}</h4>`;
+
+            for (const [key, val] of Object.entries(data.info)) {
+                if (typeof val === 'string') {
+                    html += `<div class="row"><span class="k">${key}</span><span class="v">${val}</span></div>`;
+                }
+            }
+
+            tooltipEl.innerHTML = html;
+            tooltipEl.classList.add('visible');
+
+            // Position tooltip in screen space
+            const vec = node.position.clone().project(camera);
+            const x = Math.round((vec.x * 0.5 + 0.5) * window.innerWidth);
+            const y = Math.round((-vec.y * 0.5 + 0.5) * window.innerHeight);
+
+            // Keep tooltip on screen
+            const tooltipRect = tooltipEl.getBoundingClientRect();
+            const maxX = window.innerWidth - tooltipRect.width - 20;
+            const maxY = window.innerHeight - tooltipRect.height - 20;
+
+            tooltipEl.style.left = `${Math.min(x + 20, maxX)}px`;
+            tooltipEl.style.top = `${Math.min(Math.max(y - 20, 20), maxY)}px`;
+        }
+
+        // ============================================
+        // VIEW SWITCHING
+        // ============================================
+
+        /**
+         * Switch visualization view mode
+         * @param {ViewMode} view - The view to switch to
+         * @returns {void}
+         */
+        function switchView(view) {
+            currentView = view;
+
+            // Update button states
+            document.querySelectorAll('.view-btn').forEach(btn => {
+                if (btn instanceof HTMLElement) {
+                    btn.classList.toggle('active', btn.dataset.view === view);
+                }
+            });
+
+            // Reset edge opacity
+            networkEdges.forEach(edge => {
+                if (edge.material instanceof THREE.LineBasicMaterial) {
+                    edge.material.opacity = edge.userData.baseOpacity;
+                }
+            });
+
+            // Clear packets if not in dataflow view
+            if (view !== 'dataflow' && scene) {
+                packets.forEach(p => {
+                    scene.remove(p.mesh);
+                    p.mesh.geometry.dispose();
+                    if (p.mesh.material instanceof THREE.Material) {
+                        p.mesh.material.dispose();
+                    }
+                });
+                packets = [];
+            }
+
+            // Update status text
+            if (statusTextEl) {
+                const statusText = {
+                    network: 'Network Active',
+                    dataflow: 'Data Flow Active',
+                    workload: 'Workload Distribution'
+                };
+                statusTextEl.textContent = statusText[view];
+            }
+        }
+
+        // ============================================
+        // EVENT HANDLERS
+        // ============================================
+
+        /**
+         * Handle window resize
+         * @returns {void}
+         */
+        function handleResize() {
+            if (!camera || !renderer || !composer) return;
+
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+
+            renderer.setSize(width, height);
+            composer.setSize(width, height);
+        }
+
+        /**
+         * Handle mouse move
+         * @param {MouseEvent} event - Mouse event
+         * @returns {void}
+         */
+        function handleMouseMove(event) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        /**
+         * Handle keydown
+         * @param {KeyboardEvent} event - Keyboard event
+         * @returns {void}
+         */
+        function handleKeydown(event) {
+            switch (event.key) {
+                case '1':
+                    switchView('network');
+                    break;
+                case '2':
+                    switchView('dataflow');
+                    break;
+                case '3':
+                    switchView('workload');
+                    break;
+            }
+        }
+
+        /**
+         * Set up event listeners
+         * @returns {void}
+         */
+        function setupEvents() {
+            // Resize with debounce
+            let resizeTimeout = 0;
+            window.addEventListener('resize', () => {
+                clearTimeout(resizeTimeout);
+                resizeTimeout = window.setTimeout(handleResize, 100);
+            });
+
+            // Mouse tracking
+            if (renderer) {
+                renderer.domElement.addEventListener('mousemove', handleMouseMove, { passive: true });
+                renderer.domElement.addEventListener('mouseleave', () => {
+                    mouse.set(-999, -999);
+                    if (hoveredNode) {
+                        setNodeHighlight(hoveredNode, false);
+                        hoveredNode = null;
+                        if (tooltipEl) {
+                            tooltipEl.classList.remove('visible');
+                        }
+                    }
+                });
+            }
+
+            // View buttons
+            document.querySelectorAll('.view-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (btn instanceof HTMLElement && btn.dataset.view) {
+                        const view = /** @type {ViewMode} */ (btn.dataset.view);
+                        switchView(view);
+                    }
+                });
+            });
+
+            // Keyboard shortcuts
+            document.addEventListener('keydown', handleKeydown);
+        }
+
+        /**
+         * Cleanup resources
+         * @returns {void}
+         */
+        function dispose() {
+            cancelAnimationFrame(animationFrameId);
+
+            // Dispose geometries and materials
+            networkNodes.forEach(node => {
+                node.traverse(child => {
+                    if (child instanceof THREE.Mesh) {
+                        child.geometry.dispose();
+                        if (child.material instanceof THREE.Material) {
+                            child.material.dispose();
+                        }
+                    }
+                });
+            });
+
+            networkEdges.forEach(edge => {
+                edge.geometry.dispose();
+                if (edge.material instanceof THREE.Material) {
+                    edge.material.dispose();
+                }
+            });
+
+            packets.forEach(p => {
+                p.mesh.geometry.dispose();
+                if (p.mesh.material instanceof THREE.Material) {
+                    p.mesh.material.dispose();
+                }
+            });
+
+            if (renderer) {
+                renderer.dispose();
+            }
+
+            if (composer) {
+                composer.dispose();
+            }
+        }
+
+        // Handle page unload
+        window.addEventListener('beforeunload', dispose);
+
+        // ============================================
+        // START
+        // ============================================
+        init();
+    </script>
+</body>
+</html>

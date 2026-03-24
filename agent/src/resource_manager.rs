@@ -177,9 +177,7 @@ impl ResourceManager {
             Some(ts) => {
                 let secs = ts
                     .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|_| {
-                        AgentError::Config("Lock timestamp is before UNIX epoch".into())
-                    })?
+                    .map_err(|_| AgentError::Config("Lock timestamp is before UNIX epoch".into()))?
                     .as_secs();
                 Some(secs)
             }
@@ -193,8 +191,8 @@ impl ResourceManager {
             cooldown_hours: self.cooldown_period.as_secs() / 3600,
         };
 
-        let toml_str = toml::to_string_pretty(&config)
-            .map_err(|e| AgentError::Config(e.to_string()))?;
+        let toml_str =
+            toml::to_string_pretty(&config).map_err(|e| AgentError::Config(e.to_string()))?;
 
         // Ensure parent directory exists
         if let Some(parent) = self.config_path.parent() {
@@ -234,9 +232,9 @@ impl ResourceManager {
 
         self.user_allocated = config.user_allocated;
         self.locked_memory = config.locked_memory;
-        self.lock_timestamp = config.lock_timestamp.map(|secs| {
-            SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-        });
+        self.lock_timestamp = config
+            .lock_timestamp
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
         self.cooldown_period = Duration::from_secs(config.cooldown_hours * 3600);
 
         info!(
@@ -510,7 +508,10 @@ impl ResourceManager {
 
                 if result == 0 {
                     let err = std::io::Error::last_os_error();
-                    return Err(AgentError::Resource(format!("VirtualUnlock failed: {}", err)));
+                    return Err(AgentError::Resource(format!(
+                        "VirtualUnlock failed: {}",
+                        err
+                    )));
                 }
             }
         } else {
@@ -542,37 +543,43 @@ pub fn parse_memory_string(s: &str) -> Result<u64> {
 
     // Binary units (IEC standard)
     if let Some(gib_str) = s.strip_suffix("GIB") {
-        let gib: f64 = gib_str.trim().parse().map_err(|_| {
-            AgentError::Config(format!("Invalid memory format: {}", s))
-        })?;
+        let gib: f64 = gib_str
+            .trim()
+            .parse()
+            .map_err(|_| AgentError::Config(format!("Invalid memory format: {}", s)))?;
         return Ok((gib * 1_073_741_824.0) as u64); // 2^30
     } else if let Some(mib_str) = s.strip_suffix("MIB") {
-        let mib: f64 = mib_str.trim().parse().map_err(|_| {
-            AgentError::Config(format!("Invalid memory format: {}", s))
-        })?;
+        let mib: f64 = mib_str
+            .trim()
+            .parse()
+            .map_err(|_| AgentError::Config(format!("Invalid memory format: {}", s)))?;
         return Ok((mib * 1_048_576.0) as u64); // 2^20
     } else if let Some(kib_str) = s.strip_suffix("KIB") {
-        let kib: f64 = kib_str.trim().parse().map_err(|_| {
-            AgentError::Config(format!("Invalid memory format: {}", s))
-        })?;
+        let kib: f64 = kib_str
+            .trim()
+            .parse()
+            .map_err(|_| AgentError::Config(format!("Invalid memory format: {}", s)))?;
         return Ok((kib * 1_024.0) as u64); // 2^10
     }
 
     // Decimal units (SI standard)
     if let Some(gb_str) = s.strip_suffix("GB") {
-        let gb: f64 = gb_str.trim().parse().map_err(|_| {
-            AgentError::Config(format!("Invalid memory format: {}", s))
-        })?;
+        let gb: f64 = gb_str
+            .trim()
+            .parse()
+            .map_err(|_| AgentError::Config(format!("Invalid memory format: {}", s)))?;
         Ok((gb * 1_000_000_000.0) as u64)
     } else if let Some(mb_str) = s.strip_suffix("MB") {
-        let mb: f64 = mb_str.trim().parse().map_err(|_| {
-            AgentError::Config(format!("Invalid memory format: {}", s))
-        })?;
+        let mb: f64 = mb_str
+            .trim()
+            .parse()
+            .map_err(|_| AgentError::Config(format!("Invalid memory format: {}", s)))?;
         Ok((mb * 1_000_000.0) as u64)
     } else if let Some(kb_str) = s.strip_suffix("KB") {
-        let kb: f64 = kb_str.trim().parse().map_err(|_| {
-            AgentError::Config(format!("Invalid memory format: {}", s))
-        })?;
+        let kb: f64 = kb_str
+            .trim()
+            .parse()
+            .map_err(|_| AgentError::Config(format!("Invalid memory format: {}", s)))?;
         Ok((kb * 1_000.0) as u64)
     } else {
         // Assume raw bytes

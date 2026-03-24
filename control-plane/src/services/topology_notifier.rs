@@ -618,7 +618,10 @@ mod tests {
         let notifier = create_test_notifier();
 
         notifier
-            .register_callback("device-1".to_string(), Some("http://localhost:8080".to_string()))
+            .register_callback(
+                "device-1".to_string(),
+                Some("http://localhost:8080".to_string()),
+            )
             .unwrap();
 
         let callbacks = notifier.callbacks.read().unwrap();

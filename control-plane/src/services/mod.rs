@@ -11,7 +11,9 @@ pub use network_service::{
     create_network, list_networks, load_network_connectivity, require_network_exists,
 };
 pub use presence::presence_monitor;
-pub use ring_manager::{RingTopologyManager, RingPosition, ModelShard, Worker, RingTopology, WorkerTopologyInfo};
+pub use ring_manager::{
+    ModelShard, RingPosition, RingTopology, RingTopologyManager, Worker, WorkerTopologyInfo,
+};
 pub use topology_notifier::{
     HandoffStatus, ShardHandoff, TopologyEventType, TopologyNotification, TopologyNotifier,
     WorkerCallback,

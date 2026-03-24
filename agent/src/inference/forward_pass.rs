@@ -296,7 +296,8 @@ impl ForwardPass {
             .await?;
 
         // 4. Update KV cache
-        self.kv_cache.update_layer(layer_idx, k_full.clone(), v_full.clone())?;
+        self.kv_cache
+            .update_layer(layer_idx, k_full.clone(), v_full.clone())?;
 
         // 5. Compute attention (simplified - no heads split for clarity)
         // In production, this would properly handle multi-head attention
@@ -355,7 +356,11 @@ impl ForwardPass {
     /// Compute logits from final hidden states
     pub fn compute_logits(&self, hidden: &Tensor2D) -> Result<Tensor1D> {
         // Apply final RMS norm
-        let normed = rms_norm(hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
+        let normed = rms_norm(
+            hidden,
+            &self.weights.final_norm,
+            self.weights.config.rms_norm_eps,
+        )?;
 
         // Take last token's hidden state
         let last_row = normed.row(normed.rows - 1);
@@ -388,15 +393,25 @@ impl ForwardPass {
 
         // 1. Embed tokens
         let mut hidden = self.embed(tokens)?;
-        debug!("Embedded {} tokens -> {:?}", tokens.len(), (hidden.rows, hidden.cols));
+        debug!(
+            "Embedded {} tokens -> {:?}",
+            tokens.len(),
+            (hidden.rows, hidden.cols)
+        );
 
         // 2. Run through all layers
         for layer_idx in 0..self.weights.config.num_layers {
-            hidden = self.forward_layer(&hidden, layer_idx, worker_ring, job_id).await?;
+            hidden = self
+                .forward_layer(&hidden, layer_idx, worker_ring, job_id)
+                .await?;
         }
 
         // 3. Apply final norm
-        hidden = rms_norm(&hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
+        hidden = rms_norm(
+            &hidden,
+            &self.weights.final_norm,
+            self.weights.config.rms_norm_eps,
+        )?;
 
         info!(
             "Full forward pass complete: {} layers in {:?}",
@@ -443,9 +458,7 @@ impl ForwardPass {
         let flat = tensor.to_allreduce_tensor();
 
         // Perform ring all-reduce
-        let reduced = worker_ring
-            .ring_all_reduce(flat, job_id, layer_idx)
-            .await?;
+        let reduced = worker_ring.ring_all_reduce(flat, job_id, layer_idx).await?;
 
         // Convert back to 2D
         Tensor2D::from_allreduce_tensor(&reduced)
@@ -515,13 +528,22 @@ impl LocalForwardPass {
         }
 
         // Final norm
-        hidden = rms_norm(&hidden, &self.weights.final_norm, self.weights.config.rms_norm_eps)?;
+        hidden = rms_norm(
+            &hidden,
+            &self.weights.final_norm,
+            self.weights.config.rms_norm_eps,
+        )?;
 
         Ok(hidden)
     }
 
     /// Generate next token locally
-    pub fn generate_next_token(&mut self, tokens: &[u32], temperature: f32, top_p: f32) -> Result<u32> {
+    pub fn generate_next_token(
+        &mut self,
+        tokens: &[u32],
+        temperature: f32,
+        top_p: f32,
+    ) -> Result<u32> {
         let hidden = self.forward(tokens)?;
 
         // Get last hidden state

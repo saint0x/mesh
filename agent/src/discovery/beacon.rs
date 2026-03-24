@@ -22,9 +22,9 @@ pub const BEACON_INTERVAL_SECS: u64 = 5;
 pub const STALE_PEER_THRESHOLD_SECS: u64 = 30;
 
 /// Capability flags for beacon capabilities_bitmap
-pub const CAPABILITY_CAN_SIGN_CERTS: u32 = 0x0001;  // Admin can sign member certificates
-pub const CAPABILITY_ACCEPTING_JOINS: u32 = 0x0002;  // Admin is accepting new pool joins
-pub const CAPABILITY_HAS_RELAY: u32 = 0x0004;        // Node has relay server running
+pub const CAPABILITY_CAN_SIGN_CERTS: u32 = 0x0001; // Admin can sign member certificates
+pub const CAPABILITY_ACCEPTING_JOINS: u32 = 0x0002; // Admin is accepting new pool joins
+pub const CAPABILITY_HAS_RELAY: u32 = 0x0004; // Node has relay server running
 pub const CAPABILITY_HAS_CONTROL_PLANE: u32 = 0x0008; // Node has control plane running
 
 /// Beacon message types for LAN discovery
@@ -88,7 +88,10 @@ mod hex_array {
         let s = String::deserialize(deserializer)?;
         let bytes = hex::decode(&s).map_err(D::Error::custom)?;
         if bytes.len() != 64 {
-            return Err(D::Error::custom(format!("expected 64 bytes, got {}", bytes.len())));
+            return Err(D::Error::custom(format!(
+                "expected 64 bytes, got {}",
+                bytes.len()
+            )));
         }
         let mut array = [0u8; 64];
         array.copy_from_slice(&bytes);
@@ -281,7 +284,8 @@ impl BeaconBroadcaster {
     /// Run beacon broadcaster loop
     pub async fn run(mut self) -> Result<()> {
         let mut pool_beacon_interval = interval(Duration::from_secs(BEACON_INTERVAL_SECS));
-        let target_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
+        let target_addr: SocketAddr =
+            format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
 
         loop {
             tokio::select! {
@@ -313,16 +317,14 @@ impl BeaconBroadcaster {
     async fn broadcast_message(&self, message: &BeaconMessage, target_addr: &SocketAddr) {
         let mut packet = Vec::new();
         match ciborium::ser::into_writer(message, &mut packet) {
-            Ok(_) => {
-                match self.socket.send_to(&packet, target_addr).await {
-                    Ok(sent) => {
-                        tracing::trace!(bytes = sent, "Beacon message broadcast");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to broadcast message");
-                    }
+            Ok(_) => match self.socket.send_to(&packet, target_addr).await {
+                Ok(sent) => {
+                    tracing::trace!(bytes = sent, "Beacon message broadcast");
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to broadcast message");
+                }
+            },
             Err(e) => {
                 tracing::error!(error = %e, "Failed to serialize message");
             }
@@ -349,7 +351,11 @@ impl BeaconListener {
     pub async fn new(
         pools: Vec<(PoolConfig, PoolMembershipCert)>,
         device_keypair: &DeviceKeyPair,
-    ) -> Result<(Self, mpsc::Receiver<DiscoveredPeer>, mpsc::Receiver<RingGossipMessage>)> {
+    ) -> Result<(
+        Self,
+        mpsc::Receiver<DiscoveredPeer>,
+        mpsc::Receiver<RingGossipMessage>,
+    )> {
         // === PRODUCTION MULTICAST SOCKET CONFIGURATION FOR macOS ===
         //
         // CRITICAL: macOS requires SO_REUSEPORT for multicast UDP sockets.
@@ -406,7 +412,7 @@ impl BeaconListener {
         // Join the multicast group (must be done AFTER bind)
         socket.join_multicast_v4(
             BEACON_MULTICAST_ADDR.parse()?,
-            Ipv4Addr::new(0, 0, 0, 0),  // Listen on all interfaces
+            Ipv4Addr::new(0, 0, 0, 0), // Listen on all interfaces
         )?;
 
         // Build pool map
@@ -486,12 +492,10 @@ impl BeaconListener {
                 let before_resp = self.cert_response_cache.len();
 
                 // Remove entries older than 5 minutes
-                self.cert_request_cache.retain(|_, last_seen| {
-                    last_seen.elapsed() < Duration::from_secs(300)
-                });
-                self.cert_response_cache.retain(|_, last_seen| {
-                    last_seen.elapsed() < Duration::from_secs(300)
-                });
+                self.cert_request_cache
+                    .retain(|_, last_seen| last_seen.elapsed() < Duration::from_secs(300));
+                self.cert_response_cache
+                    .retain(|_, last_seen| last_seen.elapsed() < Duration::from_secs(300));
 
                 let after_req = self.cert_request_cache.len();
                 let after_resp = self.cert_response_cache.len();
@@ -512,22 +516,20 @@ impl BeaconListener {
                 Ok((len, sender_addr)) => {
                     // Parse beacon message
                     match ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
-                        Ok(message) => {
-                            match message {
-                                BeaconMessage::PoolBeacon(beacon) => {
-                                    self.handle_pool_beacon(beacon, sender_addr).await;
-                                }
-                                BeaconMessage::CertRequest(request) => {
-                                    self.handle_cert_request(request, sender_addr).await;
-                                }
-                                BeaconMessage::CertResponse(cert) => {
-                                    self.handle_cert_response(cert, sender_addr).await;
-                                }
-                                BeaconMessage::RingGossip(gossip) => {
-                                    self.handle_ring_gossip(gossip).await;
-                                }
+                        Ok(message) => match message {
+                            BeaconMessage::PoolBeacon(beacon) => {
+                                self.handle_pool_beacon(beacon, sender_addr).await;
                             }
-                        }
+                            BeaconMessage::CertRequest(request) => {
+                                self.handle_cert_request(request, sender_addr).await;
+                            }
+                            BeaconMessage::CertResponse(cert) => {
+                                self.handle_cert_response(cert, sender_addr).await;
+                            }
+                            BeaconMessage::RingGossip(gossip) => {
+                                self.handle_ring_gossip(gossip).await;
+                            }
+                        },
                         Err(e) => {
                             tracing::debug!(
                                 error = %e,
@@ -675,8 +677,8 @@ impl BeaconListener {
         }
 
         // Load pool root keypair to sign cert
-        let pool_dir = crate::pki::PoolConfig::pool_dir(&request.pool_id)
-            .expect("Failed to get pool dir");
+        let pool_dir =
+            crate::pki::PoolConfig::pool_dir(&request.pool_id).expect("Failed to get pool dir");
         let root_keypair_path = pool_dir.join("pool-root-private");
 
         let pool_root = match std::fs::read(&root_keypair_path) {
@@ -716,7 +718,8 @@ impl BeaconListener {
         );
 
         // Mark this request as processed to prevent duplicate signing
-        self.cert_request_cache.insert(request_key, std::time::Instant::now());
+        self.cert_request_cache
+            .insert(request_key, std::time::Instant::now());
 
         tracing::info!(
             pool_id = %request.pool_id,
@@ -733,9 +736,10 @@ impl BeaconListener {
             return;
         }
 
-        let target_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT)
-            .parse()
-            .unwrap();
+        let target_addr: SocketAddr =
+            format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT)
+                .parse()
+                .unwrap();
 
         if let Err(e) = self.socket.send_to(&packet, target_addr).await {
             tracing::error!(error = %e, "Failed to send cert response");
@@ -759,8 +763,14 @@ impl BeaconListener {
         );
 
         // Check if this cert is for us
-        let my_device_pubkey = self.my_pools.values().next().map(|(_config, my_cert)| my_cert.device_pubkey);
-        let is_for_me = my_device_pubkey.map(|pk| pk == cert.device_pubkey).unwrap_or(false);
+        let my_device_pubkey = self
+            .my_pools
+            .values()
+            .next()
+            .map(|(_config, my_cert)| my_cert.device_pubkey);
+        let is_for_me = my_device_pubkey
+            .map(|pk| pk == cert.device_pubkey)
+            .unwrap_or(false);
 
         if !is_for_me {
             tracing::trace!("Cert not for us, ignoring");
@@ -925,7 +935,7 @@ mod tests {
         let cert = crate::pki::PoolMembershipCert::new(
             device.public,
             &pool_root,
-            crate::pki::MembershipRole::Admin,  // Admin role
+            crate::pki::MembershipRole::Admin, // Admin role
             u64::MAX,
         );
 
@@ -934,7 +944,7 @@ mod tests {
             name: "Test Pool".to_string(),
             pool_root_pubkey: pool_root.public,
             beacon_config: crate::pki::BeaconConfig::default(),
-            role: crate::pki::MembershipRole::Admin,  // Admin role
+            role: crate::pki::MembershipRole::Admin, // Admin role
             expires_at: u64::MAX,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -942,10 +952,22 @@ mod tests {
         let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
 
         // Verify admin capabilities
-        assert!(beacon.can_sign_certs(), "Admin beacon should have can_sign_certs=true");
-        assert!(beacon.is_accepting_joins(), "Admin beacon should have is_accepting_joins=true");
-        assert_eq!(beacon.capabilities_bitmap & CAPABILITY_CAN_SIGN_CERTS, CAPABILITY_CAN_SIGN_CERTS);
-        assert_eq!(beacon.capabilities_bitmap & CAPABILITY_ACCEPTING_JOINS, CAPABILITY_ACCEPTING_JOINS);
+        assert!(
+            beacon.can_sign_certs(),
+            "Admin beacon should have can_sign_certs=true"
+        );
+        assert!(
+            beacon.is_accepting_joins(),
+            "Admin beacon should have is_accepting_joins=true"
+        );
+        assert_eq!(
+            beacon.capabilities_bitmap & CAPABILITY_CAN_SIGN_CERTS,
+            CAPABILITY_CAN_SIGN_CERTS
+        );
+        assert_eq!(
+            beacon.capabilities_bitmap & CAPABILITY_ACCEPTING_JOINS,
+            CAPABILITY_ACCEPTING_JOINS
+        );
     }
 
     #[test]
@@ -958,7 +980,7 @@ mod tests {
         let cert = crate::pki::PoolMembershipCert::new(
             device.public,
             &pool_root,
-            crate::pki::MembershipRole::Member,  // Member role
+            crate::pki::MembershipRole::Member, // Member role
             u64::MAX,
         );
 
@@ -967,7 +989,7 @@ mod tests {
             name: "Test Pool".to_string(),
             pool_root_pubkey: pool_root.public,
             beacon_config: crate::pki::BeaconConfig::default(),
-            role: crate::pki::MembershipRole::Member,  // Member role
+            role: crate::pki::MembershipRole::Member, // Member role
             expires_at: u64::MAX,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -975,8 +997,14 @@ mod tests {
         let beacon = PoolBeacon::new(&pool_config, &cert, &device, None, 4001);
 
         // Verify member does NOT have signing capabilities
-        assert!(!beacon.can_sign_certs(), "Member beacon should have can_sign_certs=false");
-        assert!(!beacon.is_accepting_joins(), "Member beacon should have is_accepting_joins=false");
+        assert!(
+            !beacon.can_sign_certs(),
+            "Member beacon should have can_sign_certs=false"
+        );
+        assert!(
+            !beacon.is_accepting_joins(),
+            "Member beacon should have is_accepting_joins=false"
+        );
         assert_eq!(beacon.capabilities_bitmap & CAPABILITY_CAN_SIGN_CERTS, 0);
         assert_eq!(beacon.capabilities_bitmap & CAPABILITY_ACCEPTING_JOINS, 0);
     }
@@ -1018,8 +1046,14 @@ mod tests {
         assert_eq!(decoded.capabilities_bitmap, beacon.capabilities_bitmap);
         assert_eq!(decoded.can_sign_certs(), beacon.can_sign_certs());
         assert_eq!(decoded.is_accepting_joins(), beacon.is_accepting_joins());
-        assert!(decoded.can_sign_certs(), "Deserialized admin beacon should still have can_sign_certs=true");
-        assert!(decoded.is_accepting_joins(), "Deserialized admin beacon should still have is_accepting_joins=true");
+        assert!(
+            decoded.can_sign_certs(),
+            "Deserialized admin beacon should still have can_sign_certs=true"
+        );
+        assert!(
+            decoded.is_accepting_joins(),
+            "Deserialized admin beacon should still have is_accepting_joins=true"
+        );
         assert!(decoded.verify());
     }
 

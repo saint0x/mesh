@@ -246,7 +246,8 @@ impl InferenceJob {
     /// Check if a checkpoint should be created
     pub fn should_checkpoint(&self) -> bool {
         let interval = self.request.config.checkpoint_interval;
-        interval > 0 && self.current_token_idx > 0
+        interval > 0
+            && self.current_token_idx > 0
             && self.current_token_idx % interval == 0
             && self.current_token_idx > self.last_checkpoint_idx
     }
@@ -258,7 +259,8 @@ impl InferenceJob {
 
     /// Get time to first token
     pub fn time_to_first_token(&self) -> Option<std::time::Duration> {
-        self.first_token_time.map(|t| t.duration_since(self.start_time))
+        self.first_token_time
+            .map(|t| t.duration_since(self.start_time))
     }
 
     /// Get total elapsed time
@@ -321,12 +323,7 @@ mod tests {
     #[test]
     fn test_inference_result_success() {
         let job_id = Uuid::new_v4();
-        let result = InferenceResult::success(
-            job_id,
-            vec![100, 101, 102],
-            10,
-            1000,
-        );
+        let result = InferenceResult::success(job_id, vec![100, 101, 102], 10, 1000);
 
         assert!(result.success);
         assert_eq!(result.completion_tokens, 3);
@@ -351,7 +348,8 @@ mod tests {
             "llama-70b".to_string(),
             vec![1, 2, 3],
             "executor-1".to_string(),
-        ).with_config(GenerationConfig {
+        )
+        .with_config(GenerationConfig {
             max_tokens: 5,
             checkpoint_interval: 2,
             ..Default::default()
@@ -391,7 +389,8 @@ mod tests {
             "model".to_string(),
             vec![1],
             "exec".to_string(),
-        ).with_config(GenerationConfig {
+        )
+        .with_config(GenerationConfig {
             max_tokens: 10,
             ..Default::default()
         });

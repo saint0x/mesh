@@ -12,8 +12,8 @@ use crate::api::types::{
     ListNetworksResponse, RegisterDeviceRequest, RegisterDeviceResponse, RingPositionInfo,
     ShardInfo,
 };
-use crate::services::{device_service, network_service};
 use crate::services::ring_manager::Worker;
+use crate::services::{device_service, network_service};
 use crate::state::AppState;
 
 /// Health check endpoint
@@ -127,9 +127,7 @@ pub async fn create_network(
 }
 
 #[instrument(skip(state))]
-pub async fn list_networks(
-    State(state): State<AppState>,
-) -> ApiResult<Json<ListNetworksResponse>> {
+pub async fn list_networks(State(state): State<AppState>) -> ApiResult<Json<ListNetworksResponse>> {
     let db = state.db.clone();
     let networks = tokio::task::spawn_blocking(move || network_service::list_networks(&db))
         .await
@@ -169,11 +167,11 @@ pub async fn heartbeat(
 mod tests {
     use super::*;
     use crate::connectivity::NetworkConnectivity;
-    use crate::device::{DeviceCapabilities, Tier};
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState,
     };
+    use crate::device::{DeviceCapabilities, Tier};
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::network_service;
     use std::sync::Arc;
@@ -235,17 +233,16 @@ mod tests {
         };
 
         // Call handler directly
-        let result = register_device(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let result = register_device(axum::extract::State(state), axum::Json(request)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
         assert!(response.success);
         assert!(response.certificate.is_some());
-        assert_eq!(response.connectivity.preferred_path, ConnectivityPath::Relayed);
+        assert_eq!(
+            response.connectivity.preferred_path,
+            ConnectivityPath::Relayed
+        );
     }
 
     #[tokio::test]
@@ -294,7 +291,10 @@ mod tests {
         let response = result.unwrap().0;
         assert!(response.success);
         assert!(!response.last_seen.is_empty());
-        assert_eq!(response.connectivity_state.status, ConnectivityStatus::Connected);
+        assert_eq!(
+            response.connectivity_state.status,
+            ConnectivityStatus::Connected
+        );
     }
 
     #[tokio::test]
@@ -351,17 +351,16 @@ mod tests {
         };
 
         // Call handler directly
-        let result = register_device(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let result = register_device(axum::extract::State(state), axum::Json(request)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
         assert!(response.success);
         assert!(response.certificate.is_some());
-        assert_eq!(response.connectivity.preferred_path, ConnectivityPath::Relayed);
+        assert_eq!(
+            response.connectivity.preferred_path,
+            ConnectivityPath::Relayed
+        );
 
         // Should have ring position info
         assert!(response.ring_position.is_some());

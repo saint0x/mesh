@@ -264,7 +264,9 @@ pub fn matvec(a: &Tensor2D, v: &Tensor1D) -> Result<Tensor1D> {
     if a.cols != v.len() {
         return Err(AgentError::Execution(format!(
             "Matvec shape mismatch: {}x{} @ {}",
-            a.rows, a.cols, v.len()
+            a.rows,
+            a.cols,
+            v.len()
         )));
     }
 
@@ -342,7 +344,8 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
     if tensor.cols != gamma.len() {
         return Err(AgentError::Execution(format!(
             "RMS norm dimension mismatch: tensor cols {} vs gamma {}",
-            tensor.cols, gamma.len()
+            tensor.cols,
+            gamma.len()
         )));
     }
 
@@ -448,7 +451,11 @@ pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
 
 /// Softmax for 1D tensor (single row of logits)
 pub fn softmax_1d(tensor: &Tensor1D) -> Tensor1D {
-    let max_val = tensor.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = tensor
+        .data
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     let exp_sum: f32 = tensor.data.iter().map(|x| (x - max_val).exp()).sum();
 
     let data: Vec<f32> = tensor
@@ -469,12 +476,7 @@ pub fn softmax_1d(tensor: &Tensor1D) -> Tensor1D {
 /// * `temperature` - Temperature for scaling (1.0 = no change, lower = more deterministic)
 /// * `top_p` - Nucleus sampling threshold (0.9 = consider tokens comprising 90% probability mass)
 /// * `rng_seed` - Random seed for reproducibility
-pub fn sample_token(
-    logits: &Tensor1D,
-    temperature: f32,
-    top_p: f32,
-    rng_seed: u64,
-) -> u32 {
+pub fn sample_token(logits: &Tensor1D, temperature: f32, top_p: f32, rng_seed: u64) -> u32 {
     // Apply temperature
     let scaled_logits: Vec<f32> = if temperature != 1.0 && temperature > 0.0 {
         logits.data.iter().map(|x| x / temperature).collect()
@@ -483,7 +485,10 @@ pub fn sample_token(
     };
 
     // Convert to probabilities via softmax
-    let max_val = scaled_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = scaled_logits
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     let exp_vals: Vec<f32> = scaled_logits.iter().map(|x| (x - max_val).exp()).collect();
     let sum: f32 = exp_vals.iter().sum();
     let probs: Vec<f32> = exp_vals.iter().map(|x| x / sum).collect();
@@ -645,10 +650,7 @@ pub fn apply_rope(
 impl Tensor2D {
     /// Convert to flat Tensor for ring all-reduce
     pub fn to_allreduce_tensor(&self) -> crate::executor::ring_allreduce::Tensor {
-        crate::executor::ring_allreduce::Tensor::new(
-            self.data.clone(),
-            vec![self.rows, self.cols],
-        )
+        crate::executor::ring_allreduce::Tensor::new(self.data.clone(), vec![self.rows, self.cols])
     }
 
     /// Create from ring all-reduce Tensor

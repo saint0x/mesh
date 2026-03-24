@@ -1,5 +1,5 @@
-use crate::db::Database;
 use crate::connectivity::DeviceConnectivityState;
+use crate::db::Database;
 use rusqlite::params;
 use time::OffsetDateTime;
 use tokio::time::{interval, Duration};
@@ -43,10 +43,7 @@ fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Erro
 
     let stale_devices = stale_stmt
         .query_map(params![&threshold_str], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 

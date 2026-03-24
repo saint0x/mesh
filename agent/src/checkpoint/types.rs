@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use uuid::Uuid;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Configuration for checkpoint management
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +184,11 @@ impl Checkpoint {
     /// Calculate checkpoint data hash using BLAKE3
     pub fn compute_hash(&self) -> String {
         let bytes = self.to_cbor().unwrap_or_default();
-        hex::encode({ let mut hasher = sha2::Sha256::new(); hasher.update(bytes); hasher.finalize() })
+        hex::encode({
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(bytes);
+            hasher.finalize()
+        })
     }
 
     /// Serialize checkpoint to CBOR bytes
@@ -291,7 +295,10 @@ mod tests {
         let restored: Checkpoint = Checkpoint::from_cbor(&bytes).unwrap();
 
         assert_eq!(restored.generated_tokens, checkpoint.generated_tokens);
-        assert_eq!(restored.request.prompt_tokens, checkpoint.request.prompt_tokens);
+        assert_eq!(
+            restored.request.prompt_tokens,
+            checkpoint.request.prompt_tokens
+        );
     }
 
     #[test]

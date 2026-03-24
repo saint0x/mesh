@@ -1,6 +1,6 @@
+use crate::errors::{RelayError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use crate::errors::{RelayError, Result};
 
 /// Main configuration for the relay server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,43 +109,51 @@ impl Config {
         // Validate reservation limits
         if self.relay.max_reservations == 0 || self.relay.max_reservations > 10000 {
             return Err(RelayError::Config(
-                "max_reservations must be between 1 and 10000".into()
+                "max_reservations must be between 1 and 10000".into(),
             ));
         }
 
         if self.relay.max_reservations_per_peer == 0 {
             return Err(RelayError::Config(
-                "max_reservations_per_peer must be at least 1".into()
+                "max_reservations_per_peer must be at least 1".into(),
             ));
         }
 
         if self.relay.max_circuits_per_peer == 0 {
             return Err(RelayError::Config(
-                "max_circuits_per_peer must be at least 1".into()
+                "max_circuits_per_peer must be at least 1".into(),
             ));
         }
 
         // Validate multiaddrs
-        self.network.tcp_listen_addr.parse::<libp2p::Multiaddr>()
+        self.network
+            .tcp_listen_addr
+            .parse::<libp2p::Multiaddr>()
             .map_err(|e| RelayError::Config(format!("Invalid TCP address: {}", e)))?;
 
-        self.network.quic_listen_addr.parse::<libp2p::Multiaddr>()
+        self.network
+            .quic_listen_addr
+            .parse::<libp2p::Multiaddr>()
             .map_err(|e| RelayError::Config(format!("Invalid QUIC address: {}", e)))?;
 
         // Validate log level
         match self.logging.level.to_lowercase().as_str() {
-            "trace" | "debug" | "info" | "warn" | "error" => {},
-            _ => return Err(RelayError::Config(
-                "log level must be one of: trace, debug, info, warn, error".into()
-            )),
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            _ => {
+                return Err(RelayError::Config(
+                    "log level must be one of: trace, debug, info, warn, error".into(),
+                ))
+            }
         }
 
         // Validate log format
         match self.logging.log_format.as_str() {
-            "pretty" | "json" => {},
-            _ => return Err(RelayError::Config(
-                "log_format must be 'pretty' or 'json'".into()
-            )),
+            "pretty" | "json" => {}
+            _ => {
+                return Err(RelayError::Config(
+                    "log_format must be 'pretty' or 'json'".into(),
+                ))
+            }
         }
 
         Ok(())
@@ -260,8 +268,14 @@ mod tests {
         let loaded = Config::load(&config_path).expect("load should succeed");
 
         // Verify values match
-        assert_eq!(original.relay.max_reservations, loaded.relay.max_reservations);
-        assert_eq!(original.network.tcp_listen_addr, loaded.network.tcp_listen_addr);
+        assert_eq!(
+            original.relay.max_reservations,
+            loaded.relay.max_reservations
+        );
+        assert_eq!(
+            original.network.tcp_listen_addr,
+            loaded.network.tcp_listen_addr
+        );
         assert_eq!(original.logging.level, loaded.logging.level);
     }
 

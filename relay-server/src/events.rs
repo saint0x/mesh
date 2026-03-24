@@ -1,5 +1,5 @@
-use libp2p::swarm::SwarmEvent;
 use crate::relay::RelayBehaviourEvent;
+use libp2p::swarm::SwarmEvent;
 
 /// Handle swarm events from the libp2p event loop
 pub async fn handle_swarm_event(event: SwarmEvent<RelayBehaviourEvent>) {
@@ -50,7 +50,11 @@ pub async fn handle_swarm_event(event: SwarmEvent<RelayBehaviourEvent>) {
             }
         }
 
-        SwarmEvent::IncomingConnection { send_back_addr, local_addr, connection_id } => {
+        SwarmEvent::IncomingConnection {
+            send_back_addr,
+            local_addr,
+            connection_id,
+        } => {
             tracing::debug!(
                 connection_id = ?connection_id,
                 from = %send_back_addr,
@@ -59,7 +63,12 @@ pub async fn handle_swarm_event(event: SwarmEvent<RelayBehaviourEvent>) {
             );
         }
 
-        SwarmEvent::IncomingConnectionError { send_back_addr, error, connection_id, .. } => {
+        SwarmEvent::IncomingConnectionError {
+            send_back_addr,
+            error,
+            connection_id,
+            ..
+        } => {
             tracing::warn!(
                 connection_id = ?connection_id,
                 from = %send_back_addr,
@@ -68,7 +77,11 @@ pub async fn handle_swarm_event(event: SwarmEvent<RelayBehaviourEvent>) {
             );
         }
 
-        SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id } => {
+        SwarmEvent::OutgoingConnectionError {
+            peer_id,
+            error,
+            connection_id,
+        } => {
             if let Some(peer) = peer_id {
                 tracing::warn!(
                     peer_id = %peer,
@@ -121,7 +134,7 @@ async fn handle_behaviour_event(event: RelayBehaviourEvent) {
             identify::Event::Error { peer_id, error, .. } => {
                 tracing::warn!(peer_id = %peer_id, error = ?error, "Identify error");
             }
-        }
+        },
 
         // Relay protocol events - Reservations
         RelayBehaviourEvent::Relay(relay::Event::ReservationReqAccepted {
@@ -141,19 +154,14 @@ async fn handle_behaviour_event(event: RelayBehaviourEvent) {
             }
         }
 
-        RelayBehaviourEvent::Relay(relay::Event::ReservationReqDenied {
-            src_peer_id,
-            ..
-        }) => {
+        RelayBehaviourEvent::Relay(relay::Event::ReservationReqDenied { src_peer_id, .. }) => {
             tracing::warn!(
                 peer_id = %src_peer_id,
                 "Reservation denied (likely hit max limit)"
             );
         }
 
-        RelayBehaviourEvent::Relay(relay::Event::ReservationTimedOut {
-            src_peer_id,
-        }) => {
+        RelayBehaviourEvent::Relay(relay::Event::ReservationTimedOut { src_peer_id }) => {
             tracing::info!(
                 peer_id = %src_peer_id,
                 "Reservation timed out"

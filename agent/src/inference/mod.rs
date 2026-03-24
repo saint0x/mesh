@@ -51,7 +51,7 @@ pub mod stats;
 pub mod tensor_ops;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
-pub use coordinator::{InferenceCoordinator, InferenceConfig};
+pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
 pub use job::{GenerationConfig, InferenceJob, InferenceRequest, InferenceResult};
 pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};

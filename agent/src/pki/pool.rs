@@ -1,4 +1,6 @@
-use super::types::{DeviceKeyPair, MembershipRole, NodeId, PoolId, PoolMembershipCert, PoolRootKeyPair};
+use super::types::{
+    DeviceKeyPair, MembershipRole, NodeId, PoolId, PoolMembershipCert, PoolRootKeyPair,
+};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -39,23 +41,21 @@ pub struct PoolConfig {
 
 impl PoolConfig {
     /// Create a new pool (admin role, self-issued cert)
-    pub fn create_pool(name: String, device: &DeviceKeyPair) -> Result<(Self, PoolRootKeyPair, PoolMembershipCert)> {
+    pub fn create_pool(
+        name: String,
+        device: &DeviceKeyPair,
+    ) -> Result<(Self, PoolRootKeyPair, PoolMembershipCert)> {
         // Generate pool root keypair (CLIENT-SIDE, never sent to platform)
         let pool_root = PoolRootKeyPair::generate();
         let pool_id = pool_root.pool_id();
 
         // Admin role expires in 10 years (effectively never for testing)
-        let expires_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs() + (10 * 365 * 24 * 60 * 60); // 10 years
+        let expires_at =
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + (10 * 365 * 24 * 60 * 60); // 10 years
 
         // Issue self-signed membership cert as admin
-        let membership_cert = PoolMembershipCert::new(
-            device.public,
-            &pool_root,
-            MembershipRole::Admin,
-            expires_at,
-        );
+        let membership_cert =
+            PoolMembershipCert::new(device.public, &pool_root, MembershipRole::Admin, expires_at);
 
         let created_at = chrono::Utc::now().to_rfc3339();
 
@@ -94,8 +94,7 @@ impl PoolConfig {
 
     /// Get pool directory path: ~/.meshnet/pools/{pool_id}/
     pub fn pool_dir(pool_id: &PoolId) -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Could not determine home directory"))?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
 
         Ok(home.join(".meshnet").join("pools").join(pool_id.to_hex()))
     }
@@ -126,7 +125,11 @@ impl PoolConfig {
     }
 
     /// Save pool configuration and membership cert
-    pub fn save(&self, membership_cert: &PoolMembershipCert, pool_root: Option<&PoolRootKeyPair>) -> Result<()> {
+    pub fn save(
+        &self,
+        membership_cert: &PoolMembershipCert,
+        pool_root: Option<&PoolRootKeyPair>,
+    ) -> Result<()> {
         let pool_dir = Self::pool_dir(&self.pool_id)?;
         fs::create_dir_all(&pool_dir)?;
 
@@ -216,8 +219,7 @@ impl PoolConfig {
 
     /// List all pools
     pub fn list_pools() -> Result<Vec<(PoolId, PoolConfig, PoolMembershipCert)>> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Could not determine home directory"))?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
 
         let pools_dir = home.join(".meshnet").join("pools");
 
@@ -335,7 +337,8 @@ impl PeerCache {
     /// Add or update a peer
     pub fn upsert_peer(&mut self, peer: DiscoveredPeer) {
         // Remove old entry if exists
-        self.peers.retain(|p| !(p.pool_id == peer.pool_id && p.node_id == peer.node_id));
+        self.peers
+            .retain(|p| !(p.pool_id == peer.pool_id && p.node_id == peer.node_id));
 
         // Add new entry
         self.peers.push(peer);
@@ -368,7 +371,8 @@ mod tests {
     #[test]
     fn test_create_pool() {
         let device = DeviceKeyPair::generate();
-        let (config, pool_root, cert) = PoolConfig::create_pool("Test Pool".to_string(), &device).unwrap();
+        let (config, pool_root, cert) =
+            PoolConfig::create_pool("Test Pool".to_string(), &device).unwrap();
 
         assert_eq!(config.name, "Test Pool");
         assert_eq!(config.role, MembershipRole::Admin);
@@ -385,7 +389,8 @@ mod tests {
         // Override home directory for test
         std::env::set_var("HOME", temp_dir.path());
 
-        let (config, pool_root, cert) = PoolConfig::create_pool("Test Pool".to_string(), &device).unwrap();
+        let (config, pool_root, cert) =
+            PoolConfig::create_pool("Test Pool".to_string(), &device).unwrap();
 
         // Save
         config.save(&cert, Some(&pool_root)).unwrap();
@@ -407,10 +412,12 @@ mod tests {
         std::env::set_var("HOME", temp_dir.path());
 
         // Create and save multiple pools
-        let (config1, root1, cert1) = PoolConfig::create_pool("Pool 1".to_string(), &device).unwrap();
+        let (config1, root1, cert1) =
+            PoolConfig::create_pool("Pool 1".to_string(), &device).unwrap();
         config1.save(&cert1, Some(&root1)).unwrap();
 
-        let (config2, root2, cert2) = PoolConfig::create_pool("Pool 2".to_string(), &device).unwrap();
+        let (config2, root2, cert2) =
+            PoolConfig::create_pool("Pool 2".to_string(), &device).unwrap();
         config2.save(&cert2, Some(&root2)).unwrap();
 
         // List pools

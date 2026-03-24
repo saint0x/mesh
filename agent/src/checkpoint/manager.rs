@@ -69,12 +69,15 @@ impl CheckpointManager {
         let checkpoint = self.create_checkpoint(job, kv_cache)?;
 
         // Serialize to CBOR
-        let data = checkpoint.to_cbor().map_err(|e| {
-            AgentError::Config(format!("Failed to serialize checkpoint: {}", e))
-        })?;
+        let data = checkpoint
+            .to_cbor()
+            .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?;
 
         // Create job directory if needed
-        let job_dir = self.config.checkpoint_dir.join(job.request.job_id.to_string());
+        let job_dir = self
+            .config
+            .checkpoint_dir
+            .join(job.request.job_id.to_string());
         std::fs::create_dir_all(&job_dir)?;
 
         // Write checkpoint file
@@ -284,7 +287,10 @@ impl CheckpointManager {
                     }
 
                     // Remove empty job directories
-                    if std::fs::read_dir(&path).map(|d| d.count() == 0).unwrap_or(false) {
+                    if std::fs::read_dir(&path)
+                        .map(|d| d.count() == 0)
+                        .unwrap_or(false)
+                    {
                         let _ = std::fs::remove_dir(&path);
                     }
                 }
@@ -322,14 +328,18 @@ impl CheckpointManager {
     // === Private Methods ===
 
     /// Create a checkpoint from job state
-    fn create_checkpoint(&self, job: &InferenceJob, kv_cache: Option<&KVCache>) -> Result<Checkpoint> {
+    fn create_checkpoint(
+        &self,
+        job: &InferenceJob,
+        kv_cache: Option<&KVCache>,
+    ) -> Result<Checkpoint> {
         let metadata = CheckpointMetadata::new(
             job.request.job_id,
             job.current_token_idx,
             job.current_layer,
             job.request.model_id.clone(),
             self.worker_id.clone(),
-            0, // Will be updated after serialization
+            0,             // Will be updated after serialization
             String::new(), // Will be computed after creation
         );
 
@@ -368,9 +378,8 @@ impl CheckpointManager {
     /// Load a checkpoint from file
     async fn load_checkpoint_file(&self, path: &Path) -> Result<Checkpoint> {
         let data = std::fs::read(path)?;
-        let checkpoint = Checkpoint::from_cbor(&data).map_err(|e| {
-            AgentError::Config(format!("Failed to deserialize checkpoint: {}", e))
-        })?;
+        let checkpoint = Checkpoint::from_cbor(&data)
+            .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
         Ok(checkpoint)
     }
 
@@ -416,7 +425,8 @@ impl CheckpointManager {
         if checkpoints.len() > self.config.max_checkpoints_per_job as usize {
             let to_delete = &checkpoints[self.config.max_checkpoints_per_job as usize..];
             for metadata in to_delete {
-                self.delete_checkpoint(job_id, metadata.checkpoint_id).await?;
+                self.delete_checkpoint(job_id, metadata.checkpoint_id)
+                    .await?;
             }
         }
 
@@ -427,10 +437,10 @@ impl CheckpointManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::job::{GenerationConfig, InferenceRequest};
     use crate::inference::kv_cache::{KVCache, KVCacheConfig};
     use crate::inference::tensor_ops::Tensor2D;
     use tempfile::TempDir;
-    use crate::inference::job::{GenerationConfig, InferenceRequest};
 
     fn create_test_job() -> InferenceJob {
         let request = InferenceRequest::new(
@@ -438,7 +448,8 @@ mod tests {
             "llama-70b".to_string(),
             vec![1, 2, 3, 4, 5],
             "executor-1".to_string(),
-        ).with_config(GenerationConfig {
+        )
+        .with_config(GenerationConfig {
             max_tokens: 100,
             checkpoint_interval: 10,
             ..Default::default()
@@ -516,7 +527,10 @@ mod tests {
             )
             .unwrap();
 
-        manager.save_checkpoint(&job, Some(&kv_cache)).await.unwrap();
+        manager
+            .save_checkpoint(&job, Some(&kv_cache))
+            .await
+            .unwrap();
         let restored = manager
             .load_checkpoint_kv_cache(job.request.job_id)
             .await
@@ -524,7 +538,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(restored.seq_len(), 1);
-        assert_eq!(restored.layers[0].keys.as_ref().unwrap().data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            restored.layers[0].keys.as_ref().unwrap().data,
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
     }
 
     #[tokio::test]
@@ -571,7 +588,10 @@ mod tests {
 
         // Save and then delete
         let metadata = manager.save_checkpoint(&job, None).await.unwrap();
-        manager.delete_checkpoint(job_id, metadata.checkpoint_id).await.unwrap();
+        manager
+            .delete_checkpoint(job_id, metadata.checkpoint_id)
+            .await
+            .unwrap();
 
         // Should be empty now
         let checkpoints = manager.list_checkpoints(job_id).await.unwrap();

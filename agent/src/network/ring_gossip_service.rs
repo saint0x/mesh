@@ -38,7 +38,11 @@ impl RingGossipService {
         device_keypair: DeviceKeyPair,
         gossip_tx: mpsc::Sender<RingGossipMessage>,
         gossip_rx: mpsc::Receiver<RingGossipMessage>,
-    ) -> (Self, Arc<RwLock<RingState>>, broadcast::Receiver<RingTopology>) {
+    ) -> (
+        Self,
+        Arc<RwLock<RingState>>,
+        broadcast::Receiver<RingTopology>,
+    ) {
         let ring_state = Arc::new(RwLock::new(RingState::new(pool_id)));
         let (topology_tx, topology_rx) = broadcast::channel(16);
 
@@ -97,9 +101,7 @@ impl RingGossipService {
 
     /// Announce presence in ring
     async fn announce_presence(&mut self) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
         // Update our own member info in ring state
         let member = RingMember {
@@ -449,7 +451,10 @@ mod tests {
         // Ring should be unchanged
         let final_count = ring_state1.read().await.members.len();
         let final_version = ring_state1.read().await.version;
-        assert_eq!(final_count, initial_count, "Should ignore different pool gossip");
+        assert_eq!(
+            final_count, initial_count,
+            "Should ignore different pool gossip"
+        );
         assert_eq!(final_version, initial_version, "Version should not change");
     }
 
@@ -501,7 +506,11 @@ mod tests {
 
         // Check that ring was updated
         let state1 = ring_state1.read().await;
-        assert_eq!(state1.members.len(), 2, "Ring should have 2 members after merge");
+        assert_eq!(
+            state1.members.len(),
+            2,
+            "Ring should have 2 members after merge"
+        );
 
         // Check that topology was broadcast (convergence triggered)
         let topology = topology_rx1.try_recv();
@@ -559,14 +568,8 @@ mod tests {
         let (gossip_tx, _gossip_rx_for_tx) = mpsc::channel(10);
         let (_gossip_tx_for_rx, gossip_rx) = mpsc::channel(10);
 
-        let (mut service, ring_state, mut topology_rx) = RingGossipService::new(
-            pool_id,
-            node1,
-            peer1,
-            device1.clone(),
-            gossip_tx,
-            gossip_rx,
-        );
+        let (mut service, ring_state, mut topology_rx) =
+            RingGossipService::new(pool_id, node1, peer1, device1.clone(), gossip_tx, gossip_rx);
 
         // Manually add other members to ring (but not ourselves)
         {
@@ -609,14 +612,8 @@ mod tests {
         let (gossip_tx, _gossip_rx_for_tx) = mpsc::channel(10);
         let (_gossip_tx_for_rx, gossip_rx) = mpsc::channel(10);
 
-        let (mut service, ring_state, mut topology_rx) = RingGossipService::new(
-            pool_id,
-            node1,
-            peer1,
-            device1.clone(),
-            gossip_tx,
-            gossip_rx,
-        );
+        let (mut service, ring_state, mut topology_rx) =
+            RingGossipService::new(pool_id, node1, peer1, device1.clone(), gossip_tx, gossip_rx);
 
         // Add both members to ring
         service.announce_presence().await.unwrap();
@@ -665,7 +662,10 @@ mod tests {
         // Check convergence with new version → should notify again
         service.check_convergence().await.unwrap();
         let result3 = topology_rx.try_recv();
-        assert!(result3.is_ok(), "Convergence with new version should notify");
+        assert!(
+            result3.is_ok(),
+            "Convergence with new version should notify"
+        );
     }
 
     /// Test 30: Convergence calculates correct topology
@@ -683,14 +683,8 @@ mod tests {
         let (gossip_tx, _gossip_rx_for_tx) = mpsc::channel(10);
         let (_gossip_tx_for_rx, gossip_rx) = mpsc::channel(10);
 
-        let (mut service, ring_state, mut topology_rx) = RingGossipService::new(
-            pool_id,
-            node1,
-            peer1,
-            device1.clone(),
-            gossip_tx,
-            gossip_rx,
-        );
+        let (mut service, ring_state, mut topology_rx) =
+            RingGossipService::new(pool_id, node1, peer1, device1.clone(), gossip_tx, gossip_rx);
 
         // Create 3-node ring
         service.announce_presence().await.unwrap();
@@ -774,7 +768,10 @@ mod tests {
         stale_gossip_from_other.sender_device_pubkey = device2.public;
 
         // Handle stale gossip (should not change ring)
-        service.handle_gossip(stale_gossip_from_other).await.unwrap();
+        service
+            .handle_gossip(stale_gossip_from_other)
+            .await
+            .unwrap();
 
         // Should NOT broadcast topology (no changes)
         let result = topology_rx.try_recv();

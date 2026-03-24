@@ -59,7 +59,11 @@ impl NetworkSettings {
 
 impl NetworkConnectivity {
     pub fn validate(&self) -> ApiResult<()> {
-        if self.attachments.iter().any(|attachment| attachment.endpoint.trim().is_empty()) {
+        if self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.endpoint.trim().is_empty())
+        {
             return Err(ApiError::BadRequest(
                 "connectivity attachments must include a non-empty endpoint".to_string(),
             ));

@@ -125,11 +125,7 @@ fn xavier_tensor_1d(_rng: &mut Rng, size: usize) -> Tensor1D {
 /// # MOCK Implementation Note
 /// This generates weights for VALIDATION ONLY. Replace with actual
 /// safetensors loading for production inference.
-pub fn generate_mock_weights(
-    config: &ModelConfig,
-    shard_cols: usize,
-    seed: u64,
-) -> ModelWeights {
+pub fn generate_mock_weights(config: &ModelConfig, shard_cols: usize, seed: u64) -> ModelWeights {
     let mut rng = Rng::new(seed);
 
     // Generate per-layer weights
@@ -323,7 +319,11 @@ mod tests {
         let mut rng2 = Rng::new(12345);
 
         for _ in 0..100 {
-            assert_eq!(rng1.next_u64(), rng2.next_u64(), "RNG must be deterministic");
+            assert_eq!(
+                rng1.next_u64(),
+                rng2.next_u64(),
+                "RNG must be deterministic"
+            );
         }
     }
 
@@ -335,7 +335,10 @@ mod tests {
         let val1 = rng1.next_u64();
         let val2 = rng2.next_u64();
 
-        assert_ne!(val1, val2, "Different seeds should produce different values");
+        assert_ne!(
+            val1, val2,
+            "Different seeds should produce different values"
+        );
     }
 
     #[test]
@@ -364,11 +367,7 @@ mod tests {
 
         // Check mean is close to 0
         let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
-        assert!(
-            mean.abs() < 0.01,
-            "Xavier mean should be ~0, got {}",
-            mean
-        );
+        assert!(mean.abs() < 0.01, "Xavier mean should be ~0, got {}", mean);
 
         // Check values are within expected limit
         let limit = (6.0_f32 / (fan_in + fan_out) as f32).sqrt();

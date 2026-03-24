@@ -22,7 +22,10 @@ pub struct RingGossipMessage {
     /// Lamport timestamp for conflict resolution
     pub version: u64,
     /// Signature by device private key (hex encoded for serde)
-    #[serde(serialize_with = "hex_64_serialize", deserialize_with = "hex_64_deserialize")]
+    #[serde(
+        serialize_with = "hex_64_serialize",
+        deserialize_with = "hex_64_deserialize"
+    )]
     pub signature: [u8; 64],
 }
 
@@ -41,7 +44,10 @@ where
     let s = String::deserialize(deserializer)?;
     let bytes = hex::decode(&s).map_err(D::Error::custom)?;
     if bytes.len() != 64 {
-        return Err(D::Error::custom(format!("expected 64 bytes, got {}", bytes.len())));
+        return Err(D::Error::custom(format!(
+            "expected 64 bytes, got {}",
+            bytes.len()
+        )));
     }
     let mut array = [0u8; 64];
     array.copy_from_slice(&bytes);
@@ -50,11 +56,7 @@ where
 
 impl RingGossipMessage {
     /// Create a new ring gossip message
-    pub fn new(
-        pool_id: PoolId,
-        ring_state: RingState,
-        device_keypair: &DeviceKeyPair,
-    ) -> Self {
+    pub fn new(pool_id: PoolId, ring_state: RingState, device_keypair: &DeviceKeyPair) -> Self {
         let sender_node_id = device_keypair.node_id();
         let sender_device_pubkey = device_keypair.public;
         let version = ring_state.version;
@@ -319,12 +321,17 @@ impl RingState {
 
     /// Check if ring is stable (all members Active)
     pub fn is_stable(&self) -> bool {
-        self.members.values().all(|m| m.status == MemberStatus::Active)
+        self.members
+            .values()
+            .all(|m| m.status == MemberStatus::Active)
     }
 
     /// Get count of active members
     pub fn active_member_count(&self) -> usize {
-        self.members.values().filter(|m| m.status == MemberStatus::Active).count()
+        self.members
+            .values()
+            .filter(|m| m.status == MemberStatus::Active)
+            .count()
     }
 
     /// Hash node ID for consistent ring ordering
@@ -404,11 +411,7 @@ mod test_utils {
     }
 
     /// Create a test ring member with specified parameters
-    pub fn create_test_member(
-        node_id: NodeId,
-        last_seen: u64,
-        status: MemberStatus,
-    ) -> RingMember {
+    pub fn create_test_member(node_id: NodeId, last_seen: u64, status: MemberStatus) -> RingMember {
         RingMember {
             node_id,
             peer_id: None,
@@ -533,8 +536,8 @@ mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_utils::*;
+    use super::*;
     use crate::pki::DeviceKeyPair;
 
     #[test]
@@ -729,8 +732,10 @@ mod tests {
 
             let current_order: Vec<_> = ring.members.keys().copied().collect();
             assert_eq!(
-                current_order, initial_order,
-                "Member order changed after merge #{}", i + 1
+                current_order,
+                initial_order,
+                "Member order changed after merge #{}",
+                i + 1
             );
         }
 
@@ -780,8 +785,14 @@ mod tests {
         assert_eq!(ranges[1].1, 8192);
 
         // Verify full coverage
-        assert!(assert_shard_coverage(&ring), "Two nodes should have full coverage");
-        assert!(assert_no_shard_overlap(&ring), "Two nodes should not overlap");
+        assert!(
+            assert_shard_coverage(&ring),
+            "Two nodes should have full coverage"
+        );
+        assert!(
+            assert_no_shard_overlap(&ring),
+            "Two nodes should not overlap"
+        );
     }
 
     #[test]
@@ -814,7 +825,10 @@ mod tests {
         let total: u32 = ranges.iter().map(|(s, e)| e - s).sum();
         assert_eq!(total, 8192, "Three nodes should cover all 8192 columns");
 
-        assert!(assert_shard_coverage(&ring), "Three nodes should have full coverage");
+        assert!(
+            assert_shard_coverage(&ring),
+            "Three nodes should have full coverage"
+        );
     }
 
     #[test]
@@ -833,7 +847,11 @@ mod tests {
 
             // Verify invariants
             assert_eq!(ranges[0].0, 0, "First shard should start at 0");
-            assert_eq!(ranges.last().unwrap().1, 8192, "Last shard should end at 8192");
+            assert_eq!(
+                ranges.last().unwrap().1,
+                8192,
+                "Last shard should end at 8192"
+            );
 
             // Verify full coverage and no overlaps
             assert!(
@@ -874,13 +892,31 @@ mod tests {
         for (pos, expected_start) in [(0, 0), (4095, 4095), (8191, 8191)] {
             let node_id = &sorted_members[pos].node_id;
             let (start, end) = ring.calculate_shard_range(node_id).unwrap();
-            assert_eq!(start, expected_start, "Position {} should start at {}", pos, expected_start);
-            assert_eq!(end, expected_start + 1, "Position {} should end at {}", pos, expected_start + 1);
-            assert_eq!(end - start, 1, "Position {} should have exactly 1 column", pos);
+            assert_eq!(
+                start, expected_start,
+                "Position {} should start at {}",
+                pos, expected_start
+            );
+            assert_eq!(
+                end,
+                expected_start + 1,
+                "Position {} should end at {}",
+                pos,
+                expected_start + 1
+            );
+            assert_eq!(
+                end - start,
+                1,
+                "Position {} should have exactly 1 column",
+                pos
+            );
         }
 
         // Verify full coverage
-        assert!(assert_shard_coverage(&ring), "8192 nodes should have full coverage");
+        assert!(
+            assert_shard_coverage(&ring),
+            "8192 nodes should have full coverage"
+        );
     }
 
     #[test]
@@ -903,21 +939,33 @@ mod tests {
         let sorted_members: Vec<_> = ring.members.values().collect();
 
         // Sample positions
-        let (start_0, end_0) = ring.calculate_shard_range(&sorted_members[0].node_id).unwrap();
+        let (start_0, end_0) = ring
+            .calculate_shard_range(&sorted_members[0].node_id)
+            .unwrap();
         assert_eq!(start_0, 0);
         assert_eq!(end_0, 0, "With overflow, most shards have 0 columns");
 
-        let (start_4096, end_4096) = ring.calculate_shard_range(&sorted_members[4096].node_id).unwrap();
+        let (start_4096, end_4096) = ring
+            .calculate_shard_range(&sorted_members[4096].node_id)
+            .unwrap();
         assert_eq!(start_4096, 0);
         assert_eq!(end_4096, 0);
 
         // Last position gets all columns
-        let (start_last, end_last) = ring.calculate_shard_range(&sorted_members[8192].node_id).unwrap();
+        let (start_last, end_last) = ring
+            .calculate_shard_range(&sorted_members[8192].node_id)
+            .unwrap();
         assert_eq!(start_last, 0);
-        assert_eq!(end_last, 8192, "Last shard with overflow should get all remaining columns");
+        assert_eq!(
+            end_last, 8192,
+            "Last shard with overflow should get all remaining columns"
+        );
 
         // Verify no panic and deterministic behavior
-        assert!(assert_shard_coverage(&ring), "Overflow case should still have valid coverage");
+        assert!(
+            assert_shard_coverage(&ring),
+            "Overflow case should still have valid coverage"
+        );
     }
 
     #[test]
@@ -972,10 +1020,7 @@ mod tests {
             let full_coverage = total == 8192;
 
             TestResult::from_bool(
-                first_starts_at_zero
-                    && last_ends_at_8192
-                    && no_gaps_or_overlaps
-                    && full_coverage
+                first_starts_at_zero && last_ends_at_8192 && no_gaps_or_overlaps && full_coverage,
             )
         }
 
@@ -996,16 +1041,17 @@ mod tests {
 
         // Add a new member to ring2 (forces merge to succeed)
         let device = DeviceKeyPair::generate();
-        ring2.add_member(create_test_member(device.node_id(), 2000, MemberStatus::Active));
+        ring2.add_member(create_test_member(
+            device.node_id(),
+            2000,
+            MemberStatus::Active,
+        ));
 
         // Merge ring2 into ring1
         let changed = ring1.merge(&ring2);
 
         assert!(changed, "Merge should succeed with new member");
-        assert_eq!(
-            ring1.version, 6,
-            "Version should be max(5, 3) + 1 = 6"
-        );
+        assert_eq!(ring1.version, 6, "Version should be max(5, 3) + 1 = 6");
     }
 
     #[test]
@@ -1022,16 +1068,21 @@ mod tests {
         ciborium::ser::into_writer(&original, &mut serialized).unwrap();
 
         // Deserialize from CBOR
-        let deserialized: RingGossipMessage =
-            ciborium::de::from_reader(&serialized[..]).unwrap();
+        let deserialized: RingGossipMessage = ciborium::de::from_reader(&serialized[..]).unwrap();
 
         // Verify fields match
         assert_eq!(deserialized.pool_id, original.pool_id);
         assert_eq!(deserialized.sender_node_id, original.sender_node_id);
-        assert_eq!(deserialized.sender_device_pubkey, original.sender_device_pubkey);
+        assert_eq!(
+            deserialized.sender_device_pubkey,
+            original.sender_device_pubkey
+        );
         assert_eq!(deserialized.version, original.version);
         assert_eq!(deserialized.signature, original.signature);
-        assert_eq!(deserialized.ring_state.members.len(), original.ring_state.members.len());
+        assert_eq!(
+            deserialized.ring_state.members.len(),
+            original.ring_state.members.len()
+        );
         assert!(deserialized.verify());
     }
 
@@ -1079,7 +1130,11 @@ mod tests {
         // Should use newer info (last-write-wins)
         let member = find_member(&ring1, &node_id).unwrap();
         assert_eq!(member.last_seen, now - 10, "Should use newer last_seen");
-        assert_eq!(member.status, MemberStatus::Active, "Should use newer status");
+        assert_eq!(
+            member.status,
+            MemberStatus::Active,
+            "Should use newer status"
+        );
 
         // Version should increment
         assert_eq!(ring1.version, initial_version + 1);
@@ -1113,7 +1168,11 @@ mod tests {
         // Should keep newer info
         let member = find_member(&ring1, &node_id).unwrap();
         assert_eq!(member.last_seen, now - 10, "Should keep newer last_seen");
-        assert_eq!(member.status, MemberStatus::Active, "Should keep newer status");
+        assert_eq!(
+            member.status,
+            MemberStatus::Active,
+            "Should keep newer status"
+        );
 
         // Version should not change
         assert_eq!(ring1.version, initial_version);
@@ -1136,7 +1195,11 @@ mod tests {
         let changed = ring1.merge(&ring2);
 
         assert!(!changed, "Merge should reject different pool IDs");
-        assert_eq!(ring1.members.len(), initial_count, "Ring1 should be unchanged");
+        assert_eq!(
+            ring1.members.len(),
+            initial_count,
+            "Ring1 should be unchanged"
+        );
         assert_eq!(ring1.version, initial_version, "Version should not change");
     }
 
@@ -1168,10 +1231,16 @@ mod tests {
         assert!(changed, "Merge should detect stale member removal");
 
         // node_A should be removed (>60s old)
-        assert!(!contains_member(&ring, &node_a), "Stale member should be removed");
+        assert!(
+            !contains_member(&ring, &node_a),
+            "Stale member should be removed"
+        );
 
         // node_B should be retained (<60s old)
-        assert!(contains_member(&ring, &node_b), "Fresh member should be retained");
+        assert!(
+            contains_member(&ring, &node_b),
+            "Fresh member should be retained"
+        );
 
         assert_eq!(ring.members.len(), 1, "Should have 1 member after cleanup");
     }
@@ -1199,7 +1268,10 @@ mod tests {
         assert!(!changed, "Merge should not remove member at 59s boundary");
 
         // Member should be retained
-        assert!(contains_member(&ring, &node_id), "Member at 59s should be retained");
+        assert!(
+            contains_member(&ring, &node_id),
+            "Member at 59s should be retained"
+        );
         assert_eq!(ring.members.len(), 1);
     }
 
@@ -1226,7 +1298,10 @@ mod tests {
         assert!(changed, "Merge should remove member at 60s boundary");
 
         // Member should be removed
-        assert!(!contains_member(&ring, &node_id), "Member at 60s should be removed");
+        assert!(
+            !contains_member(&ring, &node_id),
+            "Member at 60s should be removed"
+        );
         assert_eq!(ring.members.len(), 0);
     }
 
@@ -1283,7 +1358,10 @@ mod tests {
         let (ring, _) = create_ring_with_members(pool_id, 5, now);
 
         // All members created with Active status
-        assert!(ring.is_stable(), "Ring with all Active members should be stable");
+        assert!(
+            ring.is_stable(),
+            "Ring with all Active members should be stable"
+        );
     }
 
     /// Test 22: is_stable() should return false when any member is not Active
@@ -1296,7 +1374,10 @@ mod tests {
         // Change one member to Joining status
         ring.update_member_status(&node_ids[2], MemberStatus::Joining);
 
-        assert!(!ring.is_stable(), "Ring with Joining member should not be stable");
+        assert!(
+            !ring.is_stable(),
+            "Ring with Joining member should not be stable"
+        );
     }
 
     // =========================================================================
@@ -1320,10 +1401,16 @@ mod tests {
         let (left, right) = ring.get_neighbors(&node_at_pos_0).unwrap();
 
         // Left neighbor should be position 4 (wraps around)
-        assert_eq!(left, node_at_pos_4, "Left neighbor of position 0 should be position 4");
+        assert_eq!(
+            left, node_at_pos_4,
+            "Left neighbor of position 0 should be position 4"
+        );
 
         // Right neighbor should be position 1
-        assert_eq!(right, node_at_pos_1, "Right neighbor of position 0 should be position 1");
+        assert_eq!(
+            right, node_at_pos_1,
+            "Right neighbor of position 0 should be position 1"
+        );
     }
 
     /// Test 33: Neighbors at last position should wrap around to position 0
@@ -1343,10 +1430,16 @@ mod tests {
         let (left, right) = ring.get_neighbors(&node_at_pos_6).unwrap();
 
         // Left neighbor should be position 5
-        assert_eq!(left, node_at_pos_5, "Left neighbor of position 6 should be position 5");
+        assert_eq!(
+            left, node_at_pos_5,
+            "Left neighbor of position 6 should be position 5"
+        );
 
         // Right neighbor should be position 0 (wraps around)
-        assert_eq!(right, node_at_pos_0, "Right neighbor of position 6 should wrap to position 0");
+        assert_eq!(
+            right, node_at_pos_0,
+            "Right neighbor of position 6 should wrap to position 0"
+        );
     }
 
     /// Test 34: Single node ring has no neighbors
@@ -1388,7 +1481,9 @@ mod tests {
             // Check right neighbor symmetry
             let (left_of_right, _) = match ring.get_neighbors(&right_of_a) {
                 Some(neighbors) => neighbors,
-                None => return quickcheck::TestResult::error("get_neighbors failed for right neighbor"),
+                None => {
+                    return quickcheck::TestResult::error("get_neighbors failed for right neighbor")
+                }
             };
 
             if left_of_right != node_a {
@@ -1398,7 +1493,9 @@ mod tests {
             // Check left neighbor symmetry
             let (_, right_of_left) = match ring.get_neighbors(&left_of_a) {
                 Some(neighbors) => neighbors,
-                None => return quickcheck::TestResult::error("get_neighbors failed for left neighbor"),
+                None => {
+                    return quickcheck::TestResult::error("get_neighbors failed for left neighbor")
+                }
             };
 
             if right_of_left != node_a {

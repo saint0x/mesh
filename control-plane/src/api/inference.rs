@@ -1,4 +1,7 @@
-use axum::{extract::{Path, State}, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use rusqlite::{params, OptionalExtension};
 use time::{Duration, OffsetDateTime};
 use tracing::{info, instrument};
@@ -50,9 +53,10 @@ pub async fn submit_inference(
 
     let ring_manager = state.get_ring_manager(&req.network_id)?;
     let topology_network_id = req.network_id.clone();
-    let topology = tokio::task::spawn_blocking(move || ring_manager.get_topology(&topology_network_id))
-        .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    let topology =
+        tokio::task::spawn_blocking(move || ring_manager.get_topology(&topology_network_id))
+            .await
+            .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
     if topology.workers.is_empty() {
         return Err(ApiError::BadRequest(
@@ -67,7 +71,9 @@ pub async fn submit_inference(
 
     let prompt_tokens: Vec<u32> = req.prompt.chars().map(|c| c as u32).collect();
     if prompt_tokens.is_empty() {
-        return Err(ApiError::BadRequest("Prompt tokenization failed".to_string()));
+        return Err(ApiError::BadRequest(
+            "Prompt tokenization failed".to_string(),
+        ));
     }
 
     let db = state.db.clone();
@@ -265,10 +271,14 @@ pub async fn get_inference_job_status(
 
 fn validate_submit_request(req: &SubmitInferenceRequest) -> ApiResult<()> {
     if req.device_id.is_empty() {
-        return Err(ApiError::BadRequest("device_id cannot be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "device_id cannot be empty".to_string(),
+        ));
     }
     if req.network_id.is_empty() {
-        return Err(ApiError::BadRequest("network_id cannot be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "network_id cannot be empty".to_string(),
+        ));
     }
     if req.model_id.is_empty() {
         return Err(ApiError::BadRequest("model_id cannot be empty".to_string()));
@@ -425,7 +435,13 @@ fn report_assignment_result(
             SET status = ?, completed_at = ?, lease_expires_at = NULL, failure_reason = ?
             WHERE job_id = ? AND device_id = ?
             "#,
-            params![assignment_status, &now, req.error.as_deref(), job_id, &req.device_id],
+            params![
+                assignment_status,
+                &now,
+                req.error.as_deref(),
+                job_id,
+                &req.device_id
+            ],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -437,8 +453,12 @@ fn report_assignment_result(
     }
 
     let assignment_states = load_assignment_states(&tx, job_id)?;
-    let failed = assignment_states.iter().find(|(_, status, _)| status == "failed");
-    let all_completed = assignment_states.iter().all(|(_, status, _)| status == "completed");
+    let failed = assignment_states
+        .iter()
+        .find(|(_, status, _)| status == "failed");
+    let all_completed = assignment_states
+        .iter()
+        .all(|(_, status, _)| status == "completed");
 
     let (job_status, completion, completion_tokens, execution_time_ms, error, completed_at) =
         if let Some((_, _, failure_reason)) = failed {
@@ -563,7 +583,9 @@ fn load_assignment_states(
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     let rows = stmt
-        .query_map(params![job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_map(params![job_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -656,7 +678,9 @@ mod tests {
                 contributed_memory: 8_000_000_000 + idx as u64,
             };
 
-            let _ = join_ring(State(state.clone()), Json(join_request)).await.unwrap();
+            let _ = join_ring(State(state.clone()), Json(join_request))
+                .await
+                .unwrap();
         }
 
         state

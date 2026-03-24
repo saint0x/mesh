@@ -34,9 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => Level::INFO,
     };
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
-        .finish();
+    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting Meshnet Control Plane");
@@ -45,9 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = Database::default_path()?;
     info!(path = %db_path.display(), "Using database");
 
-    let db_path_str = db_path
-        .to_str()
-        .ok_or_else(|| format!("Invalid database path (contains invalid UTF-8): {}", db_path.display()))?;
+    let db_path_str = db_path.to_str().ok_or_else(|| {
+        format!(
+            "Invalid database path (contains invalid UTF-8): {}",
+            db_path.display()
+        )
+    })?;
     let db = Database::new(db_path_str)?;
 
     // Run migrations
@@ -79,15 +80,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             // Port in use, try to find an available port
-            info!(port = cli.port, "Port already in use, searching for available port...");
+            info!(
+                port = cli.port,
+                "Port already in use, searching for available port..."
+            );
 
             let mut found = None;
             for try_port in (cli.port + 1)..(cli.port + 100) {
                 let try_addr = format!("0.0.0.0:{}", try_port);
                 if let Ok(listener) = tokio::net::TcpListener::bind(&try_addr).await {
                     info!(address = %try_addr, "Control plane listening on alternative port");
-                    println!("\n⚠️  Port {} was in use. Using port {} instead.", cli.port, try_port);
-                    println!("Update agent commands to use: --control-plane http://localhost:{}\n", try_port);
+                    println!(
+                        "\n⚠️  Port {} was in use. Using port {} instead.",
+                        cli.port, try_port
+                    );
+                    println!(
+                        "Update agent commands to use: --control-plane http://localhost:{}\n",
+                        try_port
+                    );
                     found = Some(listener);
                     break;
                 }

@@ -126,9 +126,10 @@ impl RingTopologyManager {
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-        let mut workers_map = self.workers.write().map_err(|_| {
-            ApiError::Internal("Failed to acquire workers write lock".to_string())
-        })?;
+        let mut workers_map = self
+            .workers
+            .write()
+            .map_err(|_| ApiError::Internal("Failed to acquire workers write lock".to_string()))?;
         let mut ring_seq = self.ring_sequence.write().map_err(|_| {
             ApiError::Internal("Failed to acquire ring_sequence write lock".to_string())
         })?;
@@ -137,8 +138,8 @@ impl RingTopologyManager {
         ring_seq.clear();
 
         for worker_result in workers_iter {
-            let worker =
-                worker_result.map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let worker = worker_result
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             ring_seq.push(worker.device_id.clone());
             workers_map.insert(worker.device_id.clone(), worker);
         }
@@ -159,10 +160,14 @@ impl RingTopologyManager {
     pub fn add_worker(&self, worker: Worker) -> ApiResult<RingPosition> {
         // Validate worker
         if worker.device_id.is_empty() {
-            return Err(ApiError::BadRequest("device_id cannot be empty".to_string()));
+            return Err(ApiError::BadRequest(
+                "device_id cannot be empty".to_string(),
+            ));
         }
         if worker.network_id.is_empty() {
-            return Err(ApiError::BadRequest("network_id cannot be empty".to_string()));
+            return Err(ApiError::BadRequest(
+                "network_id cannot be empty".to_string(),
+            ));
         }
 
         let conn = self.db.get_conn()?;
@@ -185,9 +190,10 @@ impl RingTopologyManager {
         }
 
         // Acquire write locks
-        let mut workers_map = self.workers.write().map_err(|_| {
-            ApiError::Internal("Failed to acquire workers write lock".to_string())
-        })?;
+        let mut workers_map = self
+            .workers
+            .write()
+            .map_err(|_| ApiError::Internal("Failed to acquire workers write lock".to_string()))?;
         let mut ring_seq = self.ring_sequence.write().map_err(|_| {
             ApiError::Internal("Failed to acquire ring_sequence write lock".to_string())
         })?;
@@ -223,7 +229,10 @@ impl RingTopologyManager {
             let right = if right_pos == new_position {
                 worker.device_id.clone()
             } else {
-                ring_seq.get(right_pos as usize).cloned().unwrap_or_default()
+                ring_seq
+                    .get(right_pos as usize)
+                    .cloned()
+                    .unwrap_or_default()
             };
             (left, right)
         };
@@ -267,11 +276,15 @@ impl RingTopologyManager {
 
         if let Err(e) = update_result {
             conn.execute("ROLLBACK", []).ok();
-            return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))));
+            return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
+                e,
+            ))));
         }
 
         // Update ring connections for all workers
-        if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq, total_workers as u32) {
+        if let Err(e) =
+            self.update_ring_connections_internal(&conn, &ring_seq, total_workers as u32)
+        {
             conn.execute("ROLLBACK", []).ok();
             return Err(e);
         }
@@ -396,7 +409,10 @@ impl RingTopologyManager {
                 let right_pos = (position + 1) % total_workers;
 
                 let left = ring_seq.get(left_pos as usize).cloned().unwrap_or_default();
-                let right = ring_seq.get(right_pos as usize).cloned().unwrap_or_default();
+                let right = ring_seq
+                    .get(right_pos as usize)
+                    .cloned()
+                    .unwrap_or_default();
                 (left, right)
             };
 
@@ -433,15 +449,18 @@ impl RingTopologyManager {
     /// Marks worker as offline, removes from ring, and triggers redistribution.
     pub fn handle_worker_failure(&self, failed_worker_id: DeviceId) -> ApiResult<()> {
         if failed_worker_id.is_empty() {
-            return Err(ApiError::BadRequest("device_id cannot be empty".to_string()));
+            return Err(ApiError::BadRequest(
+                "device_id cannot be empty".to_string(),
+            ));
         }
 
         let conn = self.db.get_conn()?;
 
         // Acquire write locks
-        let mut workers_map = self.workers.write().map_err(|_| {
-            ApiError::Internal("Failed to acquire workers write lock".to_string())
-        })?;
+        let mut workers_map = self
+            .workers
+            .write()
+            .map_err(|_| ApiError::Internal("Failed to acquire workers write lock".to_string()))?;
         let mut ring_seq = self.ring_sequence.write().map_err(|_| {
             ApiError::Internal("Failed to acquire ring_sequence write lock".to_string())
         })?;
@@ -492,7 +511,9 @@ impl RingTopologyManager {
 
         if let Err(e) = update_result {
             conn.execute("ROLLBACK", []).ok();
-            return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))));
+            return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
+                e,
+            ))));
         }
 
         // Update ring connections for remaining workers
@@ -593,8 +614,8 @@ impl RingTopologyManager {
 
         let mut workers = Vec::new();
         for worker_result in workers_iter {
-            let mut worker =
-                worker_result.map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let mut worker = worker_result
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             worker.shard.model_id = self.default_model_id.clone();
             workers.push(worker);
         }
@@ -610,10 +631,7 @@ impl RingTopologyManager {
 
     /// Get worker count in ring
     pub fn worker_count(&self) -> usize {
-        self.ring_sequence
-            .read()
-            .map(|seq| seq.len())
-            .unwrap_or(0)
+        self.ring_sequence.read().map(|seq| seq.len()).unwrap_or(0)
     }
 }
 
@@ -743,7 +761,9 @@ mod tests {
                     assert!(
                         end_i <= start_j || end_j <= start_i,
                         "Overlapping ranges at total={}: {:?} and {:?}",
-                        total, ranges[i], ranges[j]
+                        total,
+                        ranges[i],
+                        ranges[j]
                     );
                 }
             }
@@ -892,7 +912,9 @@ mod tests {
         }
 
         // Remove middle worker
-        manager.handle_worker_failure("device-1".to_string()).unwrap();
+        manager
+            .handle_worker_failure("device-1".to_string())
+            .unwrap();
 
         // Verify remaining ring
         let topology = manager.get_topology(network_id).unwrap();
@@ -980,8 +1002,12 @@ mod tests {
         }
 
         // Remove all workers
-        manager.handle_worker_failure("device-0".to_string()).unwrap();
-        manager.handle_worker_failure("device-1".to_string()).unwrap();
+        manager
+            .handle_worker_failure("device-0".to_string())
+            .unwrap();
+        manager
+            .handle_worker_failure("device-1".to_string())
+            .unwrap();
 
         // Verify ring is empty
         let topology = manager.get_topology(network_id).unwrap();
@@ -1019,7 +1045,11 @@ mod tests {
 
         // Verify neighbor correctness for each worker
         for worker in &topology.workers {
-            let left_pos = if worker.position == 0 { 9 } else { worker.position - 1 };
+            let left_pos = if worker.position == 0 {
+                9
+            } else {
+                worker.position - 1
+            };
             let right_pos = (worker.position + 1) % 10;
 
             let expected_left = format!("device-{}", left_pos);
@@ -1030,7 +1060,9 @@ mod tests {
         }
 
         // Verify shard coverage
-        let mut all_ranges: Vec<(u32, u32)> = topology.workers.iter()
+        let mut all_ranges: Vec<(u32, u32)> = topology
+            .workers
+            .iter()
             .map(|w| w.shard.column_range)
             .collect();
         all_ranges.sort_by_key(|r| r.0);
