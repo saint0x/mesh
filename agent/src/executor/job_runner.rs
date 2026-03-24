@@ -95,6 +95,9 @@ pub struct JobStats {
 
     /// Number of jobs rejected because a peer exceeded its per-peer quota
     pub peer_quota_rejections: AtomicU64,
+
+    /// Number of jobs rejected because a workload exceeded its workload quota
+    pub workload_quota_rejections: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -126,6 +129,7 @@ impl JobStats {
             backpressure_rejections: AtomicU64::new(0),
             admission_rejections: AtomicU64::new(0),
             peer_quota_rejections: AtomicU64::new(0),
+            workload_quota_rejections: AtomicU64::new(0),
         }
     }
 
@@ -213,6 +217,11 @@ impl JobStats {
 
     pub fn record_peer_quota_rejection(&self) {
         self.peer_quota_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_workload_quota_rejection(&self) {
+        self.workload_quota_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -325,6 +334,10 @@ impl JobStats {
             "  Peer Quota Hit:   {}",
             self.peer_quota_rejections.load(Ordering::Relaxed)
         );
+        println!(
+            "  Workload Quota:   {}",
+            self.workload_quota_rejections.load(Ordering::Relaxed)
+        );
         println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
 
         println!("\n{}", "Performance:".bold());
@@ -409,6 +422,7 @@ impl JobStats {
             "rejected": self.backpressure_rejections.load(Ordering::Relaxed),
             "admission_rejected": self.admission_rejections.load(Ordering::Relaxed),
             "peer_quota_rejected": self.peer_quota_rejections.load(Ordering::Relaxed),
+            "workload_quota_rejected": self.workload_quota_rejections.load(Ordering::Relaxed),
             "success_rate": self.success_rate() * 100.0,
             "avg_execution_time_ms": self.avg_execution_time_ms(),
             "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
@@ -452,6 +466,7 @@ pub struct JobRunner {
     tier: Option<crate::device::Tier>,
     punch_attempt_state: HashMap<PeerId, bool>,
     active_jobs_by_peer: HashMap<PeerId, usize>,
+    active_jobs_by_workload: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -460,6 +475,7 @@ pub struct AdmissionPolicy {
     max_job_timeout_ms: u64,
     max_concurrent_jobs_per_peer: usize,
     allowed_workloads: Vec<String>,
+    workload_concurrency_limits: HashMap<String, usize>,
 }
 
 impl Default for AdmissionPolicy {
@@ -469,6 +485,10 @@ impl Default for AdmissionPolicy {
             max_job_timeout_ms: 300_000,
             max_concurrent_jobs_per_peer: 1,
             allowed_workloads: vec!["embeddings".to_string(), "embeddings-v1".to_string()],
+            workload_concurrency_limits: HashMap::from([
+                ("embeddings".to_string(), 1usize),
+                ("embeddings-v1".to_string(), 1usize),
+            ]),
         }
     }
 }
@@ -479,12 +499,23 @@ impl AdmissionPolicy {
         max_concurrent_jobs_per_peer: usize,
         max_job_timeout_ms: u64,
         allowed_workloads: Vec<String>,
+        workload_concurrency_limits: Vec<crate::device::WorkloadConcurrencyLimit>,
     ) -> Self {
         let normalized_workloads = allowed_workloads
             .into_iter()
             .map(|workload| workload.trim().to_string())
             .filter(|workload| !workload.is_empty())
             .collect::<Vec<_>>();
+        let normalized_limits = workload_concurrency_limits
+            .into_iter()
+            .map(|limit| {
+                (
+                    limit.workload_id.trim().to_string(),
+                    limit.max_concurrent_jobs.max(1),
+                )
+            })
+            .filter(|(workload_id, _)| !workload_id.is_empty())
+            .collect::<HashMap<_, _>>();
 
         Self {
             local_network_id,
@@ -495,6 +526,14 @@ impl AdmissionPolicy {
             } else {
                 normalized_workloads
             },
+            workload_concurrency_limits: if normalized_limits.is_empty() {
+                HashMap::from([
+                    ("embeddings".to_string(), 1usize),
+                    ("embeddings-v1".to_string(), 1usize),
+                ])
+            } else {
+                normalized_limits
+            },
         }
     }
 
@@ -502,6 +541,7 @@ impl AdmissionPolicy {
         &self,
         job: &JobEnvelope,
         active_jobs_for_peer: usize,
+        active_jobs_for_workload: usize,
     ) -> std::result::Result<(), String> {
         if !self.local_network_id.is_empty() && job.network_id != self.local_network_id {
             return Err(format!(
@@ -534,6 +574,15 @@ impl AdmissionPolicy {
                 "peer quota exceeded: {} active jobs (limit {})",
                 active_jobs_for_peer, self.max_concurrent_jobs_per_peer
             ));
+        }
+
+        if let Some(limit) = self.workload_concurrency_limits.get(&job.workload_id) {
+            if active_jobs_for_workload >= *limit {
+                return Err(format!(
+                    "workload quota exceeded for {}: {} active jobs (limit {})",
+                    job.workload_id, active_jobs_for_workload, limit
+                ));
+            }
         }
 
         Ok(())
@@ -574,6 +623,7 @@ impl JobRunner {
             tier: None,
             punch_attempt_state: HashMap::new(),
             active_jobs_by_peer: HashMap::new(),
+            active_jobs_by_workload: HashMap::new(),
         }
     }
 
@@ -882,9 +932,15 @@ impl JobRunner {
     ) -> Result<()> {
         info!("Received job from peer");
         let active_jobs_for_peer = self.active_jobs_for_peer(peer_id);
-        if let Err(rejection_reason) = self.admission_policy.evaluate(&job, active_jobs_for_peer) {
+        let active_jobs_for_workload = self.active_jobs_for_workload(&job.workload_id);
+        if let Err(rejection_reason) =
+            self.admission_policy
+                .evaluate(&job, active_jobs_for_peer, active_jobs_for_workload)
+        {
             if rejection_reason.contains("peer quota exceeded") {
                 self.stats.record_peer_quota_rejection();
+            } else if rejection_reason.contains("workload quota exceeded") {
+                self.stats.record_workload_quota_rejection();
             } else {
                 self.stats.record_admission_rejection();
             }
@@ -895,6 +951,7 @@ impl JobRunner {
                 workload = %job.workload_id,
                 timeout_ms = job.timeout_ms,
                 active_jobs_for_peer = active_jobs_for_peer,
+                active_jobs_for_workload = active_jobs_for_workload,
                 rejection_reason = %rejection_reason,
                 "Rejecting job due to admission policy"
             );
@@ -939,6 +996,7 @@ impl JobRunner {
 
         self.stats.start_job();
         self.increment_active_jobs_for_peer(peer_id);
+        self.increment_active_jobs_for_workload(&job.workload_id);
         let executor = self.executor.clone();
         let ledger_client = self.ledger_client.clone();
         let device_id = self.device_id;
@@ -969,6 +1027,7 @@ impl JobRunner {
         }
         self.stats.finish_job();
         self.decrement_active_jobs_for_peer(completed.peer_id);
+        self.decrement_active_jobs_for_workload(&completed.workload_id);
 
         debug!(
             job_id = %completed.job_id,
@@ -995,6 +1054,29 @@ impl JobRunner {
             *active_jobs = active_jobs.saturating_sub(1);
             if *active_jobs == 0 {
                 self.active_jobs_by_peer.remove(&peer_id);
+            }
+        }
+    }
+
+    fn active_jobs_for_workload(&self, workload_id: &str) -> usize {
+        self.active_jobs_by_workload
+            .get(workload_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn increment_active_jobs_for_workload(&mut self, workload_id: &str) {
+        *self
+            .active_jobs_by_workload
+            .entry(workload_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn decrement_active_jobs_for_workload(&mut self, workload_id: &str) {
+        if let Some(active_jobs) = self.active_jobs_by_workload.get_mut(workload_id) {
+            *active_jobs = active_jobs.saturating_sub(1);
+            if *active_jobs == 0 {
+                self.active_jobs_by_workload.remove(workload_id);
             }
         }
     }
@@ -1123,6 +1205,7 @@ impl JobRunner {
 struct CompletedJob {
     peer_id: libp2p::PeerId,
     job_id: uuid::Uuid,
+    workload_id: String,
     channel: libp2p::request_response::ResponseChannel<JobResult>,
     result: JobResult,
     execution_time_ms: u64,
@@ -1139,6 +1222,7 @@ async fn execute_job_task(
     channel: libp2p::request_response::ResponseChannel<JobResult>,
 ) -> CompletedJob {
     let job_id = job.job_id;
+    let workload_id = job.workload_id.clone();
     let result = JobRunner::execute_job_with_executor(&executor, job).await;
     let execution_time_ms = result.execution_time_ms;
 
@@ -1167,6 +1251,7 @@ async fn execute_job_task(
     CompletedJob {
         peer_id,
         job_id,
+        workload_id,
         channel,
         result,
         execution_time_ms,
@@ -1318,6 +1403,14 @@ mod tests {
     }
 
     #[test]
+    fn test_job_stats_workload_quota_rejection_metrics() {
+        let stats = JobStats::new();
+        stats.record_workload_quota_rejection();
+        stats.record_workload_quota_rejection();
+        assert_eq!(stats.workload_quota_rejections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn test_with_max_concurrent_jobs_clamps_to_one() {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let swarm = MeshSwarm::builder(keypair).build().unwrap();
@@ -1334,6 +1427,10 @@ mod tests {
             1,
             30_000,
             vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1345,7 +1442,7 @@ mod tests {
             created_at: 0,
         };
 
-        assert!(policy.evaluate(&job, 0).is_ok());
+        assert!(policy.evaluate(&job, 0, 0).is_ok());
     }
 
     #[test]
@@ -1355,6 +1452,10 @@ mod tests {
             1,
             30_000,
             vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1367,7 +1468,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0)
+            .evaluate(&job, 0, 0)
             .unwrap_err()
             .contains("job network mismatch"));
     }
@@ -1379,6 +1480,10 @@ mod tests {
             1,
             30_000,
             vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1391,7 +1496,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0)
+            .evaluate(&job, 0, 0)
             .unwrap_err()
             .contains("unsupported workload"));
     }
@@ -1403,6 +1508,10 @@ mod tests {
             1,
             10_000,
             vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1415,7 +1524,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0)
+            .evaluate(&job, 0, 0)
             .unwrap_err()
             .contains("exceeds admission limit"));
     }
@@ -1427,6 +1536,10 @@ mod tests {
             1,
             30_000,
             vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1439,9 +1552,37 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 1)
+            .evaluate(&job, 1, 0)
             .unwrap_err()
             .contains("peer quota exceeded"));
+    }
+
+    #[test]
+    fn test_admission_policy_rejects_workload_quota_over_limit() {
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            2,
+            30_000,
+            vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "test-network".to_string(),
+            workload_id: "embeddings".to_string(),
+            payload: vec![],
+            timeout_ms: 5_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy
+            .evaluate(&job, 0, 1)
+            .unwrap_err()
+            .contains("workload quota exceeded"));
     }
 
     #[tokio::test]

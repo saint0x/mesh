@@ -97,6 +97,8 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Admission rejection accounting is now separate from capacity rejection, so invalid jobs and overload pressure are visible independently.
 - ✅ Peer-level runtime fairness now has an explicit concurrent-job quota, so one valid peer cannot monopolize the agent’s executor slots.
 - ✅ Peer-quota rejection accounting is now separate from generic admission rejection and node-capacity rejection.
+- ✅ Workload-level runtime fairness now has explicit concurrency quotas, so one admitted workload class cannot monopolize the executor.
+- ✅ Workload-quota rejection accounting is now separate from peer-quota and node-capacity rejection.
 - ✅ Relay reservations now depend on explicit authoritative relay advertised addresses instead of implicit empty-address behavior.
 - ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
 - ✅ Coverage now includes a live multi-peer relay dialing runtime gate that exercises multiple reserved peers connecting through the same relay at once.

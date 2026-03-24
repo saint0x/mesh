@@ -79,6 +79,18 @@ pub struct GovernanceConfig {
 
     /// Workloads this agent will admit in the production runtime path.
     pub allowed_workloads: Vec<String>,
+
+    /// Workload-specific concurrency caps enforced within the local runner.
+    pub workload_concurrency_limits: Vec<WorkloadConcurrencyLimit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadConcurrencyLimit {
+    /// Workload identifier this cap applies to.
+    pub workload_id: String,
+
+    /// Maximum concurrent jobs of this workload allowed on the agent.
+    pub max_concurrent_jobs: usize,
 }
 
 impl Default for GovernanceConfig {
@@ -88,6 +100,16 @@ impl Default for GovernanceConfig {
             max_concurrent_jobs_per_peer: 1,
             max_job_timeout_ms: 300_000,
             allowed_workloads: vec!["embeddings".to_string(), "embeddings-v1".to_string()],
+            workload_concurrency_limits: vec![
+                WorkloadConcurrencyLimit {
+                    workload_id: "embeddings".to_string(),
+                    max_concurrent_jobs: 1,
+                },
+                WorkloadConcurrencyLimit {
+                    workload_id: "embeddings-v1".to_string(),
+                    max_concurrent_jobs: 1,
+                },
+            ],
         }
     }
 }
@@ -366,6 +388,19 @@ mod tests {
             config.governance.allowed_workloads,
             vec!["embeddings".to_string(), "embeddings-v1".to_string()]
         );
+        assert_eq!(
+            config.governance.workload_concurrency_limits,
+            vec![
+                WorkloadConcurrencyLimit {
+                    workload_id: "embeddings".to_string(),
+                    max_concurrent_jobs: 1
+                },
+                WorkloadConcurrencyLimit {
+                    workload_id: "embeddings-v1".to_string(),
+                    max_concurrent_jobs: 1
+                }
+            ]
+        );
     }
 
     #[test]
@@ -402,6 +437,19 @@ arch = "x86_64"
         assert_eq!(
             loaded.governance.allowed_workloads,
             vec!["embeddings".to_string(), "embeddings-v1".to_string()]
+        );
+        assert_eq!(
+            loaded.governance.workload_concurrency_limits,
+            vec![
+                WorkloadConcurrencyLimit {
+                    workload_id: "embeddings".to_string(),
+                    max_concurrent_jobs: 1
+                },
+                WorkloadConcurrencyLimit {
+                    workload_id: "embeddings-v1".to_string(),
+                    max_concurrent_jobs: 1
+                }
+            ]
         );
     }
 
@@ -446,6 +494,10 @@ arch = "x86_64"
         assert_eq!(
             original.governance.allowed_workloads,
             loaded.governance.allowed_workloads
+        );
+        assert_eq!(
+            original.governance.workload_concurrency_limits,
+            loaded.governance.workload_concurrency_limits
         );
 
         // CRITICAL: Verify keypair bytes are identical

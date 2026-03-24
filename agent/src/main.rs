@@ -1280,6 +1280,7 @@ async fn cmd_start() -> Result<()> {
             config.governance.max_concurrent_jobs_per_peer,
             config.governance.max_job_timeout_ms,
             config.governance.allowed_workloads.clone(),
+            config.governance.workload_concurrency_limits.clone(),
         ));
     runner.run().await?;
 
