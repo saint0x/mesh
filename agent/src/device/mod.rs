@@ -112,6 +112,15 @@ pub struct GovernanceConfig {
 
     /// Sustained outbound tensor-plane bandwidth budget for this node.
     pub tensor_plane_max_send_bandwidth_bytes_per_sec: u64,
+
+    /// Maximum checkpoint recovery attempts allowed for a single inference job.
+    pub recovery_max_attempts_per_job: u32,
+
+    /// Minimum cooldown between checkpoint recovery attempts for the same job.
+    pub recovery_cooldown_ms: u64,
+
+    /// Maximum checkpoint loads this node will perform in a rolling minute.
+    pub recovery_max_checkpoint_loads_per_minute: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +186,9 @@ impl Default for GovernanceConfig {
             tensor_plane_max_inbound_queued_bytes: 64 * 1024 * 1024,
             tensor_plane_max_outbound_inflight_bytes: 64 * 1024 * 1024,
             tensor_plane_max_send_bandwidth_bytes_per_sec: 10 * 1024 * 1024,
+            recovery_max_attempts_per_job: 2,
+            recovery_cooldown_ms: 5_000,
+            recovery_max_checkpoint_loads_per_minute: 8,
         }
     }
 }
@@ -499,6 +511,12 @@ mod tests {
             config.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
             10 * 1024 * 1024
         );
+        assert_eq!(config.governance.recovery_max_attempts_per_job, 2);
+        assert_eq!(config.governance.recovery_cooldown_ms, 5_000);
+        assert_eq!(
+            config.governance.recovery_max_checkpoint_loads_per_minute,
+            8
+        );
     }
 
     #[test]
@@ -579,6 +597,12 @@ arch = "x86_64"
         assert_eq!(
             loaded.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
             10 * 1024 * 1024
+        );
+        assert_eq!(loaded.governance.recovery_max_attempts_per_job, 2);
+        assert_eq!(loaded.governance.recovery_cooldown_ms, 5_000);
+        assert_eq!(
+            loaded.governance.recovery_max_checkpoint_loads_per_minute,
+            8
         );
     }
 
@@ -667,6 +691,18 @@ arch = "x86_64"
         assert_eq!(
             original.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
             loaded.governance.tensor_plane_max_send_bandwidth_bytes_per_sec
+        );
+        assert_eq!(
+            original.governance.recovery_max_attempts_per_job,
+            loaded.governance.recovery_max_attempts_per_job
+        );
+        assert_eq!(
+            original.governance.recovery_cooldown_ms,
+            loaded.governance.recovery_cooldown_ms
+        );
+        assert_eq!(
+            original.governance.recovery_max_checkpoint_loads_per_minute,
+            loaded.governance.recovery_max_checkpoint_loads_per_minute
         );
 
         // CRITICAL: Verify keypair bytes are identical

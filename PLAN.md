@@ -132,14 +132,16 @@ This is important for mature production behavior, but it should not define the h
 - ✅ The dedicated tensor plane now also enforces a sustained outbound bandwidth budget, so hot-path tensor sends are shaped by one explicit throughput contract instead of only by queue pressure.
 - ✅ Inference stats now persist tensor-plane pressure and transport metrics including bytes sent/received, outbound wait counts/time, inbound queue drops, byte-budget drops, and oversize-message drops.
 - ✅ Inference stats now also persist bandwidth-governor wait counts/time so throughput shaping is operator-visible rather than hidden in transport latency.
+- ✅ Inference execution now uses one explicit bounded checkpoint-recovery contract with capped attempts per job, cooldown between recovery attempts, and a node-level checkpoint-load budget.
+- ✅ Recovery-path governance metrics now persist recovery attempts, cooldown rejections, recovery-budget rejections, and checkpoint misses so degraded retry behavior is operator-visible.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
 - ✅ Governance coverage now includes focused tensor-plane tests for bounded inbound-queue rejection and queued-byte-budget rejection on the dedicated data plane.
 - ✅ Governance coverage now includes focused tensor-plane limiter tests for sustained throughput shaping on the dedicated data plane.
+- ✅ Governance coverage now includes focused recovery-governor tests for cooldown enforcement and checkpoint-load budget exhaustion.
 
 ### Governance Still Open
 
-- ⬜ Recovery-path governance so retries, reconnect storms, checkpoint reloads, and degraded relay behavior cannot overwhelm a node after transport failures.
 - ⬜ Pool-level quota policy beyond the current configurable submitter and model soft caps, including harder explicit ring-wide quota control tied to pool capacity classes.
 
 ## Non-Goals

@@ -1084,7 +1084,16 @@ async fn cmd_start() -> Result<()> {
         }
 
         // Create inference coordinator
-        let inference_config = InferenceConfig::default();
+        let mut inference_config = InferenceConfig::default();
+        inference_config.recovery_max_attempts_per_job = inference_config_task
+            .governance
+            .recovery_max_attempts_per_job;
+        inference_config.recovery_cooldown = std::time::Duration::from_millis(
+            inference_config_task.governance.recovery_cooldown_ms,
+        );
+        inference_config.recovery_max_checkpoint_loads_per_minute = inference_config_task
+            .governance
+            .recovery_max_checkpoint_loads_per_minute;
         let mut coordinator =
             InferenceCoordinator::new(inference_swarm, tensor_plane, inference_config);
 
@@ -2086,6 +2095,18 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(recoveries) = stats.get("checkpoint_recoveries") {
         println!("  Recoveries:       {}", recoveries);
+    }
+    if let Some(attempts) = stats.get("recovery_attempts") {
+        println!("  Recovery Attempts: {}", attempts);
+    }
+    if let Some(cooldown_hits) = stats.get("recovery_cooldown_rejections") {
+        println!("  Recovery Cooldowns: {}", cooldown_hits);
+    }
+    if let Some(budget_hits) = stats.get("recovery_budget_rejections") {
+        println!("  Recovery Budget Hit: {}", budget_hits);
+    }
+    if let Some(misses) = stats.get("recovery_checkpoint_misses") {
+        println!("  Recovery Misses:   {}", misses);
     }
 
     println!("\n{}", "System:".bold());

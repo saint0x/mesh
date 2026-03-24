@@ -35,6 +35,18 @@ pub struct InferenceStats {
     /// Number of recoveries from checkpoint
     pub checkpoint_recoveries: AtomicU64,
 
+    /// Number of checkpoint recovery attempts initiated.
+    pub recovery_attempts: AtomicU64,
+
+    /// Number of checkpoint recovery attempts skipped due to cooldown.
+    pub recovery_cooldown_rejections: AtomicU64,
+
+    /// Number of checkpoint recovery attempts skipped due to node-level load budget.
+    pub recovery_budget_rejections: AtomicU64,
+
+    /// Number of checkpoint recovery attempts that found no usable checkpoint.
+    pub recovery_checkpoint_misses: AtomicU64,
+
     /// Start time for uptime tracking
     pub start_time: Instant,
 
@@ -96,6 +108,10 @@ impl InferenceStats {
             total_allreduce_time_ms: AtomicU64::new(0),
             checkpoints_created: AtomicU64::new(0),
             checkpoint_recoveries: AtomicU64::new(0),
+            recovery_attempts: AtomicU64::new(0),
+            recovery_cooldown_rejections: AtomicU64::new(0),
+            recovery_budget_rejections: AtomicU64::new(0),
+            recovery_checkpoint_misses: AtomicU64::new(0),
             start_time: Instant::now(),
             allreduce_operations: AtomicU64::new(0),
             total_layers_processed: AtomicU64::new(0),
@@ -154,6 +170,25 @@ impl InferenceStats {
     /// Record a recovery from checkpoint
     pub fn record_recovery(&self) {
         self.checkpoint_recoveries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery_attempt(&self) {
+        self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery_cooldown_rejection(&self) {
+        self.recovery_cooldown_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery_budget_rejection(&self) {
+        self.recovery_budget_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery_checkpoint_miss(&self) {
+        self.recovery_checkpoint_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn update_tensor_plane_metrics(&self, snapshot: TensorPlaneMetricsSnapshot) {
@@ -271,6 +306,7 @@ impl InferenceStats {
         let total_tokens = self.total_tokens_generated.load(Ordering::Relaxed);
         let checkpoints = self.checkpoints_created.load(Ordering::Relaxed);
         let recoveries = self.checkpoint_recoveries.load(Ordering::Relaxed);
+        let recovery_attempts = self.recovery_attempts.load(Ordering::Relaxed);
 
         info!(
             jobs_completed = jobs_completed,
@@ -281,6 +317,7 @@ impl InferenceStats {
             avg_allreduce_latency_ms = format!("{:.2}", self.avg_allreduce_latency_ms()),
             checkpoints_created = checkpoints,
             checkpoint_recoveries = recoveries,
+            recovery_attempts = recovery_attempts,
             tensor_bytes_sent = self.tensor_bytes_sent.load(Ordering::Relaxed),
             tensor_bytes_received = self.tensor_bytes_received.load(Ordering::Relaxed),
             tensor_backpressure_waits = self
@@ -398,6 +435,25 @@ impl InferenceStats {
             "  Recoveries:          {}",
             self.checkpoint_recoveries.load(Ordering::Relaxed)
         );
+        println!(
+            "  Recovery Attempts:   {}",
+            self.recovery_attempts.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Recovery Cooldowns:  {}",
+            self.recovery_cooldown_rejections
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Recovery Budget Hit: {}",
+            self.recovery_budget_rejections
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Recovery Misses:     {}",
+            self.recovery_checkpoint_misses
+                .load(Ordering::Relaxed)
+        );
 
         println!("\n{}", "System:".bold());
         println!("  Uptime:              {}", self.uptime_string());
@@ -417,6 +473,10 @@ impl InferenceStats {
             "total_layers_processed": self.total_layers_processed.load(Ordering::Relaxed),
             "checkpoints_created": self.checkpoints_created.load(Ordering::Relaxed),
             "checkpoint_recoveries": self.checkpoint_recoveries.load(Ordering::Relaxed),
+            "recovery_attempts": self.recovery_attempts.load(Ordering::Relaxed),
+            "recovery_cooldown_rejections": self.recovery_cooldown_rejections.load(Ordering::Relaxed),
+            "recovery_budget_rejections": self.recovery_budget_rejections.load(Ordering::Relaxed),
+            "recovery_checkpoint_misses": self.recovery_checkpoint_misses.load(Ordering::Relaxed),
             "tensor_bytes_sent": self.tensor_bytes_sent.load(Ordering::Relaxed),
             "tensor_bytes_received": self.tensor_bytes_received.load(Ordering::Relaxed),
             "tensor_outbound_backpressure_wait_count": self.tensor_outbound_backpressure_wait_count.load(Ordering::Relaxed),
@@ -511,9 +571,20 @@ mod tests {
         stats.record_checkpoint();
         stats.record_checkpoint();
         stats.record_recovery();
+        stats.record_recovery_attempt();
+        stats.record_recovery_cooldown_rejection();
+        stats.record_recovery_budget_rejection();
+        stats.record_recovery_checkpoint_miss();
 
         assert_eq!(stats.checkpoints_created.load(Ordering::Relaxed), 2);
         assert_eq!(stats.checkpoint_recoveries.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.recovery_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.recovery_cooldown_rejections.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stats.recovery_budget_rejections.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.recovery_checkpoint_misses.load(Ordering::Relaxed), 1);
     }
 
     #[test]

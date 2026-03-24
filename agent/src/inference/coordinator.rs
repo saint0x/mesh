@@ -16,7 +16,7 @@ use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
 use crate::network::{MeshSwarm, TensorPlane};
 use libp2p::PeerId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,6 +49,15 @@ pub struct InferenceConfig {
 
     /// Directory for checkpoint storage
     pub checkpoint_dir: std::path::PathBuf,
+
+    /// Maximum checkpoint recovery attempts allowed for a single job.
+    pub recovery_max_attempts_per_job: u32,
+
+    /// Minimum cooldown between checkpoint recovery attempts for the same job.
+    pub recovery_cooldown: Duration,
+
+    /// Maximum checkpoint loads allowed across the node in a rolling minute.
+    pub recovery_max_checkpoint_loads_per_minute: u32,
 }
 
 impl Default for InferenceConfig {
@@ -63,7 +72,54 @@ impl Default for InferenceConfig {
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join(".meshnet")
                 .join("checkpoints"),
+            recovery_max_attempts_per_job: 2,
+            recovery_cooldown: Duration::from_secs(5),
+            recovery_max_checkpoint_loads_per_minute: 8,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAllowance {
+    Allowed,
+    Cooldown,
+    LoadBudget,
+}
+
+#[derive(Debug, Default)]
+struct RecoveryGovernor {
+    last_attempts_by_job: HashMap<Uuid, Instant>,
+    checkpoint_loads: VecDeque<Instant>,
+}
+
+impl RecoveryGovernor {
+    fn allow_attempt(
+        &mut self,
+        job_id: Uuid,
+        cooldown: Duration,
+        max_checkpoint_loads_per_minute: u32,
+        now: Instant,
+    ) -> RecoveryAllowance {
+        while let Some(oldest) = self.checkpoint_loads.front().copied() {
+            if now.duration_since(oldest) < Duration::from_secs(60) {
+                break;
+            }
+            self.checkpoint_loads.pop_front();
+        }
+
+        if let Some(last_attempt) = self.last_attempts_by_job.get(&job_id).copied() {
+            if now.duration_since(last_attempt) < cooldown {
+                return RecoveryAllowance::Cooldown;
+            }
+        }
+
+        if self.checkpoint_loads.len() >= max_checkpoint_loads_per_minute as usize {
+            return RecoveryAllowance::LoadBudget;
+        }
+
+        self.last_attempts_by_job.insert(job_id, now);
+        self.checkpoint_loads.push_back(now);
+        RecoveryAllowance::Allowed
     }
 }
 
@@ -141,6 +197,9 @@ pub struct InferenceCoordinator {
 
     /// Active forward pass state for the currently executing job
     active_forward_pass: Option<ForwardPass>,
+
+    /// Governs checkpoint recovery cadence and node-level recovery load.
+    recovery_governor: RecoveryGovernor,
 }
 
 impl InferenceCoordinator {
@@ -164,6 +223,7 @@ impl InferenceCoordinator {
             loader,
             weight_cache: RwLock::new(HashMap::new()),
             active_forward_pass: None,
+            recovery_governor: RecoveryGovernor::default(),
         }
     }
 
@@ -335,6 +395,8 @@ impl InferenceCoordinator {
 
         // Create inference job
         let mut job = InferenceJob::new(request.clone(), self.config.total_layers);
+        let mut recovered_from_checkpoint = false;
+        let mut recovery_attempts = 0;
 
         // Store as active job
         {
@@ -342,9 +404,31 @@ impl InferenceCoordinator {
             *active = Some(job.clone());
         }
 
-        // Run generation loop
-        // NOTE: WorkerRing is created per-token inside generate_next_token()
-        let result = self.run_generation_loop(&mut job, &position).await;
+        // Run generation loop with bounded checkpoint recovery.
+        let result = loop {
+            match self.run_generation_loop(&mut job, &position).await {
+                Ok(()) => break Ok(()),
+                Err(error) => {
+                    if !self.config.checkpointing_enabled
+                        || recovery_attempts >= self.config.recovery_max_attempts_per_job
+                    {
+                        break Err(error);
+                    }
+
+                    match self.try_recover_job(job.request.job_id).await? {
+                        Some(recovered_job) => {
+                            recovery_attempts += 1;
+                            recovered_from_checkpoint = true;
+                            job = recovered_job;
+                            let mut active = self.active_job.write().await;
+                            *active = Some(job.clone());
+                            continue;
+                        }
+                        None => break Err(error),
+                    }
+                }
+            }
+        };
 
         // Clear active job
         {
@@ -357,7 +441,10 @@ impl InferenceCoordinator {
 
         match result {
             Ok(()) => {
-                let result = job.into_result();
+                let mut result = job.into_result();
+                if recovered_from_checkpoint {
+                    result = result.with_recovery();
+                }
                 self.stats.record_success(
                     result.prompt_tokens,
                     result.completion_tokens,
@@ -597,6 +684,43 @@ impl InferenceCoordinator {
         Ok(None)
     }
 
+    async fn try_recover_job(&mut self, job_id: Uuid) -> Result<Option<InferenceJob>> {
+        match self.recovery_governor.allow_attempt(
+            job_id,
+            self.config.recovery_cooldown,
+            self.config.recovery_max_checkpoint_loads_per_minute,
+            Instant::now(),
+        ) {
+            RecoveryAllowance::Allowed => {
+                self.stats.record_recovery_attempt();
+            }
+            RecoveryAllowance::Cooldown => {
+                self.stats.record_recovery_cooldown_rejection();
+                warn!(
+                    job_id = %job_id,
+                    cooldown_ms = self.config.recovery_cooldown.as_millis(),
+                    "Skipping checkpoint recovery because cooldown is still active"
+                );
+                return Ok(None);
+            }
+            RecoveryAllowance::LoadBudget => {
+                self.stats.record_recovery_budget_rejection();
+                warn!(
+                    job_id = %job_id,
+                    max_loads_per_minute = self.config.recovery_max_checkpoint_loads_per_minute,
+                    "Skipping checkpoint recovery because node recovery load budget is exhausted"
+                );
+                return Ok(None);
+            }
+        }
+
+        let recovered = self.recover_from_checkpoint(job_id).await?;
+        if recovered.is_none() {
+            self.stats.record_recovery_checkpoint_miss();
+        }
+        Ok(recovered)
+    }
+
     /// Run the coordinator event loop
     ///
     /// This listens for network events and processes them.
@@ -687,6 +811,9 @@ mod tests {
         assert_eq!(config.total_layers, 70);
         assert_eq!(config.model_id, "llama-70b");
         assert!(config.checkpointing_enabled);
+        assert_eq!(config.recovery_max_attempts_per_job, 2);
+        assert_eq!(config.recovery_cooldown, Duration::from_secs(5));
+        assert_eq!(config.recovery_max_checkpoint_loads_per_minute, 8);
     }
 
     #[test]
@@ -709,5 +836,48 @@ mod tests {
 
         assert_eq!(position.position, 3);
         assert_eq!(position.total_workers, 10);
+    }
+
+    #[test]
+    fn test_recovery_governor_rejects_attempts_inside_cooldown() {
+        let mut governor = RecoveryGovernor::default();
+        let job_id = Uuid::new_v4();
+        let now = Instant::now();
+
+        assert_eq!(
+            governor.allow_attempt(job_id, Duration::from_secs(5), 8, now),
+            RecoveryAllowance::Allowed
+        );
+        assert_eq!(
+            governor.allow_attempt(job_id, Duration::from_secs(5), 8, now + Duration::from_secs(1)),
+            RecoveryAllowance::Cooldown
+        );
+        assert_eq!(
+            governor.allow_attempt(job_id, Duration::from_secs(5), 8, now + Duration::from_secs(6)),
+            RecoveryAllowance::Allowed
+        );
+    }
+
+    #[test]
+    fn test_recovery_governor_rejects_when_load_budget_is_exhausted() {
+        let mut governor = RecoveryGovernor::default();
+        let now = Instant::now();
+
+        assert_eq!(
+            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now),
+            RecoveryAllowance::Allowed
+        );
+        assert_eq!(
+            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now + Duration::from_secs(1)),
+            RecoveryAllowance::Allowed
+        );
+        assert_eq!(
+            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now + Duration::from_secs(2)),
+            RecoveryAllowance::LoadBudget
+        );
+        assert_eq!(
+            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now + Duration::from_secs(61)),
+            RecoveryAllowance::Allowed
+        );
     }
 }
