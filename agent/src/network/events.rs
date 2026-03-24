@@ -44,6 +44,12 @@ pub enum MeshEvent {
     /// Listening on a new address (including relay addresses)
     NewListenAddr { address: Multiaddr },
 
+    /// A new external/public address candidate was observed for this node
+    ExternalAddrCandidateDiscovered { address: Multiaddr },
+
+    /// An external/public address was confirmed for this node
+    ExternalAddrConfirmed { address: Multiaddr },
+
     /// DCUTR (direct connection upgrade) succeeded
     DirectConnectionUpgraded { peer_id: PeerId },
 
@@ -58,6 +64,9 @@ pub enum MeshEvent {
 
     /// Relay reservation was denied
     ReservationDenied { relay_peer_id: PeerId },
+
+    /// Direct dialing failed and relay fallback was attempted for a peer
+    RelayFallbackToPeer { peer_id: PeerId },
 
     /// Received a job request from a peer
     JobReceived {

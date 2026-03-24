@@ -74,11 +74,11 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Ring workers now resolve direct peers from authoritative `direct_candidates` metadata rather than rebuilding dial order from generic listen-address lists.
 - ✅ Live swarm-observed external address candidates are now persisted and folded into heartbeat candidate publication alongside local listen addresses.
 - ✅ Agent status and pool-status now expose local and remote direct-candidate quality so operators can inspect current reachability and best direct endpoints without digging through raw state files.
+- ✅ Agent metrics now persist and display direct-path quality signals including direct vs relayed peer connections, relay fallback usage, direct-upgrade success/failure, and external address discovery counts.
 
 ### NAT Traversal Still Open
 
 - ⬜ Add focused integration coverage for direct upgrade and relay fallback behavior under more realistic multi-peer networking scenarios.
-- ⬜ Add operator-visible path quality metrics for direct success rate, relay fallback rate, upgrade failure causes, and candidate selection outcomes.
 - ⬜ Extend candidate gathering beyond current local/observed addresses so hostile NAT cases can exchange richer hole-punch inputs and more durable public reachability hints.
 
 ### 3. Governance Third
@@ -172,6 +172,7 @@ After Phase 1:
 - ✅ `cargo test -p agent current_state_prefers_runtime_state_when_present -- --nocapture`
 - ✅ `cargo test -p agent build_direct_peer_candidates_excludes_relay_and_sorts -- --nocapture`
 - ✅ `cargo test -p agent direct_candidate_seed_addrs_merge_listen_and_observed -- --nocapture`
+- ✅ `cargo test -p agent test_job_stats_connectivity_metrics -- --nocapture`
 - ✅ `cargo test -p agent test_worker_position -- --nocapture`
 - ✅ `cargo test -p control-plane test_update_heartbeat -- --nocapture`
 - ✅ `cargo test -p control-plane test_get_topology_handler -- --nocapture`

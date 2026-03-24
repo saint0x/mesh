@@ -6,6 +6,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
+use std::collections::VecDeque;
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
@@ -168,6 +169,7 @@ impl MeshSwarmBuilder {
             config: self.config,
             relay_peer_id: None,
             ring_connections: None,
+            pending_events: VecDeque::new(),
         })
     }
 }
@@ -187,6 +189,7 @@ pub struct MeshSwarm {
     config: MeshSwarmConfig,
     relay_peer_id: Option<PeerId>,
     ring_connections: Option<RingConnections>,
+    pending_events: VecDeque<MeshEvent>,
 }
 
 impl MeshSwarm {
@@ -305,6 +308,9 @@ impl MeshSwarm {
                             error = %relay_error,
                             "Relay fallback failed for neighbor"
                         );
+                    } else {
+                        self.pending_events
+                            .push_back(MeshEvent::RelayFallbackToPeer { peer_id });
                     }
                 } else {
                     warn!(
@@ -357,6 +363,10 @@ impl MeshSwarm {
         use futures::StreamExt;
 
         loop {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Some(event);
+            }
+
             match self.swarm.next().await? {
                 // Identify events
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Identify(event)) => match *event {
@@ -579,11 +589,13 @@ impl MeshSwarm {
                 SwarmEvent::NewExternalAddrCandidate { address } => {
                     info!(address = %address, "Discovered external address candidate");
                     let _ = persist_observed_reachability_addr(&address);
+                    return Some(MeshEvent::ExternalAddrCandidateDiscovered { address });
                 }
 
                 SwarmEvent::ExternalAddrConfirmed { address } => {
                     info!(address = %address, "Confirmed external address");
                     let _ = persist_observed_reachability_addr(&address);
+                    return Some(MeshEvent::ExternalAddrConfirmed { address });
                 }
 
                 // Dial events

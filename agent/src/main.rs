@@ -1510,6 +1510,33 @@ async fn cmd_metrics() -> Result<()> {
     println!("\n{}", "System:".bold());
     println!("  Uptime:           {}", stats.uptime);
     println!("  Last Updated:     {}", stats.last_updated);
+
+    println!("\n{}", "Connectivity:".bold());
+    println!(
+        "  Direct Peers:     {}",
+        stats.connectivity.direct_peer_connections
+    );
+    println!(
+        "  Relayed Peers:    {}",
+        stats.connectivity.relayed_peer_connections
+    );
+    println!("  Relay Fallbacks:  {}", stats.connectivity.relay_fallbacks);
+    println!(
+        "  DCUTR Successes:  {}",
+        stats.connectivity.direct_upgrade_successes
+    );
+    println!(
+        "  DCUTR Failures:   {}",
+        stats.connectivity.direct_upgrade_failures
+    );
+    println!(
+        "  Ext Candidates:   {}",
+        stats.connectivity.external_addr_candidates
+    );
+    println!(
+        "  Ext Confirmed:    {}",
+        stats.connectivity.external_addr_confirmed
+    );
     println!();
 
     Ok(())
@@ -1525,7 +1552,20 @@ struct SavedStats {
     avg_execution_time_ms: f64,
     total_execution_time_ms: u64,
     uptime: String,
+    #[serde(default)]
+    connectivity: SavedConnectivityStats,
     last_updated: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SavedConnectivityStats {
+    direct_peer_connections: u64,
+    relayed_peer_connections: u64,
+    relay_fallbacks: u64,
+    direct_upgrade_successes: u64,
+    direct_upgrade_failures: u64,
+    external_addr_candidates: u64,
+    external_addr_confirmed: u64,
 }
 
 /// Lock resources for pool contribution

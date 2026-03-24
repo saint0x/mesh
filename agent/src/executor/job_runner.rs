@@ -50,6 +50,27 @@ pub struct JobStats {
 
     /// Start time for uptime tracking
     pub start_time: Instant,
+
+    /// Number of direct peer connections established
+    pub direct_peer_connections: AtomicU64,
+
+    /// Number of relayed peer connections established
+    pub relayed_peer_connections: AtomicU64,
+
+    /// Number of times relay fallback was used after a direct dial failed
+    pub relay_fallbacks: AtomicU64,
+
+    /// Number of successful direct connection upgrades
+    pub direct_upgrade_successes: AtomicU64,
+
+    /// Number of failed direct connection upgrades
+    pub direct_upgrade_failures: AtomicU64,
+
+    /// Number of external/public address candidates discovered
+    pub external_addr_candidates: AtomicU64,
+
+    /// Number of external/public addresses confirmed
+    pub external_addr_confirmed: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -67,6 +88,13 @@ impl JobStats {
             total_execution_time_ms: AtomicU64::new(0),
             active_jobs: AtomicU64::new(0),
             start_time: Instant::now(),
+            direct_peer_connections: AtomicU64::new(0),
+            relayed_peer_connections: AtomicU64::new(0),
+            relay_fallbacks: AtomicU64::new(0),
+            direct_upgrade_successes: AtomicU64::new(0),
+            direct_upgrade_failures: AtomicU64::new(0),
+            external_addr_candidates: AtomicU64::new(0),
+            external_addr_confirmed: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +120,37 @@ impl JobStats {
     /// Decrement active job count
     pub fn finish_job(&self) {
         self.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_peer_connection(&self) {
+        self.direct_peer_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_relayed_peer_connection(&self) {
+        self.relayed_peer_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_relay_fallback(&self) {
+        self.relay_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_upgrade_success(&self) {
+        self.direct_upgrade_successes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_upgrade_failure(&self) {
+        self.direct_upgrade_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_external_addr_candidate(&self) {
+        self.external_addr_candidates
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_external_addr_confirmed(&self) {
+        self.external_addr_confirmed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -203,6 +262,35 @@ impl JobStats {
 
         println!("\n{}", "System:".bold());
         println!("  Uptime:           {}", self.uptime_string());
+        println!("\n{}", "Connectivity:".bold());
+        println!(
+            "  Direct Peers:     {}",
+            self.direct_peer_connections.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Relayed Peers:    {}",
+            self.relayed_peer_connections.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Relay Fallbacks:  {}",
+            self.relay_fallbacks.load(Ordering::Relaxed)
+        );
+        println!(
+            "  DCUTR Successes:  {}",
+            self.direct_upgrade_successes.load(Ordering::Relaxed)
+        );
+        println!(
+            "  DCUTR Failures:   {}",
+            self.direct_upgrade_failures.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Ext Candidates:   {}",
+            self.external_addr_candidates.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Ext Confirmed:    {}",
+            self.external_addr_confirmed.load(Ordering::Relaxed)
+        );
         println!();
     }
 
@@ -230,6 +318,15 @@ impl JobStats {
             "avg_execution_time_ms": self.avg_execution_time_ms(),
             "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
             "uptime": self.uptime_string(),
+            "connectivity": {
+                "direct_peer_connections": self.direct_peer_connections.load(Ordering::Relaxed),
+                "relayed_peer_connections": self.relayed_peer_connections.load(Ordering::Relaxed),
+                "relay_fallbacks": self.relay_fallbacks.load(Ordering::Relaxed),
+                "direct_upgrade_successes": self.direct_upgrade_successes.load(Ordering::Relaxed),
+                "direct_upgrade_failures": self.direct_upgrade_failures.load(Ordering::Relaxed),
+                "external_addr_candidates": self.external_addr_candidates.load(Ordering::Relaxed),
+                "external_addr_confirmed": self.external_addr_confirmed.load(Ordering::Relaxed),
+            },
             "last_updated": chrono::Local::now().to_rfc3339(),
         });
 
@@ -426,6 +523,15 @@ impl JobRunner {
                 peer_id,
                 connection_info,
             } => {
+                match connection_info.connection_type {
+                    crate::network::ConnectionType::Direct => {
+                        self.stats.record_direct_peer_connection()
+                    }
+                    crate::network::ConnectionType::Relayed => {
+                        self.stats.record_relayed_peer_connection()
+                    }
+                    crate::network::ConnectionType::Unknown => {}
+                }
                 info!(
                     peer_id = %peer_id,
                     connection_type = ?connection_info.connection_type,
@@ -464,6 +570,31 @@ impl JobRunner {
                     relay_peer_id = %relay_peer_id,
                     "Relay reservation denied"
                 );
+            }
+
+            MeshEvent::RelayFallbackToPeer { peer_id } => {
+                self.stats.record_relay_fallback();
+                warn!(peer_id = %peer_id, "Relay fallback used for peer");
+            }
+
+            MeshEvent::DirectConnectionUpgraded { peer_id } => {
+                self.stats.record_direct_upgrade_success();
+                info!(peer_id = %peer_id, "Direct connection upgrade succeeded");
+            }
+
+            MeshEvent::DirectConnectionUpgradeFailed { peer_id, error } => {
+                self.stats.record_direct_upgrade_failure();
+                warn!(peer_id = %peer_id, error = %error, "Direct connection upgrade failed");
+            }
+
+            MeshEvent::ExternalAddrCandidateDiscovered { address } => {
+                self.stats.record_external_addr_candidate();
+                debug!(address = %address, "External address candidate discovered");
+            }
+
+            MeshEvent::ExternalAddrConfirmed { address } => {
+                self.stats.record_external_addr_confirmed();
+                info!(address = %address, "External address confirmed");
             }
 
             _ => {
@@ -737,5 +868,26 @@ mod tests {
 
         stats.finish_job();
         assert_eq!(stats.active_jobs(), 0);
+    }
+
+    #[test]
+    fn test_job_stats_connectivity_metrics() {
+        let stats = JobStats::new();
+
+        stats.record_direct_peer_connection();
+        stats.record_relayed_peer_connection();
+        stats.record_relay_fallback();
+        stats.record_direct_upgrade_success();
+        stats.record_direct_upgrade_failure();
+        stats.record_external_addr_candidate();
+        stats.record_external_addr_confirmed();
+
+        assert_eq!(stats.direct_peer_connections.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.relayed_peer_connections.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.relay_fallbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.direct_upgrade_successes.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.direct_upgrade_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.external_addr_candidates.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.external_addr_confirmed.load(Ordering::Relaxed), 1);
     }
 }
