@@ -1094,25 +1094,69 @@ async fn cmd_job(
     println!("   Target: {}", target_peer);
     println!("   Timeout: {}ms", timeout_ms);
 
-    let relay_addr = resolve_primary_mesh_endpoint(&config)?;
+    let runtime_endpoint = config.connectivity.runtime_endpoint()?;
 
     // Create ephemeral swarm for job submission
     let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
-    let mut swarm = MeshSwarmBuilder::new(libp2p_keypair)
-        .with_relay_addr(relay_addr.clone())
-        .build()?;
+    let mut swarm_builder = MeshSwarmBuilder::new(libp2p_keypair);
+    if let Some(endpoint) = runtime_endpoint.clone() {
+        swarm_builder = swarm_builder.with_relay_addr(endpoint);
+    }
+    let mut swarm = swarm_builder.build()?;
+    swarm.listen_on_direct_addrs()?;
 
-    println!("\n🌐 Connecting to relay...");
-    swarm.connect_to_relay()?;
+    match config.connectivity.preferred_path {
+        agent::ConnectivityPath::Relayed => {
+            println!("\n🌐 Connecting to relay...");
+            swarm.connect_to_relay()?;
 
-    // Wait for relay connection
-    let mut relay_connected = false;
-    while !relay_connected {
-        if let Some(event) = swarm.next_event().await {
-            if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
-                println!("   ✓ Connected to relay");
-                relay_connected = true;
+            let mut relay_connected = false;
+            while !relay_connected {
+                if let Some(event) = swarm.next_event().await {
+                    if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
+                        println!("   ✓ Connected to relay");
+                        relay_connected = true;
+                    }
+                }
             }
+        }
+        agent::ConnectivityPath::Direct => {
+            println!("\n🌐 Resolving direct target address...");
+            let client = reqwest::Client::new();
+            let topology_url = format!(
+                "{}/api/ring/topology?network_id={}",
+                config.control_plane_url.trim_end_matches('/'),
+                config.network_id
+            );
+            let topology = client
+                .get(&topology_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<RingTopologyResponse>()
+                .await?;
+
+            let worker = topology
+                .workers
+                .into_iter()
+                .find(|worker| worker.peer_id == target_peer.to_string())
+                .context("Target peer not found in topology for direct mode")?;
+
+            let target_addrs = worker
+                .listen_addrs
+                .iter()
+                .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+                .collect::<Vec<_>>();
+
+            if target_addrs.is_empty() {
+                anyhow::bail!("Target peer has no advertised direct listen addresses");
+            }
+
+            swarm.dial_direct_peer(target_peer, &target_addrs)?;
+            println!("   ✓ Dialing target directly");
+        }
+        agent::ConnectivityPath::Overlay => {
+            anyhow::bail!("ad hoc job submission does not yet support overlay connectivity");
         }
     }
 
