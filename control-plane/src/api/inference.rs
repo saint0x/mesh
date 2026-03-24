@@ -322,7 +322,25 @@ fn claim_assignment(
                     OR (a.status = 'leased' AND (a.lease_expires_at IS NULL OR a.lease_expires_at <= ?))
                   )
               AND j.status IN ('dispatched', 'running')
-            ORDER BY a.assigned_at ASC
+            ORDER BY
+                (
+                    SELECT COUNT(*)
+                    FROM inference_job_assignments submitter_assignments
+                    INNER JOIN inference_jobs submitter_jobs
+                        ON submitter_jobs.job_id = submitter_assignments.job_id
+                    WHERE submitter_jobs.network_id = a.network_id
+                      AND submitter_jobs.submitted_by_device_id = j.submitted_by_device_id
+                      AND submitter_assignments.status IN ('leased', 'acknowledged')
+                ) ASC,
+                (
+                    SELECT COUNT(*)
+                    FROM inference_job_assignments job_assignments
+                    WHERE job_assignments.job_id = a.job_id
+                      AND job_assignments.status IN ('leased', 'acknowledged')
+                ) ASC,
+                j.created_at ASC,
+                a.assigned_at ASC,
+                a.assignment_id ASC
             LIMIT 1
             "#,
             params![&req.device_id, &req.network_id, &now_str],
@@ -753,6 +771,138 @@ mod tests {
 
         assert_eq!(status.status, "running");
         assert_eq!(status.assignments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_claim_assignment_prefers_less_served_submitter() {
+        let network_id = "test-network-fairness";
+        let state = joined_state(&["worker-1", "worker-2", "worker-3"], network_id).await;
+
+        let submit_a = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-a".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let submit_b = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-b".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-3".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected first assignment");
+        assert_eq!(first_claim.job_id, submit_a.job_id);
+
+        let second_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected second assignment");
+        assert_eq!(second_claim.job_id, submit_b.job_id);
+    }
+
+    #[tokio::test]
+    async fn test_claim_assignment_prefers_less_served_job_before_created_at() {
+        let network_id = "test-network-job-fairness";
+        let state = joined_state(&["worker-1", "worker-2", "worker-3"], network_id).await;
+
+        let submit_a = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-a".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let submit_b = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-b".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-3".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected first assignment");
+        assert_eq!(first_claim.job_id, submit_a.job_id);
+
+        let second_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected second assignment");
+        assert_eq!(second_claim.job_id, submit_b.job_id);
     }
 
     #[tokio::test]
