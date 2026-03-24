@@ -72,12 +72,13 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Heartbeat now publishes an explicit ranked `direct_candidates` set instead of requiring peers to infer direct dialing intent from raw `listen_addrs`.
 - ✅ Control-plane device state and ring topology now persist and return structured direct-connect candidates as a first-class contract.
 - ✅ Ring workers now resolve direct peers from authoritative `direct_candidates` metadata rather than rebuilding dial order from generic listen-address lists.
+- ✅ Live swarm-observed external address candidates are now persisted and folded into heartbeat candidate publication alongside local listen addresses.
 
 ### NAT Traversal Still Open
 
 - ⬜ Add focused integration coverage for direct upgrade and relay fallback behavior under more realistic multi-peer networking scenarios.
 - ⬜ Add operator-visible path quality metrics for direct success rate, relay fallback rate, upgrade failure causes, and candidate selection outcomes.
-- ⬜ Extend candidate gathering beyond currently advertised local listen addresses so hostile NAT cases can exchange richer hole-punch inputs and observed reachability hints.
+- ⬜ Extend candidate gathering beyond current local/observed addresses so hostile NAT cases can exchange richer hole-punch inputs and more durable public reachability hints.
 - ⬜ Tighten control-plane/operator surfaces so direct-candidate quality and selection outcomes are visible rather than only stored internally.
 
 ### 3. Governance Third
@@ -170,6 +171,7 @@ After Phase 1:
 - ✅ `cargo test -p agent select_direct_dial_addrs_prefers_public_quic_then_private_tcp -- --nocapture`
 - ✅ `cargo test -p agent current_state_prefers_runtime_state_when_present -- --nocapture`
 - ✅ `cargo test -p agent build_direct_peer_candidates_excludes_relay_and_sorts -- --nocapture`
+- ✅ `cargo test -p agent direct_candidate_seed_addrs_merge_listen_and_observed -- --nocapture`
 - ✅ `cargo test -p agent test_worker_position -- --nocapture`
 - ✅ `cargo test -p control-plane test_update_heartbeat -- --nocapture`
 - ✅ `cargo test -p control-plane test_get_topology_handler -- --nocapture`

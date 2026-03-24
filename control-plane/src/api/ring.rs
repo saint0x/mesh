@@ -591,7 +591,11 @@ mod tests {
                 &db,
                 device_id.clone(),
                 test_connectivity_state(),
-                vec![format!("/ip4/192.168.1.{}/tcp/4100/p2p/test-peer-ring-device-{}", i + 2, i)],
+                vec![format!(
+                    "/ip4/192.168.1.{}/tcp/4100/p2p/test-peer-ring-device-{}",
+                    i + 2,
+                    i
+                )],
                 vec![DirectPeerCandidate {
                     endpoint: format!(
                         "/ip4/192.168.1.{}/tcp/4100/p2p/test-peer-ring-device-{}",

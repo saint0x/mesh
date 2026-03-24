@@ -3,7 +3,7 @@ use crate::api::types::{
     ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse, InferenceAssignment,
     RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentRequest,
 };
-use crate::connectivity::build_direct_peer_candidates;
+use crate::connectivity::{build_direct_peer_candidates, load_direct_candidate_seed_addrs};
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
 use reqwest::Client;
@@ -152,17 +152,19 @@ impl RegistrationClient {
         let response = self
             .client
             .post(&url)
-            .json(&HeartbeatRequest {
-                connectivity_state: config.connectivity.current_state(),
-                listen_addrs: load_advertised_listen_addrs().unwrap_or_default(),
-                direct_candidates: load_advertised_listen_addrs()
-                    .map(|addrs| {
-                        let peer_id = crate::device::keypair::to_libp2p_keypair(&config.keypair)
-                            .public()
-                            .to_peer_id();
-                        build_direct_peer_candidates(peer_id, &addrs)
-                    })
-                    .unwrap_or_default(),
+            .json(&{
+                let listen_addrs = load_advertised_listen_addrs().unwrap_or_default();
+                let candidate_seed_addrs =
+                    load_direct_candidate_seed_addrs().unwrap_or_else(|| listen_addrs.clone());
+                let peer_id = crate::device::keypair::to_libp2p_keypair(&config.keypair)
+                    .public()
+                    .to_peer_id();
+
+                HeartbeatRequest {
+                    connectivity_state: config.connectivity.current_state(),
+                    listen_addrs,
+                    direct_candidates: build_direct_peer_candidates(peer_id, &candidate_seed_addrs),
+                }
             })
             .send()
             .await

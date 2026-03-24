@@ -12,8 +12,8 @@ use tracing::{debug, info, instrument, warn};
 use super::events::{ConnectionInfo, ConnectionType, MeshEvent};
 use super::job_protocol::{self, JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
 use crate::connectivity::{
-    persist_runtime_connectivity_state, select_direct_dial_multiaddrs, ConnectivityPath,
-    ConnectivityStatus, DeviceConnectivityState,
+    persist_observed_reachability_addr, persist_runtime_connectivity_state,
+    select_direct_dial_multiaddrs, ConnectivityPath, ConnectivityStatus, DeviceConnectivityState,
 };
 use crate::errors::{AgentError, Result};
 
@@ -574,6 +574,16 @@ impl MeshSwarm {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     info!(address = %address, "Listening on new address");
                     return Some(MeshEvent::NewListenAddr { address });
+                }
+
+                SwarmEvent::NewExternalAddrCandidate { address } => {
+                    info!(address = %address, "Discovered external address candidate");
+                    let _ = persist_observed_reachability_addr(&address);
+                }
+
+                SwarmEvent::ExternalAddrConfirmed { address } => {
+                    info!(address = %address, "Confirmed external address");
+                    let _ = persist_observed_reachability_addr(&address);
                 }
 
                 // Dial events

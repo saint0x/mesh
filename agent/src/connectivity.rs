@@ -142,6 +142,13 @@ fn runtime_connectivity_state_path() -> Option<PathBuf> {
     Some(base.join(".meshnet").join("connectivity_state.json"))
 }
 
+fn meshnet_state_path(filename: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("MESHNET_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(base.join(".meshnet").join(filename))
+}
+
 pub fn persist_runtime_connectivity_state(state: &DeviceConnectivityState) -> Result<()> {
     let path = runtime_connectivity_state_path()
         .ok_or_else(|| AgentError::Config("Could not determine home directory".to_string()))?;
@@ -156,6 +163,41 @@ pub fn persist_runtime_connectivity_state(state: &DeviceConnectivityState) -> Re
 
 pub fn load_runtime_connectivity_state() -> Option<DeviceConnectivityState> {
     let path = runtime_connectivity_state_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub fn persist_observed_reachability_addr(address: &Multiaddr) -> Result<()> {
+    let path = meshnet_state_path("observed_addrs.json")
+        .ok_or_else(|| AgentError::Config("Could not determine home directory".to_string()))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut addrs = load_json_string_vec(&path).unwrap_or_default();
+    let address = address.to_string();
+    if !addrs.iter().any(|existing| existing == &address) {
+        addrs.push(address);
+        fs::write(path, serde_json::to_string_pretty(&addrs)?)?;
+    }
+    Ok(())
+}
+
+pub fn load_direct_candidate_seed_addrs() -> Option<Vec<String>> {
+    let listen_path = meshnet_state_path("listen_addrs.json")?;
+    let observed_path = meshnet_state_path("observed_addrs.json")?;
+
+    let mut combined = load_json_string_vec(&listen_path).unwrap_or_default();
+    for addr in load_json_string_vec(&observed_path).unwrap_or_default() {
+        if !combined.iter().any(|existing| existing == &addr) {
+            combined.push(addr);
+        }
+    }
+
+    Some(combined)
+}
+
+fn load_json_string_vec(path: &PathBuf) -> Option<Vec<String>> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
@@ -419,6 +461,35 @@ mod tests {
         };
 
         assert_eq!(connectivity.current_state(), state);
+        std::env::remove_var("MESHNET_HOME");
+    }
+
+    #[test]
+    fn direct_candidate_seed_addrs_merge_listen_and_observed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::env::set_var("MESHNET_HOME", tempdir.path());
+
+        let listen_path = tempdir.path().join(".meshnet").join("listen_addrs.json");
+        std::fs::create_dir_all(listen_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &listen_path,
+            serde_json::to_string_pretty(&vec![
+                "/ip4/10.0.0.2/tcp/4001".to_string(),
+                "/dns4/peer.mesh.example/udp/4001/quic-v1".to_string(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        persist_observed_reachability_addr(
+            &"/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+        )
+        .unwrap();
+
+        let merged = load_direct_candidate_seed_addrs().unwrap();
+        assert_eq!(merged.len(), 3);
+        assert!(merged.iter().any(|addr| addr.contains("34.120.0.10")));
+
         std::env::remove_var("MESHNET_HOME");
     }
 }
