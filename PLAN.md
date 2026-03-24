@@ -127,6 +127,40 @@ After Phase 1:
 - ring execution uses one transport path, not two
 - old tensor compatibility code is deleted
 
+## Current Status
+
+### Completed
+
+- ✅ Production direction is locked: dedicated tensor data plane first, NAT traversal second, governance third.
+- ✅ The old libp2p tensor request/response protocol file was deleted.
+- ✅ Dedicated tensor transport primitives were introduced in `agent/src/network/tensor_plane.rs`.
+- ✅ Tensor message types were split into a transport-neutral module in `agent/src/network/tensor_message.rs`.
+- ✅ Ring all-reduce now uses the dedicated tensor plane in the active inference path.
+- ✅ The inference coordinator now owns the tensor data plane directly instead of depending on tensor request/response callbacks.
+- ✅ The active inference path advertises dedicated tensor endpoints through the existing heartbeat/listen-address path.
+- ✅ Neighbor tensor endpoints are resolved from authoritative topology metadata rather than placeholder local values.
+- ✅ `ring_state.json` was removed from the active runtime/CLI path as a second source of truth.
+- ✅ The active tensor path is now single-path by construction in the production inference flow.
+- ✅ The production plan and extrapolation docs were updated to reflect shipped vs remaining work.
+- ✅ Work was pushed to `origin/codex/data-plane-phase1`.
+
+### Validated
+
+- ✅ `cargo test -p agent --no-run`
+- ✅ `cargo test -p control-plane --no-run`
+- ✅ `cargo test -p agent test_worker_position -- --nocapture`
+- ✅ `cargo test -p control-plane test_get_topology_handler -- --nocapture`
+- ✅ `cargo test -p control-plane test_ring_stability -- --nocapture`
+- ✅ `fozzy --cwd . validate tests/production_dispatch.fozzy.json --json`
+- ✅ `fozzy --cwd . doctor --deep --scenario tests/production_dispatch.fozzy.json --runs 5 --seed 1 --json`
+
+### Still Open In Phase 1
+
+- ⬜ Extend coverage so the dedicated tensor data plane is exercised by focused runtime/integration tests, not only compile-time and structural tests.
+- ⬜ Eliminate any remaining mixed-path assumptions in control-plane and operator surfaces that still treat generic listen addresses as sufficient for tensor execution.
+- ⬜ Add stronger transport-level observability for tensor-plane connection health, timeouts, and throughput.
+- ⬜ Harden dedicated tensor endpoint selection for multi-interface/NAT-hostile environments before starting the NAT traversal phase.
+
 ## Phase 1 Implementation Plan
 
 ### Step 1. Define the New Data Plane Boundary
@@ -187,6 +221,31 @@ Run:
 Required outcome:
 
 - only the new tensor data-plane path is validated as production
+
+## Next
+
+The next production step is:
+
+1. Add focused dedicated-data-plane runtime tests that actually exercise tensor send/receive over the new hot path.
+2. Tighten endpoint advertisement and selection so tensor-plane endpoints are explicit, validated, and operator-visible.
+3. Add tensor-plane metrics/logging for connection establishment, send latency, receive latency, timeout causes, and payload size.
+4. Once the dedicated path is fully hardened and observable, begin NAT traversal phase work for punched/direct execution.
+
+## Deferred PR Analysis
+
+These PRs are not being merged as branches into the production line, but they are worth analyzing and selectively piping into `main` later:
+
+- ✅ Analyze PR #8: `Enable direct LAN peer connections via beacon discovery`
+  Why it matters:
+  This is relevant to the NAT/direct-connect phase because it may contain useful LAN peer dialing ideas that can be adapted to the new single-path production transport model.
+
+- ✅ Analyze PR #6: `Add storage reservation system with 24h cooldown enforcement`
+  Why it matters:
+  This is relevant to the governance/resource phase because it may contain useful storage reservation and resource accounting ideas that fit future production hardening.
+
+- ❌ Do not revive PR #7: `Replace ring all-reduce with pipeline-parallel execution`
+  Why not:
+  It changes the core distributed inference architecture away from the chosen production direction and should not be piped into the current plan.
 
 ## Deletion Policy
 
