@@ -125,6 +125,7 @@ This is important for mature production behavior, but it should not define the h
 - ✅ Scheduler dispatch counts and queued-job counts are now persisted alongside the existing rejection metrics, so weighted fairness behavior is operator-visible.
 - ✅ Durable assignment claims now use pool-level fairness ordering across submitters and jobs, so workers lease the least-served work first instead of blindly taking the oldest per-device assignment.
 - ✅ Pool scheduling now uses the existing durable dispatch tables as the single source of truth for fairness, rather than adding a second coordinator path beside claim/ack/result.
+- ✅ Pool claim ordering now applies an explicit submitter soft cap, so one submitter cannot open a second active job across the ring while another submitter still has uncapped work waiting.
 - ✅ Legacy device configs now deserialize with governance defaults, keeping one production config contract without a runtime compatibility branch.
 - ✅ Governance coverage now includes focused agent tests for governance defaults, concurrency-cap clamping, backpressure accounting, and admission-policy rejection paths.
 
@@ -132,7 +133,7 @@ This is important for mature production behavior, but it should not define the h
 
 - ⬜ Tensor-plane and bandwidth backpressure, not just executor-slot backpressure.
 - ⬜ Recovery-path governance so retries, reconnect storms, and degraded relay behavior cannot overwhelm a node.
-- ⬜ Pool-level quota policy above the new fair claim ordering, so one submitter can be explicitly capped across the ring instead of only deprioritized.
+- ⬜ Pool-level quota policy beyond the current submitter soft cap, including workload- and capacity-aware ring-wide quota control.
 
 ## Non-Goals
 

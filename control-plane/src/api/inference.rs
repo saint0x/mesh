@@ -17,6 +17,7 @@ use crate::api::types::{
 use crate::state::AppState;
 
 const ASSIGNMENT_LEASE_SECS: i64 = 60;
+const SUBMITTER_ACTIVE_JOB_SOFT_CAP: i64 = 1;
 
 #[derive(Clone)]
 struct PersistedAssignment {
@@ -323,6 +324,23 @@ fn claim_assignment(
                   )
               AND j.status IN ('dispatched', 'running')
             ORDER BY
+                CASE
+                    WHEN (
+                        SELECT COUNT(*)
+                        FROM inference_jobs active_jobs
+                        WHERE active_jobs.network_id = a.network_id
+                          AND active_jobs.submitted_by_device_id = j.submitted_by_device_id
+                          AND active_jobs.status IN ('dispatched', 'running')
+                          AND EXISTS (
+                              SELECT 1
+                              FROM inference_job_assignments active_assignments
+                              WHERE active_assignments.job_id = active_jobs.job_id
+                                AND active_assignments.status IN ('leased', 'acknowledged')
+                          )
+                    ) >= ?
+                    THEN 1
+                    ELSE 0
+                END ASC,
                 (
                     SELECT COUNT(*)
                     FROM inference_job_assignments submitter_assignments
@@ -343,7 +361,12 @@ fn claim_assignment(
                 a.assignment_id ASC
             LIMIT 1
             "#,
-            params![&req.device_id, &req.network_id, &now_str],
+            params![
+                &req.device_id,
+                &req.network_id,
+                &now_str,
+                SUBMITTER_ACTIVE_JOB_SOFT_CAP
+            ],
             |row| {
                 let prompt_tokens_json: String = row.get(6)?;
                 let prompt_tokens = serde_json::from_str::<Vec<u32>>(&prompt_tokens_json)
@@ -903,6 +926,102 @@ mod tests {
         .assignment
         .expect("expected second assignment");
         assert_eq!(second_claim.job_id, submit_b.job_id);
+    }
+
+    #[tokio::test]
+    async fn test_claim_assignment_applies_submitter_soft_cap_before_second_active_job() {
+        let network_id = "test-network-submitter-cap";
+        let state = joined_state(&["worker-1", "worker-2", "worker-3"], network_id).await;
+
+        let submit_a1 = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-a1".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let submit_a2 = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-a2".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let submit_b1 = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "job-b1".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-3".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected first assignment");
+        assert_eq!(first_claim.job_id, submit_a1.job_id);
+
+        let second_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected second assignment");
+        assert_eq!(second_claim.job_id, submit_b1.job_id);
+
+        let third_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected third assignment");
+        assert_eq!(third_claim.job_id, submit_a2.job_id);
     }
 
     #[tokio::test]

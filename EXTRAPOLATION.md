@@ -105,6 +105,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Peer and workload priority weights now give the node one deterministic production rule for weighted local fairness under contention.
 - ✅ Queued-job and scheduler-dispatch accounting are now persisted alongside the rest of the runtime metrics, so weighted governance behavior is observable.
 - ✅ Durable pool assignment claims now prefer the least-served submitter and least-served job before falling back to age, so ring workers no longer lease work in naive per-device FIFO order.
+- ✅ Durable pool assignment claims now apply an explicit submitter soft cap, so a single submitter cannot open a second active ring job while another submitter still has uncapped work waiting.
 - ✅ Relay reservations now depend on explicit authoritative relay advertised addresses instead of implicit empty-address behavior.
 - ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
 - ✅ Coverage now includes a live multi-peer relay dialing runtime gate that exercises multiple reserved peers connecting through the same relay at once.
