@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "staggered-direct-upgrade-live-relay-runtime-gate",
+  "steps": [
+    {
+      "name": "staggered live relay rendezvous still upgrades to direct connectivity",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "test_live_peers_upgrade_with_staggered_relay_rendezvous_timing",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "times": 1
+    }
+  ]
+}

@@ -95,7 +95,8 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
 - ✅ Coverage now includes a live multi-peer relay dialing runtime gate that exercises multiple reserved peers connecting through the same relay at once.
 - ✅ Coverage now includes a live relay-rendezvous direct-upgrade runtime gate that proves peers can establish relay connectivity first and then upgrade off relay when direct reachability exists.
-- ⬜ Broader concurrent relay-rendezvous and harsher direct-upgrade coverage beyond the current `production_dispatch`, `punch_path_coordination`, `live_relay_runtime`, `multi_peer_live_relay_runtime`, and `direct_upgrade_live_relay_runtime` host-backed/runtime gates.
+- ✅ Coverage now includes a staggered relay-rendezvous direct-upgrade runtime gate that exercises later-arriving peers and non-synchronized upgrade timing.
+- ⬜ Broader asymmetric-reachability and harsher direct-upgrade coverage beyond the current `production_dispatch`, `punch_path_coordination`, `live_relay_runtime`, `multi_peer_live_relay_runtime`, `direct_upgrade_live_relay_runtime`, and `staggered_direct_upgrade_live_relay_runtime` host-backed/runtime gates.
 - ⬜ More explicit operator-facing visibility into path quality, fallback reasons, and degraded connectivity behavior.
 - ⬜ Continued work on production-grade model/data-plane performance once correctness is no longer the dominant concern.
 

@@ -397,6 +397,64 @@ async fn test_live_peers_upgrade_to_direct_after_relay_rendezvous() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_live_peers_upgrade_with_staggered_relay_rendezvous_timing() {
+    let relay_runtime = start_live_relay_runtime(43114).await;
+
+    let build_agent = || {
+        MeshSwarm::builder(libp2p::identity::Keypair::generate_ed25519())
+            .with_relay_addr(relay_runtime.relay_addr.clone())
+            .build()
+            .unwrap()
+    };
+
+    let mut swarm_a = build_agent();
+    let peer_id_a = *swarm_a.local_peer_id();
+    swarm_a.listen_on_direct_addrs().unwrap();
+    swarm_a.connect_to_relay().unwrap();
+    let relay_peer_a = wait_for_peer_connected(&mut swarm_a).await;
+    swarm_a.listen_on_relay(relay_peer_a).unwrap();
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut swarm_b = build_agent();
+    let peer_id_b = *swarm_b.local_peer_id();
+    swarm_b.listen_on_direct_addrs().unwrap();
+    swarm_b.connect_to_relay().unwrap();
+    let relay_peer_b = wait_for_peer_connected(&mut swarm_b).await;
+    assert_eq!(relay_peer_a, relay_peer_b);
+    swarm_b.listen_on_relay(relay_peer_b).unwrap();
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
+    swarm_b.dial_peer(peer_id_a).unwrap();
+
+    wait_for_relay_then_direct_upgrade(
+        &mut [(&mut swarm_a, peer_id_b), (&mut swarm_b, peer_id_a)],
+        peer_id_a,
+        peer_id_b,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    let mut swarm_c = build_agent();
+    let peer_id_c = *swarm_c.local_peer_id();
+    swarm_c.listen_on_direct_addrs().unwrap();
+    swarm_c.connect_to_relay().unwrap();
+    let relay_peer_c = wait_for_peer_connected(&mut swarm_c).await;
+    assert_eq!(relay_peer_a, relay_peer_c);
+    swarm_c.listen_on_relay(relay_peer_c).unwrap();
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
+    swarm_c.dial_peer(peer_id_a).unwrap();
+
+    wait_for_relay_then_direct_upgrade(
+        &mut [(&mut swarm_a, peer_id_c), (&mut swarm_c, peer_id_a)],
+        peer_id_a,
+        peer_id_c,
+    )
+    .await;
+}
+
 async fn wait_for_peer_connected(swarm: &mut MeshSwarm) -> libp2p::PeerId {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
