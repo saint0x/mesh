@@ -12,7 +12,7 @@ use agent::executor::Tensor;
 use agent::network::{AllReducePhase, MeshEvent, MeshSwarm, TensorMessage};
 use futures::StreamExt;
 use relay_server::config::Config as RelayConfig;
-use relay_server::relay::build_swarm as build_relay_swarm;
+use relay_server::relay::{build_swarm as build_relay_swarm, configured_advertised_addrs};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -274,9 +274,16 @@ async fn test_multiple_live_peers_attach_to_same_relay_runtime() {
     let mut relay_config = RelayConfig::default();
     relay_config.network.tcp_listen_addr = relay_addr.to_string();
     relay_config.network.quic_listen_addr = "/ip4/127.0.0.1/udp/43111/quic-v1".to_string();
+    relay_config.network.advertised_addrs = vec![
+        relay_addr.to_string(),
+        "/ip4/127.0.0.1/udp/43111/quic-v1".to_string(),
+    ];
 
     let mut relay_swarm = build_relay_swarm(&relay_config).await.unwrap();
     relay_swarm.listen_on(relay_addr.clone()).unwrap();
+    for advertised_addr in configured_advertised_addrs(&relay_config).unwrap() {
+        relay_swarm.add_external_address(advertised_addr);
+    }
 
     let relay_task = tokio::spawn(async move {
         loop {
@@ -314,10 +321,9 @@ async fn test_multiple_live_peers_attach_to_same_relay_runtime() {
     swarm_b.listen_on_relay(relay_peer_b).unwrap();
     swarm_c.listen_on_relay(relay_peer_c).unwrap();
 
-    // Give the relay setup a bounded window to progress on live swarms.
-    let _ = tokio::time::timeout(Duration::from_secs(2), swarm_a.next_event()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), swarm_b.next_event()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), swarm_c.next_event()).await;
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
 
     relay_task.abort();
     let _ = relay_task.await;
@@ -340,6 +346,20 @@ async fn wait_for_peer_connected(swarm: &mut MeshSwarm) -> libp2p::PeerId {
         }
     }
     panic!("timed out waiting for peer connection");
+}
+
+async fn wait_for_reservation_accepted(swarm: &mut MeshSwarm) -> libp2p::PeerId {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(2), swarm.next_event()).await
+        {
+            if let MeshEvent::ReservationAccepted { relay_peer_id, .. } = event {
+                return relay_peer_id;
+            }
+        }
+    }
+    panic!("timed out waiting for relay reservation acceptance");
 }
 
 /// Test with mixed positive/negative/zero

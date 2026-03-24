@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
     if let Some(port) = cli.port {
         config.network.tcp_listen_addr = format!("/ip4/0.0.0.0/tcp/{}", port);
         config.network.quic_listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port);
+        config.network.advertised_addrs = vec![
+            format!("/ip4/127.0.0.1/tcp/{}", port),
+            format!("/ip4/127.0.0.1/udp/{}/quic-v1", port),
+        ];
         tracing::info!(port = port, "Port overridden via CLI argument");
     }
 
@@ -95,6 +99,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         tcp = %config.network.tcp_listen_addr,
         quic = %config.network.quic_listen_addr,
+        advertised = ?config.network.advertised_addrs,
         "Network configuration"
     );
 
@@ -128,6 +133,11 @@ async fn main() -> Result<()> {
     // QUIC is optional - warn if it fails but don't exit
     if let Err(e) = swarm.listen_on(quic_addr) {
         tracing::warn!(error = %e, "Failed to listen on QUIC, continuing with TCP only");
+    }
+
+    for advertised_addr in relay::configured_advertised_addrs(&config)? {
+        tracing::info!(address = %advertised_addr, "Advertising relay address for reservations");
+        swarm.add_external_address(advertised_addr);
     }
 
     tracing::info!("Relay server started successfully");

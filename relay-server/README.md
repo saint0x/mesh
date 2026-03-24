@@ -39,6 +39,10 @@ max_circuit_bytes = 10485760        # Max data per circuit (10MB)
 [network]
 tcp_listen_addr = "/ip4/0.0.0.0/tcp/4001"
 quic_listen_addr = "/ip4/0.0.0.0/udp/4001/quic-v1"
+advertised_addrs = [
+  "/dns4/relay.example.com/tcp/4001",
+  "/dns4/relay.example.com/udp/4001/quic-v1",
+]
 
 [auth]
 auth_token = "CHANGE_ME_IN_PRODUCTION"
@@ -50,6 +54,7 @@ log_format = "pretty"               # or "json"
 ```
 
 **⚠️ IMPORTANT:** Change `auth_token` before enabling authentication in production!
+**⚠️ IMPORTANT:** `advertised_addrs` must contain the real externally reachable relay addresses that reservations should hand back to peers. Binding `0.0.0.0` without authoritative advertised addresses is not a valid production setup.
 
 ### 3. Start the Relay Server
 
@@ -91,6 +96,7 @@ Listening on: /ip4/127.0.0.1/udp/4001/quic-v1
 |-------|---------|-------------|
 | `tcp_listen_addr` | `/ip4/0.0.0.0/tcp/4001` | TCP listen multiaddr |
 | `quic_listen_addr` | `/ip4/0.0.0.0/udp/4001/quic-v1` | QUIC listen multiaddr |
+| `advertised_addrs` | `["/ip4/127.0.0.1/tcp/4001", "/ip4/127.0.0.1/udp/4001/quic-v1"]` | Authoritative reservation addresses the relay returns to peers |
 
 ### Authentication Settings (Placeholder)
 

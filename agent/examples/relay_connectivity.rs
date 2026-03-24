@@ -48,6 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut swarm_b = MeshSwarm::builder(keypair_b).build()?;
 
+    swarm_a.listen_on_direct_addrs()?;
+    swarm_b.listen_on_direct_addrs()?;
+
     info!("Both agents initialized");
 
     // Step 1: Agent A connects to relay
@@ -156,6 +159,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(MeshEvent::ReservationAccepted { .. }) => {
                 info!("Agent B: Relay reservation accepted");
                 break;
+            }
+            Some(MeshEvent::ReservationDenied { relay_peer_id }) => {
+                error!("Agent B: Relay reservation denied by {}", relay_peer_id);
+                return Err("Reservation denied".into());
             }
             Some(MeshEvent::NewListenAddr { address }) => {
                 info!("Agent B: Now listening on: {}", address);

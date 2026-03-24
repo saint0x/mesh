@@ -91,7 +91,9 @@ These are the main remaining production-facing areas, but they are mostly new ca
 
 ### Still Worth Hardening Over Time
 
-- ⬜ Broader concurrent relay-rendezvous and successful peer-dial coverage beyond the current `production_dispatch` and `punch_path_coordination` host-backed/runtime gates.
+- ✅ Relay reservations now depend on explicit authoritative relay advertised addresses instead of implicit empty-address behavior.
+- ✅ Coverage now includes a live external-process relay runtime gate that boots the real `relay-server` binary and requires successful reservation-based peer connectivity.
+- ⬜ Broader concurrent relay-rendezvous and successful peer-dial coverage beyond the current `production_dispatch`, `punch_path_coordination`, and `live_relay_runtime` host-backed/runtime gates.
 - ⬜ More explicit operator-facing visibility into path quality, fallback reasons, and degraded connectivity behavior.
 - ⬜ Continued work on production-grade model/data-plane performance once correctness is no longer the dominant concern.
 

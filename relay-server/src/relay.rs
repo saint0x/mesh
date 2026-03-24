@@ -1,7 +1,7 @@
 use libp2p::{
-    identify, noise, relay,
+    identify, multiaddr::Protocol, noise, relay,
     swarm::{NetworkBehaviour, Swarm},
-    tcp, yamux, SwarmBuilder,
+    tcp, yamux, Multiaddr, SwarmBuilder,
 };
 use std::time::Duration;
 
@@ -92,6 +92,45 @@ pub async fn build_swarm(config: &Config) -> Result<Swarm<RelayBehaviour>> {
     );
 
     Ok(swarm)
+}
+
+pub fn configured_advertised_addrs(config: &Config) -> Result<Vec<Multiaddr>> {
+    if !config.network.advertised_addrs.is_empty() {
+        return config
+            .network
+            .advertised_addrs
+            .iter()
+            .map(|addr| {
+                addr.parse::<Multiaddr>().map_err(|e| {
+                    RelayError::Config(format!("Invalid advertised address: {}", e))
+                })
+            })
+            .collect();
+    }
+
+    [
+        config.network.tcp_listen_addr.as_str(),
+        config.network.quic_listen_addr.as_str(),
+    ]
+    .into_iter()
+    .map(|addr| {
+        addr.parse::<Multiaddr>()
+            .map_err(|e| RelayError::Config(format!("Invalid listen address: {}", e)))
+    })
+    .filter_map(|addr| match addr {
+        Ok(addr) if is_unspecified_ip_addr(&addr) => None,
+        Ok(addr) => Some(Ok(addr)),
+        Err(error) => Some(Err(error)),
+    })
+    .collect()
+}
+
+fn is_unspecified_ip_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_unspecified(),
+        Protocol::Ip6(ip) => ip.is_unspecified(),
+        _ => false,
+    })
 }
 
 /// Load keypair from file or generate new one

@@ -1,4 +1,5 @@
 use crate::errors::{RelayError, Result};
+use libp2p::{multiaddr::Protocol, Multiaddr};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,7 @@ pub struct RelayConfig {
 pub struct NetworkConfig {
     pub tcp_listen_addr: String,
     pub quic_listen_addr: String,
+    pub advertised_addrs: Vec<String>,
 }
 
 /// Authentication configuration
@@ -83,6 +85,10 @@ impl Config {
             network: NetworkConfig {
                 tcp_listen_addr: "/ip4/0.0.0.0/tcp/4001".to_string(),
                 quic_listen_addr: "/ip4/0.0.0.0/udp/4001/quic-v1".to_string(),
+                advertised_addrs: vec![
+                    "/ip4/127.0.0.1/tcp/4001".to_string(),
+                    "/ip4/127.0.0.1/udp/4001/quic-v1".to_string(),
+                ],
             },
             auth: AuthConfig {
                 auth_token: "CHANGE_ME_IN_PRODUCTION".to_string(),
@@ -126,15 +132,37 @@ impl Config {
         }
 
         // Validate multiaddrs
-        self.network
+        let tcp_listen_addr = self
+            .network
             .tcp_listen_addr
-            .parse::<libp2p::Multiaddr>()
+            .parse::<Multiaddr>()
             .map_err(|e| RelayError::Config(format!("Invalid TCP address: {}", e)))?;
 
-        self.network
+        let quic_listen_addr = self
+            .network
             .quic_listen_addr
-            .parse::<libp2p::Multiaddr>()
+            .parse::<Multiaddr>()
             .map_err(|e| RelayError::Config(format!("Invalid QUIC address: {}", e)))?;
+
+        let advertised_addrs = self
+            .network
+            .advertised_addrs
+            .iter()
+            .map(|addr| {
+                addr.parse::<Multiaddr>()
+                    .map_err(|e| RelayError::Config(format!("Invalid advertised address: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if advertised_addrs.is_empty()
+            && [tcp_listen_addr, quic_listen_addr]
+                .iter()
+                .all(is_unspecified_ip_addr)
+        {
+            return Err(RelayError::Config(
+                "network.advertised_addrs must be set when relay listen addresses bind unspecified interfaces".into(),
+            ));
+        }
 
         // Validate log level
         match self.logging.level.to_lowercase().as_str() {
@@ -204,6 +232,14 @@ impl Config {
     }
 }
 
+fn is_unspecified_ip_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_unspecified(),
+        Protocol::Ip6(ip) => ip.is_unspecified(),
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +252,13 @@ mod tests {
         assert_eq!(config.relay.max_reservations, 100);
         assert_eq!(config.relay.max_reservations_per_peer, 5);
         assert_eq!(config.network.tcp_listen_addr, "/ip4/0.0.0.0/tcp/4001");
+        assert_eq!(
+            config.network.advertised_addrs,
+            vec![
+                "/ip4/127.0.0.1/tcp/4001".to_string(),
+                "/ip4/127.0.0.1/udp/4001/quic-v1".to_string()
+            ]
+        );
         assert!(!config.auth.auth_enabled);
         assert_eq!(config.logging.level, "info");
     }
@@ -275,6 +318,10 @@ mod tests {
         assert_eq!(
             original.network.tcp_listen_addr,
             loaded.network.tcp_listen_addr
+        );
+        assert_eq!(
+            original.network.advertised_addrs,
+            loaded.network.advertised_addrs
         );
         assert_eq!(original.logging.level, loaded.logging.level);
     }

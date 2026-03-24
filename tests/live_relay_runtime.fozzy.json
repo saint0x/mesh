@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "live-relay-runtime-gate",
+  "steps": [
+    {
+      "name": "external relay runtime with live peer connection example",
+      "type": "proc_when",
+      "cmd": "bash",
+      "args": [
+        "scripts/test_live_relay_runtime.sh"
+      ],
+      "exit_code": 0,
+      "stdout": "live relay runtime test passed\n",
+      "times": 1
+    }
+  ]
+}
