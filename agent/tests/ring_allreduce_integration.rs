@@ -264,36 +264,11 @@ fn test_negative_values() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_multiple_live_peers_attach_to_same_relay_runtime() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let original_home = std::env::var_os("HOME");
-    unsafe {
-        std::env::set_var("HOME", temp_home.path());
-    }
-
-    let relay_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/43111".parse().unwrap();
-    let mut relay_config = RelayConfig::default();
-    relay_config.network.tcp_listen_addr = relay_addr.to_string();
-    relay_config.network.quic_listen_addr = "/ip4/127.0.0.1/udp/43111/quic-v1".to_string();
-    relay_config.network.advertised_addrs = vec![
-        relay_addr.to_string(),
-        "/ip4/127.0.0.1/udp/43111/quic-v1".to_string(),
-    ];
-
-    let mut relay_swarm = build_relay_swarm(&relay_config).await.unwrap();
-    relay_swarm.listen_on(relay_addr.clone()).unwrap();
-    for advertised_addr in configured_advertised_addrs(&relay_config).unwrap() {
-        relay_swarm.add_external_address(advertised_addr);
-    }
-
-    let relay_task = tokio::spawn(async move {
-        loop {
-            let _ = relay_swarm.select_next_some().await;
-        }
-    });
+    let relay_runtime = start_live_relay_runtime(43111).await;
 
     let build_agent = || {
         MeshSwarm::builder(libp2p::identity::Keypair::generate_ed25519())
-            .with_relay_addr(relay_addr.clone())
+            .with_relay_addr(relay_runtime.relay_addr.clone())
             .build()
             .unwrap()
     };
@@ -324,14 +299,61 @@ async fn test_multiple_live_peers_attach_to_same_relay_runtime() {
     assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
     assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
     assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
+}
 
-    relay_task.abort();
-    let _ = relay_task.await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiple_live_peers_connect_via_relay_runtime() {
+    let relay_runtime = start_live_relay_runtime(43112).await;
 
-    match original_home {
-        Some(home) => unsafe { std::env::set_var("HOME", home) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
+    let build_agent = || {
+        MeshSwarm::builder(libp2p::identity::Keypair::generate_ed25519())
+            .with_relay_addr(relay_runtime.relay_addr.clone())
+            .build()
+            .unwrap()
+    };
+
+    let mut swarm_a = build_agent();
+    let mut swarm_b = build_agent();
+    let mut swarm_c = build_agent();
+
+    let peer_id_a = *swarm_a.local_peer_id();
+    let peer_id_b = *swarm_b.local_peer_id();
+    let peer_id_c = *swarm_c.local_peer_id();
+
+    swarm_a.listen_on_direct_addrs().unwrap();
+    swarm_b.listen_on_direct_addrs().unwrap();
+    swarm_c.listen_on_direct_addrs().unwrap();
+
+    swarm_a.connect_to_relay().unwrap();
+    swarm_b.connect_to_relay().unwrap();
+    swarm_c.connect_to_relay().unwrap();
+
+    let relay_peer_a = wait_for_peer_connected(&mut swarm_a).await;
+    let relay_peer_b = wait_for_peer_connected(&mut swarm_b).await;
+    let relay_peer_c = wait_for_peer_connected(&mut swarm_c).await;
+
+    assert_eq!(relay_peer_a, relay_peer_b);
+    assert_eq!(relay_peer_b, relay_peer_c);
+
+    swarm_a.listen_on_relay(relay_peer_a).unwrap();
+    swarm_b.listen_on_relay(relay_peer_b).unwrap();
+    swarm_c.listen_on_relay(relay_peer_c).unwrap();
+
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_a).await, relay_peer_a);
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_b).await, relay_peer_b);
+    assert_eq!(wait_for_reservation_accepted(&mut swarm_c).await, relay_peer_c);
+
+    swarm_b.dial_peer(peer_id_a).unwrap();
+    swarm_c.dial_peer(peer_id_a).unwrap();
+
+    wait_for_runtime_connections(
+        &mut [
+            (&mut swarm_a, vec![peer_id_b, peer_id_c]),
+            (&mut swarm_b, vec![peer_id_a]),
+            (&mut swarm_c, vec![peer_id_a]),
+        ],
+    )
+    .await;
 }
 
 async fn wait_for_peer_connected(swarm: &mut MeshSwarm) -> libp2p::PeerId {
@@ -360,6 +382,95 @@ async fn wait_for_reservation_accepted(swarm: &mut MeshSwarm) -> libp2p::PeerId 
         }
     }
     panic!("timed out waiting for relay reservation acceptance");
+}
+
+async fn wait_for_runtime_connections(swarms: &mut [(&mut MeshSwarm, Vec<libp2p::PeerId>)]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut remaining: Vec<std::collections::BTreeSet<libp2p::PeerId>> = swarms
+        .iter()
+        .map(|(_, peers)| peers.iter().copied().collect())
+        .collect();
+
+    while tokio::time::Instant::now() < deadline {
+        if remaining.iter().all(|peers| peers.is_empty()) {
+            return;
+        }
+
+        for ((swarm, _), pending_peers) in swarms.iter_mut().zip(remaining.iter_mut()) {
+            if pending_peers.is_empty() {
+                continue;
+            }
+
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(250), swarm.next_event()).await
+            {
+                match event {
+                    MeshEvent::PeerConnected { peer_id, .. }
+                    | MeshEvent::DirectConnectionUpgraded { peer_id } => {
+                        pending_peers.remove(&peer_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    panic!("timed out waiting for expected live peer connections: {:?}", remaining);
+}
+
+struct LiveRelayRuntime {
+    relay_addr: libp2p::Multiaddr,
+    relay_task: tokio::task::JoinHandle<()>,
+    original_home: Option<std::ffi::OsString>,
+    home_dir: std::path::PathBuf,
+}
+
+impl Drop for LiveRelayRuntime {
+    fn drop(&mut self) {
+        self.relay_task.abort();
+        match self.original_home.take() {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&self.home_dir);
+    }
+}
+
+async fn start_live_relay_runtime(port: u16) -> LiveRelayRuntime {
+    let temp_home = tempfile::tempdir().unwrap();
+    let original_home = std::env::var_os("HOME");
+    let home_dir = temp_home.keep();
+    unsafe {
+        std::env::set_var("HOME", &home_dir);
+    }
+
+    let relay_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap();
+    let mut relay_config = RelayConfig::default();
+    relay_config.network.tcp_listen_addr = relay_addr.to_string();
+    relay_config.network.quic_listen_addr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", port);
+    relay_config.network.advertised_addrs = vec![
+        relay_addr.to_string(),
+        format!("/ip4/127.0.0.1/udp/{}/quic-v1", port),
+    ];
+
+    let mut relay_swarm = build_relay_swarm(&relay_config).await.unwrap();
+    relay_swarm.listen_on(relay_addr.clone()).unwrap();
+    for advertised_addr in configured_advertised_addrs(&relay_config).unwrap() {
+        relay_swarm.add_external_address(advertised_addr);
+    }
+
+    let relay_task = tokio::spawn(async move {
+        loop {
+            let _ = relay_swarm.select_next_some().await;
+        }
+    });
+
+    LiveRelayRuntime {
+        relay_addr,
+        relay_task,
+        original_home,
+        home_dir,
+    }
 }
 
 /// Test with mixed positive/negative/zero

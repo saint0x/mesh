@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "multi-peer-live-relay-runtime-gate",
+  "steps": [
+    {
+      "name": "multi-peer live relay dialing runtime",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "test_multiple_live_peers_connect_via_relay_runtime",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "times": 1
+    }
+  ]
+}

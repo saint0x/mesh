@@ -86,10 +86,11 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ NAT coverage now includes a live concurrent relay-attachment runtime test with multiple in-process peers sharing the same relay, not just scripted or single-peer checks.
 - ✅ Relay reservations now have an explicit authoritative address contract through `network.advertised_addrs`, so the relay returns real reservation endpoints instead of relying on implicit swarm state.
 - ✅ NAT coverage now includes an external-process live relay runtime gate that boots the real `relay-server` binary and requires a successful live peer connection through relay reservation flow.
+- ✅ NAT coverage now includes a live multi-peer relay dialing runtime gate where multiple reserved peers connect to the same target through the real relay path.
 
 ### NAT Traversal Still Open
 
-- ⬜ Extend from the current host-backed, in-process live reservation coverage, and external-process live relay gate into fuller concurrent runtime/NAT execution scenarios that verify relay-mediated peer dialing and direct upgrade outcomes across more than a single live peer pair.
+- ⬜ Extend from the current host-backed, in-process live reservation coverage, external-process live relay gate, and live multi-peer relay dial gate into fuller concurrent runtime/NAT execution scenarios that verify relay-mediated direct-upgrade outcomes and harsher relay-rendezvous timing behavior.
 
 ### 3. Governance Third
 
@@ -224,6 +225,7 @@ After Phase 1:
 - ✅ `cargo test -p control-plane test_get_topology_generates_peer_punch_plans_for_relayed_workers -- --nocapture`
 - ✅ `cargo test -p agent test_set_ring_neighbors_emits_punch_attempts_for_both_neighbors -- --nocapture`
 - ✅ `cargo test -p agent test_multiple_live_peers_attach_to_same_relay_runtime -- --nocapture`
+- ✅ `cargo test -p agent test_multiple_live_peers_connect_via_relay_runtime -- --nocapture`
 - ✅ `cargo test -p relay-server --no-run`
 - ✅ `fozzy --cwd . validate tests/live_relay_runtime.fozzy.json --json`
 - ✅ `fozzy --cwd . doctor --deep --scenario tests/live_relay_runtime.fozzy.json --runs 5 --seed 1 --json`
@@ -232,6 +234,13 @@ After Phase 1:
 - ✅ `fozzy --cwd . trace verify .fozzy/live-relay-runtime.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/live-relay-runtime.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/live-relay-runtime.trace.fozzy --json`
+- ✅ `fozzy --cwd . validate tests/multi_peer_live_relay_runtime.fozzy.json --json`
+- ✅ `fozzy --cwd . doctor --deep --scenario tests/multi_peer_live_relay_runtime.fozzy.json --runs 5 --seed 1 --json`
+- ✅ `fozzy --cwd . test --det --strict tests/multi_peer_live_relay_runtime.fozzy.json --json`
+- ✅ `fozzy --cwd . run tests/multi_peer_live_relay_runtime.fozzy.json --det --proc-backend host --fs-backend host --http-backend host --record .fozzy/multi-peer-live-relay-runtime.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/multi-peer-live-relay-runtime.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/multi-peer-live-relay-runtime.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/multi-peer-live-relay-runtime.trace.fozzy --json`
 
 ### Still Open In Phase 1
 
