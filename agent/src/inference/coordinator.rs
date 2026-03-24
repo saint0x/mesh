@@ -9,6 +9,7 @@
 //! - Checkpointing for fault tolerance
 //! - Returning results to the control plane
 
+use crate::api::types::PeerPunchPlan;
 use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::WorkerRing;
 use crate::model::registry::ShardRegistry;
@@ -81,6 +82,9 @@ pub struct WorkerPosition {
     /// Left neighbor control-plane listen addresses
     pub left_neighbor_addrs: Vec<libp2p::Multiaddr>,
 
+    /// Explicit punched-path coordination plan for the left neighbor
+    pub left_neighbor_punch_plan: Option<PeerPunchPlan>,
+
     /// Left neighbor dedicated tensor endpoint
     pub left_neighbor_tensor_addr: SocketAddr,
 
@@ -89,6 +93,9 @@ pub struct WorkerPosition {
 
     /// Right neighbor control-plane listen addresses
     pub right_neighbor_addrs: Vec<libp2p::Multiaddr>,
+
+    /// Explicit punched-path coordination plan for the right neighbor
+    pub right_neighbor_punch_plan: Option<PeerPunchPlan>,
 
     /// Right neighbor dedicated tensor endpoint
     pub right_neighbor_tensor_addr: SocketAddr,
@@ -273,8 +280,10 @@ impl InferenceCoordinator {
         self.swarm.set_ring_neighbors(
             position.left_neighbor,
             &position.left_neighbor_addrs,
+            position.left_neighbor_punch_plan.as_ref(),
             position.right_neighbor,
             &position.right_neighbor_addrs,
+            position.right_neighbor_punch_plan.as_ref(),
         );
 
         self.position = Some(position);
@@ -680,9 +689,11 @@ mod tests {
             total_workers: 10,
             left_neighbor: PeerId::random(),
             left_neighbor_addrs: vec![],
+            left_neighbor_punch_plan: None,
             left_neighbor_tensor_addr: "127.0.0.1:5001".parse().unwrap(),
             right_neighbor: PeerId::random(),
             right_neighbor_addrs: vec![],
+            right_neighbor_punch_plan: None,
             right_neighbor_tensor_addr: "127.0.0.1:5002".parse().unwrap(),
             shard_column_range: (2457, 3276),
             shard_memory_bytes: 7_000_000_000,

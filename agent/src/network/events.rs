@@ -68,6 +68,14 @@ pub enum MeshEvent {
     /// Direct dialing failed and relay fallback was attempted for a peer
     RelayFallbackToPeer { peer_id: PeerId },
 
+    /// An explicit punched-path attempt was scheduled for a peer
+    PunchPathAttemptInitiated {
+        peer_id: PeerId,
+        reason: String,
+        candidate_count: usize,
+        relay_rendezvous_required: bool,
+    },
+
     /// Received a job request from a peer
     JobReceived {
         peer_id: PeerId,

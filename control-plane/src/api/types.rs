@@ -153,6 +153,37 @@ pub struct RingTopologyResponse {
     pub workers: Vec<WorkerInfo>,
     /// Whether the ring is stable
     pub ring_stable: bool,
+    /// Explicit punched-path coordination plans
+    #[serde(default)]
+    pub peer_punch_plans: Vec<PeerPunchPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PunchPathReason {
+    RelayPath,
+    DegradedConnectivity,
+    PrivateReachabilityOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PunchPathStrategy {
+    SimultaneousDial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPunchPlan {
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub target_peer_id: String,
+    pub strategy: PunchPathStrategy,
+    pub reason: PunchPathReason,
+    pub relay_rendezvous_required: bool,
+    pub attempt_window_ms: u64,
+    pub issued_at_ms: u64,
+    #[serde(default)]
+    pub target_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Worker information in topology response

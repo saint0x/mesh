@@ -8,10 +8,10 @@ use tracing::instrument;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    CreateHandoffRequest, CreateHandoffResponse, HandoffInfo, ListHandoffsResponse,
-    RegisterCallbackRequest, RegisterCallbackResponse, RingJoinRequest, RingJoinResponse,
-    RingLeaveResponse, RingTopologyResponse, ShardInfo, TopologyVersionRequest,
-    TopologyVersionResponse, UpdateHandoffRequest, WorkerInfo,
+    CreateHandoffRequest, CreateHandoffResponse, HandoffInfo, ListHandoffsResponse, PeerPunchPlan,
+    PunchPathReason, PunchPathStrategy, RegisterCallbackRequest, RegisterCallbackResponse,
+    RingJoinRequest, RingJoinResponse, RingLeaveResponse, RingTopologyResponse, ShardInfo,
+    TopologyVersionRequest, TopologyVersionResponse, UpdateHandoffRequest, WorkerInfo,
 };
 use crate::services::network_service;
 use crate::services::ring_manager::Worker;
@@ -174,6 +174,35 @@ pub async fn get_topology(
     Ok(Json(RingTopologyResponse {
         workers,
         ring_stable: topology.ring_stable,
+        peer_punch_plans: topology
+            .peer_punch_plans
+            .into_iter()
+            .map(|plan| PeerPunchPlan {
+                source_device_id: plan.source_device_id,
+                target_device_id: plan.target_device_id,
+                target_peer_id: plan.target_peer_id,
+                strategy: match plan.strategy {
+                    crate::services::ring_manager::PunchPathStrategy::SimultaneousDial => {
+                        PunchPathStrategy::SimultaneousDial
+                    }
+                },
+                reason: match plan.reason {
+                    crate::services::ring_manager::PunchPathReason::RelayPath => {
+                        PunchPathReason::RelayPath
+                    }
+                    crate::services::ring_manager::PunchPathReason::DegradedConnectivity => {
+                        PunchPathReason::DegradedConnectivity
+                    }
+                    crate::services::ring_manager::PunchPathReason::PrivateReachabilityOnly => {
+                        PunchPathReason::PrivateReachabilityOnly
+                    }
+                },
+                relay_rendezvous_required: plan.relay_rendezvous_required,
+                attempt_window_ms: plan.attempt_window_ms,
+                issued_at_ms: plan.issued_at_ms,
+                target_candidates: plan.target_candidates,
+            })
+            .collect(),
     }))
 }
 
@@ -639,6 +668,7 @@ mod tests {
         assert!(response.ring_stable);
         assert_eq!(response.workers.len(), 2);
         assert_eq!(response.workers[0].direct_candidates.len(), 1);
+        assert!(!response.peer_punch_plans.is_empty());
         assert_eq!(
             response.workers[0].direct_candidates[0].scope,
             DirectCandidateScope::Private

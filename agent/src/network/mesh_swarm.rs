@@ -12,6 +12,7 @@ use tracing::{debug, info, instrument, warn};
 
 use super::events::{ConnectionInfo, ConnectionType, MeshEvent};
 use super::job_protocol::{self, JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
+use crate::api::types::PeerPunchPlan;
 use crate::connectivity::{
     persist_observed_reachability_addr, persist_runtime_connectivity_state,
     select_direct_dial_multiaddrs, ConnectivityPath, ConnectivityStatus, DeviceConnectivityState,
@@ -292,8 +293,48 @@ impl MeshSwarm {
         }
     }
 
-    fn dial_neighbor(&mut self, peer_id: PeerId, addrs: &[Multiaddr]) {
-        match self.dial_direct_peer(peer_id, addrs) {
+    pub fn dial_direct_peer_with_punch_plan(
+        &mut self,
+        peer_id: PeerId,
+        plan: &PeerPunchPlan,
+    ) -> Result<()> {
+        let planned_addrs = select_direct_dial_multiaddrs(
+            peer_id,
+            &plan
+                .target_candidates
+                .iter()
+                .filter_map(|candidate| candidate.endpoint.parse().ok())
+                .collect::<Vec<Multiaddr>>(),
+        );
+        if planned_addrs.is_empty() {
+            return Err(AgentError::Network(format!(
+                "Punch plan for peer {} has no viable direct candidates",
+                peer_id
+            )));
+        }
+
+        self.pending_events
+            .push_back(MeshEvent::PunchPathAttemptInitiated {
+                peer_id,
+                reason: format!("{:?}", plan.reason),
+                candidate_count: plan.target_candidates.len(),
+                relay_rendezvous_required: plan.relay_rendezvous_required,
+            });
+        self.dial_direct_peer(peer_id, &planned_addrs)
+    }
+
+    fn dial_neighbor(
+        &mut self,
+        peer_id: PeerId,
+        addrs: &[Multiaddr],
+        plan: Option<&PeerPunchPlan>,
+    ) {
+        let direct_result = match plan {
+            Some(plan) => self.dial_direct_peer_with_punch_plan(peer_id, plan),
+            None => self.dial_direct_peer(peer_id, addrs),
+        };
+
+        match direct_result {
             Ok(()) => {}
             Err(direct_error) => {
                 if self.relay_peer_id.is_some() {
@@ -640,8 +681,10 @@ impl MeshSwarm {
         &mut self,
         left: PeerId,
         left_addrs: &[Multiaddr],
+        left_plan: Option<&PeerPunchPlan>,
         right: PeerId,
         right_addrs: &[Multiaddr],
+        right_plan: Option<&PeerPunchPlan>,
     ) {
         info!("Setting ring neighbors");
 
@@ -651,8 +694,8 @@ impl MeshSwarm {
         });
 
         // Direct is the canonical neighbor path. Relay is only a degraded fallback.
-        self.dial_neighbor(left, left_addrs);
-        self.dial_neighbor(right, right_addrs);
+        self.dial_neighbor(left, left_addrs, left_plan);
+        self.dial_neighbor(right, right_addrs, right_plan);
 
         info!("Ring neighbors set: left={}, right={}", left, right);
     }

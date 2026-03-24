@@ -78,11 +78,13 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Direct-path event handling now has integration-style coverage through the live job-runner metrics path for direct connections, relay fallback, direct upgrades, and external-address discovery.
 - ✅ Direct candidate publication now carries explicit source and freshness metadata so observed public reachability hints can outrank stale local-only advertisements deterministically.
 - ✅ Control-plane validation and topology persistence now treat candidate recency as part of the production reachability contract instead of an implicit local detail.
+- ✅ Ring topology now publishes explicit `peer_punch_plans` for hostile NAT pairs so peers consume a first-class punch coordination contract instead of inferring upgrade behavior from endpoint ranking alone.
+- ✅ Ring inference and ad hoc job dialing now apply those explicit punch plans before relay fallback instead of treating every direct attempt as the same kind of path.
+- ✅ Agent metrics now distinguish punch-assisted attempts, punch-assisted direct connections, and punch-assisted upgrade outcomes from ordinary direct-path success.
 
 ### NAT Traversal Still Open
 
-- ⬜ Exchange explicit punched-path coordination inputs for hostile NAT pairs instead of relying only on ranked endpoint advertisement.
-- ⬜ Add direct-upgrade quality metrics that distinguish pre-punch direct success from punched-path success once explicit punch coordination lands.
+- ⬜ Add deeper host-backed and multi-peer NAT execution coverage that exercises real relay-rendezvous plus punched-path behavior beyond the deterministic control-plane scenario.
 
 ### 3. Governance Third
 
@@ -194,10 +196,15 @@ After Phase 1:
 - ✅ `fozzy --cwd . replay .fozzy/nat-candidates.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/nat-candidates.trace.fozzy --json`
 - ✅ `cargo test -p agent build_direct_peer_candidates_prefers_observed_external_hints -- --nocapture`
+- ✅ `cargo test -p agent test_handle_event_records_punch_assisted_metrics -- --nocapture`
 - ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --record .fozzy/reachability-hints.trace.fozzy --json`
 - ✅ `fozzy --cwd . trace verify .fozzy/reachability-hints.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/reachability-hints.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/reachability-hints.trace.fozzy --json`
+- ✅ `fozzy --cwd . run tests/production_dispatch.fozzy.json --det --record .fozzy/punch-path.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/punch-path.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/punch-path.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/punch-path.trace.fozzy --json`
 
 ### Still Open In Phase 1
 

@@ -1,10 +1,14 @@
 use crate::api::error::{ApiError, ApiResult};
-use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate};
+use crate::connectivity::{
+    ConnectivityPath, ConnectivityStatus, DeviceConnectivityState, DirectCandidateScope,
+    DirectPeerCandidate,
+};
 use crate::db::Database;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Total number of columns in the model shard space (fixed at 8192)
@@ -56,6 +60,7 @@ pub struct PoolStatus {
 pub struct RingTopology {
     pub workers: Vec<WorkerTopologyInfo>,
     pub ring_stable: bool,
+    pub peer_punch_plans: Vec<PeerPunchPlan>,
 }
 
 /// Worker topology information
@@ -72,6 +77,33 @@ pub struct WorkerTopologyInfo {
     pub connectivity_state: Option<DeviceConnectivityState>,
     pub listen_addrs: Vec<String>,
     pub direct_candidates: Vec<DirectPeerCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PunchPathReason {
+    RelayPath,
+    DegradedConnectivity,
+    PrivateReachabilityOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PunchPathStrategy {
+    SimultaneousDial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPunchPlan {
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub target_peer_id: String,
+    pub strategy: PunchPathStrategy,
+    pub reason: PunchPathReason,
+    pub relay_rendezvous_required: bool,
+    pub attempt_window_ms: u64,
+    pub issued_at_ms: u64,
+    pub target_candidates: Vec<DirectPeerCandidate>,
 }
 
 /// Ring Topology Manager for distributed worker coordination
@@ -638,6 +670,7 @@ impl RingTopologyManager {
         let ring_stable = !workers.is_empty();
 
         Ok(RingTopology {
+            peer_punch_plans: build_peer_punch_plans(&workers),
             workers,
             ring_stable,
         })
@@ -647,6 +680,98 @@ impl RingTopologyManager {
     pub fn worker_count(&self) -> usize {
         self.ring_sequence.read().map(|seq| seq.len()).unwrap_or(0)
     }
+}
+
+fn build_peer_punch_plans(workers: &[WorkerTopologyInfo]) -> Vec<PeerPunchPlan> {
+    let issued_at_ms = current_epoch_ms();
+    let mut plans = Vec::new();
+
+    for source in workers.iter().filter(|worker| worker.status == "online") {
+        for target in workers.iter().filter(|worker| worker.status == "online") {
+            if source.device_id == target.device_id
+                || source.direct_candidates.is_empty()
+                || target.direct_candidates.is_empty()
+            {
+                continue;
+            }
+
+            let Some(reason) = classify_punch_reason(source, target) else {
+                continue;
+            };
+
+            plans.push(PeerPunchPlan {
+                source_device_id: source.device_id.clone(),
+                target_device_id: target.device_id.clone(),
+                target_peer_id: target.peer_id.clone(),
+                strategy: PunchPathStrategy::SimultaneousDial,
+                reason,
+                relay_rendezvous_required: uses_relay_path(source) || uses_relay_path(target),
+                attempt_window_ms: 5_000,
+                issued_at_ms,
+                target_candidates: target.direct_candidates.iter().take(6).cloned().collect(),
+            });
+        }
+    }
+
+    plans
+}
+
+fn classify_punch_reason(
+    source: &WorkerTopologyInfo,
+    target: &WorkerTopologyInfo,
+) -> Option<PunchPathReason> {
+    if uses_relay_path(source) || uses_relay_path(target) {
+        return Some(PunchPathReason::RelayPath);
+    }
+
+    if has_degraded_connectivity(source) || has_degraded_connectivity(target) {
+        return Some(PunchPathReason::DegradedConnectivity);
+    }
+
+    if !has_publicish_candidate(source) || !has_publicish_candidate(target) {
+        return Some(PunchPathReason::PrivateReachabilityOnly);
+    }
+
+    None
+}
+
+fn uses_relay_path(worker: &WorkerTopologyInfo) -> bool {
+    worker
+        .connectivity_state
+        .as_ref()
+        .map(|state| state.active_path == ConnectivityPath::Relayed)
+        .unwrap_or(false)
+}
+
+fn has_degraded_connectivity(worker: &WorkerTopologyInfo) -> bool {
+    worker
+        .connectivity_state
+        .as_ref()
+        .map(|state| {
+            matches!(
+                state.status,
+                ConnectivityStatus::Unknown
+                    | ConnectivityStatus::Degraded
+                    | ConnectivityStatus::Disconnected
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn has_publicish_candidate(worker: &WorkerTopologyInfo) -> bool {
+    worker.direct_candidates.iter().any(|candidate| {
+        matches!(
+            candidate.scope,
+            DirectCandidateScope::Public | DirectCandidateScope::Dns
+        )
+    })
+}
+
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

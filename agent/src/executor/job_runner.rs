@@ -25,6 +25,8 @@
 use crate::errors::Result;
 use crate::executor::{EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput};
 use crate::network::{JobEnvelope, JobResult, MeshEvent, MeshSwarm};
+use libp2p::PeerId;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -71,6 +73,18 @@ pub struct JobStats {
 
     /// Number of external/public addresses confirmed
     pub external_addr_confirmed: AtomicU64,
+
+    /// Number of explicit punch-path attempts initiated
+    pub punch_path_attempts: AtomicU64,
+
+    /// Number of direct peer connections established while a punch-path plan was active
+    pub punch_assisted_direct_peer_connections: AtomicU64,
+
+    /// Number of successful direct upgrades after an explicit punch-path plan
+    pub punch_assisted_upgrade_successes: AtomicU64,
+
+    /// Number of failed direct upgrades after an explicit punch-path plan
+    pub punch_assisted_upgrade_failures: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -95,6 +109,10 @@ impl JobStats {
             direct_upgrade_failures: AtomicU64::new(0),
             external_addr_candidates: AtomicU64::new(0),
             external_addr_confirmed: AtomicU64::new(0),
+            punch_path_attempts: AtomicU64::new(0),
+            punch_assisted_direct_peer_connections: AtomicU64::new(0),
+            punch_assisted_upgrade_successes: AtomicU64::new(0),
+            punch_assisted_upgrade_failures: AtomicU64::new(0),
         }
     }
 
@@ -151,6 +169,25 @@ impl JobStats {
 
     pub fn record_external_addr_confirmed(&self) {
         self.external_addr_confirmed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_punch_path_attempt(&self) {
+        self.punch_path_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_punch_assisted_direct_peer_connection(&self) {
+        self.punch_assisted_direct_peer_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_punch_assisted_upgrade_success(&self) {
+        self.punch_assisted_upgrade_successes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_punch_assisted_upgrade_failure(&self) {
+        self.punch_assisted_upgrade_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -291,6 +328,24 @@ impl JobStats {
             "  Ext Confirmed:    {}",
             self.external_addr_confirmed.load(Ordering::Relaxed)
         );
+        println!(
+            "  Punch Attempts:   {}",
+            self.punch_path_attempts.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Punch Direct:     {}",
+            self.punch_assisted_direct_peer_connections
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Punch Upgrades:   {}",
+            self.punch_assisted_upgrade_successes
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Punch Failures:   {}",
+            self.punch_assisted_upgrade_failures.load(Ordering::Relaxed)
+        );
         println!();
     }
 
@@ -326,6 +381,10 @@ impl JobStats {
                 "direct_upgrade_failures": self.direct_upgrade_failures.load(Ordering::Relaxed),
                 "external_addr_candidates": self.external_addr_candidates.load(Ordering::Relaxed),
                 "external_addr_confirmed": self.external_addr_confirmed.load(Ordering::Relaxed),
+                "punch_path_attempts": self.punch_path_attempts.load(Ordering::Relaxed),
+                "punch_assisted_direct_peer_connections": self.punch_assisted_direct_peer_connections.load(Ordering::Relaxed),
+                "punch_assisted_upgrade_successes": self.punch_assisted_upgrade_successes.load(Ordering::Relaxed),
+                "punch_assisted_upgrade_failures": self.punch_assisted_upgrade_failures.load(Ordering::Relaxed),
             },
             "last_updated": chrono::Local::now().to_rfc3339(),
         });
@@ -349,6 +408,7 @@ pub struct JobRunner {
     device_id: Option<uuid::Uuid>,
     network_id: Option<String>,
     tier: Option<crate::device::Tier>,
+    punch_attempt_state: HashMap<PeerId, bool>,
 }
 
 impl JobRunner {
@@ -381,6 +441,7 @@ impl JobRunner {
             device_id: None,
             network_id: None,
             tier: None,
+            punch_attempt_state: HashMap::new(),
         }
     }
 
@@ -523,6 +584,17 @@ impl JobRunner {
                 peer_id,
                 connection_info,
             } => {
+                if matches!(
+                    connection_info.connection_type,
+                    crate::network::ConnectionType::Direct
+                ) {
+                    if let Some(recorded_direct) = self.punch_attempt_state.get_mut(&peer_id) {
+                        if !*recorded_direct {
+                            self.stats.record_punch_assisted_direct_peer_connection();
+                            *recorded_direct = true;
+                        }
+                    }
+                }
                 match connection_info.connection_type {
                     crate::network::ConnectionType::Direct => {
                         self.stats.record_direct_peer_connection()
@@ -540,6 +612,7 @@ impl JobRunner {
             }
 
             MeshEvent::PeerDisconnected { peer_id } => {
+                self.punch_attempt_state.remove(&peer_id);
                 info!(peer_id = %peer_id, "Peer disconnected");
             }
 
@@ -574,16 +647,23 @@ impl JobRunner {
 
             MeshEvent::RelayFallbackToPeer { peer_id } => {
                 self.stats.record_relay_fallback();
+                self.punch_attempt_state.remove(&peer_id);
                 warn!(peer_id = %peer_id, "Relay fallback used for peer");
             }
 
             MeshEvent::DirectConnectionUpgraded { peer_id } => {
                 self.stats.record_direct_upgrade_success();
+                if self.punch_attempt_state.remove(&peer_id).is_some() {
+                    self.stats.record_punch_assisted_upgrade_success();
+                }
                 info!(peer_id = %peer_id, "Direct connection upgrade succeeded");
             }
 
             MeshEvent::DirectConnectionUpgradeFailed { peer_id, error } => {
                 self.stats.record_direct_upgrade_failure();
+                if self.punch_attempt_state.remove(&peer_id).is_some() {
+                    self.stats.record_punch_assisted_upgrade_failure();
+                }
                 warn!(peer_id = %peer_id, error = %error, "Direct connection upgrade failed");
             }
 
@@ -595,6 +675,23 @@ impl JobRunner {
             MeshEvent::ExternalAddrConfirmed { address } => {
                 self.stats.record_external_addr_confirmed();
                 info!(address = %address, "External address confirmed");
+            }
+
+            MeshEvent::PunchPathAttemptInitiated {
+                peer_id,
+                reason,
+                candidate_count,
+                relay_rendezvous_required,
+            } => {
+                self.stats.record_punch_path_attempt();
+                self.punch_attempt_state.insert(peer_id, false);
+                info!(
+                    peer_id = %peer_id,
+                    reason = %reason,
+                    candidate_count = candidate_count,
+                    relay_rendezvous_required = relay_rendezvous_required,
+                    "Explicit punched-path attempt initiated"
+                );
             }
 
             _ => {
@@ -883,6 +980,10 @@ mod tests {
         stats.record_direct_upgrade_failure();
         stats.record_external_addr_candidate();
         stats.record_external_addr_confirmed();
+        stats.record_punch_path_attempt();
+        stats.record_punch_assisted_direct_peer_connection();
+        stats.record_punch_assisted_upgrade_success();
+        stats.record_punch_assisted_upgrade_failure();
 
         assert_eq!(stats.direct_peer_connections.load(Ordering::Relaxed), 1);
         assert_eq!(stats.relayed_peer_connections.load(Ordering::Relaxed), 1);
@@ -891,6 +992,25 @@ mod tests {
         assert_eq!(stats.direct_upgrade_failures.load(Ordering::Relaxed), 1);
         assert_eq!(stats.external_addr_candidates.load(Ordering::Relaxed), 1);
         assert_eq!(stats.external_addr_confirmed.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.punch_path_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats
+                .punch_assisted_direct_peer_connections
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .punch_assisted_upgrade_successes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .punch_assisted_upgrade_failures
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1003,6 +1123,56 @@ mod tests {
         );
         assert_eq!(
             runner.stats.external_addr_confirmed.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_records_punch_assisted_metrics() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().unwrap();
+        let executor = EmbeddingsExecutor::new_fast().unwrap();
+        let mut runner = JobRunner::new(swarm, executor);
+        let peer_id = libp2p::PeerId::random();
+
+        runner
+            .handle_event(MeshEvent::PunchPathAttemptInitiated {
+                peer_id,
+                reason: "RelayPath".to_string(),
+                candidate_count: 2,
+                relay_rendezvous_required: true,
+            })
+            .await
+            .unwrap();
+        runner
+            .handle_event(MeshEvent::PeerConnected {
+                peer_id,
+                connection_info: ConnectionInfo {
+                    connection_type: ConnectionType::Direct,
+                    remote_addr: "/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+                    num_established: 1,
+                },
+            })
+            .await
+            .unwrap();
+        runner
+            .handle_event(MeshEvent::DirectConnectionUpgraded { peer_id })
+            .await
+            .unwrap();
+
+        assert_eq!(runner.stats.punch_path_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runner
+                .stats
+                .punch_assisted_direct_peer_connections
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            runner
+                .stats
+                .punch_assisted_upgrade_successes
+                .load(Ordering::Relaxed),
             1
         );
     }

@@ -35,13 +35,14 @@ use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
 use agent::{
-    api::types::RingTopologyResponse, build_direct_peer_candidates_from_records, format_bytes,
-    init_production_logging, init_simple_logging, load_direct_candidate_seed_records,
-    load_observed_reachability_addrs, parse_data_plane_endpoint, parse_memory_string,
-    persist_runtime_connectivity_state, select_direct_dial_addrs_from_candidates,
-    ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus, DeviceConfig,
-    DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner,
-    MeshSwarmBuilder, RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
+    api::types::{PeerPunchPlan, RingTopologyResponse, WorkerInfo},
+    build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
+    init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
+    parse_data_plane_endpoint, parse_memory_string, persist_runtime_connectivity_state,
+    select_direct_dial_addrs_from_candidates, ConnectivityAttachmentKind, ConnectivityPath,
+    ConnectivityStatus, DeviceConfig, DeviceConnectivityState, EmbeddingsExecutor, EmbeddingsInput,
+    EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
+    TensorPlane, TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -557,27 +558,62 @@ fn build_worker_position_from_topology(
         .peer_id
         .parse::<PeerId>()
         .context("Invalid right neighbor peer ID")?;
+    let left_punch_plan = find_peer_punch_plan(topology, device_id, &left_worker.device_id);
+    let right_punch_plan = find_peer_punch_plan(topology, device_id, &right_worker.device_id);
 
     Ok(agent::inference::coordinator::WorkerPosition {
         position: self_worker.position,
         total_workers: topology.workers.len() as u32,
         left_neighbor: left_peer_id,
-        left_neighbor_addrs: select_direct_dial_addrs_from_candidates(
+        left_neighbor_addrs: resolve_target_direct_addrs(
+            topology,
+            device_id,
+            left_worker,
             left_peer_id,
-            &left_worker.direct_candidates,
         ),
+        left_neighbor_punch_plan: left_punch_plan,
         left_neighbor_tensor_addr: extract_tensor_addr(&left_worker.listen_addrs)
             .context("Left neighbor has no dedicated tensor data-plane endpoint")?,
         right_neighbor: right_peer_id,
-        right_neighbor_addrs: select_direct_dial_addrs_from_candidates(
+        right_neighbor_addrs: resolve_target_direct_addrs(
+            topology,
+            device_id,
+            right_worker,
             right_peer_id,
-            &right_worker.direct_candidates,
         ),
+        right_neighbor_punch_plan: right_punch_plan,
         right_neighbor_tensor_addr: extract_tensor_addr(&right_worker.listen_addrs)
             .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
         shard_column_range: (self_worker.shard.column_start, self_worker.shard.column_end),
         shard_memory_bytes: self_worker.contributed_memory,
     })
+}
+
+fn find_peer_punch_plan(
+    topology: &RingTopologyResponse,
+    source_device_id: &Uuid,
+    target_device_id: &str,
+) -> Option<PeerPunchPlan> {
+    topology
+        .peer_punch_plans
+        .iter()
+        .find(|plan| {
+            plan.source_device_id == source_device_id.to_string()
+                && plan.target_device_id == target_device_id
+        })
+        .cloned()
+}
+
+fn resolve_target_direct_addrs(
+    topology: &RingTopologyResponse,
+    source_device_id: &Uuid,
+    worker: &WorkerInfo,
+    target_peer_id: PeerId,
+) -> Vec<Multiaddr> {
+    let candidates = find_peer_punch_plan(topology, source_device_id, &worker.device_id)
+        .map(|plan| plan.target_candidates)
+        .unwrap_or_else(|| worker.direct_candidates.clone());
+    select_direct_dial_addrs_from_candidates(target_peer_id, &candidates)
 }
 
 async fn fetch_ring_topology(config: &DeviceConfig) -> Result<RingTopologyResponse> {
@@ -1289,15 +1325,26 @@ async fn cmd_job(input: String, target: String, workload: String, timeout_ms: u6
 
     let worker = topology
         .workers
-        .into_iter()
+        .iter()
         .find(|worker| worker.peer_id == target_peer.to_string())
+        .cloned()
         .context("Target peer not found in topology")?;
 
+    let punch_plan = find_peer_punch_plan(&topology, &config.device_id, &worker.device_id);
     let target_addrs =
-        select_direct_dial_addrs_from_candidates(target_peer, &worker.direct_candidates);
+        resolve_target_direct_addrs(&topology, &config.device_id, &worker, target_peer);
     if !target_addrs.is_empty() {
-        swarm.dial_direct_peer(target_peer, &target_addrs)?;
-        println!("   ✓ Dialing target directly");
+        if let Some(plan) = punch_plan.as_ref() {
+            swarm.dial_direct_peer_with_punch_plan(target_peer, plan)?;
+            println!(
+                "   ✓ Applying punched-path plan ({:?}, {} candidates)",
+                plan.reason,
+                plan.target_candidates.len()
+            );
+        } else {
+            swarm.dial_direct_peer(target_peer, &target_addrs)?;
+            println!("   ✓ Dialing target directly");
+        }
     } else if matches!(
         config.connectivity.preferred_path,
         ConnectivityPath::Relayed
@@ -1549,6 +1596,22 @@ async fn cmd_metrics() -> Result<()> {
         "  Ext Confirmed:    {}",
         stats.connectivity.external_addr_confirmed
     );
+    println!(
+        "  Punch Attempts:   {}",
+        stats.connectivity.punch_path_attempts
+    );
+    println!(
+        "  Punch Direct:     {}",
+        stats.connectivity.punch_assisted_direct_peer_connections
+    );
+    println!(
+        "  Punch Upgrades:   {}",
+        stats.connectivity.punch_assisted_upgrade_successes
+    );
+    println!(
+        "  Punch Failures:   {}",
+        stats.connectivity.punch_assisted_upgrade_failures
+    );
     println!();
 
     Ok(())
@@ -1578,6 +1641,10 @@ struct SavedConnectivityStats {
     direct_upgrade_failures: u64,
     external_addr_candidates: u64,
     external_addr_confirmed: u64,
+    punch_path_attempts: u64,
+    punch_assisted_direct_peer_connections: u64,
+    punch_assisted_upgrade_successes: u64,
+    punch_assisted_upgrade_failures: u64,
 }
 
 /// Lock resources for pool contribution
