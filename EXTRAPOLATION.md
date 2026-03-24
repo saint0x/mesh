@@ -87,8 +87,10 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ A dedicated higher-performance data plane beyond libp2p request/response now exists in the active tensor path.
 - ✅ Stronger NAT traversal now includes explicit punched-path coordination, relay rendezvous, and direct-upgrade runtime coverage rather than only direct vs relayed selection.
 - ✅ The dedicated tensor path now has explicit bounded backpressure with enforced message-size, inbound-queue, queued-byte, and outbound in-flight byte budgets instead of an unbounded transport queue.
+- ✅ The dedicated tensor path now also has an explicit sustained outbound bandwidth governor instead of relying only on queue pressure and socket timing.
 - ✅ Persisted inference stats now expose tensor-plane pressure signals and transport volume so operators can see real hot-path drops and waits instead of only executor-level governance.
-- ⬜ More complete runtime governance and backpressure controls still remain across broader bandwidth shaping, execution, fairness, and recovery paths.
+- ✅ Persisted inference stats now expose bandwidth-governor wait signals so transport shaping is operator-visible in the same metrics surface.
+- ⬜ More complete runtime governance and backpressure controls still remain across recovery paths, execution fairness, and harder pool-capacity policy.
 - ⬜ Any future overlay backend must be implemented for real before reintroduction.
 
 ### Still Worth Hardening Over Time
@@ -108,6 +110,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Queued-job and scheduler-dispatch accounting are now persisted alongside the rest of the runtime metrics, so weighted governance behavior is observable.
 - ✅ Tensor-plane backpressure is now explicit in the runtime contract, with bounded queued messages and bytes on ingress plus bounded in-flight bytes on egress.
 - ✅ Tensor-plane metrics now persist bytes sent/received, outbound wait counts/time, inbound queue drops, byte-budget drops, and oversize drops.
+- ✅ Tensor-plane throughput shaping is now explicit too, with a governed sustained send-rate budget and persisted bandwidth-wait metrics.
 - ✅ Durable pool assignment claims now prefer the least-served submitter and least-served job before falling back to age, so ring workers no longer lease work in naive per-device FIFO order.
 - ✅ Durable pool assignment claims now apply an explicit submitter soft cap, so a single submitter cannot open a second active ring job while another submitter still has uncapped work waiting.
 - ✅ Durable pool assignment claims now apply a model-aware soft cap tied to live ring size, so one model/workload class cannot consume the pool while competing model work is still waiting.
@@ -118,7 +121,7 @@ These are the main remaining production-facing areas, but they are mostly new ca
 - ✅ Coverage now includes a live relay-rendezvous direct-upgrade runtime gate that proves peers can establish relay connectivity first and then upgrade off relay when direct reachability exists.
 - ✅ Coverage now includes a staggered relay-rendezvous direct-upgrade runtime gate that exercises later-arriving peers and non-synchronized upgrade timing.
 - ⬜ Broader asymmetric-reachability and harsher direct-upgrade coverage beyond the current `production_dispatch`, `punch_path_coordination`, `live_relay_runtime`, `multi_peer_live_relay_runtime`, `direct_upgrade_live_relay_runtime`, and `staggered_direct_upgrade_live_relay_runtime` host-backed/runtime gates.
-- ⬜ More explicit operator-facing visibility into path quality, fallback reasons, degraded connectivity behavior, and higher-level bandwidth shaping beyond the current tensor-plane counters.
+- ⬜ More explicit operator-facing visibility into recovery-path throttling, fallback reasons, degraded connectivity behavior, and higher-level pool-capacity policy beyond the current tensor-plane counters.
 - ⬜ Continued work on production-grade model/data-plane performance once correctness is no longer the dominant concern.
 
 ## Recommended Next Phase

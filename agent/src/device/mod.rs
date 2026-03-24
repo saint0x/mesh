@@ -109,6 +109,9 @@ pub struct GovernanceConfig {
 
     /// Maximum total outbound tensor bytes allowed in flight at once.
     pub tensor_plane_max_outbound_inflight_bytes: usize,
+
+    /// Sustained outbound tensor-plane bandwidth budget for this node.
+    pub tensor_plane_max_send_bandwidth_bytes_per_sec: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +176,7 @@ impl Default for GovernanceConfig {
             tensor_plane_max_inbound_messages: 64,
             tensor_plane_max_inbound_queued_bytes: 64 * 1024 * 1024,
             tensor_plane_max_outbound_inflight_bytes: 64 * 1024 * 1024,
+            tensor_plane_max_send_bandwidth_bytes_per_sec: 10 * 1024 * 1024,
         }
     }
 }
@@ -491,6 +495,10 @@ mod tests {
             config.governance.tensor_plane_max_outbound_inflight_bytes,
             64 * 1024 * 1024
         );
+        assert_eq!(
+            config.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
+            10 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -567,6 +575,10 @@ arch = "x86_64"
         assert_eq!(
             loaded.governance.tensor_plane_max_outbound_inflight_bytes,
             64 * 1024 * 1024
+        );
+        assert_eq!(
+            loaded.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
+            10 * 1024 * 1024
         );
     }
 
@@ -651,6 +663,10 @@ arch = "x86_64"
         assert_eq!(
             original.governance.tensor_plane_max_outbound_inflight_bytes,
             loaded.governance.tensor_plane_max_outbound_inflight_bytes
+        );
+        assert_eq!(
+            original.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
+            loaded.governance.tensor_plane_max_send_bandwidth_bytes_per_sec
         );
 
         // CRITICAL: Verify keypair bytes are identical

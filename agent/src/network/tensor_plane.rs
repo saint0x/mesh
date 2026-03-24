@@ -1,11 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::errors::{AgentError, Result};
@@ -27,6 +28,7 @@ pub struct TensorPlaneConfig {
     pub max_inbound_messages: usize,
     pub max_inbound_queued_bytes: usize,
     pub max_outbound_inflight_bytes: usize,
+    pub max_send_bandwidth_bytes_per_sec: u64,
 }
 
 impl Default for TensorPlaneConfig {
@@ -39,6 +41,7 @@ impl Default for TensorPlaneConfig {
             max_inbound_messages: DEFAULT_MAX_INBOUND_MESSAGES,
             max_inbound_queued_bytes: DEFAULT_MAX_INBOUND_QUEUED_BYTES,
             max_outbound_inflight_bytes: DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES,
+            max_send_bandwidth_bytes_per_sec: DEFAULT_MAX_MESSAGE_BYTES as u64,
         }
     }
 }
@@ -56,6 +59,8 @@ pub struct TensorPlaneMetricsSnapshot {
     pub bytes_received: u64,
     pub outbound_backpressure_wait_count: u64,
     pub outbound_backpressure_wait_ms: u64,
+    pub outbound_bandwidth_wait_count: u64,
+    pub outbound_bandwidth_wait_ms: u64,
     pub inbound_queue_full_rejections: u64,
     pub inbound_byte_budget_rejections: u64,
     pub oversized_message_rejections: u64,
@@ -69,6 +74,8 @@ struct TensorPlaneMetrics {
     bytes_received: AtomicU64,
     outbound_backpressure_wait_count: AtomicU64,
     outbound_backpressure_wait_ms: AtomicU64,
+    outbound_bandwidth_wait_count: AtomicU64,
+    outbound_bandwidth_wait_ms: AtomicU64,
     inbound_queue_full_rejections: AtomicU64,
     inbound_byte_budget_rejections: AtomicU64,
     oversized_message_rejections: AtomicU64,
@@ -81,6 +88,8 @@ impl TensorPlaneMetrics {
             bytes_received: AtomicU64::new(0),
             outbound_backpressure_wait_count: AtomicU64::new(0),
             outbound_backpressure_wait_ms: AtomicU64::new(0),
+            outbound_bandwidth_wait_count: AtomicU64::new(0),
+            outbound_bandwidth_wait_ms: AtomicU64::new(0),
             inbound_queue_full_rejections: AtomicU64::new(0),
             inbound_byte_budget_rejections: AtomicU64::new(0),
             oversized_message_rejections: AtomicU64::new(0),
@@ -99,7 +108,50 @@ struct TensorPlaneState {
     outbound_inflight_byte_capacity: usize,
     inbound_queue_bytes: Arc<Semaphore>,
     outbound_inflight_bytes: Arc<Semaphore>,
+    outbound_bandwidth_limiter: Mutex<BandwidthLimiter>,
     metrics: TensorPlaneMetrics,
+}
+
+#[derive(Debug)]
+struct BandwidthLimiter {
+    rate_bytes_per_sec: u64,
+    burst_bytes: f64,
+    available_bytes: f64,
+    last_refill: Instant,
+}
+
+impl BandwidthLimiter {
+    fn new(rate_bytes_per_sec: u64, burst_bytes: usize) -> Self {
+        let rate_bytes_per_sec = rate_bytes_per_sec.max(1);
+        let burst_bytes = burst_bytes.max(1) as f64;
+        Self {
+            rate_bytes_per_sec,
+            burst_bytes,
+            available_bytes: burst_bytes,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn reserve_wait(&mut self, bytes: usize) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let replenished =
+            self.available_bytes + elapsed * self.rate_bytes_per_sec as f64;
+        self.available_bytes = replenished.min(self.burst_bytes);
+        self.last_refill = now;
+
+        let bytes = bytes.max(1) as f64;
+        if self.available_bytes >= bytes {
+            self.available_bytes -= bytes;
+            return Duration::ZERO;
+        }
+
+        let deficit = bytes - self.available_bytes;
+        let wait = Duration::from_secs_f64(deficit / self.rate_bytes_per_sec as f64);
+        self.available_bytes = 0.0;
+        self.last_refill = now + wait;
+        wait
+    }
 }
 
 pub struct TensorPlane {
@@ -144,6 +196,10 @@ impl TensorPlane {
             outbound_inflight_byte_capacity: config.max_outbound_inflight_bytes,
             inbound_queue_bytes,
             outbound_inflight_bytes,
+            outbound_bandwidth_limiter: Mutex::new(BandwidthLimiter::new(
+                config.max_send_bandwidth_bytes_per_sec,
+                config.max_message_bytes,
+            )),
             metrics,
         });
         let accept_state = Arc::clone(&metrics_state);
@@ -278,6 +334,16 @@ impl TensorPlane {
                 .metrics
                 .outbound_backpressure_wait_ms
                 .load(Ordering::Relaxed),
+            outbound_bandwidth_wait_count: self
+                .state
+                .metrics
+                .outbound_bandwidth_wait_count
+                .load(Ordering::Relaxed),
+            outbound_bandwidth_wait_ms: self
+                .state
+                .metrics
+                .outbound_bandwidth_wait_ms
+                .load(Ordering::Relaxed),
             inbound_queue_full_rejections: self
                 .state
                 .metrics
@@ -349,6 +415,21 @@ impl TensorPlane {
                 permit
             }
         };
+        let bandwidth_wait = {
+            let mut limiter = self.state.outbound_bandwidth_limiter.lock().await;
+            limiter.reserve_wait(message_bytes)
+        };
+        if !bandwidth_wait.is_zero() {
+            self.state
+                .metrics
+                .outbound_bandwidth_wait_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.state
+                .metrics
+                .outbound_bandwidth_wait_ms
+                .fetch_add(bandwidth_wait.as_millis() as u64, Ordering::Relaxed);
+            tokio::time::sleep(bandwidth_wait).await;
+        }
         let mut stream =
             tokio::time::timeout(self.state.connect_timeout, TcpStream::connect(target))
                 .await
@@ -411,6 +492,7 @@ fn sanitized_config(config: TensorPlaneConfig) -> Result<TensorPlaneConfig> {
         max_inbound_messages: config.max_inbound_messages.max(1),
         max_inbound_queued_bytes: config.max_inbound_queued_bytes.max(1),
         max_outbound_inflight_bytes: config.max_outbound_inflight_bytes.max(1),
+        max_send_bandwidth_bytes_per_sec: config.max_send_bandwidth_bytes_per_sec.max(1),
         ..config
     })
 }
@@ -564,5 +646,12 @@ mod tests {
         assert!(timeout(Duration::from_millis(100), plane.recv()).await.is_err());
         let snapshot = plane.metrics_snapshot();
         assert!(snapshot.inbound_byte_budget_rejections >= 1);
+    }
+
+    #[test]
+    fn test_bandwidth_limiter_reserves_wait_when_tokens_exhausted() {
+        let mut limiter = BandwidthLimiter::new(100, 100);
+        assert_eq!(limiter.reserve_wait(100), Duration::ZERO);
+        assert!(limiter.reserve_wait(100) >= Duration::from_millis(900));
     }
 }

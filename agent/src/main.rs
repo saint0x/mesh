@@ -1060,6 +1060,9 @@ async fn cmd_start() -> Result<()> {
             max_outbound_inflight_bytes: inference_config_task
                 .governance
                 .tensor_plane_max_outbound_inflight_bytes,
+            max_send_bandwidth_bytes_per_sec: inference_config_task
+                .governance
+                .tensor_plane_max_send_bandwidth_bytes_per_sec,
             ..TensorPlaneConfig::default()
         })
         .await
@@ -2060,6 +2063,12 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(wait_ms) = stats.get("tensor_outbound_backpressure_wait_ms") {
         println!("  Send Wait Time:    {}ms", wait_ms);
+    }
+    if let Some(wait_count) = stats.get("tensor_outbound_bandwidth_wait_count") {
+        println!("  Bandwidth Waits:   {}", wait_count);
+    }
+    if let Some(wait_ms) = stats.get("tensor_outbound_bandwidth_wait_ms") {
+        println!("  Bandwidth Wait:    {}ms", wait_ms);
     }
     if let Some(queue_drops) = stats.get("tensor_inbound_queue_full_rejections") {
         println!("  Queue Drops:       {}", queue_drops);

@@ -56,6 +56,12 @@ pub struct InferenceStats {
     /// Total time spent waiting on outbound tensor-plane byte-budget permits.
     pub tensor_outbound_backpressure_wait_ms: AtomicU64,
 
+    /// Number of outbound sends delayed by the tensor-plane bandwidth governor.
+    pub tensor_outbound_bandwidth_wait_count: AtomicU64,
+
+    /// Total time spent waiting on the tensor-plane bandwidth governor.
+    pub tensor_outbound_bandwidth_wait_ms: AtomicU64,
+
     /// Number of inbound tensor messages rejected because the bounded queue was full.
     pub tensor_inbound_queue_full_rejections: AtomicU64,
 
@@ -97,6 +103,8 @@ impl InferenceStats {
             tensor_bytes_received: AtomicU64::new(0),
             tensor_outbound_backpressure_wait_count: AtomicU64::new(0),
             tensor_outbound_backpressure_wait_ms: AtomicU64::new(0),
+            tensor_outbound_bandwidth_wait_count: AtomicU64::new(0),
+            tensor_outbound_bandwidth_wait_ms: AtomicU64::new(0),
             tensor_inbound_queue_full_rejections: AtomicU64::new(0),
             tensor_inbound_byte_budget_rejections: AtomicU64::new(0),
             tensor_oversized_message_rejections: AtomicU64::new(0),
@@ -159,6 +167,14 @@ impl InferenceStats {
         );
         self.tensor_outbound_backpressure_wait_ms.store(
             snapshot.outbound_backpressure_wait_ms,
+            Ordering::Relaxed,
+        );
+        self.tensor_outbound_bandwidth_wait_count.store(
+            snapshot.outbound_bandwidth_wait_count,
+            Ordering::Relaxed,
+        );
+        self.tensor_outbound_bandwidth_wait_ms.store(
+            snapshot.outbound_bandwidth_wait_ms,
             Ordering::Relaxed,
         );
         self.tensor_inbound_queue_full_rejections.store(
@@ -270,6 +286,9 @@ impl InferenceStats {
             tensor_backpressure_waits = self
                 .tensor_outbound_backpressure_wait_count
                 .load(Ordering::Relaxed),
+            tensor_bandwidth_waits = self
+                .tensor_outbound_bandwidth_wait_count
+                .load(Ordering::Relaxed),
             tensor_queue_rejections = self
                 .tensor_inbound_queue_full_rejections
                 .load(Ordering::Relaxed),
@@ -345,6 +364,16 @@ impl InferenceStats {
                 .load(Ordering::Relaxed)
         );
         println!(
+            "  Bandwidth Waits:     {}",
+            self.tensor_outbound_bandwidth_wait_count
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Bandwidth Wait Time: {}ms",
+            self.tensor_outbound_bandwidth_wait_ms
+                .load(Ordering::Relaxed)
+        );
+        println!(
             "  Inbound Queue Drops: {}",
             self.tensor_inbound_queue_full_rejections
                 .load(Ordering::Relaxed)
@@ -392,6 +421,8 @@ impl InferenceStats {
             "tensor_bytes_received": self.tensor_bytes_received.load(Ordering::Relaxed),
             "tensor_outbound_backpressure_wait_count": self.tensor_outbound_backpressure_wait_count.load(Ordering::Relaxed),
             "tensor_outbound_backpressure_wait_ms": self.tensor_outbound_backpressure_wait_ms.load(Ordering::Relaxed),
+            "tensor_outbound_bandwidth_wait_count": self.tensor_outbound_bandwidth_wait_count.load(Ordering::Relaxed),
+            "tensor_outbound_bandwidth_wait_ms": self.tensor_outbound_bandwidth_wait_ms.load(Ordering::Relaxed),
             "tensor_inbound_queue_full_rejections": self.tensor_inbound_queue_full_rejections.load(Ordering::Relaxed),
             "tensor_inbound_byte_budget_rejections": self.tensor_inbound_byte_budget_rejections.load(Ordering::Relaxed),
             "tensor_oversized_message_rejections": self.tensor_oversized_message_rejections.load(Ordering::Relaxed),
@@ -504,6 +535,8 @@ mod tests {
             bytes_received: 256,
             outbound_backpressure_wait_count: 3,
             outbound_backpressure_wait_ms: 42,
+            outbound_bandwidth_wait_count: 4,
+            outbound_bandwidth_wait_ms: 55,
             inbound_queue_full_rejections: 5,
             inbound_byte_budget_rejections: 7,
             oversized_message_rejections: 11,
@@ -518,6 +551,12 @@ mod tests {
                 .tensor_outbound_backpressure_wait_count
                 .load(Ordering::Relaxed),
             3
+        );
+        assert_eq!(
+            stats
+                .tensor_outbound_bandwidth_wait_count
+                .load(Ordering::Relaxed),
+            4
         );
         assert_eq!(
             stats
