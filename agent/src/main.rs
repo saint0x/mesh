@@ -2242,6 +2242,195 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::api::types::{
+        PeerPunchPlan, PunchPathReason, PunchPathStrategy, ShardInfo, WorkerInfo,
+    };
+
+    fn test_worker(
+        device_id: &str,
+        peer_id: &PeerId,
+        direct_candidates: Vec<agent::DirectPeerCandidate>,
+    ) -> WorkerInfo {
+        WorkerInfo {
+            device_id: device_id.to_string(),
+            peer_id: peer_id.to_string(),
+            position: 0,
+            status: "online".to_string(),
+            contributed_memory: 8_000_000_000,
+            shard: ShardInfo {
+                model_id: "test-model".to_string(),
+                column_start: 0,
+                column_end: 4096,
+                estimated_memory: 8_000_000_000,
+            },
+            left_neighbor: device_id.to_string(),
+            right_neighbor: device_id.to_string(),
+            connectivity_state: None,
+            listen_addrs: vec![
+                "/ip4/127.0.0.1/tcp/7001/p2p/12D3KooWTestTensor".to_string(),
+                "dataplane://127.0.0.1:9001".to_string(),
+            ],
+            direct_candidates,
+        }
+    }
+
+    fn tcp_candidate(endpoint: &str) -> agent::DirectPeerCandidate {
+        agent::DirectPeerCandidate {
+            endpoint: endpoint.to_string(),
+            transport: agent::DirectCandidateTransport::Tcp,
+            scope: agent::DirectCandidateScope::Private,
+            source: agent::DirectCandidateSource::LocalListen,
+            priority: 10,
+            last_updated_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn resolve_target_direct_addrs_prefers_punch_plan_candidates() {
+        let source_device_id = Uuid::new_v4();
+        let source_peer_id = PeerId::random();
+        let target_peer_id = PeerId::random();
+        let worker = test_worker(
+            "target",
+            &target_peer_id,
+            vec![tcp_candidate("/ip4/10.0.0.8/tcp/4100")],
+        );
+        let topology = RingTopologyResponse {
+            workers: vec![
+                test_worker(
+                    &source_device_id.to_string(),
+                    &source_peer_id,
+                    vec![tcp_candidate("/ip4/10.0.0.7/tcp/4100")],
+                ),
+                worker.clone(),
+            ],
+            ring_stable: true,
+            peer_punch_plans: vec![PeerPunchPlan {
+                source_device_id: source_device_id.to_string(),
+                target_device_id: worker.device_id.clone(),
+                target_peer_id: target_peer_id.to_string(),
+                strategy: PunchPathStrategy::SimultaneousDial,
+                reason: PunchPathReason::RelayPath,
+                relay_rendezvous_required: true,
+                attempt_window_ms: 5_000,
+                issued_at_ms: 1_700_000_000_000,
+                target_candidates: vec![tcp_candidate("/ip4/34.120.0.10/tcp/4001")],
+            }],
+        };
+
+        let resolved =
+            resolve_target_direct_addrs(&topology, &source_device_id, &worker, target_peer_id);
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].to_string().contains("34.120.0.10"));
+    }
+
+    #[test]
+    fn build_worker_position_from_topology_attaches_neighbor_punch_plans() {
+        let self_device_id = Uuid::new_v4();
+        let left_peer_id = PeerId::random();
+        let right_peer_id = PeerId::random();
+
+        let topology = RingTopologyResponse {
+            workers: vec![
+                WorkerInfo {
+                    device_id: self_device_id.to_string(),
+                    peer_id: PeerId::random().to_string(),
+                    position: 0,
+                    status: "online".to_string(),
+                    contributed_memory: 8_000_000_000,
+                    shard: ShardInfo {
+                        model_id: "test-model".to_string(),
+                        column_start: 0,
+                        column_end: 4096,
+                        estimated_memory: 8_000_000_000,
+                    },
+                    left_neighbor: "left".to_string(),
+                    right_neighbor: "right".to_string(),
+                    connectivity_state: None,
+                    listen_addrs: vec!["dataplane://127.0.0.1:9000".to_string()],
+                    direct_candidates: vec![tcp_candidate("/ip4/10.0.0.5/tcp/4100")],
+                },
+                WorkerInfo {
+                    device_id: "left".to_string(),
+                    peer_id: left_peer_id.to_string(),
+                    position: 1,
+                    status: "online".to_string(),
+                    contributed_memory: 8_000_000_000,
+                    shard: ShardInfo {
+                        model_id: "test-model".to_string(),
+                        column_start: 4096,
+                        column_end: 6144,
+                        estimated_memory: 8_000_000_000,
+                    },
+                    left_neighbor: "right".to_string(),
+                    right_neighbor: self_device_id.to_string(),
+                    connectivity_state: None,
+                    listen_addrs: vec!["dataplane://127.0.0.1:9001".to_string()],
+                    direct_candidates: vec![tcp_candidate("/ip4/10.0.0.6/tcp/4100")],
+                },
+                WorkerInfo {
+                    device_id: "right".to_string(),
+                    peer_id: right_peer_id.to_string(),
+                    position: 2,
+                    status: "online".to_string(),
+                    contributed_memory: 8_000_000_000,
+                    shard: ShardInfo {
+                        model_id: "test-model".to_string(),
+                        column_start: 6144,
+                        column_end: 8192,
+                        estimated_memory: 8_000_000_000,
+                    },
+                    left_neighbor: self_device_id.to_string(),
+                    right_neighbor: "left".to_string(),
+                    connectivity_state: None,
+                    listen_addrs: vec!["dataplane://127.0.0.1:9002".to_string()],
+                    direct_candidates: vec![tcp_candidate("/ip4/10.0.0.7/tcp/4100")],
+                },
+            ],
+            ring_stable: true,
+            peer_punch_plans: vec![
+                PeerPunchPlan {
+                    source_device_id: self_device_id.to_string(),
+                    target_device_id: "left".to_string(),
+                    target_peer_id: left_peer_id.to_string(),
+                    strategy: PunchPathStrategy::SimultaneousDial,
+                    reason: PunchPathReason::RelayPath,
+                    relay_rendezvous_required: true,
+                    attempt_window_ms: 5_000,
+                    issued_at_ms: 1_700_000_000_000,
+                    target_candidates: vec![tcp_candidate("/ip4/34.120.0.11/tcp/4001")],
+                },
+                PeerPunchPlan {
+                    source_device_id: self_device_id.to_string(),
+                    target_device_id: "right".to_string(),
+                    target_peer_id: right_peer_id.to_string(),
+                    strategy: PunchPathStrategy::SimultaneousDial,
+                    reason: PunchPathReason::PrivateReachabilityOnly,
+                    relay_rendezvous_required: false,
+                    attempt_window_ms: 5_000,
+                    issued_at_ms: 1_700_000_000_000,
+                    target_candidates: vec![tcp_candidate("/ip4/34.120.0.12/tcp/4001")],
+                },
+            ],
+        };
+
+        let position = build_worker_position_from_topology(&topology, &self_device_id).unwrap();
+
+        assert!(position.left_neighbor_punch_plan.is_some());
+        assert!(position.right_neighbor_punch_plan.is_some());
+        assert!(position.left_neighbor_addrs[0]
+            .to_string()
+            .contains("34.120.0.11"));
+        assert!(position.right_neighbor_addrs[0]
+            .to_string()
+            .contains("34.120.0.12"));
+    }
+}
+
 /// Leave ring topology
 async fn cmd_leave_ring() -> Result<()> {
     use colored::Colorize;

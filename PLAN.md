@@ -81,10 +81,11 @@ But it does not by itself make tensor traffic fundamentally faster.
 - ✅ Ring topology now publishes explicit `peer_punch_plans` for hostile NAT pairs so peers consume a first-class punch coordination contract instead of inferring upgrade behavior from endpoint ranking alone.
 - ✅ Ring inference and ad hoc job dialing now apply those explicit punch plans before relay fallback instead of treating every direct attempt as the same kind of path.
 - ✅ Agent metrics now distinguish punch-assisted attempts, punch-assisted direct connections, and punch-assisted upgrade outcomes from ordinary direct-path success.
+- ✅ NAT coverage now includes a dedicated `punch_path_coordination` Fozzy scenario plus host-backed trace validation for punch-plan topology and agent-side punch-plan consumption.
 
 ### NAT Traversal Still Open
 
-- ⬜ Add deeper host-backed and multi-peer NAT execution coverage that exercises real relay-rendezvous plus punched-path behavior beyond the deterministic control-plane scenario.
+- ⬜ Extend from the current host-backed contract coverage into fuller multi-peer runtime/NAT execution scenarios with real concurrent peers and relay rendezvous timing behavior.
 
 ### 3. Governance Third
 
@@ -205,6 +206,17 @@ After Phase 1:
 - ✅ `fozzy --cwd . trace verify .fozzy/punch-path.trace.fozzy --strict --json`
 - ✅ `fozzy --cwd . replay .fozzy/punch-path.trace.fozzy --json`
 - ✅ `fozzy --cwd . ci .fozzy/punch-path.trace.fozzy --json`
+- ✅ `fozzy --cwd . validate tests/punch_path_coordination.fozzy.json --json`
+- ✅ `fozzy --cwd . doctor --deep --scenario tests/punch_path_coordination.fozzy.json --runs 5 --seed 1 --json`
+- ✅ `fozzy --cwd . test --det --strict tests/punch_path_coordination.fozzy.json --json`
+- ✅ `fozzy --cwd . run tests/punch_path_coordination.fozzy.json --det --record .fozzy/punch-path-coordination.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/punch-path-coordination.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/punch-path-coordination.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/punch-path-coordination.trace.fozzy --json`
+- ✅ `fozzy --cwd . run tests/punch_path_coordination.fozzy.json --det --proc-backend host --fs-backend host --http-backend host --record .fozzy/punch-path-coordination-host.trace.fozzy --json`
+- ✅ `fozzy --cwd . trace verify .fozzy/punch-path-coordination-host.trace.fozzy --strict --json`
+- ✅ `fozzy --cwd . replay .fozzy/punch-path-coordination-host.trace.fozzy --json`
+- ✅ `fozzy --cwd . ci .fozzy/punch-path-coordination-host.trace.fozzy --json`
 
 ### Still Open In Phase 1
 
