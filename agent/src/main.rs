@@ -1281,6 +1281,8 @@ async fn cmd_start() -> Result<()> {
             config.governance.max_job_timeout_ms,
             config.governance.allowed_workloads.clone(),
             config.governance.workload_concurrency_limits.clone(),
+            config.governance.trusted_peer_ids.clone(),
+            config.governance.blocked_peer_ids.clone(),
         ));
     runner.run().await?;
 

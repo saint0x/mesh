@@ -82,6 +82,12 @@ pub struct GovernanceConfig {
 
     /// Workload-specific concurrency caps enforced within the local runner.
     pub workload_concurrency_limits: Vec<WorkloadConcurrencyLimit>,
+
+    /// If non-empty, only these peers may submit mesh jobs to this agent.
+    pub trusted_peer_ids: Vec<String>,
+
+    /// These peers are always denied mesh job admission.
+    pub blocked_peer_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +116,8 @@ impl Default for GovernanceConfig {
                     max_concurrent_jobs: 1,
                 },
             ],
+            trusted_peer_ids: Vec::new(),
+            blocked_peer_ids: Vec::new(),
         }
     }
 }
@@ -401,6 +409,8 @@ mod tests {
                 }
             ]
         );
+        assert!(config.governance.trusted_peer_ids.is_empty());
+        assert!(config.governance.blocked_peer_ids.is_empty());
     }
 
     #[test]
@@ -451,6 +461,8 @@ arch = "x86_64"
                 }
             ]
         );
+        assert!(loaded.governance.trusted_peer_ids.is_empty());
+        assert!(loaded.governance.blocked_peer_ids.is_empty());
     }
 
     #[test]
@@ -498,6 +510,14 @@ arch = "x86_64"
         assert_eq!(
             original.governance.workload_concurrency_limits,
             loaded.governance.workload_concurrency_limits
+        );
+        assert_eq!(
+            original.governance.trusted_peer_ids,
+            loaded.governance.trusted_peer_ids
+        );
+        assert_eq!(
+            original.governance.blocked_peer_ids,
+            loaded.governance.blocked_peer_ids
         );
 
         // CRITICAL: Verify keypair bytes are identical

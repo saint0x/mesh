@@ -98,6 +98,9 @@ pub struct JobStats {
 
     /// Number of jobs rejected because a workload exceeded its workload quota
     pub workload_quota_rejections: AtomicU64,
+
+    /// Number of jobs rejected by explicit peer trust policy
+    pub trust_rejections: AtomicU64,
 }
 
 impl Default for JobStats {
@@ -130,6 +133,7 @@ impl JobStats {
             admission_rejections: AtomicU64::new(0),
             peer_quota_rejections: AtomicU64::new(0),
             workload_quota_rejections: AtomicU64::new(0),
+            trust_rejections: AtomicU64::new(0),
         }
     }
 
@@ -222,6 +226,10 @@ impl JobStats {
     pub fn record_workload_quota_rejection(&self) {
         self.workload_quota_rejections
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_trust_rejection(&self) {
+        self.trust_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get total jobs processed (completed + failed)
@@ -338,6 +346,10 @@ impl JobStats {
             "  Workload Quota:   {}",
             self.workload_quota_rejections.load(Ordering::Relaxed)
         );
+        println!(
+            "  Trust Denied:     {}",
+            self.trust_rejections.load(Ordering::Relaxed)
+        );
         println!("  Success Rate:     {:.1}%", self.success_rate() * 100.0);
 
         println!("\n{}", "Performance:".bold());
@@ -423,6 +435,7 @@ impl JobStats {
             "admission_rejected": self.admission_rejections.load(Ordering::Relaxed),
             "peer_quota_rejected": self.peer_quota_rejections.load(Ordering::Relaxed),
             "workload_quota_rejected": self.workload_quota_rejections.load(Ordering::Relaxed),
+            "trust_rejected": self.trust_rejections.load(Ordering::Relaxed),
             "success_rate": self.success_rate() * 100.0,
             "avg_execution_time_ms": self.avg_execution_time_ms(),
             "total_execution_time_ms": self.total_execution_time_ms.load(Ordering::Relaxed),
@@ -476,6 +489,8 @@ pub struct AdmissionPolicy {
     max_concurrent_jobs_per_peer: usize,
     allowed_workloads: Vec<String>,
     workload_concurrency_limits: HashMap<String, usize>,
+    trusted_peer_ids: Vec<String>,
+    blocked_peer_ids: Vec<String>,
 }
 
 impl Default for AdmissionPolicy {
@@ -489,6 +504,8 @@ impl Default for AdmissionPolicy {
                 ("embeddings".to_string(), 1usize),
                 ("embeddings-v1".to_string(), 1usize),
             ]),
+            trusted_peer_ids: Vec::new(),
+            blocked_peer_ids: Vec::new(),
         }
     }
 }
@@ -500,6 +517,8 @@ impl AdmissionPolicy {
         max_job_timeout_ms: u64,
         allowed_workloads: Vec<String>,
         workload_concurrency_limits: Vec<crate::device::WorkloadConcurrencyLimit>,
+        trusted_peer_ids: Vec<String>,
+        blocked_peer_ids: Vec<String>,
     ) -> Self {
         let normalized_workloads = allowed_workloads
             .into_iter()
@@ -516,6 +535,16 @@ impl AdmissionPolicy {
             })
             .filter(|(workload_id, _)| !workload_id.is_empty())
             .collect::<HashMap<_, _>>();
+        let normalized_trusted_peer_ids = trusted_peer_ids
+            .into_iter()
+            .map(|peer_id| peer_id.trim().to_string())
+            .filter(|peer_id| !peer_id.is_empty())
+            .collect::<Vec<_>>();
+        let normalized_blocked_peer_ids = blocked_peer_ids
+            .into_iter()
+            .map(|peer_id| peer_id.trim().to_string())
+            .filter(|peer_id| !peer_id.is_empty())
+            .collect::<Vec<_>>();
 
         Self {
             local_network_id,
@@ -534,15 +563,29 @@ impl AdmissionPolicy {
             } else {
                 normalized_limits
             },
+            trusted_peer_ids: normalized_trusted_peer_ids,
+            blocked_peer_ids: normalized_blocked_peer_ids,
         }
     }
 
     fn evaluate(
         &self,
+        peer_id: PeerId,
         job: &JobEnvelope,
         active_jobs_for_peer: usize,
         active_jobs_for_workload: usize,
     ) -> std::result::Result<(), String> {
+        let peer_id = peer_id.to_string();
+        if self.blocked_peer_ids.iter().any(|blocked| blocked == &peer_id) {
+            return Err(format!("peer blocked by governance policy: {}", peer_id));
+        }
+
+        if !self.trusted_peer_ids.is_empty()
+            && !self.trusted_peer_ids.iter().any(|trusted| trusted == &peer_id)
+        {
+            return Err(format!("peer not trusted by governance policy: {}", peer_id));
+        }
+
         if !self.local_network_id.is_empty() && job.network_id != self.local_network_id {
             return Err(format!(
                 "job network mismatch: got {}, expected {}",
@@ -933,11 +976,18 @@ impl JobRunner {
         info!("Received job from peer");
         let active_jobs_for_peer = self.active_jobs_for_peer(peer_id);
         let active_jobs_for_workload = self.active_jobs_for_workload(&job.workload_id);
-        if let Err(rejection_reason) =
-            self.admission_policy
-                .evaluate(&job, active_jobs_for_peer, active_jobs_for_workload)
+        if let Err(rejection_reason) = self.admission_policy.evaluate(
+            peer_id,
+            &job,
+            active_jobs_for_peer,
+            active_jobs_for_workload,
+        )
         {
-            if rejection_reason.contains("peer quota exceeded") {
+            if rejection_reason.contains("peer blocked by governance policy")
+                || rejection_reason.contains("peer not trusted by governance policy")
+            {
+                self.stats.record_trust_rejection();
+            } else if rejection_reason.contains("peer quota exceeded") {
                 self.stats.record_peer_quota_rejection();
             } else if rejection_reason.contains("workload quota exceeded") {
                 self.stats.record_workload_quota_rejection();
@@ -1411,6 +1461,14 @@ mod tests {
     }
 
     #[test]
+    fn test_job_stats_trust_rejection_metrics() {
+        let stats = JobStats::new();
+        stats.record_trust_rejection();
+        stats.record_trust_rejection();
+        assert_eq!(stats.trust_rejections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn test_with_max_concurrent_jobs_clamps_to_one() {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let swarm = MeshSwarm::builder(keypair).build().unwrap();
@@ -1431,6 +1489,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1442,7 +1502,9 @@ mod tests {
             created_at: 0,
         };
 
-        assert!(policy.evaluate(&job, 0, 0).is_ok());
+        assert!(policy
+            .evaluate(libp2p::PeerId::random(), &job, 0, 0)
+            .is_ok());
     }
 
     #[test]
@@ -1456,6 +1518,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1468,7 +1532,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0, 0)
+            .evaluate(libp2p::PeerId::random(), &job, 0, 0)
             .unwrap_err()
             .contains("job network mismatch"));
     }
@@ -1484,6 +1548,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1496,7 +1562,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0, 0)
+            .evaluate(libp2p::PeerId::random(), &job, 0, 0)
             .unwrap_err()
             .contains("unsupported workload"));
     }
@@ -1512,6 +1578,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1524,7 +1592,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0, 0)
+            .evaluate(libp2p::PeerId::random(), &job, 0, 0)
             .unwrap_err()
             .contains("exceeds admission limit"));
     }
@@ -1540,6 +1608,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1552,7 +1622,7 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 1, 0)
+            .evaluate(libp2p::PeerId::random(), &job, 1, 0)
             .unwrap_err()
             .contains("peer quota exceeded"));
     }
@@ -1568,6 +1638,8 @@ mod tests {
                 workload_id: "embeddings".to_string(),
                 max_concurrent_jobs: 1,
             }],
+            Vec::new(),
+            Vec::new(),
         );
         let job = JobEnvelope {
             job_id: uuid::Uuid::new_v4(),
@@ -1580,9 +1652,72 @@ mod tests {
         };
 
         assert!(policy
-            .evaluate(&job, 0, 1)
+            .evaluate(libp2p::PeerId::random(), &job, 0, 1)
             .unwrap_err()
             .contains("workload quota exceeded"));
+    }
+
+    #[test]
+    fn test_admission_policy_rejects_blocked_peer() {
+        let blocked_peer_id = libp2p::PeerId::random();
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            2,
+            30_000,
+            vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
+            Vec::new(),
+            vec![blocked_peer_id.to_string()],
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "test-network".to_string(),
+            workload_id: "embeddings".to_string(),
+            payload: vec![],
+            timeout_ms: 5_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy
+            .evaluate(blocked_peer_id, &job, 0, 0)
+            .unwrap_err()
+            .contains("peer blocked by governance policy"));
+    }
+
+    #[test]
+    fn test_admission_policy_rejects_untrusted_peer_when_allowlist_present() {
+        let trusted_peer_id = libp2p::PeerId::random();
+        let untrusted_peer_id = libp2p::PeerId::random();
+        let policy = AdmissionPolicy::new(
+            "test-network".to_string(),
+            2,
+            30_000,
+            vec!["embeddings".to_string()],
+            vec![crate::device::WorkloadConcurrencyLimit {
+                workload_id: "embeddings".to_string(),
+                max_concurrent_jobs: 1,
+            }],
+            vec![trusted_peer_id.to_string()],
+            Vec::new(),
+        );
+        let job = JobEnvelope {
+            job_id: uuid::Uuid::new_v4(),
+            network_id: "test-network".to_string(),
+            workload_id: "embeddings".to_string(),
+            payload: vec![],
+            timeout_ms: 5_000,
+            auth_signature: vec![],
+            created_at: 0,
+        };
+
+        assert!(policy
+            .evaluate(untrusted_peer_id, &job, 0, 0)
+            .unwrap_err()
+            .contains("peer not trusted by governance policy"));
     }
 
     #[tokio::test]
