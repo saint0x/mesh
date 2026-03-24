@@ -136,16 +136,18 @@ impl RegistrationClient {
     }
 
     /// Send a single heartbeat
-    pub async fn heartbeat(&self, device_id: Uuid) -> Result<()> {
+    pub async fn heartbeat(&self, config: &DeviceConfig) -> Result<()> {
         let url = format!(
             "{}/api/devices/{}/heartbeat",
-            self.control_plane_url, device_id
+            self.control_plane_url, config.device_id
         );
 
         let response = self
             .client
             .post(&url)
-            .json(&HeartbeatRequest {})
+            .json(&HeartbeatRequest {
+                connectivity_state: config.connectivity.current_state(),
+            })
             .send()
             .await
             .map_err(|e| AgentError::Http(format!("Heartbeat request failed: {}", e)))?;
@@ -174,8 +176,10 @@ impl RegistrationClient {
         }
 
         debug!(
-            device_id = %device_id,
+            device_id = %config.device_id,
             last_seen = %heartbeat_response.last_seen,
+            active_path = ?heartbeat_response.connectivity_state.active_path,
+            connectivity_status = ?heartbeat_response.connectivity_state.status,
             "Heartbeat sent successfully"
         );
 
@@ -185,17 +189,17 @@ impl RegistrationClient {
     /// Run heartbeat loop indefinitely
     ///
     /// Sends heartbeats every 5 seconds. Does not fail on errors, just logs warnings.
-    pub async fn heartbeat_loop(self, device_id: Uuid) {
-        info!(device_id = %device_id, "Starting heartbeat loop");
+    pub async fn heartbeat_loop(self, config: DeviceConfig) {
+        info!(device_id = %config.device_id, "Starting heartbeat loop");
 
         let mut tick = interval(Duration::from_secs(5));
 
         loop {
             tick.tick().await;
 
-            if let Err(e) = self.heartbeat(device_id).await {
+            if let Err(e) = self.heartbeat(&config).await {
                 warn!(
-                    device_id = %device_id,
+                    device_id = %config.device_id,
                     error = %e,
                     "Heartbeat failed (will retry)"
                 );

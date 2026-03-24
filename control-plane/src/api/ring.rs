@@ -148,6 +148,8 @@ pub async fn get_topology(
         .map(|w| WorkerInfo {
             device_id: w.device_id,
             position: w.position,
+            status: w.status,
+            contributed_memory: w.contributed_memory,
             shard: ShardInfo {
                 model_id: w.shard.model_id,
                 column_start: w.shard.column_range.0,
@@ -156,6 +158,7 @@ pub async fn get_topology(
             },
             left_neighbor: w.left_neighbor,
             right_neighbor: w.right_neighbor,
+            connectivity_state: w.connectivity_state,
         })
         .collect();
 

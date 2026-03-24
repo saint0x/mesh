@@ -22,6 +22,7 @@ pub struct Device {
     pub created_at: String,           // ISO 8601 timestamp
     pub last_seen: Option<String>,
     pub status: String, // 'online', 'offline', 'revoked'
+    pub connectivity_state: Option<String>, // JSON string
 }
 
 /// Device status enum

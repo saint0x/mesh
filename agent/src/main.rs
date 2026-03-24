@@ -33,6 +33,7 @@
 
 use agent::{
     format_bytes, init_production_logging, init_simple_logging, parse_memory_string,
+    api::types::RingTopologyResponse,
     ConnectivityAttachmentKind, DeviceConfig, EmbeddingsExecutor, EmbeddingsInput,
     EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
 };
@@ -722,7 +723,7 @@ async fn cmd_start() -> Result<()> {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
                 loop {
-                    if let Err(e) = client.heartbeat(heartbeat_config.device_id).await {
+                    if let Err(e) = client.heartbeat(&heartbeat_config).await {
                         // Downgrade to WARN (not ERROR) since this is non-fatal for LAN-only operation
                         tracing::warn!(error = %e, "Heartbeat failed (control plane may be offline)");
                     }
@@ -1147,6 +1148,12 @@ async fn cmd_status() -> Result<()> {
 
             println!("\n📡 Control Plane: {}", config.control_plane_url);
             println!("📡 Preferred Path: {:?}", config.connectivity.preferred_path);
+            let connectivity_state = config.connectivity.current_state();
+            println!("📡 Active Connectivity: {:?}", connectivity_state.status);
+            println!("   Active Path: {:?}", connectivity_state.active_path);
+            if let Some(endpoint) = connectivity_state.active_endpoint {
+                println!("   Active Endpoint: {}", endpoint);
+            }
             if config.connectivity.attachments.is_empty() {
                 println!("   Connectivity Attachments: none");
             } else {
@@ -1629,7 +1636,7 @@ async fn cmd_pool_status() -> Result<()> {
     // Fetch ring topology from control plane
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/ring/{}",
+        "{}/api/ring/topology?network_id={}",
         control_plane_url.trim_end_matches('/'),
         config.network_id
     );
@@ -1637,57 +1644,44 @@ async fn cmd_pool_status() -> Result<()> {
     match client.get(&url).send().await {
         Ok(response) => {
             if response.status().is_success() {
-                if let Ok(data) = response.json::<serde_json::Value>().await {
+                if let Ok(data) = response.json::<RingTopologyResponse>().await {
                     println!("\n{}", "Ring Topology:".bold());
+                    println!("  Total Workers: {}", data.workers.len().to_string().green());
+                    println!(
+                        "  Ring Stable:   {}",
+                        if data.ring_stable { "yes".green() } else { "no".yellow() }
+                    );
+                    println!();
 
-                    if let Some(workers) = data.get("workers").and_then(|w| w.as_array()) {
-                        println!("  Total Workers: {}", workers.len().to_string().green());
-                        println!();
+                    for (i, worker) in data.workers.iter().enumerate() {
+                        let is_self = worker.device_id == config.device_id.to_string();
+                        let prefix = if is_self { "→ " } else { "  " };
 
-                        for (i, worker) in workers.iter().enumerate() {
-                            let device_id = worker
-                                .get("device_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let position = worker
-                                .get("ring_position")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let memory = worker
-                                .get("locked_memory")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let status = worker
-                                .get("status")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
+                        let status_colored = match worker.status.as_str() {
+                            "online" => "ONLINE".green().to_string(),
+                            "offline" => "OFFLINE".red().to_string(),
+                            _ => worker.status.yellow().to_string(),
+                        };
 
-                            let is_self = device_id == config.device_id.to_string();
-                            let prefix = if is_self { "→ " } else { "  " };
+                        let connectivity = worker
+                            .connectivity_state
+                            .as_ref()
+                            .map(|state| format!("{:?}/{:?}", state.status, state.active_path))
+                            .unwrap_or_else(|| "unknown".to_string());
 
-                            let status_colored = match status {
-                                "online" => "ONLINE".green().to_string(),
-                                "offline" => "OFFLINE".red().to_string(),
-                                _ => status.yellow().to_string(),
-                            };
-
-                            println!(
-                                "{}Worker {} (pos {}): {} - {} RAM",
-                                prefix,
-                                i,
-                                position,
-                                status_colored,
-                                format_bytes(memory)
-                            );
-                        }
-                    } else {
-                        println!("  {}", "No workers in ring".yellow());
+                        println!(
+                            "{}Worker {} (pos {}): {} - {} RAM - {}",
+                            prefix,
+                            i,
+                            worker.position,
+                            status_colored,
+                            format_bytes(worker.contributed_memory),
+                            connectivity
+                        );
                     }
 
-                    // Show shard distribution if available
-                    if let Some(total_columns) = data.get("total_columns").and_then(|v| v.as_u64()) {
-                        println!("\n{}", "Shard Distribution:".bold());
-                        println!("  Total Columns: {}", total_columns);
+                    if data.workers.is_empty() {
+                        println!("  {}", "No workers in ring".yellow());
                     }
                 } else {
                     println!("  {}", "Failed to parse response".red());

@@ -1,5 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
-use crate::connectivity::NetworkConnectivity;
+use crate::connectivity::{DeviceConnectivityState, NetworkConnectivity};
 use crate::db::Database;
 use crate::device::DeviceCapabilities;
 use crate::services::certificate::ControlPlaneKeypair;
@@ -33,6 +33,7 @@ pub fn register_device(
 
     network_service::require_network_exists(db, &network_id)?;
     let connectivity = network_service::load_network_connectivity(db, &network_id)?;
+    let initial_connectivity_state = DeviceConnectivityState::unknown(&connectivity);
 
     let conn = db.get_conn()?;
 
@@ -61,6 +62,8 @@ pub fn register_device(
     // Serialize capabilities to JSON
     let capabilities_json = serde_json::to_string(&capabilities)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize capabilities: {}", e)))?;
+    let connectivity_state_json = serde_json::to_string(&initial_connectivity_state)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize connectivity state: {}", e)))?;
 
     // Insert device into database
     let now = OffsetDateTime::now_utc();
@@ -72,8 +75,8 @@ pub fn register_device(
         r#"
         INSERT INTO devices (
             device_id, network_id, name, public_key, capabilities,
-            certificate, status, created_at, last_seen
-        ) VALUES (?, ?, ?, ?, ?, ?, 'online', ?, ?)
+            certificate, status, connectivity_state, created_at, last_seen
+        ) VALUES (?, ?, ?, ?, ?, ?, 'online', ?, ?, ?)
         "#,
         params![
             &device_id,
@@ -82,6 +85,7 @@ pub fn register_device(
             &public_key,
             &capabilities_json,
             &certificate,
+            &connectivity_state_json,
             &now_str,
             &now_str
         ],
@@ -99,11 +103,19 @@ pub fn register_device(
 }
 
 /// Update device heartbeat
-pub fn update_heartbeat(db: &Database, device_id: String) -> ApiResult<String> {
+pub fn update_heartbeat(
+    db: &Database,
+    device_id: String,
+    connectivity_state: DeviceConnectivityState,
+) -> ApiResult<(String, DeviceConnectivityState)> {
     // Validate device_id
     if device_id.is_empty() {
         return Err(ApiError::BadRequest("device_id cannot be empty".into()));
     }
+    connectivity_state.validate()?;
+
+    let connectivity_state_json = serde_json::to_string(&connectivity_state)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize connectivity state: {}", e)))?;
 
     let now = OffsetDateTime::now_utc();
     let now_str = now
@@ -117,10 +129,10 @@ pub fn update_heartbeat(db: &Database, device_id: String) -> ApiResult<String> {
         .execute(
             r#"
         UPDATE devices
-        SET last_seen = ?, status = 'online'
+        SET last_seen = ?, status = 'online', connectivity_state = ?
         WHERE device_id = ?
         "#,
-            params![&now_str, &device_id],
+            params![&now_str, &connectivity_state_json, &device_id],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -133,14 +145,15 @@ pub fn update_heartbeat(db: &Database, device_id: String) -> ApiResult<String> {
 
     debug!(device_id = %device_id, last_seen = %now_str, "Heartbeat updated");
 
-    Ok(now_str)
+    Ok((now_str, connectivity_state))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connectivity::{
-        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, NetworkConnectivity,
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
+        DeviceConnectivityState, NetworkConnectivity,
     };
     use crate::db::create_test_db;
     use crate::device::Tier;
@@ -154,6 +167,14 @@ mod tests {
                 endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
                 priority: 0,
             }],
+        }
+    }
+
+    fn test_connectivity_state() -> DeviceConnectivityState {
+        DeviceConnectivityState {
+            active_path: ConnectivityPath::Relayed,
+            active_endpoint: Some("/dns4/relay.mesh.example/tcp/4001".to_string()),
+            status: ConnectivityStatus::Connected,
         }
     }
 
@@ -286,9 +307,10 @@ mod tests {
         .unwrap();
 
         // Update heartbeat
-        let timestamp = update_heartbeat(&db, device_id.to_string()).unwrap();
+        let heartbeat = update_heartbeat(&db, device_id.to_string(), test_connectivity_state()).unwrap();
 
-        assert!(!timestamp.is_empty());
+        assert!(!heartbeat.0.is_empty());
+        assert_eq!(heartbeat.1.status, ConnectivityStatus::Connected);
 
         // Verify in database
         let conn = db.get_conn().unwrap();
@@ -301,14 +323,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(device.1, "online");
-        assert_eq!(device.0, timestamp);
+        assert_eq!(device.0, heartbeat.0);
     }
 
     #[test]
     fn test_heartbeat_nonexistent_device() {
         let db = create_test_db();
 
-        let result = update_heartbeat(&db, "nonexistent-device".to_string());
+        let result = update_heartbeat(&db, "nonexistent-device".to_string(), test_connectivity_state());
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));

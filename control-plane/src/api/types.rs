@@ -1,4 +1,4 @@
-use crate::connectivity::NetworkConnectivity;
+use crate::connectivity::{DeviceConnectivityState, NetworkConnectivity};
 use crate::device::DeviceCapabilities;
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +82,7 @@ pub struct RingPositionInfo {
 /// Request to update device heartbeat
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
-    // Empty for MVP, can add metrics later
+    pub connectivity_state: DeviceConnectivityState,
 }
 
 /// Response to heartbeat update
@@ -92,6 +92,8 @@ pub struct HeartbeatResponse {
     pub success: bool,
     /// Updated last_seen timestamp (ISO 8601)
     pub last_seen: String,
+    /// Recorded connectivity state
+    pub connectivity_state: DeviceConnectivityState,
 }
 
 /// Request to join the ring topology
@@ -149,12 +151,19 @@ pub struct WorkerInfo {
     pub device_id: String,
     /// Ring position
     pub position: u32,
+    /// Reported device status
+    pub status: String,
+    /// Reported contributed memory in bytes
+    pub contributed_memory: u64,
     /// Assigned shard
     pub shard: ShardInfo,
     /// Left neighbor device ID
     pub left_neighbor: String,
     /// Right neighbor device ID
     pub right_neighbor: String,
+    /// Latest reported connectivity state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectivity_state: Option<DeviceConnectivityState>,
 }
 
 /// Response to ring leave request

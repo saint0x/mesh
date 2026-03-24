@@ -145,20 +145,21 @@ pub async fn list_networks(
 pub async fn heartbeat(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
-    Json(_req): Json<HeartbeatRequest>,
+    Json(req): Json<HeartbeatRequest>,
 ) -> ApiResult<Json<HeartbeatResponse>> {
     // Execute blocking database operation in thread pool
     let db = state.db.clone();
 
     let last_seen = tokio::task::spawn_blocking(move || {
-        device_service::update_heartbeat(&db, device_id)
+        device_service::update_heartbeat(&db, device_id, req.connectivity_state)
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
     Ok(Json(HeartbeatResponse {
         success: true,
-        last_seen,
+        last_seen: last_seen.0,
+        connectivity_state: last_seen.1,
     }))
 }
 
@@ -168,7 +169,8 @@ mod tests {
     use crate::connectivity::NetworkConnectivity;
     use crate::device::{DeviceCapabilities, Tier};
     use crate::connectivity::{
-        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
+        ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
+        DeviceConnectivityState,
     };
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::network_service;
@@ -193,6 +195,14 @@ mod tests {
                 endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
                 priority: 0,
             }],
+        }
+    }
+
+    fn test_connectivity_state() -> DeviceConnectivityState {
+        DeviceConnectivityState {
+            active_path: ConnectivityPath::Relayed,
+            active_endpoint: Some("/dns4/relay.mesh.example/tcp/4001".to_string()),
+            status: ConnectivityStatus::Connected,
         }
     }
 
@@ -269,7 +279,9 @@ mod tests {
         let result = heartbeat(
             axum::extract::State(state),
             axum::extract::Path(device_id.to_string()),
-            axum::Json(HeartbeatRequest {}),
+            axum::Json(HeartbeatRequest {
+                connectivity_state: test_connectivity_state(),
+            }),
         )
         .await;
 
@@ -277,6 +289,7 @@ mod tests {
         let response = result.unwrap().0;
         assert!(response.success);
         assert!(!response.last_seen.is_empty());
+        assert_eq!(response.connectivity_state.status, ConnectivityStatus::Connected);
     }
 
     #[tokio::test]
@@ -289,7 +302,9 @@ mod tests {
         let result = heartbeat(
             axum::extract::State(state),
             axum::extract::Path("nonexistent-device".to_string()),
-            axum::Json(HeartbeatRequest {}),
+            axum::Json(HeartbeatRequest {
+                connectivity_state: test_connectivity_state(),
+            }),
         )
         .await;
 

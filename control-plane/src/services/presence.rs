@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::connectivity::DeviceConnectivityState;
 use rusqlite::params;
 use time::OffsetDateTime;
 use tokio::time::{interval, Duration};
@@ -31,15 +32,46 @@ fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Erro
 
     let conn = db.get_conn()?;
 
-    let affected = conn.execute(
+    let mut stale_stmt = conn.prepare(
         r#"
-        UPDATE devices
-        SET status = 'offline'
+        SELECT device_id, connectivity_state
+        FROM devices
         WHERE status = 'online'
           AND (last_seen IS NULL OR datetime(last_seen) < datetime(?))
         "#,
-        params![&threshold_str],
     )?;
+
+    let stale_devices = stale_stmt
+        .query_map(params![&threshold_str], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (device_id, connectivity_state_json) in &stale_devices {
+        let connectivity_state = connectivity_state_json
+            .as_ref()
+            .and_then(|json| serde_json::from_str::<DeviceConnectivityState>(json).ok())
+            .map(|state| state.disconnected());
+
+        let connectivity_state_json = connectivity_state
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        conn.execute(
+            r#"
+            UPDATE devices
+            SET status = 'offline', connectivity_state = ?
+            WHERE device_id = ?
+            "#,
+            params![connectivity_state_json, device_id],
+        )?;
+    }
+
+    let affected = stale_devices.len();
 
     if affected > 0 {
         debug!(count = affected, "Marked devices offline");

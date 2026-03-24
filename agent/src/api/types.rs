@@ -1,4 +1,4 @@
-use crate::connectivity::NetworkConnectivity;
+use crate::connectivity::{DeviceConnectivityState, NetworkConnectivity};
 use crate::device::DeviceCapabilities;
 use serde::{Deserialize, Serialize};
 
@@ -23,13 +23,42 @@ pub struct RegisterDeviceResponse {
 
 /// Request to update device heartbeat
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatRequest {}
+pub struct HeartbeatRequest {
+    pub connectivity_state: DeviceConnectivityState,
+}
 
 /// Response to heartbeat update
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub success: bool,
     pub last_seen: String,
+    pub connectivity_state: DeviceConnectivityState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardInfo {
+    pub model_id: String,
+    pub column_start: u32,
+    pub column_end: u32,
+    pub estimated_memory: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerInfo {
+    pub device_id: String,
+    pub position: u32,
+    pub status: String,
+    pub contributed_memory: u64,
+    pub shard: ShardInfo,
+    pub left_neighbor: String,
+    pub right_neighbor: String,
+    pub connectivity_state: Option<DeviceConnectivityState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RingTopologyResponse {
+    pub workers: Vec<WorkerInfo>,
+    pub ring_stable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -32,6 +32,23 @@ pub struct NetworkConnectivity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityStatus {
+    Unknown,
+    Connected,
+    Degraded,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceConnectivityState {
+    pub active_path: ConnectivityPath,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_endpoint: Option<String>,
+    pub status: ConnectivityStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkSettings {
     pub connectivity: NetworkConnectivity,
 }
@@ -81,5 +98,65 @@ impl NetworkConnectivity {
                 }
             }
         }
+    }
+
+    pub fn preferred_attachment(&self) -> Option<&ConnectivityAttachment> {
+        let expected_kind = match self.preferred_path {
+            ConnectivityPath::Direct => return None,
+            ConnectivityPath::Relayed => ConnectivityAttachmentKind::Libp2pRelay,
+            ConnectivityPath::Overlay => ConnectivityAttachmentKind::UserspaceOverlay,
+        };
+
+        self.attachments
+            .iter()
+            .filter(|attachment| attachment.kind == expected_kind)
+            .min_by_key(|attachment| attachment.priority)
+    }
+}
+
+impl DeviceConnectivityState {
+    pub fn unknown(connectivity: &NetworkConnectivity) -> Self {
+        Self {
+            active_path: connectivity.preferred_path.clone(),
+            active_endpoint: connectivity
+                .preferred_attachment()
+                .map(|attachment| attachment.endpoint.clone()),
+            status: ConnectivityStatus::Unknown,
+        }
+    }
+
+    pub fn disconnected(&self) -> Self {
+        Self {
+            active_path: self.active_path.clone(),
+            active_endpoint: self.active_endpoint.clone(),
+            status: ConnectivityStatus::Disconnected,
+        }
+    }
+
+    pub fn validate(&self) -> ApiResult<()> {
+        if matches!(self.active_path, ConnectivityPath::Relayed | ConnectivityPath::Overlay)
+            && self
+                .active_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ApiError::BadRequest(
+                "non-direct connectivity state requires an active endpoint".to_string(),
+            ));
+        }
+
+        if self
+            .active_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(ApiError::BadRequest(
+                "connectivity state endpoint must not be empty".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }

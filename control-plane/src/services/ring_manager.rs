@@ -1,4 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
+use crate::connectivity::DeviceConnectivityState;
 use crate::db::Database;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -62,9 +63,12 @@ pub struct RingTopology {
 pub struct WorkerTopologyInfo {
     pub device_id: DeviceId,
     pub position: u32,
+    pub status: String,
+    pub contributed_memory: u64,
     pub shard: ModelShard,
     pub left_neighbor: DeviceId,
     pub right_neighbor: DeviceId,
+    pub connectivity_state: Option<DeviceConnectivityState>,
 }
 
 /// Ring Topology Manager for distributed worker coordination
@@ -522,7 +526,7 @@ impl RingTopologyManager {
             .prepare(
                 r#"
                 SELECT device_id, ring_position, shard_column_start, shard_column_end,
-                       left_neighbor_id, right_neighbor_id
+                       left_neighbor_id, right_neighbor_id, status, contributed_memory, connectivity_state
                 FROM devices
                 WHERE network_id = ? AND ring_position IS NOT NULL
                 ORDER BY ring_position
@@ -538,10 +542,25 @@ impl RingTopologyManager {
                 let shard_end: u32 = row.get(3)?;
                 let left_neighbor: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
                 let right_neighbor: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+                let status: String = row.get(6)?;
+                let contributed_memory = row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64;
+                let connectivity_state = row
+                    .get::<_, Option<String>>(8)?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
 
                 Ok(WorkerTopologyInfo {
                     device_id,
                     position,
+                    status,
+                    contributed_memory,
                     shard: ModelShard {
                         model_id: String::new(), // Will be filled in
                         column_range: (shard_start, shard_end),
@@ -549,6 +568,7 @@ impl RingTopologyManager {
                     },
                     left_neighbor,
                     right_neighbor,
+                    connectivity_state,
                 })
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
