@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::job_protocol::{JobEnvelope, JobResult};
-use super::tensor_protocol::TensorMessage;
 
 /// High-level events emitted by the mesh swarm
 #[derive(Debug)]
@@ -76,16 +75,6 @@ pub enum MeshEvent {
         job_id: Uuid,
         error: String,
     },
-
-    /// Received a tensor message from a peer (for ring all-reduce)
-    TensorReceived {
-        peer_id: PeerId,
-        tensor: TensorMessage,
-        channel: ResponseChannel<TensorMessage>,
-    },
-
-    /// Failed to send a tensor message
-    TensorSendFailed { peer_id: PeerId, error: String },
 }
 
 /// Information about a peer connection

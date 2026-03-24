@@ -13,18 +13,19 @@ use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::WorkerRing;
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
-use crate::network::MeshSwarm;
-use libp2p::{Multiaddr, PeerId};
+use crate::network::{MeshSwarm, TensorPlane};
+use libp2p::PeerId;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+use super::artifact_loader::{ArtifactShardLoader, ShardLoader};
 use super::forward_pass::{ForwardPass, ModelWeights};
 use super::job::{InferenceJob, InferenceRequest, InferenceResult};
-use super::artifact_loader::{ArtifactShardLoader, ShardLoader};
 use super::stats::InferenceStats;
 
 /// Configuration for the inference coordinator
@@ -77,14 +78,20 @@ pub struct WorkerPosition {
     /// Left neighbor peer ID
     pub left_neighbor: PeerId,
 
-    /// Left neighbor direct listen addresses
-    pub left_neighbor_addrs: Vec<Multiaddr>,
+    /// Left neighbor control-plane listen addresses
+    pub left_neighbor_addrs: Vec<libp2p::Multiaddr>,
+
+    /// Left neighbor dedicated tensor endpoint
+    pub left_neighbor_tensor_addr: SocketAddr,
 
     /// Right neighbor peer ID
     pub right_neighbor: PeerId,
 
-    /// Right neighbor direct listen addresses
-    pub right_neighbor_addrs: Vec<Multiaddr>,
+    /// Right neighbor control-plane listen addresses
+    pub right_neighbor_addrs: Vec<libp2p::Multiaddr>,
+
+    /// Right neighbor dedicated tensor endpoint
+    pub right_neighbor_tensor_addr: SocketAddr,
 
     /// Column range this worker is responsible for
     pub shard_column_range: (u32, u32),
@@ -97,6 +104,9 @@ pub struct WorkerPosition {
 pub struct InferenceCoordinator {
     /// Network swarm for P2P communication
     swarm: MeshSwarm,
+
+    /// Dedicated tensor data plane for the hot inference path.
+    tensor_plane: TensorPlane,
 
     /// Inference configuration
     config: InferenceConfig,
@@ -128,17 +138,16 @@ pub struct InferenceCoordinator {
 
 impl InferenceCoordinator {
     /// Create a new inference coordinator
-    pub fn new(swarm: MeshSwarm, config: InferenceConfig) -> Self {
+    pub fn new(swarm: MeshSwarm, tensor_plane: TensorPlane, config: InferenceConfig) -> Self {
         // Initialize shard registry with default path
-        let shard_registry = Arc::new(
-            ShardRegistry::with_defaults()
-                .expect("Failed to create shard registry"),
-        );
+        let shard_registry =
+            Arc::new(ShardRegistry::with_defaults().expect("Failed to create shard registry"));
 
-                let loader: Arc<dyn ShardLoader> = Arc::new(ArtifactShardLoader::with_defaults());
+        let loader: Arc<dyn ShardLoader> = Arc::new(ArtifactShardLoader::with_defaults());
 
         Self {
             swarm,
+            tensor_plane,
             config,
             position: None,
             stats: Arc::new(InferenceStats::new()),
@@ -173,6 +182,10 @@ impl InferenceCoordinator {
     /// Get mutable reference to swarm
     pub fn swarm_mut(&mut self) -> &mut MeshSwarm {
         &mut self.swarm
+    }
+
+    pub fn tensor_plane_mut(&mut self) -> &mut TensorPlane {
+        &mut self.tensor_plane
     }
 
     /// Check if this worker has joined a ring
@@ -217,9 +230,7 @@ impl InferenceCoordinator {
 
         // Assign shard to registry if not already assigned
         if self.shard_registry.get_shard(model_id).await.is_none() {
-            self.shard_registry
-                .assign_shard(assignment.clone())
-                .await?;
+            self.shard_registry.assign_shard(assignment.clone()).await?;
         }
 
         // Load from loader (simulated download + load for mock, real for production)
@@ -259,13 +270,12 @@ impl InferenceCoordinator {
         );
 
         // Set ring neighbors on the swarm
-        self.swarm
-            .set_ring_neighbors(
-                position.left_neighbor,
-                &position.left_neighbor_addrs,
-                position.right_neighbor,
-                &position.right_neighbor_addrs,
-            );
+        self.swarm.set_ring_neighbors(
+            position.left_neighbor,
+            &position.left_neighbor_addrs,
+            position.right_neighbor,
+            &position.right_neighbor_addrs,
+        );
 
         self.position = Some(position);
 
@@ -290,7 +300,10 @@ impl InferenceCoordinator {
     /// 2. Runs the token generation loop
     /// 3. Returns the result
     #[instrument(skip(self, request), fields(job_id = %request.job_id))]
-    pub async fn process_inference(&mut self, request: InferenceRequest) -> Result<InferenceResult> {
+    pub async fn process_inference(
+        &mut self,
+        request: InferenceRequest,
+    ) -> Result<InferenceResult> {
         // Check if we're in a ring and clone position to avoid borrow issues
         let position = self.position.clone().ok_or_else(|| {
             AgentError::Execution("Worker is not part of a ring topology".to_string())
@@ -346,7 +359,8 @@ impl InferenceCoordinator {
             }
             Err(e) => {
                 self.stats.record_failure();
-                let result = InferenceResult::failure(request.job_id, e.to_string(), execution_time_ms);
+                let result =
+                    InferenceResult::failure(request.job_id, e.to_string(), execution_time_ms);
                 error!(
                     job_id = %request.job_id,
                     error = %e,
@@ -439,9 +453,7 @@ impl InferenceCoordinator {
             "Loading model weights"
         );
 
-        let weights = self
-            .get_or_load_weights(&model_id, position)
-            .await?;
+        let weights = self.get_or_load_weights(&model_id, position).await?;
 
         if self.active_forward_pass.is_none() {
             self.active_forward_pass = Some(ForwardPass::new(
@@ -475,7 +487,9 @@ impl InferenceCoordinator {
                 position.total_workers,
                 position.left_neighbor,
                 position.right_neighbor,
-                self.swarm_mut(),
+                position.left_neighbor_tensor_addr,
+                position.right_neighbor_tensor_addr,
+                self.tensor_plane_mut(),
             );
 
             forward_pass
@@ -533,10 +547,7 @@ impl InferenceCoordinator {
 
     /// Attempt to recover a job from checkpoint
     #[instrument(skip(self))]
-    pub async fn recover_from_checkpoint(
-        &mut self,
-        job_id: Uuid,
-    ) -> Result<Option<InferenceJob>> {
+    pub async fn recover_from_checkpoint(&mut self, job_id: Uuid) -> Result<Option<InferenceJob>> {
         if let Some(manager) = self.checkpoint_manager.clone() {
             if let Some(job) = manager.load_checkpoint(job_id).await? {
                 if let Some(position) = self.position.clone() {
@@ -627,33 +638,6 @@ impl InferenceCoordinator {
         use crate::network::MeshEvent;
 
         match event {
-            MeshEvent::TensorReceived {
-                peer_id,
-                tensor,
-                channel,
-            } => {
-                // Handle tensor message from ring neighbor
-                debug!(
-                    peer_id = %peer_id,
-                    job_id = %tensor.job_id,
-                    layer = tensor.layer_idx,
-                    phase = ?tensor.phase,
-                    "Received tensor from ring neighbor"
-                );
-
-                // Acknowledge the tensor (echo back)
-                let ack = tensor.clone();
-                self.swarm.respond_to_tensor(channel, ack)?;
-            }
-
-            MeshEvent::TensorSendFailed { peer_id, error } => {
-                warn!(
-                    peer_id = %peer_id,
-                    error = %error,
-                    "Failed to send tensor"
-                );
-            }
-
             MeshEvent::PeerDisconnected { peer_id } => {
                 // Check if disconnected peer is a ring neighbor
                 if let Some(pos) = &self.position {
@@ -696,8 +680,10 @@ mod tests {
             total_workers: 10,
             left_neighbor: PeerId::random(),
             left_neighbor_addrs: vec![],
+            left_neighbor_tensor_addr: "127.0.0.1:5001".parse().unwrap(),
             right_neighbor: PeerId::random(),
             right_neighbor_addrs: vec![],
+            right_neighbor_tensor_addr: "127.0.0.1:5002".parse().unwrap(),
             shard_column_range: (2457, 3276),
             shard_memory_bytes: 7_000_000_000,
         };

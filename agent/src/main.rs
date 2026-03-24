@@ -31,19 +31,22 @@
 //! - `shard-status` - Show this worker's shard assignment
 //! - `inference-stats` - Show inference statistics
 
-use agent::{
-    format_bytes, init_production_logging, init_simple_logging, parse_memory_string,
-    api::types::RingTopologyResponse,
-    ConnectivityAttachmentKind, DeviceConfig, EmbeddingsExecutor, EmbeddingsInput,
-    EmbeddingsOutput, JobRunner, MeshSwarmBuilder, RegistrationClient, ResourceManager,
+use agent::pki::{
+    DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
-use agent::pki::{DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert};
+use agent::{
+    api::types::RingTopologyResponse, format_bytes, init_production_logging, init_simple_logging,
+    parse_data_plane_endpoint, parse_memory_string, ConnectivityAttachmentKind, DeviceConfig,
+    EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner, MeshSwarmBuilder,
+    RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing::debug;
 use libp2p::{Multiaddr, PeerId};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::debug;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -381,7 +384,10 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
             if config.connectivity.attachments.is_empty() {
                 println!("   Connectivity attachments: none advertised by control plane");
             } else {
-                println!("   Preferred path: {:?}", config.connectivity.preferred_path);
+                println!(
+                    "   Preferred path: {:?}",
+                    config.connectivity.preferred_path
+                );
                 println!("   Connectivity attachments:");
                 for attachment in &config.connectivity.attachments {
                     println!(
@@ -413,7 +419,10 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
 }
 
 fn resolve_primary_mesh_endpoint(config: &DeviceConfig) -> Result<Multiaddr> {
-    config.connectivity.resolve_primary_endpoint().map_err(Into::into)
+    config
+        .connectivity
+        .resolve_primary_endpoint()
+        .map_err(Into::into)
 }
 
 fn listen_addrs_path() -> Result<std::path::PathBuf> {
@@ -455,6 +464,99 @@ fn persist_listen_addr(local_peer_id: libp2p::PeerId, address: &Multiaddr) -> Re
     Ok(())
 }
 
+fn persist_advertised_endpoint(endpoint: &str) -> Result<()> {
+    let path = listen_addrs_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut addrs: Vec<String> = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        Vec::new()
+    };
+
+    if !addrs.iter().any(|addr| addr == endpoint) {
+        addrs.push(endpoint.to_string());
+        std::fs::write(path, serde_json::to_string_pretty(&addrs)?)?;
+    }
+
+    Ok(())
+}
+
+fn extract_tensor_addr(addrs: &[String]) -> Option<SocketAddr> {
+    addrs
+        .iter()
+        .find_map(|addr| parse_data_plane_endpoint(addr))
+}
+
+fn build_worker_position_from_topology(
+    topology: &RingTopologyResponse,
+    device_id: &Uuid,
+) -> Result<agent::inference::coordinator::WorkerPosition> {
+    let self_worker = topology
+        .workers
+        .iter()
+        .find(|worker| worker.device_id == device_id.to_string())
+        .context("Current worker not found in ring topology")?;
+    let left_worker = topology
+        .workers
+        .iter()
+        .find(|candidate| candidate.device_id == self_worker.left_neighbor)
+        .context("Left neighbor not found in ring topology")?;
+    let right_worker = topology
+        .workers
+        .iter()
+        .find(|candidate| candidate.device_id == self_worker.right_neighbor)
+        .context("Right neighbor not found in ring topology")?;
+
+    Ok(agent::inference::coordinator::WorkerPosition {
+        position: self_worker.position,
+        total_workers: topology.workers.len() as u32,
+        left_neighbor: left_worker
+            .peer_id
+            .parse::<PeerId>()
+            .context("Invalid left neighbor peer ID")?,
+        left_neighbor_addrs: left_worker
+            .listen_addrs
+            .iter()
+            .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
+            .collect(),
+        left_neighbor_tensor_addr: extract_tensor_addr(&left_worker.listen_addrs)
+            .context("Left neighbor has no dedicated tensor data-plane endpoint")?,
+        right_neighbor: right_worker
+            .peer_id
+            .parse::<PeerId>()
+            .context("Invalid right neighbor peer ID")?,
+        right_neighbor_addrs: right_worker
+            .listen_addrs
+            .iter()
+            .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
+            .collect(),
+        right_neighbor_tensor_addr: extract_tensor_addr(&right_worker.listen_addrs)
+            .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
+        shard_column_range: (self_worker.shard.column_start, self_worker.shard.column_end),
+        shard_memory_bytes: self_worker.contributed_memory,
+    })
+}
+
+async fn fetch_ring_topology(config: &DeviceConfig) -> Result<RingTopologyResponse> {
+    let topology_url = format!(
+        "{}/api/ring/topology?network_id={}",
+        config.control_plane_url.trim_end_matches('/'),
+        config.network_id
+    );
+
+    reqwest::Client::new()
+        .get(&topology_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RingTopologyResponse>()
+        .await
+        .map_err(Into::into)
+}
+
 /// Run agent daemon
 async fn cmd_start() -> Result<()> {
     println!("🚀 Starting Mesh AI agent daemon...\n");
@@ -494,7 +596,10 @@ async fn cmd_start() -> Result<()> {
     let local_peer_id = swarm.local_peer_id().to_owned();
     println!("   Local PeerID: {}", local_peer_id);
     swarm.listen_on_direct_addrs()?;
-    if matches!(config.connectivity.preferred_path, agent::ConnectivityPath::Relayed) {
+    if matches!(
+        config.connectivity.preferred_path,
+        agent::ConnectivityPath::Relayed
+    ) {
         let relay_addr = runtime_endpoint.clone().context("relay endpoint missing")?;
 
         // Connect to relay
@@ -504,27 +609,25 @@ async fn cmd_start() -> Result<()> {
         println!("   Waiting for relay connection...");
 
         let local_peer_id_for_events = local_peer_id.clone();
-        let relay_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    if let Some(event) = swarm.next_event().await {
-                        match event {
-                            agent::MeshEvent::NewListenAddr { address } => {
-                                let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
-                            }
-                            agent::MeshEvent::RelayConnected { .. } => {
-                                return Ok(());
-                            }
-                            agent::MeshEvent::RelayConnectionFailed { error, .. } => {
-                                anyhow::bail!("Relay connection failed: {}", error);
-                            }
-                            _ => {}
+        let relay_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(event) = swarm.next_event().await {
+                    match event {
+                        agent::MeshEvent::NewListenAddr { address } => {
+                            let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
                         }
+                        agent::MeshEvent::RelayConnected { .. } => {
+                            return Ok(());
+                        }
+                        agent::MeshEvent::RelayConnectionFailed { error, .. } => {
+                            anyhow::bail!("Relay connection failed: {}", error);
+                        }
+                        _ => {}
                     }
                 }
             }
-        ).await;
+        })
+        .await;
 
         match relay_result {
             Ok(Ok(())) => {
@@ -553,27 +656,25 @@ async fn cmd_start() -> Result<()> {
         swarm.listen_on_relay(relay_peer_id)?;
 
         let local_peer_id_for_events = local_peer_id.clone();
-        let reservation_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    if let Some(event) = swarm.next_event().await {
-                        match event {
-                            agent::MeshEvent::NewListenAddr { address } => {
-                                let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
-                            }
-                            agent::MeshEvent::ReservationAccepted { .. } => {
-                                return Ok(());
-                            }
-                            agent::MeshEvent::ReservationDenied { .. } => {
-                                anyhow::bail!("Relay reservation denied");
-                            }
-                            _ => {}
+        let reservation_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(event) = swarm.next_event().await {
+                    match event {
+                        agent::MeshEvent::NewListenAddr { address } => {
+                            let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
                         }
+                        agent::MeshEvent::ReservationAccepted { .. } => {
+                            return Ok(());
+                        }
+                        agent::MeshEvent::ReservationDenied { .. } => {
+                            anyhow::bail!("Relay reservation denied");
+                        }
+                        _ => {}
                     }
                 }
             }
-        ).await;
+        })
+        .await;
 
         match reservation_result {
             Ok(Ok(())) => {
@@ -593,9 +694,9 @@ async fn cmd_start() -> Result<()> {
 
     // Start LAN beacon discovery (if pools configured)
     {
-        use agent::pki::PoolConfig;
         use agent::discovery::{BeaconBroadcaster, BeaconListener};
         use agent::network::RingGossipService;
+        use agent::pki::PoolConfig;
 
         // Check if pools exist before starting any background services
         let has_pools = match PoolConfig::list_pools() {
@@ -657,24 +758,27 @@ async fn cmd_start() -> Result<()> {
                         // For MVP, we'll create one service for the first pool
                         if let Some((pool_config, _)) = pool_data.first() {
                             let pool_id = pool_config.pool_id;
-                            let local_peer_id = agent::device::keypair::to_libp2p_keypair(&config.keypair)
-                                .public()
-                                .to_peer_id();
+                            let local_peer_id =
+                                agent::device::keypair::to_libp2p_keypair(&config.keypair)
+                                    .public()
+                                    .to_peer_id();
 
                             info!(pool_id = %pool_id, "Creating RingGossipService");
 
                             // Create channels for ring gossip
-                            let (ring_gossip_tx, ring_gossip_to_broadcaster_rx) = tokio::sync::mpsc::channel(100);
+                            let (ring_gossip_tx, ring_gossip_to_broadcaster_rx) =
+                                tokio::sync::mpsc::channel(100);
 
                             // Create RingGossipService
-                            let (ring_service, _ring_state, mut topology_rx) = RingGossipService::new(
-                                pool_id,
-                                node_id,
-                                local_peer_id,
-                                device_keypair.clone(),
-                                ring_gossip_tx.clone(),
-                                ring_gossip_from_lan_rx,
-                            );
+                            let (ring_service, _ring_state, mut topology_rx) =
+                                RingGossipService::new(
+                                    pool_id,
+                                    node_id,
+                                    local_peer_id,
+                                    device_keypair.clone(),
+                                    ring_gossip_tx.clone(),
+                                    ring_gossip_from_lan_rx,
+                                );
 
                             // Spawn topology listener task (saves to file for InferenceCoordinator)
                             let pool_id_for_topology = pool_id;
@@ -691,17 +795,27 @@ async fn cmd_start() -> Result<()> {
                                     let topology_path = dirs::home_dir()
                                         .unwrap_or_else(|| std::path::PathBuf::from("."))
                                         .join(".meshnet")
-                                        .join(format!("ring_topology_{}.json", pool_id_for_topology.to_hex()));
+                                        .join(format!(
+                                            "ring_topology_{}.json",
+                                            pool_id_for_topology.to_hex()
+                                        ));
 
                                     if let Some(parent) = topology_path.parent() {
                                         let _ = std::fs::create_dir_all(parent);
                                     }
 
-                                    if let Ok(topology_json) = serde_json::to_string_pretty(&topology) {
-                                        if let Err(e) = std::fs::write(&topology_path, topology_json) {
+                                    if let Ok(topology_json) =
+                                        serde_json::to_string_pretty(&topology)
+                                    {
+                                        if let Err(e) =
+                                            std::fs::write(&topology_path, topology_json)
+                                        {
                                             error!(error = %e, "Failed to save ring topology");
                                         } else {
-                                            info!("Ring topology saved to: {}", topology_path.display());
+                                            info!(
+                                                "Ring topology saved to: {}",
+                                                topology_path.display()
+                                            );
                                         }
                                     }
                                 }
@@ -713,8 +827,10 @@ async fn cmd_start() -> Result<()> {
                                 device_keypair,
                                 None,
                                 4001,
-                                ring_gossip_to_broadcaster_rx
-                            ).await {
+                                ring_gossip_to_broadcaster_rx,
+                            )
+                            .await
+                            {
                                 Ok(broadcaster) => {
                                     // Spawn broadcaster task
                                     tokio::spawn(async move {
@@ -764,7 +880,9 @@ async fn cmd_start() -> Result<()> {
         if has_pools {
             let heartbeat_config = config.clone();
             tokio::spawn(async move {
-                let client = match RegistrationClient::new(heartbeat_config.control_plane_url.clone()) {
+                let client = match RegistrationClient::new(
+                    heartbeat_config.control_plane_url.clone(),
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to create heartbeat client (non-fatal)");
@@ -792,26 +910,26 @@ async fn cmd_start() -> Result<()> {
     let inference_config_task = config.clone();
     let runtime_endpoint_clone = runtime_endpoint.clone();
     tokio::spawn(async move {
-        use agent::inference::coordinator::{InferenceCoordinator, InferenceConfig};
-        use agent::inference::job::{InferenceRequest, GenerationConfig};
+        use agent::inference::coordinator::{InferenceConfig, InferenceCoordinator};
+        use agent::inference::job::{GenerationConfig, InferenceRequest};
         use uuid::Uuid;
 
         let network_id = inference_config_task.network_id.clone();
         let device_id = inference_config_task.device_id;
-        let registration_client = match RegistrationClient::new(
-            inference_config_task.control_plane_url.clone(),
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                error!(error = %e, "Failed to create inference registration client");
-                return;
-            }
-        };
+        let registration_client =
+            match RegistrationClient::new(inference_config_task.control_plane_url.clone()) {
+                Ok(client) => client,
+                Err(e) => {
+                    error!(error = %e, "Failed to create inference registration client");
+                    return;
+                }
+            };
 
         info!("Initializing inference coordinator");
 
         // Create separate swarm for inference coordination (P2P communication during all-reduce)
-        let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&inference_config_task.keypair);
+        let libp2p_keypair =
+            agent::device::keypair::to_libp2p_keypair(&inference_config_task.keypair);
         let mut swarm_builder = MeshSwarmBuilder::new(libp2p_keypair);
         if let Some(endpoint) = runtime_endpoint_clone.clone() {
             swarm_builder = swarm_builder.with_relay_addr(endpoint);
@@ -828,7 +946,10 @@ async fn cmd_start() -> Result<()> {
             return;
         }
 
-        if matches!(inference_config_task.connectivity.preferred_path, agent::ConnectivityPath::Relayed) {
+        if matches!(
+            inference_config_task.connectivity.preferred_path,
+            agent::ConnectivityPath::Relayed
+        ) {
             if let Err(e) = inference_swarm.connect_to_relay() {
                 error!(error = %e, "Failed to connect inference swarm to relay");
                 return;
@@ -845,95 +966,66 @@ async fn cmd_start() -> Result<()> {
             }
         }
 
+        let tensor_plane = match TensorPlane::bind(TensorPlaneConfig::default()).await {
+            Ok(plane) => plane,
+            Err(e) => {
+                error!(error = %e, "Failed to start dedicated tensor data plane");
+                return;
+            }
+        };
+        if let Err(e) = persist_advertised_endpoint(&tensor_plane.advertised_endpoint()) {
+            warn!(error = %e, "Failed to persist tensor data-plane endpoint");
+        } else {
+            info!(
+                endpoint = %tensor_plane.advertised_endpoint(),
+                local_addr = %tensor_plane.local_addr(),
+                "Dedicated tensor data plane ready"
+            );
+        }
+
         // Create inference coordinator
         let inference_config = InferenceConfig::default();
-        let mut coordinator = InferenceCoordinator::new(inference_swarm, inference_config);
+        let mut coordinator =
+            InferenceCoordinator::new(inference_swarm, tensor_plane, inference_config);
 
         info!("Inference coordinator initialized - starting assignment loop");
 
-        // Check if we have ring state
-        let ring_state_path = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".meshnet")
-            .join("ring_state.json");
+        let topology_url = format!(
+            "{}/api/ring/topology?network_id={}",
+            inference_config_task
+                .control_plane_url
+                .trim_end_matches('/'),
+            inference_config_task.network_id
+        );
 
         let mut ring_position = None;
-        if ring_state_path.exists() {
-            match std::fs::read_to_string(&ring_state_path) {
-                Ok(data) => {
-                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&data) {
-                        if let (Some(pos), Some(total), Some(left_peer_str), Some(right_peer_str)) = (
-                            state.get("position").and_then(|v| v.as_u64()),
-                            state.get("total_workers").and_then(|v| v.as_u64()),
-                            state.get("left_neighbor_peer_id").and_then(|v| v.as_str()),
-                            state.get("right_neighbor_peer_id").and_then(|v| v.as_str()),
-                        ) {
-                            // Parse peer IDs
-                            if let (Ok(left_peer), Ok(right_peer)) = (
-                                left_peer_str.parse::<libp2p::PeerId>(),
-                                right_peer_str.parse::<libp2p::PeerId>(),
-                            ) {
-                                use agent::inference::coordinator::WorkerPosition;
-
-                                // Get shard info from state
-                                let (col_start, col_end) = if let Some(shard) = state.get("shard") {
-                                    (
-                                        shard.get("column_start").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                                        shard.get("column_end").and_then(|v| v.as_u64()).unwrap_or(8192) as u32,
-                                    )
-                                } else {
-                                    (0, 8192)
-                                };
-
-                                let position = WorkerPosition {
-                                    position: pos as u32,
-                                    total_workers: total as u32,
-                                    left_neighbor: left_peer,
-                                    left_neighbor_addrs: state
-                                        .get("left_neighbor_listen_addrs")
-                                        .and_then(|v| v.as_array())
-                                        .into_iter()
-                                        .flatten()
-                                        .filter_map(|addr| addr.as_str())
-                                        .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
-                                        .collect(),
-                                    right_neighbor: right_peer,
-                                    right_neighbor_addrs: state
-                                        .get("right_neighbor_listen_addrs")
-                                        .and_then(|v| v.as_array())
-                                        .into_iter()
-                                        .flatten()
-                                        .filter_map(|addr| addr.as_str())
-                                        .filter_map(|addr| addr.parse::<libp2p::Multiaddr>().ok())
-                                        .collect(),
-                                    shard_column_range: (col_start, col_end),
-                                    shard_memory_bytes: 8_000_000_000, // 8GB default
-                                };
-
-                                info!(
-                                    position = pos,
-                                    total_workers = total,
-                                    shard_range = ?(col_start, col_end),
-                                    "Loaded ring position for inference"
-                                );
-
-                                // Join ring in coordinator
-                                if let Err(e) = coordinator.join_ring(position.clone()) {
-                                    error!(error = %e, "Failed to join ring in coordinator");
-                                } else {
-                                    ring_position = Some(position);
-                                }
-                            } else {
-                                warn!("Failed to parse peer IDs from ring state");
-                            }
+        match reqwest::Client::new()
+            .get(&topology_url)
+            .send()
+            .await
+            .and_then(|response| response.error_for_status())
+        {
+            Ok(response) => match response.json::<RingTopologyResponse>().await {
+                Ok(topology) => match build_worker_position_from_topology(&topology, &device_id) {
+                    Ok(position) => {
+                        if let Err(e) = coordinator.join_ring(position.clone()) {
+                            error!(error = %e, "Failed to join ring in coordinator");
                         } else {
-                            warn!("Ring state missing required fields (position, total_workers, or peer IDs)");
+                            info!(
+                                position = position.position,
+                                total_workers = position.total_workers,
+                                shard_range = ?position.shard_column_range,
+                                "Loaded ring position for inference"
+                            );
+                            ring_position = Some(position);
                         }
                     }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to load ring state");
-                }
+                    Err(e) => warn!(error = %e, "Failed to build worker position from topology"),
+                },
+                Err(e) => warn!(error = %e, "Failed to parse ring topology"),
+            },
+            Err(e) => {
+                warn!(error = %e, "Failed to refresh ring topology before inference startup")
             }
         }
 
@@ -974,19 +1066,49 @@ async fn cmd_start() -> Result<()> {
                 "Claimed distributed inference assignment"
             );
 
+            match reqwest::Client::new()
+                .get(&topology_url)
+                .send()
+                .await
+                .and_then(|response| response.error_for_status())
+            {
+                Ok(response) => match response.json::<RingTopologyResponse>().await {
+                    Ok(topology) => {
+                        match build_worker_position_from_topology(&topology, &device_id) {
+                            Ok(position) => {
+                                if let Err(e) = coordinator.join_ring(position.clone()) {
+                                    error!(error = %e, "Failed to refresh ring position from topology");
+                                } else {
+                                    ring_position = Some(position);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to build worker position for assignment")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to parse topology during assignment refresh")
+                    }
+                },
+                Err(e) => warn!(error = %e, "Failed to refresh topology during assignment"),
+            }
+
             if ring_position.is_none() {
                 warn!(job_id = %job_id, "Cannot process assignment while not in ring");
-                let _ = registration_client.report_inference_result(
-                    job_id,
-                    agent::api::types::ReportInferenceAssignmentRequest {
-                        device_id: device_id.to_string(),
-                        success: false,
-                        completion: None,
-                        completion_tokens: None,
-                        execution_time_ms: 0,
-                        error: Some("worker not in ring topology".to_string()),
-                    },
-                ).await;
+                let _ = registration_client
+                    .report_inference_result(
+                        job_id,
+                        agent::api::types::ReportInferenceAssignmentRequest {
+                            device_id: device_id.to_string(),
+                            success: false,
+                            completion: None,
+                            completion_tokens: None,
+                            execution_time_ms: 0,
+                            error: Some("worker not in ring topology".to_string()),
+                        },
+                    )
+                    .await;
                 continue;
             }
 
@@ -1023,33 +1145,38 @@ async fn cmd_start() -> Result<()> {
                         .as_ref()
                         .map(|tokens| format!("{:?}", tokens));
 
-                    if let Err(e) = registration_client.report_inference_result(
-                        job_id,
-                        agent::api::types::ReportInferenceAssignmentRequest {
-                            device_id: device_id.to_string(),
-                            success: result.success,
-                            completion,
-                            completion_tokens: Some(result.completion_tokens),
-                            execution_time_ms: result.execution_time_ms,
-                            error: result.error.clone(),
-                        },
-                    ).await {
+                    if let Err(e) = registration_client
+                        .report_inference_result(
+                            job_id,
+                            agent::api::types::ReportInferenceAssignmentRequest {
+                                device_id: device_id.to_string(),
+                                success: result.success,
+                                completion,
+                                completion_tokens: Some(result.completion_tokens),
+                                execution_time_ms: result.execution_time_ms,
+                                error: result.error.clone(),
+                            },
+                        )
+                        .await
+                    {
                         error!(job_id = %job_id, error = %e, "Failed to report inference result");
                     }
                 }
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "Inference job failed");
-                    let _ = registration_client.report_inference_result(
-                        job_id,
-                        agent::api::types::ReportInferenceAssignmentRequest {
-                            device_id: device_id.to_string(),
-                            success: false,
-                            completion: None,
-                            completion_tokens: None,
-                            execution_time_ms: 0,
-                            error: Some(e.to_string()),
-                        },
-                    ).await;
+                    let _ = registration_client
+                        .report_inference_result(
+                            job_id,
+                            agent::api::types::ReportInferenceAssignmentRequest {
+                                device_id: device_id.to_string(),
+                                success: false,
+                                completion: None,
+                                completion_tokens: None,
+                                execution_time_ms: 0,
+                                error: Some(e.to_string()),
+                            },
+                        )
+                        .await;
                 }
             }
         }
@@ -1072,12 +1199,7 @@ async fn cmd_start() -> Result<()> {
 }
 
 /// Submit a job to the network
-async fn cmd_job(
-    input: String,
-    target: String,
-    workload: String,
-    timeout_ms: u64,
-) -> Result<()> {
+async fn cmd_job(input: String, target: String, workload: String, timeout_ms: u64) -> Result<()> {
     println!("📤 Submitting job to network...\n");
 
     // Load device configuration
@@ -1262,7 +1384,10 @@ async fn cmd_status() -> Result<()> {
             }
 
             println!("\n📡 Control Plane: {}", config.control_plane_url);
-            println!("📡 Preferred Path: {:?}", config.connectivity.preferred_path);
+            println!(
+                "📡 Preferred Path: {:?}",
+                config.connectivity.preferred_path
+            );
             let connectivity_state = config.connectivity.current_state();
             println!("📡 Active Connectivity: {:?}", connectivity_state.status);
             println!("   Active Path: {:?}", connectivity_state.active_path);
@@ -1364,14 +1489,13 @@ async fn cmd_lock_resources(memory: String) -> Result<()> {
     println!("{}", "=================".cyan());
 
     // Parse memory string
-    let bytes = parse_memory_string(&memory)
-        .context("Invalid memory format")?;
+    let bytes = parse_memory_string(&memory).context("Invalid memory format")?;
 
     // Create and configure resource manager
-    let mut manager = ResourceManager::new()
-        .context("Failed to initialize resource manager")?;
+    let mut manager = ResourceManager::new().context("Failed to initialize resource manager")?;
 
-    manager.load_config()
+    manager
+        .load_config()
         .context("Failed to load resource config")?;
 
     // Check if already locked
@@ -1384,12 +1508,19 @@ async fn cmd_lock_resources(memory: String) -> Result<()> {
     }
 
     // Set allocation
-    manager.set_allocation(bytes)
+    manager
+        .set_allocation(bytes)
         .context("Failed to set allocation")?;
 
     println!("\n{}", "Allocation:".bold());
-    println!("  Requested:     {}", format_bytes(manager.user_allocated()));
-    println!("  With buffer:   {} (7% safety margin)", format_bytes(manager.locked_memory()));
+    println!(
+        "  Requested:     {}",
+        format_bytes(manager.user_allocated())
+    );
+    println!(
+        "  With buffer:   {} (7% safety margin)",
+        format_bytes(manager.locked_memory())
+    );
     println!("  Total system:  {}", format_bytes(manager.total_memory()));
 
     // Lock memory
@@ -1400,8 +1531,14 @@ async fn cmd_lock_resources(memory: String) -> Result<()> {
             println!("\n{}", "Memory locked successfully!".green().bold());
             println!("  Lock timestamp: {:?}", manager.lock_timestamp());
             println!("  Cooldown period: 24 hours");
-            println!("\n{}", "Note: Memory will remain locked for 24 hours.".yellow());
-            println!("{}", "Use 'mesh resource-status' to check lock status.".yellow());
+            println!(
+                "\n{}",
+                "Note: Memory will remain locked for 24 hours.".yellow()
+            );
+            println!(
+                "{}",
+                "Use 'mesh resource-status' to check lock status.".yellow()
+            );
         }
         Err(e) => {
             println!("\n{}", format!("Failed to lock memory: {}", e).red());
@@ -1424,10 +1561,10 @@ async fn cmd_unlock_resources() -> Result<()> {
     println!("{}", "===================".cyan());
 
     // Create resource manager and load config
-    let mut manager = ResourceManager::new()
-        .context("Failed to initialize resource manager")?;
+    let mut manager = ResourceManager::new().context("Failed to initialize resource manager")?;
 
-    manager.load_config()
+    manager
+        .load_config()
         .context("Failed to load resource config")?;
 
     // Check if locked
@@ -1445,8 +1582,14 @@ async fn cmd_unlock_resources() -> Result<()> {
         Err(agent::AgentError::CooldownActive { remaining_hours }) => {
             println!("\n{}", "Cannot unlock yet - cooldown active!".red().bold());
             println!("  Remaining time: {} hours", remaining_hours);
-            println!("\n{}", "The 24-hour cooldown period has not elapsed.".yellow());
-            println!("{}", "This prevents frequent resource changes in the pool.".yellow());
+            println!(
+                "\n{}",
+                "The 24-hour cooldown period has not elapsed.".yellow()
+            );
+            println!(
+                "{}",
+                "This prevents frequent resource changes in the pool.".yellow()
+            );
         }
         Err(e) => {
             println!("\n{}", format!("Failed to unlock memory: {}", e).red());
@@ -1465,17 +1608,20 @@ async fn cmd_resource_status() -> Result<()> {
     println!("{}", "====================".cyan());
 
     // Create resource manager and load config
-    let mut manager = ResourceManager::new()
-        .context("Failed to initialize resource manager")?;
+    let mut manager = ResourceManager::new().context("Failed to initialize resource manager")?;
 
-    manager.load_config()
+    manager
+        .load_config()
         .context("Failed to load resource config")?;
 
     println!("\n{}", "System Memory:".bold());
     println!("  Total:         {}", format_bytes(manager.total_memory()));
 
     println!("\n{}", "Allocation:".bold());
-    println!("  User request:  {}", format_bytes(manager.user_allocated()));
+    println!(
+        "  User request:  {}",
+        format_bytes(manager.user_allocated())
+    );
     println!("  Locked (buf):  {}", format_bytes(manager.locked_memory()));
 
     println!("\n{}", "Lock Status:".bold());
@@ -1536,41 +1682,30 @@ async fn cmd_ring_status() -> Result<()> {
     println!("  Device ID:     {}", config.device_id);
     println!("  Network ID:    {}", config.network_id);
 
-    // Try to load ring position from saved state
-    let ring_state_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".meshnet")
-        .join("ring_state.json");
-
-    if ring_state_path.exists() {
-        match std::fs::read_to_string(&ring_state_path) {
-            Ok(data) => {
-                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&data) {
-                    println!("\n{}", "Ring Position:".bold());
-                    if let Some(pos) = state.get("position") {
-                        println!("  Position:      {}", pos.to_string().green());
-                    }
-                    if let Some(total) = state.get("total_workers") {
-                        println!("  Total Workers: {}", total);
-                    }
-                    if let Some(left) = state.get("left_neighbor") {
-                        println!("  Left Neighbor: {}", left.as_str().unwrap_or("unknown"));
-                    }
-                    if let Some(right) = state.get("right_neighbor") {
-                        println!("  Right Neighbor: {}", right.as_str().unwrap_or("unknown"));
-                    }
-                } else {
-                    println!("\n{}", "Not currently in a ring".yellow());
-                }
-            }
-            Err(_) => {
-                println!("\n{}", "Not currently in a ring".yellow());
+    match fetch_ring_topology(&config).await {
+        Ok(topology) => {
+            if let Some(worker) = topology
+                .workers
+                .iter()
+                .find(|worker| worker.device_id == config.device_id.to_string())
+            {
+                println!("\n{}", "Ring Position:".bold());
+                println!("  Position:      {}", worker.position.to_string().green());
+                println!("  Total Workers: {}", topology.workers.len());
+                println!("  Left Neighbor: {}", worker.left_neighbor);
+                println!("  Right Neighbor: {}", worker.right_neighbor);
+            } else {
+                println!("\n{}", "Ring Status:".bold());
+                println!("  Status:        {}", "NOT JOINED".yellow());
+                println!(
+                    "\n{}",
+                    "Use 'mesh join-ring <model>' to join the production ring.".dimmed()
+                );
             }
         }
-    } else {
-        println!("\n{}", "Ring Status:".bold());
-        println!("  Status:        {}", "NOT JOINED".yellow());
-        println!("\n{}", "To join a ring, start the agent with 'mesh start'".dimmed());
+        Err(e) => {
+            println!("\n{}", format!("Failed to load topology: {}", e).yellow());
+        }
     }
 
     println!();
@@ -1589,7 +1724,10 @@ async fn cmd_shard_status() -> Result<()> {
     let registry = match ShardRegistry::with_defaults() {
         Ok(r) => r,
         Err(e) => {
-            println!("\n{}", format!("Failed to load shard registry: {}", e).red());
+            println!(
+                "\n{}",
+                format!("Failed to load shard registry: {}", e).red()
+            );
             return Ok(());
         }
     };
@@ -1603,7 +1741,10 @@ async fn cmd_shard_status() -> Result<()> {
 
     if shards.is_empty() {
         println!("\n{}", "No shards assigned".yellow());
-        println!("{}", "Shards are assigned when you join a ring topology.".dimmed());
+        println!(
+            "{}",
+            "Shards are assigned when you join a ring topology.".dimmed()
+        );
     } else {
         println!("\n{}", "Assigned Shards:".bold());
         for (model_id, info, status) in &shards {
@@ -1661,16 +1802,19 @@ async fn cmd_inference_stats() -> Result<()> {
 
     if !stats_path.exists() {
         println!("\n{}", "No inference statistics available".yellow());
-        println!("{}", "Statistics are recorded during inference jobs.".dimmed());
+        println!(
+            "{}",
+            "Statistics are recorded during inference jobs.".dimmed()
+        );
         println!();
         return Ok(());
     }
 
-    let stats_json = std::fs::read_to_string(&stats_path)
-        .context("Failed to read inference stats file")?;
+    let stats_json =
+        std::fs::read_to_string(&stats_path).context("Failed to read inference stats file")?;
 
-    let stats: serde_json::Value = serde_json::from_str(&stats_json)
-        .context("Failed to parse inference stats")?;
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_json).context("Failed to parse inference stats")?;
 
     println!("\n{}", "Job Statistics:".bold());
     if let Some(completed) = stats.get("jobs_completed") {
@@ -1680,7 +1824,10 @@ async fn cmd_inference_stats() -> Result<()> {
         println!("  Failed:          {}", failed.to_string().red());
     }
     if let Some(rate) = stats.get("success_rate") {
-        println!("  Success Rate:    {:.1}%", rate.as_f64().unwrap_or(0.0) * 100.0);
+        println!(
+            "  Success Rate:    {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
     }
 
     println!("\n{}", "Token Statistics:".bold());
@@ -1699,7 +1846,10 @@ async fn cmd_inference_stats() -> Result<()> {
         println!("  All-Reduce Ops:   {}", ops);
     }
     if let Some(latency) = stats.get("avg_allreduce_latency_ms") {
-        println!("  Avg Latency:      {:.2}ms", latency.as_f64().unwrap_or(0.0));
+        println!(
+            "  Avg Latency:      {:.2}ms",
+            latency.as_f64().unwrap_or(0.0)
+        );
     }
     if let Some(layers) = stats.get("total_layers_processed") {
         println!("  Layers Processed: {}", layers);
@@ -1715,10 +1865,16 @@ async fn cmd_inference_stats() -> Result<()> {
 
     println!("\n{}", "System:".bold());
     if let Some(uptime) = stats.get("uptime") {
-        println!("  Uptime:           {}", uptime.as_str().unwrap_or("unknown"));
+        println!(
+            "  Uptime:           {}",
+            uptime.as_str().unwrap_or("unknown")
+        );
     }
     if let Some(updated) = stats.get("last_updated") {
-        println!("  Last Updated:     {}", updated.as_str().unwrap_or("unknown"));
+        println!(
+            "  Last Updated:     {}",
+            updated.as_str().unwrap_or("unknown")
+        );
     }
 
     println!();
@@ -1760,10 +1916,17 @@ async fn cmd_pool_status() -> Result<()> {
             if response.status().is_success() {
                 if let Ok(data) = response.json::<RingTopologyResponse>().await {
                     println!("\n{}", "Ring Topology:".bold());
-                    println!("  Total Workers: {}", data.workers.len().to_string().green());
+                    println!(
+                        "  Total Workers: {}",
+                        data.workers.len().to_string().green()
+                    );
                     println!(
                         "  Ring Stable:   {}",
-                        if data.ring_stable { "yes".green() } else { "no".yellow() }
+                        if data.ring_stable {
+                            "yes".green()
+                        } else {
+                            "no".yellow()
+                        }
                     );
                     println!();
 
@@ -1840,10 +2003,7 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
     // Connect to control plane
     println!("\n{}", "Requesting ring join...".dimmed());
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/ring/join",
-        control_plane_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/ring/join", control_plane_url.trim_end_matches('/'));
 
     #[derive(serde::Serialize)]
     struct JoinRingRequest {
@@ -1881,90 +2041,15 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
                         println!("  Right Neighbor:  {}", right.as_str().unwrap_or("unknown"));
                     }
 
-                    // Save ring state locally with peer IDs
-                    let ring_state_path = dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".meshnet")
-                        .join("ring_state.json");
-
-                    if let Some(parent) = ring_state_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    // Compute local peer ID from keypair
-                    let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
-                    let local_peer_id = libp2p::PeerId::from_public_key(&libp2p_keypair.public());
-
-                    let topology_url = format!(
-                        "{}/api/ring/topology?network_id={}",
-                        control_plane_url.trim_end_matches('/'),
-                        config.network_id
-                    );
-                    let topology = client
-                        .get(&topology_url)
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json::<RingTopologyResponse>()
-                        .await?;
-
-                    let mut enhanced_data = data.clone();
-                    let self_worker = topology
-                        .workers
-                        .iter()
-                        .find(|worker| worker.device_id == config.device_id.to_string());
-                    let left_worker = self_worker.and_then(|worker| {
-                        topology
-                            .workers
-                            .iter()
-                            .find(|candidate| candidate.device_id == worker.left_neighbor)
-                    });
-                    let right_worker = self_worker.and_then(|worker| {
-                        topology
-                            .workers
-                            .iter()
-                            .find(|candidate| candidate.device_id == worker.right_neighbor)
-                    });
-
-                    if let Some(obj) = enhanced_data.as_object_mut() {
-                        obj.insert("local_peer_id".to_string(), serde_json::Value::String(local_peer_id.to_string()));
-                        obj.insert(
-                            "total_workers".to_string(),
-                            serde_json::Value::Number((topology.workers.len() as u64).into()),
-                        );
-
-                        if let Some(left_worker) = left_worker {
-                            obj.insert(
-                                "left_neighbor_peer_id".to_string(),
-                                serde_json::Value::String(left_worker.peer_id.clone()),
-                            );
-                            obj.insert(
-                                "left_neighbor_listen_addrs".to_string(),
-                                serde_json::to_value(&left_worker.listen_addrs)?,
-                            );
-                        }
-
-                        if let Some(right_worker) = right_worker {
-                            obj.insert(
-                                "right_neighbor_peer_id".to_string(),
-                                serde_json::Value::String(right_worker.peer_id.clone()),
-                            );
-                            obj.insert(
-                                "right_neighbor_listen_addrs".to_string(),
-                                serde_json::to_value(&right_worker.listen_addrs)?,
-                            );
-                        }
-                    }
-
-                    std::fs::write(&ring_state_path, serde_json::to_string_pretty(&enhanced_data)?)?;
-                    info!("Ring state saved to: {}", ring_state_path.display());
-
                     println!("\n{}", "Next steps:".bold());
                     println!("  1. Start the agent:     cargo run --bin agent -- start");
                     println!("  2. Submit inference:    cargo run --bin agent -- inference --prompt \"Hello\"");
                 }
             } else {
-                println!("  {}", format!("Failed to join ring (HTTP {})", response.status()).red());
+                println!(
+                    "  {}",
+                    format!("Failed to join ring (HTTP {})", response.status()).red()
+                );
                 if let Ok(body) = response.text().await {
                     println!("  Error: {}", body);
                 }
@@ -2007,19 +2092,11 @@ async fn cmd_leave_ring() -> Result<()> {
         Ok(response) => {
             if response.status().is_success() {
                 println!("\n{}", "✓ Left ring successfully!".green().bold());
-
-                // Remove local ring state
-                let ring_state_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".meshnet")
-                    .join("ring_state.json");
-
-                if ring_state_path.exists() {
-                    std::fs::remove_file(&ring_state_path)?;
-                    info!("Removed ring state file");
-                }
             } else {
-                println!("  {}", format!("Failed to leave ring (HTTP {})", response.status()).red());
+                println!(
+                    "  {}",
+                    format!("Failed to leave ring (HTTP {})", response.status()).red()
+                );
                 if let Ok(body) = response.text().await {
                     println!("  Error: {}", body);
                 }
@@ -2097,7 +2174,10 @@ async fn cmd_inference(
                     println!("\n{}", "✓ Inference completed!".green().bold());
 
                     if let Some(job_id) = result.get("job_id") {
-                        println!("  Job ID:          {}", job_id.as_str().unwrap_or("unknown"));
+                        println!(
+                            "  Job ID:          {}",
+                            job_id.as_str().unwrap_or("unknown")
+                        );
                     }
 
                     if let Some(tokens_generated) = result.get("completion_tokens") {
@@ -2117,14 +2197,26 @@ async fn cmd_inference(
                     }
 
                     // Show that this used mock weights
-                    println!("\n{}", "Note: This inference used mock Xavier-initialized weights.".yellow());
-                    println!("{}", "Output is deterministic but not semantically coherent.".yellow());
-                    println!("{}", "Swap in real safetensors weights for production use.".yellow());
+                    println!(
+                        "\n{}",
+                        "Note: This inference used mock Xavier-initialized weights.".yellow()
+                    );
+                    println!(
+                        "{}",
+                        "Output is deterministic but not semantically coherent.".yellow()
+                    );
+                    println!(
+                        "{}",
+                        "Swap in real safetensors weights for production use.".yellow()
+                    );
                 } else {
                     println!("  {}", "Failed to parse response".red());
                 }
             } else {
-                println!("  {}", format!("Inference failed (HTTP {})", response.status()).red());
+                println!(
+                    "  {}",
+                    format!("Inference failed (HTTP {})", response.status()).red()
+                );
                 if let Ok(body) = response.text().await {
                     println!("  Error: {}", body);
                 }
@@ -2158,27 +2250,40 @@ async fn cmd_pool_create(name: String) -> Result<()> {
     let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
 
     // Create pool
-    let (pool_config, pool_root, membership_cert) = PoolConfig::create_pool(name.clone(), &device_keypair)?;
+    let (pool_config, pool_root, membership_cert) =
+        PoolConfig::create_pool(name.clone(), &device_keypair)?;
 
     // Save pool configuration
     pool_config.save(&membership_cert, Some(&pool_root))?;
 
     println!("\n{}", "✓ Pool created successfully!".green().bold());
     println!("\n{}", "Pool Details:".bold());
-    println!("  Pool ID:           {}", pool_config.pool_id.to_hex().green());
+    println!(
+        "  Pool ID:           {}",
+        pool_config.pool_id.to_hex().green()
+    );
     println!("  Pool Name:         {}", name);
     println!("  Your Role:         {}", "admin".green());
-    println!("\n{}", "Pool Root Public Key (share this with team members):".bold());
+    println!(
+        "\n{}",
+        "Pool Root Public Key (share this with team members):".bold()
+    );
     println!("  {}", hex::encode(pool_root.public));
 
     println!("\n{}", "Saved to:".dimmed());
-    println!("  {}", PoolConfig::pool_dir(&pool_config.pool_id)?.display());
+    println!(
+        "  {}",
+        PoolConfig::pool_dir(&pool_config.pool_id)?.display()
+    );
 
     println!("\n{}", "Next steps:".bold());
     println!("  1. Share the Pool ID and Pool Root Public Key with team members");
     println!("  2. Team members run: cargo run --bin agent -- pool-join \\");
     println!("       --pool-id {} \\", pool_config.pool_id.to_hex());
-    println!("       --pool-root-pubkey {}", hex::encode(pool_root.public));
+    println!(
+        "       --pool-root-pubkey {}",
+        hex::encode(pool_root.public)
+    );
     println!("  3. Start the agent to begin LAN discovery: cargo run --bin agent -- start");
 
     println!();
@@ -2205,10 +2310,17 @@ async fn discover_pool_admin(
         }
 
         // Listen for beacons with 2-second timeout per attempt
-        match tokio::time::timeout(tokio::time::Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        {
             Ok(Ok((len, _addr))) => {
                 // Try to parse as BeaconMessage
-                if let Ok(BeaconMessage::PoolBeacon(beacon)) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
+                if let Ok(BeaconMessage::PoolBeacon(beacon)) =
+                    ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len])
+                {
                     // Check if this is an admin for our pool with capability to sign certs
                     if beacon.pool_id == pool_id
                         && beacon.can_sign_certs()
@@ -2245,10 +2357,10 @@ async fn request_certificate_with_retry(
     total_timeout: tokio::time::Duration,
     retry_interval: tokio::time::Duration,
 ) -> Result<(PoolMembershipCert, std::net::SocketAddr)> {
-    use agent::pki::{CertSigningRequest, MembershipRole};
     use agent::discovery::BeaconMessage;
-    use tokio::time::Instant;
+    use agent::pki::{CertSigningRequest, MembershipRole};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::time::Instant;
 
     // Create certificate signing request
     let csr = CertSigningRequest::new(pool_id, device_keypair, MembershipRole::Member);
@@ -2276,13 +2388,13 @@ async fn request_certificate_with_retry(
         match tokio::time::timeout(retry_interval, recv_socket.recv_from(&mut buf)).await {
             Ok(Ok((len, sender_addr))) => {
                 // Try to parse as CertResponse
-                if let Ok(BeaconMessage::CertResponse(cert)) = ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len]) {
+                if let Ok(BeaconMessage::CertResponse(cert)) =
+                    ciborium::de::from_reader::<BeaconMessage, _>(&buf[..len])
+                {
                     // Check if this cert is for us
                     if cert.device_pubkey == my_device_pubkey && cert.pool_id == pool_id {
                         // Verify cert signature
-                        let current_time = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)?
-                            .as_secs();
+                        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
                         if cert.verify(&pool_root_pubkey, current_time).is_ok() {
                             tracing::info!("Certificate received and verified from admin");
@@ -2306,7 +2418,11 @@ async fn request_certificate_with_retry(
 }
 
 /// Join an existing pool
-async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: Option<String>) -> Result<()> {
+async fn cmd_pool_join(
+    pool_id_hex: String,
+    pool_root_pubkey_hex: String,
+    name: Option<String>,
+) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Joining Pool".bold().cyan());
@@ -2321,12 +2437,11 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
 
     // Parse pool ID
-    let pool_id = PoolId::from_hex(&pool_id_hex)
-        .context("Invalid pool ID hex")?;
+    let pool_id = PoolId::from_hex(&pool_id_hex).context("Invalid pool ID hex")?;
 
     // Parse pool root pubkey
-    let pubkey_bytes = hex::decode(&pool_root_pubkey_hex)
-        .context("Invalid pool root pubkey hex")?;
+    let pubkey_bytes =
+        hex::decode(&pool_root_pubkey_hex).context("Invalid pool root pubkey hex")?;
     if pubkey_bytes.len() != 32 {
         anyhow::bail!("Pool root pubkey must be 32 bytes");
     }
@@ -2341,8 +2456,8 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
 
     // Setup multicast sockets for LAN discovery
     use agent::discovery::{BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT};
-    use tokio::net::UdpSocket;
     use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::UdpSocket;
     use tokio::time::Duration;
 
     println!("\n{}", "Setting up LAN discovery...".cyan());
@@ -2361,7 +2476,7 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     )?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
-    socket.set_reuse_port(true)?;  // Allow SO_REUSEPORT on macOS/Linux
+    socket.set_reuse_port(true)?; // Allow SO_REUSEPORT on macOS/Linux
     socket.set_nonblocking(true)?;
     socket.bind(&recv_addr.into())?;
 
@@ -2374,28 +2489,31 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     // Consistent with BeaconListener and BeaconBroadcaster behavior
     recv_socket.set_multicast_loop_v4(false)?;
 
-    recv_socket.join_multicast_v4(
-        BEACON_MULTICAST_ADDR.parse()?,
-        Ipv4Addr::new(0, 0, 0, 0),
-    )?;
+    recv_socket.join_multicast_v4(BEACON_MULTICAST_ADDR.parse()?, Ipv4Addr::new(0, 0, 0, 0))?;
 
-    let multicast_addr: SocketAddr = format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
+    let multicast_addr: SocketAddr =
+        format!("{}:{}", BEACON_MULTICAST_ADDR, BEACON_MULTICAST_PORT).parse()?;
 
     // Phase 1: Discover pool admin via beacons
     println!("\n{}", "🔍 Discovering pool admin on LAN...".cyan());
-    println!("{}", "   Listening for admin beacons (15s timeout)".dimmed());
+    println!(
+        "{}",
+        "   Listening for admin beacons (15s timeout)".dimmed()
+    );
     println!("{}", "   Make sure Device 1 (admin) is running!".dimmed());
 
-    let admin_beacon = discover_pool_admin(
-        &recv_socket,
-        pool_id,
-        Duration::from_secs(15),
-    ).await?;
+    let admin_beacon = discover_pool_admin(&recv_socket, pool_id, Duration::from_secs(15)).await?;
 
-    println!("{}", format!("✓ Found admin node: {}", admin_beacon.node_id.to_hex()).green());
+    println!(
+        "{}",
+        format!("✓ Found admin node: {}", admin_beacon.node_id.to_hex()).green()
+    );
 
     // Phase 2: Request certificate with retry mechanism
-    println!("\n{}", "📝 Requesting certificate from pool admin...".cyan());
+    println!(
+        "\n{}",
+        "📝 Requesting certificate from pool admin...".cyan()
+    );
     println!("{}", "   Retrying every 2s (30s total timeout)".dimmed());
 
     let (membership_cert, _admin_addr) = request_certificate_with_retry(
@@ -2405,32 +2523,49 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
         &device_keypair,
         pool_root_pubkey,
         multicast_addr,
-        Duration::from_secs(30),  // Total timeout
-        Duration::from_secs(2),   // Retry interval
-    ).await?;
+        Duration::from_secs(30), // Total timeout
+        Duration::from_secs(2),  // Retry interval
+    )
+    .await?;
 
-    println!("{}", "✓ Received signed certificate from admin!".green().bold());
+    println!(
+        "{}",
+        "✓ Received signed certificate from admin!".green().bold()
+    );
 
     // Create pool config
     let pool_name = name.unwrap_or_else(|| "Unnamed Pool".to_string());
-    let pool_config = PoolConfig::join_pool(pool_id, pool_name.clone(), pool_root_pubkey, membership_cert.clone())?;
+    let pool_config = PoolConfig::join_pool(
+        pool_id,
+        pool_name.clone(),
+        pool_root_pubkey,
+        membership_cert.clone(),
+    )?;
 
     // Save pool configuration with explicit error handling
     let pool_dir = PoolConfig::pool_dir(&pool_id)?;
     tracing::info!(pool_dir = %pool_dir.display(), "Saving pool configuration");
 
-    pool_config.save(&membership_cert, None)
-        .context(format!("Failed to save pool configuration to {}", pool_dir.display()))?;
+    pool_config.save(&membership_cert, None).context(format!(
+        "Failed to save pool configuration to {}",
+        pool_dir.display()
+    ))?;
 
     // Verify files were actually written
     let pool_config_file = pool_dir.join("config.toml");
     let cert_file = pool_dir.join("membership_cert.pem");
 
     if !pool_config_file.exists() {
-        anyhow::bail!("Pool config file was not created at {}", pool_config_file.display());
+        anyhow::bail!(
+            "Pool config file was not created at {}",
+            pool_config_file.display()
+        );
     }
     if !cert_file.exists() {
-        anyhow::bail!("Certificate file was not created at {}", cert_file.display());
+        anyhow::bail!(
+            "Certificate file was not created at {}",
+            cert_file.display()
+        );
     }
 
     tracing::info!(
@@ -2443,13 +2578,26 @@ async fn cmd_pool_join(pool_id_hex: String, pool_root_pubkey_hex: String, name: 
     println!("\n{}", "Pool Details:".bold());
     println!("  Pool ID:           {}", pool_id.to_hex().green());
     println!("  Pool Name:         {}", pool_name);
-    println!("  Your Role:         {}", format!("{:?}", membership_cert.role).to_lowercase().cyan());
-    println!("  Expires:           {} days", (membership_cert.expires_at - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()) / 86400);
+    println!(
+        "  Your Role:         {}",
+        format!("{:?}", membership_cert.role).to_lowercase().cyan()
+    );
+    println!(
+        "  Expires:           {} days",
+        (membership_cert.expires_at - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+            / 86400
+    );
 
     println!("\n{}", "Saved to:".dimmed());
     println!("  {}", pool_dir.display());
-    println!("  Config:      {}", pool_config_file.file_name().unwrap().to_string_lossy());
-    println!("  Certificate: {}", cert_file.file_name().unwrap().to_string_lossy());
+    println!(
+        "  Config:      {}",
+        pool_config_file.file_name().unwrap().to_string_lossy()
+    );
+    println!(
+        "  Certificate: {}",
+        cert_file.file_name().unwrap().to_string_lossy()
+    );
 
     println!("\n{}", "Next steps:".bold());
     println!("  Run the agent to join the mesh: ./agent start");
@@ -2494,10 +2642,13 @@ async fn cmd_pool_list() -> Result<()> {
         println!("{}", format!("Pool: {}", pool_config.name).bold());
         println!("  Pool ID:         {}", pool_id.to_hex().dimmed());
         println!("  Your Node ID:    {}", node_id.to_hex().dimmed());
-        println!("  Role:            {}", match pool_config.role {
-            MembershipRole::Admin => "admin".green(),
-            MembershipRole::Member => "member".cyan(),
-        });
+        println!(
+            "  Role:            {}",
+            match pool_config.role {
+                MembershipRole::Admin => "admin".green(),
+                MembershipRole::Member => "member".cyan(),
+            }
+        );
 
         if let Some(days) = pool_config.days_until_expiry() {
             if days > 0 {
@@ -2537,8 +2688,7 @@ async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
     println!("{}", "==========".cyan());
 
     // Parse pool ID
-    let pool_id = PoolId::from_hex(&pool_id_hex)
-        .context("Invalid pool ID hex")?;
+    let pool_id = PoolId::from_hex(&pool_id_hex).context("Invalid pool ID hex")?;
 
     // Load pool config
     let (pool_config, _) = PoolConfig::load(&pool_id)
@@ -2556,7 +2706,10 @@ async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
         println!("\n{}", "No peers discovered yet.".yellow());
         println!("\n{}", "Start the agent to begin LAN discovery:".bold());
         println!("  cargo run --bin agent -- start");
-        println!("\n{}", "Make sure other devices are on the same LAN and running the agent.".dimmed());
+        println!(
+            "\n{}",
+            "Make sure other devices are on the same LAN and running the agent.".dimmed()
+        );
         println!();
         return Ok(());
     }
@@ -2564,9 +2717,7 @@ async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
     println!("\n{}", format!("Discovered peers: {}", peers.len()).bold());
     println!();
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     for peer in peers {
         let age_secs = now.saturating_sub(peer.last_seen);
@@ -2595,7 +2746,10 @@ async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
     }
 
     println!("{}", "Note: Peers are discovered via LAN beacons.".dimmed());
-    println!("{}", "Ensure all devices are on the same WiFi/Ethernet network.".dimmed());
+    println!(
+        "{}",
+        "Ensure all devices are on the same WiFi/Ethernet network.".dimmed()
+    );
 
     println!();
     Ok(())

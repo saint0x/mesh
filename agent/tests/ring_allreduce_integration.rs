@@ -160,7 +160,7 @@ fn test_barrier_message_format() {
     assert_eq!(msg.chunk_data[0] as u32, 3);
 }
 
-// Note: CBOR serialization tests are in agent/src/network/tensor_protocol.rs
+// Note: Tensor serialization is exercised through the dedicated tensor data plane.
 
 /// Test large tensor handling
 #[test]
@@ -206,11 +206,7 @@ fn test_reduce_scatter_phase_correctness() {
 
     // Expected: 1+2+4+8 = 15 for all elements
     for &value in &results[0].data {
-        assert!(
-            (value - 15.0).abs() < 0.001,
-            "Expected 15.0, got {}",
-            value
-        );
+        assert!((value - 15.0).abs() < 0.001, "Expected 15.0, got {}", value);
     }
 }
 
@@ -258,11 +254,7 @@ fn test_negative_values() {
 
     // Expected: -5 + 3 + (-2) + 10 = 6
     for &value in &results[0].data {
-        assert!(
-            (value - 6.0).abs() < 0.001,
-            "Expected 6.0, got {}",
-            value
-        );
+        assert!((value - 6.0).abs() < 0.001, "Expected 6.0, got {}", value);
     }
 }
 

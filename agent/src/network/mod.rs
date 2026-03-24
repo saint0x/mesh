@@ -8,15 +8,18 @@ mod job_protocol;
 mod mesh_swarm;
 mod ring_gossip;
 mod ring_gossip_service;
-mod tensor_protocol;
+mod tensor_message;
+mod tensor_plane;
 
 pub use events::{ConnectionInfo, ConnectionType, MeshEvent};
 pub use job_protocol::{JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
 pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections};
 pub use ring_gossip::{MemberStatus, RingGossipMessage, RingMember, RingState, RingTopology};
 pub use ring_gossip_service::RingGossipService;
-pub use tensor_protocol::{
-    AllReducePhase, TensorMessage, TensorProtocol, TensorProtocolConfig, TENSOR_PROTOCOL_ID,
+pub use tensor_message::{AllReducePhase, TensorMessage};
+pub use tensor_plane::{
+    parse_data_plane_endpoint, InboundTensorMessage, TensorPlane, TensorPlaneConfig,
+    DATA_PLANE_ENDPOINT_PREFIX,
 };
 
 // Re-export libp2p types needed for handling network events

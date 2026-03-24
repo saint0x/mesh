@@ -12,9 +12,10 @@
 //! bandwidth-optimal gradient aggregation in distributed training.
 
 use crate::errors::{AgentError, Result};
-use crate::network::{AllReducePhase, MeshSwarm, TensorMessage};
+use crate::network::{AllReducePhase, TensorMessage, TensorPlane};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -130,7 +131,7 @@ impl Tensor {
 /// Each worker knows its position, the total number of workers,
 /// and its left/right neighbors in the ring.
 ///
-/// NOTE: WorkerRing borrows the MeshSwarm instead of owning it, allowing
+/// NOTE: WorkerRing borrows the tensor data plane instead of owning it, allowing
 /// the coordinator to maintain ownership for the entire inference job.
 pub struct WorkerRing<'a> {
     /// This worker's position in the ring (0 to total_workers-1)
@@ -141,8 +142,12 @@ pub struct WorkerRing<'a> {
     pub left_neighbor: PeerId,
     /// Peer ID of the right neighbor (we send to them in scatter phase)
     pub right_neighbor: PeerId,
-    /// Mesh swarm for network communication (borrowed)
-    pub swarm: &'a mut MeshSwarm,
+    /// Left neighbor data-plane socket address.
+    pub left_tensor_addr: SocketAddr,
+    /// Right neighbor data-plane socket address.
+    pub right_tensor_addr: SocketAddr,
+    /// Dedicated tensor plane for network communication (borrowed).
+    pub tensor_plane: &'a mut TensorPlane,
 }
 
 impl<'a> WorkerRing<'a> {
@@ -159,14 +164,18 @@ impl<'a> WorkerRing<'a> {
         total_workers: u32,
         left_neighbor: PeerId,
         right_neighbor: PeerId,
-        swarm: &'a mut MeshSwarm,
+        left_tensor_addr: SocketAddr,
+        right_tensor_addr: SocketAddr,
+        tensor_plane: &'a mut TensorPlane,
     ) -> Self {
         Self {
             my_position,
             total_workers,
             left_neighbor,
             right_neighbor,
-            swarm,
+            left_tensor_addr,
+            right_tensor_addr,
+            tensor_plane,
         }
     }
 
@@ -232,9 +241,7 @@ impl<'a> WorkerRing<'a> {
 
             // Send to right, receive from left (simulated with sequential ops)
             // In a real implementation, this would be done concurrently
-            let recv_msg = self
-                .send_to_right_recv_from_left(send_msg)
-                .await?;
+            let recv_msg = self.send_to_right_recv_from_left(send_msg).await?;
 
             // Convert received message to Tensor
             let received_chunk = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
@@ -271,9 +278,7 @@ impl<'a> WorkerRing<'a> {
                 chunks[send_idx].shape.clone(),
             );
 
-            let recv_msg = self
-                .send_to_right_recv_from_left(send_msg)
-                .await?;
+            let recv_msg = self.send_to_right_recv_from_left(send_msg).await?;
 
             // In all-gather, we just copy (replace) the received chunk
             chunks[recv_idx] = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
@@ -297,14 +302,14 @@ impl<'a> WorkerRing<'a> {
         layer_idx: u32,
         timeout: Duration,
     ) -> Result<Tensor> {
-        tokio::time::timeout(timeout, self.ring_all_reduce(partial_result, job_id, layer_idx))
-            .await
-            .map_err(|_| {
-                AgentError::Execution(format!(
-                    "Ring all-reduce timed out after {:?}",
-                    timeout
-                ))
-            })?
+        tokio::time::timeout(
+            timeout,
+            self.ring_all_reduce(partial_result, job_id, layer_idx),
+        )
+        .await
+        .map_err(|_| {
+            AgentError::Execution(format!("Ring all-reduce timed out after {:?}", timeout))
+        })?
     }
 
     /// Barrier synchronization - wait for all workers to reach this point
@@ -345,10 +350,10 @@ impl<'a> WorkerRing<'a> {
         &mut self,
         message: TensorMessage,
     ) -> Result<TensorMessage> {
-        use crate::network::MeshEvent;
-
-        // Send to right neighbor using tensor protocol
-        let _request_id = self.swarm.send_tensor(self.right_neighbor, message.clone());
+        // Send to right neighbor over the dedicated tensor data plane.
+        self.tensor_plane
+            .send(self.right_tensor_addr, &message)
+            .await?;
 
         debug!(
             "Sent tensor to right neighbor {}, waiting for tensor from left neighbor {}",
@@ -357,45 +362,17 @@ impl<'a> WorkerRing<'a> {
 
         // Wait for message from left neighbor
         loop {
-            if let Some(event) = self.swarm.next_event().await {
-                match event {
-                    MeshEvent::TensorReceived {
-                        peer_id,
-                        tensor,
-                        channel,
-                    } => {
-                        // Check if it's from our left neighbor
-                        if peer_id == self.left_neighbor {
-                            // Verify it's the same job and layer
-                            if tensor.job_id == message.job_id
-                                && tensor.layer_idx == message.layer_idx
-                            {
-                                // Send acknowledgment (echo back the tensor)
-                                let ack = tensor.clone();
-                                self.swarm.respond_to_tensor(channel, ack)?;
-
-                                debug!(
-                                    "Received tensor from left neighbor {}, phase={:?}, step={}",
-                                    peer_id, tensor.phase, tensor.step
-                                );
-
-                                return Ok(tensor);
-                            }
-                        }
-                        // If not from expected neighbor or wrong job/layer, acknowledge but continue
-                        let ack = tensor.clone();
-                        self.swarm.respond_to_tensor(channel, ack)?;
-                    }
-                    MeshEvent::PeerDisconnected { peer_id } => {
-                        if peer_id == self.left_neighbor {
-                            return Err(AgentError::Network(
-                                "Left neighbor disconnected during ring all-reduce".to_string(),
-                            ));
-                        }
-                    }
-                    _ => {
-                        // Ignore other events
-                    }
+            if let Some(inbound) = self.tensor_plane.recv().await {
+                let tensor = inbound.tensor;
+                if inbound.remote_addr == self.left_tensor_addr
+                    && tensor.job_id == message.job_id
+                    && tensor.layer_idx == message.layer_idx
+                {
+                    debug!(
+                        "Received tensor from left neighbor {}, phase={:?}, step={}",
+                        self.left_neighbor, tensor.phase, tensor.step
+                    );
+                    return Ok(tensor);
                 }
             }
         }
@@ -537,7 +514,7 @@ mod tests {
         assert!(msg.is_barrier());
     }
 
-    // Note: CBOR serialization tests are in agent/src/network/tensor_protocol.rs
+    // Note: Tensor message serialization is tested at the data-plane boundary.
 
     // ============== Ring All-Reduce Logic Tests ==============
 
@@ -548,10 +525,7 @@ mod tests {
         assert!(n > 1, "Need at least 2 workers");
 
         // Each worker has its own set of chunks
-        let mut all_chunks: Vec<Vec<Tensor>> = partial_results
-            .iter()
-            .map(|t| t.chunk(n))
-            .collect();
+        let mut all_chunks: Vec<Vec<Tensor>> = partial_results.iter().map(|t| t.chunk(n)).collect();
 
         // Phase 1: Reduce-Scatter
         for step in 0..(n - 1) {
@@ -572,9 +546,7 @@ mod tests {
                 let received = chunks_to_send[left].clone();
 
                 // Accumulate
-                all_chunks[worker][recv_idx] = all_chunks[worker][recv_idx]
-                    .add(&received)
-                    .unwrap();
+                all_chunks[worker][recv_idx] = all_chunks[worker][recv_idx].add(&received).unwrap();
             }
         }
 
@@ -599,9 +571,7 @@ mod tests {
         }
 
         // Concatenate each worker's chunks
-        all_chunks.into_iter()
-            .map(Tensor::concat)
-            .collect()
+        all_chunks.into_iter().map(Tensor::concat).collect()
     }
 
     #[test]
@@ -620,7 +590,9 @@ mod tests {
                 assert!(
                     (value - expected_sum).abs() < 0.001,
                     "Worker {} result mismatch: got {}, expected {}",
-                    i, value, expected_sum
+                    i,
+                    value,
+                    expected_sum
                 );
             }
         }
@@ -650,7 +622,9 @@ mod tests {
                 assert!(
                     (value - expected_sum).abs() < 0.001,
                     "Worker {} result mismatch: got {}, expected {}",
-                    i, value, expected_sum
+                    i,
+                    value,
+                    expected_sum
                 );
             }
         }
@@ -677,7 +651,9 @@ mod tests {
                 assert!(
                     (value - expected_sum).abs() < 0.001,
                     "Worker {} result mismatch: got {}, expected {}",
-                    i, value, expected_sum
+                    i,
+                    value,
+                    expected_sum
                 );
             }
         }
@@ -703,7 +679,8 @@ mod tests {
             assert!(
                 (value - expected_sum).abs() < 0.00001,
                 "Numerical stability issue: got {}, expected {}",
-                value, expected_sum
+                value,
+                expected_sum
             );
         }
     }
@@ -729,7 +706,9 @@ mod tests {
                 assert!(
                     (value - expected[i]).abs() < 0.001,
                     "Element {} mismatch: got {}, expected {}",
-                    i, value, expected[i]
+                    i,
+                    value,
+                    expected[i]
                 );
             }
         }
@@ -777,7 +756,9 @@ mod tests {
                 assert!(
                     (value - expected_sum).abs() < 0.001,
                     "Sum preservation violated for n={}: got {}, expected {}",
-                    n, value, expected_sum
+                    n,
+                    value,
+                    expected_sum
                 );
             }
         }
@@ -801,7 +782,9 @@ mod tests {
                 assert!(
                     (value - expected_sum).abs() < 0.01,
                     "Stress test failed at iteration {}: got {}, expected {}",
-                    iteration, value, expected_sum
+                    iteration,
+                    value,
+                    expected_sum
                 );
             }
 
@@ -817,5 +800,5 @@ mod tests {
     }
 
     // ============== AllReducePhase Tests ==============
-    // Note: Phase serialization tests are in agent/src/network/tensor_protocol.rs
+    // Note: Phase serialization is exercised through tensor message transport tests.
 }
