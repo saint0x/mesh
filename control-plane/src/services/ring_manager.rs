@@ -1215,4 +1215,65 @@ mod tests {
             assert_eq!(all_ranges[i].1, all_ranges[i + 1].0);
         }
     }
+
+    #[test]
+    fn test_get_topology_generates_peer_punch_plans_for_relayed_workers() {
+        let (manager, db) = create_test_ring_manager();
+        let network_id = "test-network";
+
+        for i in 0..3 {
+            let device_id = format!("device-{}", i);
+            register_test_device(&db, &device_id, network_id);
+            device_service::update_heartbeat(
+                &db,
+                device_id.clone(),
+                DeviceConnectivityState {
+                    active_path: ConnectivityPath::Relayed,
+                    active_endpoint: Some("/dns4/relay.mesh.example/tcp/4001".to_string()),
+                    status: ConnectivityStatus::Connected,
+                },
+                vec![format!(
+                    "/ip4/10.0.0.{}/tcp/4100/p2p/test-peer-manager-{}",
+                    i + 2,
+                    device_id
+                )],
+                vec![DirectPeerCandidate {
+                    endpoint: format!(
+                        "/ip4/10.0.0.{}/tcp/4100/p2p/test-peer-manager-{}",
+                        i + 2,
+                        device_id
+                    ),
+                    transport: crate::connectivity::DirectCandidateTransport::Tcp,
+                    scope: crate::connectivity::DirectCandidateScope::Private,
+                    source: crate::connectivity::DirectCandidateSource::LocalListen,
+                    priority: 21,
+                    last_updated_ms: 1_700_000_000_000,
+                }],
+            )
+            .unwrap();
+
+            manager
+                .add_worker(Worker {
+                    device_id,
+                    network_id: network_id.to_string(),
+                    contributed_memory: 8_000_000_000,
+                    ring_position: None,
+                    status: "online".to_string(),
+                })
+                .unwrap();
+        }
+
+        let topology = manager.get_topology(network_id).unwrap();
+
+        assert_eq!(topology.workers.len(), 3);
+        assert_eq!(topology.peer_punch_plans.len(), 6);
+        assert!(topology
+            .peer_punch_plans
+            .iter()
+            .all(|plan| matches!(plan.reason, PunchPathReason::RelayPath)));
+        assert!(topology
+            .peer_punch_plans
+            .iter()
+            .all(|plan| plan.relay_rendezvous_required));
+    }
 }

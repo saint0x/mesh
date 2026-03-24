@@ -725,6 +725,7 @@ impl MeshSwarm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::{PeerPunchPlan, PunchPathReason, PunchPathStrategy};
 
     #[test]
     fn test_mesh_swarm_builder() {
@@ -774,5 +775,69 @@ mod tests {
         let swarm = MeshSwarm::builder(keypair).build().unwrap();
 
         assert_eq!(swarm.connected_peers().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_ring_neighbors_emits_punch_attempts_for_both_neighbors() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let mut swarm = MeshSwarm::builder(keypair).build().unwrap();
+        let left = PeerId::random();
+        let right = PeerId::random();
+
+        let left_plan = PeerPunchPlan {
+            source_device_id: "self".to_string(),
+            target_device_id: "left".to_string(),
+            target_peer_id: left.to_string(),
+            strategy: PunchPathStrategy::SimultaneousDial,
+            reason: PunchPathReason::RelayPath,
+            relay_rendezvous_required: true,
+            attempt_window_ms: 5_000,
+            issued_at_ms: 1_700_000_000_000,
+            target_candidates: vec![crate::connectivity::DirectPeerCandidate {
+                endpoint: "/ip4/127.0.0.1/tcp/4101".to_string(),
+                transport: crate::connectivity::DirectCandidateTransport::Tcp,
+                scope: crate::connectivity::DirectCandidateScope::Private,
+                source: crate::connectivity::DirectCandidateSource::LocalListen,
+                priority: 21,
+                last_updated_ms: 1_700_000_000_000,
+            }],
+        };
+        let right_plan = PeerPunchPlan {
+            source_device_id: "self".to_string(),
+            target_device_id: "right".to_string(),
+            target_peer_id: right.to_string(),
+            strategy: PunchPathStrategy::SimultaneousDial,
+            reason: PunchPathReason::PrivateReachabilityOnly,
+            relay_rendezvous_required: false,
+            attempt_window_ms: 5_000,
+            issued_at_ms: 1_700_000_000_000,
+            target_candidates: vec![crate::connectivity::DirectPeerCandidate {
+                endpoint: "/ip4/127.0.0.1/tcp/4102".to_string(),
+                transport: crate::connectivity::DirectCandidateTransport::Tcp,
+                scope: crate::connectivity::DirectCandidateScope::Private,
+                source: crate::connectivity::DirectCandidateSource::LocalListen,
+                priority: 21,
+                last_updated_ms: 1_700_000_000_000,
+            }],
+        };
+
+        swarm.set_ring_neighbors(left, &[], Some(&left_plan), right, &[], Some(&right_plan));
+
+        assert_eq!(swarm.left_neighbor(), Some(left));
+        assert_eq!(swarm.right_neighbor(), Some(right));
+
+        let punch_events = swarm
+            .pending_events
+            .iter()
+            .filter(|event| matches!(event, MeshEvent::PunchPathAttemptInitiated { .. }))
+            .count();
+        let fallback_events = swarm
+            .pending_events
+            .iter()
+            .filter(|event| matches!(event, MeshEvent::RelayFallbackToPeer { .. }))
+            .count();
+
+        assert_eq!(punch_events, 2);
+        assert_eq!(fallback_events, 0);
     }
 }

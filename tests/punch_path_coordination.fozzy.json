@@ -19,6 +19,22 @@
       "times": 1
     },
     {
+      "name": "control-plane multi-peer relay workers generate punch plans",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_get_topology_generates_peer_punch_plans_for_relayed_workers",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
       "name": "agent worker position consumes punch plans",
       "type": "proc_when",
       "cmd": "cargo",
@@ -27,6 +43,22 @@
         "-p",
         "agent",
         "build_worker_position_from_topology_attaches_neighbor_punch_plans",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "swarm ring neighbors emit punch attempts for both peers",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "test_set_ring_neighbors_emits_punch_attempts_for_both_neighbors",
         "--",
         "--nocapture"
       ],
