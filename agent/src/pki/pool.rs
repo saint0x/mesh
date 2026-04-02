@@ -366,7 +366,10 @@ impl PeerCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_create_pool() {
@@ -383,10 +386,12 @@ mod tests {
 
     #[test]
     fn test_pool_save_and_load() {
+        let _guard = HOME_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let device = DeviceKeyPair::generate();
 
         // Override home directory for test
+        let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", temp_dir.path());
 
         let (config, pool_root, cert) =
@@ -402,13 +407,20 @@ mod tests {
         assert_eq!(config.name, loaded_config.name);
         assert_eq!(config.role, loaded_config.role);
         assert_eq!(cert.device_pubkey, loaded_cert.device_pubkey);
+
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
     fn test_list_pools() {
+        let _guard = HOME_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let device = DeviceKeyPair::generate();
 
+        let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", temp_dir.path());
 
         // Create and save multiple pools
@@ -427,11 +439,18 @@ mod tests {
         let pool_ids: Vec<PoolId> = pools.iter().map(|(id, _, _)| *id).collect();
         assert!(pool_ids.contains(&config1.pool_id));
         assert!(pool_ids.contains(&config2.pool_id));
+
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
     fn test_peer_cache() {
+        let _guard = HOME_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
+        let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", temp_dir.path());
 
         let pool_id = PoolId::from_bytes([1u8; 32]);
@@ -457,5 +476,10 @@ mod tests {
 
         assert_eq!(loaded_cache.peers.len(), 1);
         assert_eq!(loaded_cache.peers[0].node_id, node_id);
+
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

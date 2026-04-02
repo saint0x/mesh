@@ -37,6 +37,14 @@ struct PersistedJobStatus {
     assignments: Vec<InferenceJobAssignmentStatus>,
 }
 
+#[derive(Clone)]
+struct PersistedJobContext {
+    network_id: String,
+    model_id: String,
+    submitted_by_device_id: String,
+    ring_worker_count: u32,
+}
+
 #[instrument(skip(state))]
 pub async fn submit_inference(
     State(state): State<AppState>,
@@ -133,6 +141,20 @@ pub async fn submit_inference(
             ],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+        insert_ledger_event(
+            &tx,
+            &request.network_id,
+            "job_started",
+            Some(&persisted_job_id),
+            Some(&request.device_id),
+            None,
+            serde_json::json!({
+                "model_id": request.model_id,
+                "ring_worker_count": workers.len(),
+                "max_tokens": request.max_tokens,
+            }),
+        )?;
 
         for worker in &workers {
             let assignment_id = Uuid::new_v4().to_string();
@@ -299,8 +321,8 @@ fn claim_assignment(
     db: &crate::db::Database,
     req: &ClaimInferenceAssignmentRequest,
 ) -> ApiResult<Option<PersistedAssignment>> {
-    let scheduling_policy = network_service::load_network_settings(db, &req.network_id)?
-        .scheduling_policy;
+    let scheduling_policy =
+        network_service::load_network_settings(db, &req.network_id)?.scheduling_policy;
     let mut conn = db.get_conn()?;
     let tx = conn
         .transaction()
@@ -558,13 +580,14 @@ fn report_assignment_result(
         .execute(
             r#"
             UPDATE inference_job_assignments
-            SET status = ?, completed_at = ?, lease_expires_at = NULL, failure_reason = ?
+            SET status = ?, completed_at = ?, lease_expires_at = NULL, failure_reason = ?, execution_time_ms = ?
             WHERE job_id = ? AND device_id = ?
             "#,
             params![
                 assignment_status,
                 &now,
                 req.error.as_deref(),
+                req.execution_time_ms as i64,
                 job_id,
                 &req.device_id
             ],
@@ -579,6 +602,24 @@ fn report_assignment_result(
     }
 
     let assignment_states = load_assignment_states(&tx, job_id)?;
+    let job_context = load_job_context(&tx, job_id)?;
+    if req.success {
+        let earned_credits = load_device_tier_multiplier(&tx, &req.device_id)?
+            * (req.execution_time_ms as f64 / 1000.0);
+        insert_ledger_event(
+            &tx,
+            &job_context.network_id,
+            "credits_earned",
+            Some(job_id),
+            Some(&req.device_id),
+            Some(earned_credits),
+            serde_json::json!({
+                "model_id": job_context.model_id,
+                "execution_time_ms": req.execution_time_ms,
+            }),
+        )?;
+    }
+
     let failed = assignment_states
         .iter()
         .find(|(_, status, _)| status == "failed");
@@ -597,6 +638,31 @@ fn report_assignment_result(
                 Some(now.clone()),
             )
         } else if all_completed {
+            let total_credits_burned = load_total_credits_earned(&tx, job_id)?;
+            insert_ledger_event(
+                &tx,
+                &job_context.network_id,
+                "job_completed",
+                Some(job_id),
+                Some(&job_context.submitted_by_device_id),
+                None,
+                serde_json::json!({
+                    "model_id": job_context.model_id,
+                    "ring_worker_count": job_context.ring_worker_count,
+                }),
+            )?;
+            insert_ledger_event(
+                &tx,
+                &job_context.network_id,
+                "credits_burned",
+                Some(job_id),
+                Some(&job_context.submitted_by_device_id),
+                Some(-total_credits_burned),
+                serde_json::json!({
+                    "model_id": job_context.model_id,
+                    "ring_worker_count": job_context.ring_worker_count,
+                }),
+            )?;
             (
                 "completed",
                 req.completion.clone(),
@@ -719,6 +785,115 @@ fn load_assignment_states(
     Ok(rows)
 }
 
+fn load_job_context(
+    conn: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> ApiResult<PersistedJobContext> {
+    conn.query_row(
+        r#"
+        SELECT network_id, model_id, submitted_by_device_id, ring_worker_count
+        FROM inference_jobs
+        WHERE job_id = ?
+        "#,
+        params![job_id],
+        |row| {
+            Ok(PersistedJobContext {
+                network_id: row.get(0)?,
+                model_id: row.get(1)?,
+                submitted_by_device_id: row.get(2)?,
+                ring_worker_count: row.get::<_, i64>(3)? as u32,
+            })
+        },
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
+fn load_device_tier_multiplier(
+    conn: &rusqlite::Transaction<'_>,
+    device_id: &str,
+) -> ApiResult<f64> {
+    let tier: String = conn
+        .query_row(
+            "SELECT json_extract(capabilities, '$.tier') FROM devices WHERE device_id = ?",
+            params![device_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    Ok(match tier.as_str() {
+        "Tier0" => 1.0,
+        "Tier1" => 2.0,
+        "Tier2" => 4.0,
+        "Tier3" => 8.0,
+        "Tier4" => 16.0,
+        _ => 1.0,
+    })
+}
+
+fn load_total_credits_earned(conn: &rusqlite::Transaction<'_>, job_id: &str) -> ApiResult<f64> {
+    conn.query_row(
+        r#"
+        SELECT COALESCE(SUM(
+            (assignment.execution_time_ms / 1000.0) *
+            CASE json_extract(device.capabilities, '$.tier')
+                WHEN 'Tier0' THEN 1.0
+                WHEN 'Tier1' THEN 2.0
+                WHEN 'Tier2' THEN 4.0
+                WHEN 'Tier3' THEN 8.0
+                WHEN 'Tier4' THEN 16.0
+                ELSE 1.0
+            END
+        ), 0.0)
+        FROM inference_job_assignments assignment
+        INNER JOIN devices device
+            ON device.device_id = assignment.device_id
+           AND device.network_id = assignment.network_id
+        WHERE assignment.job_id = ?
+          AND assignment.status = 'completed'
+        "#,
+        params![job_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
+fn insert_ledger_event(
+    conn: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    event_type: &str,
+    job_id: Option<&str>,
+    device_id: Option<&str>,
+    credits_amount: Option<f64>,
+    metadata: serde_json::Value,
+) -> ApiResult<()> {
+    let event_id = Uuid::new_v4().to_string();
+    conn.execute(
+        r#"
+        INSERT INTO ledger_events (
+            event_id,
+            network_id,
+            event_type,
+            job_id,
+            device_id,
+            credits_amount,
+            metadata,
+            timestamp
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+        "#,
+        params![
+            event_id,
+            network_id,
+            event_type,
+            job_id,
+            device_id,
+            credits_amount,
+            metadata.to_string(),
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
+}
+
 fn now_rfc3339() -> ApiResult<String> {
     format_time(OffsetDateTime::now_utc())
 }
@@ -803,12 +978,7 @@ mod tests {
     }
 
     async fn joined_state(device_ids: &[&str], network_id: &str) -> AppState {
-        joined_state_with_policy(
-            device_ids,
-            network_id,
-            InferenceSchedulingPolicy::default(),
-        )
-        .await
+        joined_state_with_policy(device_ids, network_id, InferenceSchedulingPolicy::default()).await
     }
 
     async fn joined_state_with_policy(
@@ -864,7 +1034,12 @@ mod tests {
         );
 
         for (idx, (device_id, capabilities)) in devices.iter().enumerate() {
-            register_test_device_with_capabilities(&db, device_id, network_id, capabilities.clone());
+            register_test_device_with_capabilities(
+                &db,
+                device_id,
+                network_id,
+                capabilities.clone(),
+            );
             let join_request = RingJoinRequest {
                 device_id: (*device_id).to_string(),
                 network_id: network_id.to_string(),
@@ -946,6 +1121,122 @@ mod tests {
 
         assert_eq!(status.status, "running");
         assert_eq!(status.assignments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_inference_completion_records_ledger_events_and_credits() {
+        let network_id = "test-network-ledger";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "hello".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        for device_id in ["worker-1", "worker-2"] {
+            let claim = claim_inference_assignment(
+                State(state.clone()),
+                Json(ClaimInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    network_id: network_id.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .assignment
+            .expect("expected assignment");
+
+            let _ = acknowledge_inference_assignment(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(AcknowledgeInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let _ = report_inference_result(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(ReportInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    success: true,
+                    completion: Some(format!("completion-from-{}", device_id)),
+                    completion_tokens: Some(4),
+                    execution_time_ms: 500,
+                    error: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let status = get_inference_job_status(State(state.clone()), Path(submit.job_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.status, "completed");
+
+        let events = crate::api::ledger::list_ledger_events(
+            State(state.clone()),
+            axum::extract::Query(crate::api::ledger::ListLedgerEventsQuery {
+                network_id: Some(network_id.into()),
+                job_id: Some(Uuid::parse_str(&submit.job_id).unwrap()),
+                device_id: None,
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "job_started"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "job_completed"));
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| event.event_type == "credits_earned")
+                .count(),
+            2
+        );
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "credits_burned"));
+
+        let summary = crate::api::ledger::get_ledger_summary(
+            State(state),
+            axum::extract::Query(crate::api::ledger::LedgerSummaryQuery {
+                network_id: network_id.into(),
+                job_id: Some(Uuid::parse_str(&submit.job_id).unwrap()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(summary.total_jobs_started, 1);
+        assert_eq!(summary.total_jobs_completed, 1);
+        assert!(summary.total_credits_earned > 0.0);
+        assert!(summary.total_credits_burned > 0.0);
     }
 
     #[tokio::test]

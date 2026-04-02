@@ -18,7 +18,8 @@ pub use ring_gossip::{MemberStatus, RingGossipMessage, RingMember, RingState, Ri
 pub use ring_gossip_service::RingGossipService;
 pub use tensor_message::{AllReducePhase, TensorMessage};
 pub use tensor_plane::{
-    parse_data_plane_endpoint, InboundTensorMessage, TensorPlane, TensorPlaneConfig,
+    parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
+    parse_tensor_plane_bind_addr_env, InboundTensorMessage, TensorPlane, TensorPlaneConfig,
     TensorPlaneMetricsSnapshot, DATA_PLANE_ENDPOINT_PREFIX,
 };
 

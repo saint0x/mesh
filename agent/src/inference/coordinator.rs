@@ -544,7 +544,7 @@ impl InferenceCoordinator {
         let start = Instant::now();
 
         // Clone model_id to avoid borrow issues
-        let model_id = self.config.model_id.clone();
+        let model_id = job.request.model_id.clone();
 
         // Load weights using the verified artifact loader
         debug!(
@@ -849,11 +849,21 @@ mod tests {
             RecoveryAllowance::Allowed
         );
         assert_eq!(
-            governor.allow_attempt(job_id, Duration::from_secs(5), 8, now + Duration::from_secs(1)),
+            governor.allow_attempt(
+                job_id,
+                Duration::from_secs(5),
+                8,
+                now + Duration::from_secs(1)
+            ),
             RecoveryAllowance::Cooldown
         );
         assert_eq!(
-            governor.allow_attempt(job_id, Duration::from_secs(5), 8, now + Duration::from_secs(6)),
+            governor.allow_attempt(
+                job_id,
+                Duration::from_secs(5),
+                8,
+                now + Duration::from_secs(6)
+            ),
             RecoveryAllowance::Allowed
         );
     }
@@ -868,15 +878,30 @@ mod tests {
             RecoveryAllowance::Allowed
         );
         assert_eq!(
-            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now + Duration::from_secs(1)),
+            governor.allow_attempt(
+                Uuid::new_v4(),
+                Duration::ZERO,
+                2,
+                now + Duration::from_secs(1)
+            ),
             RecoveryAllowance::Allowed
         );
         assert_eq!(
-            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now + Duration::from_secs(2)),
+            governor.allow_attempt(
+                Uuid::new_v4(),
+                Duration::ZERO,
+                2,
+                now + Duration::from_secs(2)
+            ),
             RecoveryAllowance::LoadBudget
         );
         assert_eq!(
-            governor.allow_attempt(Uuid::new_v4(), Duration::ZERO, 2, now + Duration::from_secs(61)),
+            governor.allow_attempt(
+                Uuid::new_v4(),
+                Duration::ZERO,
+                2,
+                now + Duration::from_secs(61)
+            ),
             RecoveryAllowance::Allowed
         );
     }

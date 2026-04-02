@@ -38,7 +38,8 @@ use agent::{
     api::types::{PeerPunchPlan, RingTopologyResponse, WorkerInfo},
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
-    parse_data_plane_endpoint, parse_memory_string, persist_runtime_connectivity_state,
+    parse_data_plane_endpoint, parse_memory_string, parse_tensor_plane_advertised_addr_env,
+    parse_tensor_plane_bind_addr_env, persist_runtime_connectivity_state,
     select_direct_dial_addrs_from_candidates, AdmissionPolicy, ConnectivityAttachmentKind,
     ConnectivityPath, ConnectivityStatus, DeviceConfig, DeviceConnectivityState,
     EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner, MeshSwarmBuilder,
@@ -1048,6 +1049,9 @@ async fn cmd_start() -> Result<()> {
         }
 
         let tensor_plane = match TensorPlane::bind(TensorPlaneConfig {
+            bind_addr: parse_tensor_plane_bind_addr_env()
+                .unwrap_or_else(|| TensorPlaneConfig::default().bind_addr),
+            advertised_addr: parse_tensor_plane_advertised_addr_env(),
             max_message_bytes: inference_config_task
                 .governance
                 .tensor_plane_max_message_bytes,
@@ -1088,9 +1092,8 @@ async fn cmd_start() -> Result<()> {
         inference_config.recovery_max_attempts_per_job = inference_config_task
             .governance
             .recovery_max_attempts_per_job;
-        inference_config.recovery_cooldown = std::time::Duration::from_millis(
-            inference_config_task.governance.recovery_cooldown_ms,
-        );
+        inference_config.recovery_cooldown =
+            std::time::Duration::from_millis(inference_config_task.governance.recovery_cooldown_ms);
         inference_config.recovery_max_checkpoint_loads_per_minute = inference_config_task
             .governance
             .recovery_max_checkpoint_loads_per_minute;
@@ -2587,6 +2590,7 @@ async fn cmd_inference(
     #[derive(serde::Serialize)]
     struct InferenceJobRequest {
         device_id: String,
+        network_id: String,
         model_id: String,
         prompt: String,
         max_tokens: u32,
@@ -2596,6 +2600,7 @@ async fn cmd_inference(
 
     let request = InferenceJobRequest {
         device_id: config.device_id.to_string(),
+        network_id: config.network_id.clone(),
         model_id: model_id.clone(),
         prompt: prompt.clone(),
         max_tokens,
@@ -2614,47 +2619,110 @@ async fn cmd_inference(
     match client.post(&url).json(&request).send().await {
         Ok(response) => {
             if response.status().is_success() {
-                if let Ok(result) = response.json::<serde_json::Value>().await {
-                    println!("\n{}", "✓ Inference completed!".green().bold());
+                let submit = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .context("Failed to parse inference submit response")?;
+                let job_id = submit
+                    .get("job_id")
+                    .and_then(|value| value.as_str())
+                    .context("Inference submit response did not include job_id")?;
 
-                    if let Some(job_id) = result.get("job_id") {
-                        println!(
-                            "  Job ID:          {}",
-                            job_id.as_str().unwrap_or("unknown")
-                        );
+                println!("\n{}", "✓ Inference submitted".green().bold());
+                println!("  Job ID:          {}", job_id);
+                println!("{}", "Polling distributed job status...".dimmed());
+
+                let status_url = format!(
+                    "{}/api/inference/jobs/{}",
+                    control_plane_url.trim_end_matches('/'),
+                    job_id
+                );
+                let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                let mut last_status = None::<String>;
+
+                loop {
+                    if std::time::Instant::now() > poll_deadline {
+                        anyhow::bail!("Timed out waiting for distributed inference completion");
                     }
 
-                    if let Some(tokens_generated) = result.get("completion_tokens") {
-                        println!("  Tokens Generated: {}", tokens_generated);
+                    let status_response = client
+                        .get(&status_url)
+                        .send()
+                        .await
+                        .context("Failed to fetch inference status")?
+                        .error_for_status()
+                        .context("Inference status request failed")?;
+                    let status = status_response
+                        .json::<serde_json::Value>()
+                        .await
+                        .context("Failed to parse inference status response")?;
+
+                    let state = status
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    if last_status.as_deref() != Some(state.as_str()) {
+                        println!("  Status:          {}", state);
+                        last_status = Some(state.clone());
                     }
 
-                    if let Some(exec_time) = result.get("execution_time_ms") {
-                        println!("  Execution Time:   {}ms", exec_time);
+                    if state == "completed" {
+                        println!("\n{}", "✓ Inference completed!".green().bold());
+                        if let Some(tokens_generated) = status
+                            .get("completion_tokens")
+                            .and_then(|value| value.as_u64())
+                        {
+                            println!("  Tokens Generated: {}", tokens_generated);
+                        }
+                        if let Some(exec_time) = status
+                            .get("execution_time_ms")
+                            .and_then(|value| value.as_u64())
+                        {
+                            println!("  Execution Time:   {}ms", exec_time);
+                        }
+                        if let Some(assignments) =
+                            status.get("assignments").and_then(|value| value.as_array())
+                        {
+                            println!("\n{}", "Assignments:".bold());
+                            for assignment in assignments {
+                                let device_id = assignment
+                                    .get("device_id")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("unknown");
+                                let assignment_status = assignment
+                                    .get("status")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("unknown");
+                                let ring_position = assignment
+                                    .get("ring_position")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0);
+                                println!(
+                                    "  Worker {} ({}) -> {}",
+                                    ring_position, device_id, assignment_status
+                                );
+                            }
+                        }
+                        if let Some(completion) =
+                            status.get("completion").and_then(|value| value.as_str())
+                        {
+                            println!("\n{}", "Completion:".bold());
+                            println!("{}", completion);
+                        }
+                        break;
                     }
 
-                    if let Some(completion) = result.get("completion") {
-                        println!("\n{}", "Completion:".bold());
-                        println!("{}", completion.as_str().unwrap_or(""));
-                    } else if let Some(output) = result.get("output") {
-                        println!("\n{}", "Output:".bold());
-                        println!("{}", output.as_str().unwrap_or(""));
+                    if state == "failed" {
+                        let error_message = status
+                            .get("error")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown inference failure");
+                        anyhow::bail!("Distributed inference failed: {}", error_message);
                     }
 
-                    // Show that this used mock weights
-                    println!(
-                        "\n{}",
-                        "Note: This inference used mock Xavier-initialized weights.".yellow()
-                    );
-                    println!(
-                        "{}",
-                        "Output is deterministic but not semantically coherent.".yellow()
-                    );
-                    println!(
-                        "{}",
-                        "Swap in real safetensors weights for production use.".yellow()
-                    );
-                } else {
-                    println!("  {}", "Failed to parse response".red());
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 }
             } else {
                 println!(

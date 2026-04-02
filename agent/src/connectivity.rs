@@ -502,6 +502,9 @@ fn ipv6_is_documentation(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn select_direct_dial_addrs_prefers_public_quic_then_private_tcp() {
@@ -550,7 +553,9 @@ mod tests {
 
     #[test]
     fn current_state_prefers_runtime_state_when_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tempdir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("MESHNET_HOME");
         std::env::set_var("MESHNET_HOME", tempdir.path());
 
         let state = DeviceConnectivityState {
@@ -570,12 +575,17 @@ mod tests {
         };
 
         assert_eq!(connectivity.current_state(), state);
-        std::env::remove_var("MESHNET_HOME");
+        match previous {
+            Some(value) => std::env::set_var("MESHNET_HOME", value),
+            None => std::env::remove_var("MESHNET_HOME"),
+        }
     }
 
     #[test]
     fn direct_candidate_seed_addrs_merge_listen_and_observed() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tempdir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("MESHNET_HOME");
         std::env::set_var("MESHNET_HOME", tempdir.path());
 
         let listen_path = tempdir.path().join(".meshnet").join("listen_addrs.json");
@@ -602,7 +612,10 @@ mod tests {
             .any(|record| record.endpoint.contains("34.120.0.10")
                 && record.source == DirectCandidateSource::ObservedExternal));
 
-        std::env::remove_var("MESHNET_HOME");
+        match previous {
+            Some(value) => std::env::set_var("MESHNET_HOME", value),
+            None => std::env::remove_var("MESHNET_HOME"),
+        }
     }
 
     #[test]

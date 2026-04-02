@@ -26,7 +26,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/devices/register", post(routes::register_device))
         .route("/api/devices/:id/heartbeat", post(routes::heartbeat))
         // Ledger endpoints
-        .route("/api/ledger/events", post(ledger::create_ledger_event))
+        .route(
+            "/api/ledger/events",
+            post(ledger::create_ledger_event).get(ledger::list_ledger_events),
+        )
+        .route("/api/ledger/summary", get(ledger::get_ledger_summary))
         // Ring topology endpoints
         .route("/api/ring/join", post(ring::join_ring))
         .route("/api/ring/topology", get(ring::get_topology))

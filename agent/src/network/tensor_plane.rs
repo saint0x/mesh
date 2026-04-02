@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -22,6 +22,7 @@ pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct TensorPlaneConfig {
     pub bind_addr: SocketAddr,
+    pub advertised_addr: Option<SocketAddr>,
     pub connect_timeout: Duration,
     pub io_timeout: Duration,
     pub max_message_bytes: usize,
@@ -35,6 +36,7 @@ impl Default for TensorPlaneConfig {
     fn default() -> Self {
         Self {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            advertised_addr: None,
             connect_timeout: Duration::from_secs(2),
             io_timeout: Duration::from_secs(5),
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
@@ -135,8 +137,7 @@ impl BandwidthLimiter {
     fn reserve_wait(&mut self, bytes: usize) -> Duration {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        let replenished =
-            self.available_bytes + elapsed * self.rate_bytes_per_sec as f64;
+        let replenished = self.available_bytes + elapsed * self.rate_bytes_per_sec as f64;
         self.available_bytes = replenished.min(self.burst_bytes);
         self.last_refill = now;
 
@@ -169,13 +170,12 @@ impl TensorPlane {
         let local_addr = listener.local_addr().map_err(|e| {
             AgentError::Network(format!("Failed to inspect tensor plane bind: {}", e))
         })?;
-        let advertised_addr = SocketAddr::new(resolve_advertised_ip()?, local_addr.port());
+        let advertised_addr = resolve_advertised_addr(config.advertised_addr, local_addr.port())?;
 
         let inbound_queue_bytes = Arc::new(Semaphore::new(
-            config
-                .max_inbound_queued_bytes
-                .try_into()
-                .map_err(|_| AgentError::Config("tensor inbound byte budget exceeds u32".to_string()))?,
+            config.max_inbound_queued_bytes.try_into().map_err(|_| {
+                AgentError::Config("tensor inbound byte budget exceeds u32".to_string())
+            })?,
         ));
         let outbound_inflight_bytes = Arc::new(Semaphore::new(
             config.max_outbound_inflight_bytes.try_into().map_err(|_| {
@@ -233,10 +233,10 @@ impl TensorPlane {
                                             return;
                                         }
                                     };
-                                    state.metrics.bytes_received.fetch_add(
-                                        queued_bytes as u64,
-                                        Ordering::Relaxed,
-                                    );
+                                    state
+                                        .metrics
+                                        .bytes_received
+                                        .fetch_add(queued_bytes as u64, Ordering::Relaxed);
 
                                     let queued_bytes_permit = match state
                                         .inbound_queue_bytes
@@ -381,9 +381,9 @@ impl TensorPlane {
             )));
         }
 
-        let message_bytes_u32: u32 = message_bytes
-            .try_into()
-            .map_err(|_| AgentError::Network("Tensor message too large for byte accounting".to_string()))?;
+        let message_bytes_u32: u32 = message_bytes.try_into().map_err(|_| {
+            AgentError::Network("Tensor message too large for byte accounting".to_string())
+        })?;
         let wait_started = std::time::Instant::now();
         let outbound_permit = match self
             .state
@@ -408,10 +408,10 @@ impl TensorPlane {
                             "Tensor plane outbound byte budget unexpectedly closed".to_string(),
                         )
                     })?;
-                self.state.metrics.outbound_backpressure_wait_ms.fetch_add(
-                    wait_started.elapsed().as_millis() as u64,
-                    Ordering::Relaxed,
-                );
+                self.state
+                    .metrics
+                    .outbound_backpressure_wait_ms
+                    .fetch_add(wait_started.elapsed().as_millis() as u64, Ordering::Relaxed);
                 permit
             }
         };
@@ -486,6 +486,29 @@ fn resolve_advertised_ip() -> Result<IpAddr> {
         .map_err(|e| AgentError::Network(format!("Failed to read tensor plane local IP: {}", e)))
 }
 
+fn resolve_advertised_addr(
+    configured_addr: Option<SocketAddr>,
+    local_port: u16,
+) -> Result<SocketAddr> {
+    match configured_addr {
+        Some(addr) if addr.port() != 0 => Ok(addr),
+        Some(addr) => Ok(SocketAddr::new(addr.ip(), local_port)),
+        None => Ok(SocketAddr::new(resolve_advertised_ip()?, local_port)),
+    }
+}
+
+pub fn parse_tensor_plane_bind_addr_env() -> Option<SocketAddr> {
+    std::env::var("MESHNET_TENSOR_BIND_ADDR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+pub fn parse_tensor_plane_advertised_addr_env() -> Option<SocketAddr> {
+    std::env::var("MESHNET_TENSOR_ADVERTISED_ADDR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 fn sanitized_config(config: TensorPlaneConfig) -> Result<TensorPlaneConfig> {
     Ok(TensorPlaneConfig {
         max_message_bytes: config.max_message_bytes.max(1),
@@ -536,7 +559,8 @@ where
             std::io::ErrorKind::InvalidData,
             format!(
                 "Message size {} exceeds limit {}",
-                buf.len(), max_message_bytes
+                buf.len(),
+                max_message_bytes
             ),
         ));
     }
@@ -552,6 +576,26 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, timeout};
+
+    #[test]
+    fn test_resolve_advertised_addr_preserves_explicit_port() {
+        let addr = resolve_advertised_addr(
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242)),
+            9000,
+        )
+        .unwrap();
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242));
+    }
+
+    #[test]
+    fn test_resolve_advertised_addr_fills_missing_port_from_bind() {
+        let addr = resolve_advertised_addr(
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            9000,
+        )
+        .unwrap();
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000));
+    }
 
     fn test_message(size: usize) -> TensorMessage {
         TensorMessage {
@@ -617,7 +661,10 @@ mod tests {
         let second = test_message(16);
         plane.send(addr, &first).await.unwrap();
         plane.send(addr, &second).await.unwrap();
-        wait_for_metric(&plane, |snapshot| snapshot.inbound_queue_full_rejections >= 1).await;
+        wait_for_metric(&plane, |snapshot| {
+            snapshot.inbound_queue_full_rejections >= 1
+        })
+        .await;
 
         let received = timeout(Duration::from_secs(1), plane.recv())
             .await
@@ -642,8 +689,13 @@ mod tests {
         let addr = plane.local_addr();
         let message = test_message(32);
         plane.send(addr, &message).await.unwrap();
-        wait_for_metric(&plane, |snapshot| snapshot.inbound_byte_budget_rejections >= 1).await;
-        assert!(timeout(Duration::from_millis(100), plane.recv()).await.is_err());
+        wait_for_metric(&plane, |snapshot| {
+            snapshot.inbound_byte_budget_rejections >= 1
+        })
+        .await;
+        assert!(timeout(Duration::from_millis(100), plane.recv())
+            .await
+            .is_err());
         let snapshot = plane.metrics_snapshot();
         assert!(snapshot.inbound_byte_budget_rejections >= 1);
     }
