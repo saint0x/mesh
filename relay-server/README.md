@@ -1,6 +1,6 @@
 # Mesh Relay Server
 
-Production-ready libp2p Circuit Relay v2 server for NAT traversal and device connectivity in the Mesh network.
+libp2p Circuit Relay v2 server for NAT traversal and device connectivity in the Mesh network.
 
 ## Overview
 
@@ -10,7 +10,7 @@ The relay server enables Mesh agents to connect to each other even when behind N
 - Dual transport: TCP (port 4001) + QUIC (UDP 4001)
 - Resource limits: Configurable reservations, circuits, duration, and bytes
 - Structured logging with tracing (JSON or pretty format)
-- Token-based authentication (placeholder for MVP)
+- Optional token-based authentication
 - Graceful shutdown handling
 - Persistent relay identity (keypair stored at `~/.meshnet/relay_keypair.bin`)
 
@@ -98,14 +98,14 @@ Listening on: /ip4/127.0.0.1/udp/4001/quic-v1
 | `quic_listen_addr` | `/ip4/0.0.0.0/udp/4001/quic-v1` | QUIC listen multiaddr |
 | `advertised_addrs` | `["/ip4/127.0.0.1/tcp/4001", "/ip4/127.0.0.1/udp/4001/quic-v1"]` | Authoritative reservation addresses the relay returns to peers |
 
-### Authentication Settings (Placeholder)
+### Authentication Settings
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `auth_token` | `CHANGE_ME_IN_PRODUCTION` | Shared secret for token validation |
 | `auth_enabled` | `false` | Enable token authentication |
 
-**Note:** Token auth is a placeholder for MVP. Production deployments (Phase 1) will use mTLS with control plane integration.
+**Note:** Token auth is the current built-in auth mechanism in this repo. If mTLS or tighter control-plane-issued credentials are introduced later, they should be documented as new work rather than implied as already present.
 
 ### Logging Settings
 
@@ -312,35 +312,21 @@ Then parse logs to track:
 - Circuit duration distribution
 - Data transfer per circuit
 
-## Production Deployment
+## Deployment Notes
 
-### Current Status (MVP)
+The relay server is in good shape for local development and controlled deployments:
 
-The relay server is production-ready for **local development** with:
-- ✅ Resource limits and validation
-- ✅ Structured logging and error handling
-- ✅ Graceful shutdown
-- ✅ Persistent identity
-- ✅ Comprehensive tests
+- resource limits and validation are implemented
+- structured logging and graceful shutdown are implemented
+- persistent relay identity is implemented
+- runtime coverage includes live relay scenarios in the main repo validation flow
 
-### Deferred to Phase 1
+Areas still worth hardening over time:
 
-**Authentication:**
-- Current: Basic token auth (placeholder)
-- Phase 1: mTLS with control plane integration
-
-**Deployment:**
-- Current: Local development only
-- Phase 1 (Module 7.1): Docker + cloud deployment (Fly.io/DigitalOcean)
-
-**Monitoring:**
-- Current: Structured logging
-- Phase 1: Metrics + Prometheus integration
-
-**Security:**
-- Rate limiting per-IP
-- Ban lists / abuse prevention
-- Health check endpoints
+- tighter auth beyond the current optional token mechanism
+- more operator-facing metrics beyond structured logs
+- abuse controls such as stronger rate limiting and ban lists
+- broader deployment packaging and health-check ergonomics
 
 ## File Structure
 
@@ -351,7 +337,7 @@ relay-server/
 │   ├── config.rs    # TOML configuration
 │   ├── relay.rs     # libp2p swarm setup
 │   ├── events.rs    # Event handling
-│   ├── auth.rs      # Token auth (placeholder)
+│   ├── auth.rs      # Token auth
 │   └── errors.rs    # Error types
 ├── examples/
 │   └── test_client.rs  # Integration test client
