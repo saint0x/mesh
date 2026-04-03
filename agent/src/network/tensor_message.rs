@@ -12,6 +12,8 @@ pub enum AllReducePhase {
 /// Tensor payload exchanged on the dedicated tensor data plane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TensorMessage {
+    /// Sender ring position for protocol-level validation.
+    pub sender_position: u32,
     /// Job ID this tensor belongs to.
     pub job_id: Uuid,
     /// Layer index in the model.
@@ -33,6 +35,7 @@ impl TensorMessage {
     pub const BARRIER_STEP: u32 = 0xFFFF_FFFF;
 
     pub fn new(
+        sender_position: u32,
         job_id: Uuid,
         layer_idx: u32,
         phase: AllReducePhase,
@@ -41,6 +44,7 @@ impl TensorMessage {
         chunk_shape: Vec<usize>,
     ) -> Self {
         Self {
+            sender_position,
             job_id,
             layer_idx,
             phase,
@@ -59,7 +63,7 @@ impl TensorMessage {
     }
 
     pub fn size_bytes(&self) -> usize {
-        let fixed_size = 16 + 4 + 1 + 4 + 8;
+        let fixed_size = 4 + 16 + 4 + 1 + 4 + 8;
         let chunk_data_size = self.chunk_data.len() * std::mem::size_of::<f32>();
         let chunk_shape_size = self.chunk_shape.len() * std::mem::size_of::<usize>();
         fixed_size + chunk_data_size + chunk_shape_size

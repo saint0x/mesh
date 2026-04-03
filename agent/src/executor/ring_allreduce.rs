@@ -231,6 +231,7 @@ impl<'a> WorkerRing<'a> {
 
             // Create message for right neighbor
             let send_msg = TensorMessage::new(
+                self.my_position,
                 job_id,
                 layer_idx,
                 AllReducePhase::ReduceScatter,
@@ -270,6 +271,7 @@ impl<'a> WorkerRing<'a> {
             );
 
             let send_msg = TensorMessage::new(
+                self.my_position,
                 job_id,
                 layer_idx,
                 AllReducePhase::AllGather,
@@ -318,6 +320,7 @@ impl<'a> WorkerRing<'a> {
     /// right neighbor and waits for a message from its left neighbor.
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
         let barrier_msg = TensorMessage::new(
+            self.my_position,
             job_id,
             layer_idx,
             AllReducePhase::Barrier,
@@ -364,13 +367,17 @@ impl<'a> WorkerRing<'a> {
         loop {
             if let Some(inbound) = self.tensor_plane.recv().await {
                 let tensor = inbound.tensor;
-                if inbound.remote_addr == self.left_tensor_addr
+                let expected_sender_position =
+                    (self.my_position + self.total_workers - 1) % self.total_workers;
+                if tensor.sender_position == expected_sender_position
                     && tensor.job_id == message.job_id
                     && tensor.layer_idx == message.layer_idx
+                    && tensor.phase == message.phase
+                    && tensor.step == message.step
                 {
                     debug!(
-                        "Received tensor from left neighbor {}, phase={:?}, step={}",
-                        self.left_neighbor, tensor.phase, tensor.step
+                        "Received tensor from left neighbor {}, phase={:?}, step={}, remote_addr={}",
+                        self.left_neighbor, tensor.phase, tensor.step, inbound.remote_addr
                     );
                     return Ok(tensor);
                 }
@@ -485,6 +492,7 @@ mod tests {
     fn test_tensor_message_new() {
         let job_id = Uuid::new_v4();
         let msg = TensorMessage::new(
+            0,
             job_id,
             5,
             AllReducePhase::ReduceScatter,
@@ -503,6 +511,7 @@ mod tests {
     #[test]
     fn test_tensor_message_barrier() {
         let msg = TensorMessage::new(
+            0,
             Uuid::new_v4(),
             0,
             AllReducePhase::Barrier,

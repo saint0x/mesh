@@ -151,6 +151,7 @@ fn test_ring_allreduce_varying_sizes() {
 fn test_barrier_message_format() {
     let job_id = Uuid::new_v4();
     let msg = TensorMessage::new(
+        3,
         job_id,
         5,
         AllReducePhase::Barrier,

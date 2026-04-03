@@ -564,7 +564,7 @@ impl InferenceCoordinator {
                 position.shard_column_range.0 as usize,
                 position.shard_column_range.1 as usize,
                 position.total_workers,
-            ));
+            )?);
         }
 
         let mut forward_pass = self
@@ -665,7 +665,7 @@ impl InferenceCoordinator {
                         position.shard_column_range.0 as usize,
                         position.shard_column_range.1 as usize,
                         position.total_workers,
-                    );
+                    )?;
 
                     if let Some(kv_cache) = manager.load_checkpoint_kv_cache(job_id).await? {
                         forward_pass.kv_cache = kv_cache;

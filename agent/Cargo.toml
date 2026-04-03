@@ -44,6 +44,14 @@ tokenizers = "0.20"
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+candle-core = { version = "0.10.2", features = ["cuda"] }
+candle-nn = { version = "0.10.2", features = ["cuda"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10.2", features = ["metal"] }
+candle-nn = { version = "0.10.2", features = ["metal"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_System_Memory"] }
 
@@ -61,3 +69,4 @@ serde_json.workspace = true
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 relay-server = { path = "../relay-server" }
+serial_test = "3.2"

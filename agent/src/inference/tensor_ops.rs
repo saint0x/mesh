@@ -8,8 +8,11 @@
 //! - Token embedding lookup
 
 use crate::errors::{AgentError, Result};
+use candle_core::{DType, Device, Tensor as CandleTensor};
+use candle_nn::ops as candle_ops;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
+use std::sync::OnceLock;
 
 /// 2D Tensor for transformer computations
 ///
@@ -94,18 +97,9 @@ impl Tensor2D {
             )));
         }
 
-        let data: Vec<f32> = self
-            .data
-            .iter()
-            .zip(&other.data)
-            .map(|(a, b)| a + b)
-            .collect();
-
-        Ok(Tensor2D {
-            data,
-            rows: self.rows,
-            cols: self.cols,
-        })
+        let lhs = to_candle_2d(self)?;
+        let rhs = to_candle_2d(other)?;
+        from_candle_2d(&lhs.broadcast_add(&rhs).map_err(candle_error)?)
     }
 
     /// Element-wise multiplication (Hadamard product)
@@ -117,43 +111,25 @@ impl Tensor2D {
             )));
         }
 
-        let data: Vec<f32> = self
-            .data
-            .iter()
-            .zip(&other.data)
-            .map(|(a, b)| a * b)
-            .collect();
-
-        Ok(Tensor2D {
-            data,
-            rows: self.rows,
-            cols: self.cols,
-        })
+        let lhs = to_candle_2d(self)?;
+        let rhs = to_candle_2d(other)?;
+        from_candle_2d(&lhs.broadcast_mul(&rhs).map_err(candle_error)?)
     }
 
     /// Scale by a scalar
     pub fn scale(&self, scalar: f32) -> Tensor2D {
-        let data: Vec<f32> = self.data.iter().map(|x| x * scalar).collect();
-        Tensor2D {
-            data,
-            rows: self.rows,
-            cols: self.cols,
-        }
+        let tensor = to_candle_2d(self)
+            .and_then(|x| from_candle_2d(&x.affine(scalar as f64, 0.0).map_err(candle_error)?))
+            .expect("GPU tensor scaling failed");
+        tensor
     }
 
     /// Transpose the tensor
     pub fn transpose(&self) -> Tensor2D {
-        let mut data = vec![0.0; self.data.len()];
-        for i in 0..self.rows {
-            for j in 0..self.cols {
-                data[j * self.rows + i] = self.data[i * self.cols + j];
-            }
-        }
-        Tensor2D {
-            data,
-            rows: self.cols,
-            cols: self.rows,
-        }
+        let tensor = to_candle_2d(self)
+            .and_then(|x| from_candle_2d(&x.transpose(0, 1).map_err(candle_error)?))
+            .expect("GPU tensor transpose failed");
+        tensor
     }
 
     /// Convert to 1D tensor (flatten)
@@ -175,19 +151,8 @@ impl Tensor2D {
         }
 
         let slice_cols = col_end - col_start;
-        let mut data = Vec::with_capacity(self.rows * slice_cols);
-
-        for row in 0..self.rows {
-            let row_start = row * self.cols + col_start;
-            let row_end = row * self.cols + col_end;
-            data.extend_from_slice(&self.data[row_start..row_end]);
-        }
-
-        Ok(Tensor2D {
-            data,
-            rows: self.rows,
-            cols: slice_cols,
-        })
+        let tensor = to_candle_2d(self)?;
+        from_candle_2d(&tensor.narrow(1, col_start, slice_cols).map_err(candle_error)?)
     }
 }
 
@@ -236,27 +201,9 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
         )));
     }
 
-    let m = a.rows;
-    let k = a.cols;
-    let n = b.cols;
-
-    let mut result = vec![0.0; m * n];
-
-    // Standard matmul with cache-friendly access pattern
-    for i in 0..m {
-        for p in 0..k {
-            let a_ip = a.data[i * k + p];
-            for j in 0..n {
-                result[i * n + j] += a_ip * b.data[p * n + j];
-            }
-        }
-    }
-
-    Ok(Tensor2D {
-        data: result,
-        rows: m,
-        cols: n,
-    })
+    let lhs = to_candle_2d(a)?;
+    let rhs = to_candle_2d(b)?;
+    from_candle_2d(&lhs.matmul(&rhs).map_err(candle_error)?)
 }
 
 /// Matrix-vector multiplication: A[m, n] @ v[n] -> result[m]
@@ -270,16 +217,17 @@ pub fn matvec(a: &Tensor2D, v: &Tensor1D) -> Result<Tensor1D> {
         )));
     }
 
-    let mut result = vec![0.0; a.rows];
-    for i in 0..a.rows {
-        let mut sum = 0.0;
-        for j in 0..a.cols {
-            sum += a.data[i * a.cols + j] * v.data[j];
-        }
-        result[i] = sum;
-    }
-
-    Ok(Tensor1D { data: result })
+    let lhs = to_candle_2d(a)?;
+    let rhs = CandleTensor::from_vec(v.data.clone(), (v.len(), 1), gpu_device()?)
+        .map_err(candle_error)?;
+    let result = lhs.matmul(&rhs).map_err(candle_error)?;
+    Ok(Tensor1D {
+        data: result
+            .flatten_all()
+            .map_err(candle_error)?
+            .to_vec1::<f32>()
+            .map_err(candle_error)?,
+    })
 }
 
 // ============== Activation Functions ==============
@@ -289,32 +237,30 @@ pub fn matvec(a: &Tensor2D, v: &Tensor1D) -> Result<Tensor1D> {
 /// Used in GPT-2, BERT, and many modern transformers.
 /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
-    let sqrt_2_over_pi = (2.0 / PI).sqrt();
-
-    let data: Vec<f32> = tensor
-        .data
-        .iter()
-        .map(|&x| {
-            let inner = sqrt_2_over_pi * (x + 0.044715 * x.powi(3));
-            0.5 * x * (1.0 + inner.tanh())
-        })
-        .collect();
-
-    Tensor2D {
-        data,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    }
+    let sqrt_2_over_pi = (2.0 / PI).sqrt() as f64;
+    let result = (|| -> Result<Tensor2D> {
+        let x = to_candle_2d(tensor)?;
+        let x3 = x.sqr().map_err(candle_error)?.broadcast_mul(&x).map_err(candle_error)?;
+        let inner = x
+            .affine(0.044715, 0.0)
+            .map_err(candle_error)?
+            .broadcast_mul(&x3)
+            .map_err(candle_error)?;
+        let inner = x.broadcast_add(&inner).map_err(candle_error)?;
+        let inner = inner.affine(sqrt_2_over_pi, 0.0).map_err(candle_error)?.tanh().map_err(candle_error)?;
+        let one_plus = inner.affine(1.0, 1.0).map_err(candle_error)?;
+        let scaled = x.affine(0.5, 0.0).map_err(candle_error)?;
+        from_candle_2d(&scaled.broadcast_mul(&one_plus).map_err(candle_error)?)
+    })();
+    result.expect("GPU GELU failed")
 }
 
 /// ReLU activation function
 pub fn relu(tensor: &Tensor2D) -> Tensor2D {
-    let data: Vec<f32> = tensor.data.iter().map(|&x| x.max(0.0)).collect();
-    Tensor2D {
-        data,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    }
+    let result = to_candle_2d(tensor)
+        .and_then(|x| from_candle_2d(&x.relu().map_err(candle_error)?))
+        .expect("GPU ReLU failed");
+    result
 }
 
 /// SiLU (Sigmoid Linear Unit) / Swish activation
@@ -322,17 +268,10 @@ pub fn relu(tensor: &Tensor2D) -> Tensor2D {
 /// Used in LLaMA and other modern models.
 /// silu(x) = x * sigmoid(x)
 pub fn silu(tensor: &Tensor2D) -> Tensor2D {
-    let data: Vec<f32> = tensor
-        .data
-        .iter()
-        .map(|&x| x * (1.0 / (1.0 + (-x).exp())))
-        .collect();
-
-    Tensor2D {
-        data,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    }
+    let result = to_candle_2d(tensor)
+        .and_then(|x| from_candle_2d(&candle_ops::silu(&x).map_err(candle_error)?))
+        .expect("GPU SiLU failed");
+    result
 }
 
 // ============== Normalization ==============
@@ -349,28 +288,9 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
         )));
     }
 
-    let mut result = Vec::with_capacity(tensor.data.len());
-
-    for row in 0..tensor.rows {
-        // Compute RMS for this row
-        let row_start = row * tensor.cols;
-        let row_end = row_start + tensor.cols;
-        let row_data = &tensor.data[row_start..row_end];
-
-        let mean_sq: f32 = row_data.iter().map(|x| x * x).sum::<f32>() / tensor.cols as f32;
-        let rms = (mean_sq + eps).sqrt();
-
-        // Normalize and scale by gamma
-        for (i, &x) in row_data.iter().enumerate() {
-            result.push((x / rms) * gamma.data[i]);
-        }
-    }
-
-    Ok(Tensor2D {
-        data: result,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    })
+    let x = to_candle_2d(tensor)?;
+    let weight = to_candle_1d(gamma)?;
+    from_candle_2d(&candle_ops::rms_norm(&x, &weight, eps).map_err(candle_error)?)
 }
 
 /// Standard Layer Normalization
@@ -391,33 +311,10 @@ pub fn layer_norm(
         )));
     }
 
-    let mut result = Vec::with_capacity(tensor.data.len());
-
-    for row in 0..tensor.rows {
-        let row_start = row * tensor.cols;
-        let row_end = row_start + tensor.cols;
-        let row_data = &tensor.data[row_start..row_end];
-
-        // Compute mean
-        let mean: f32 = row_data.iter().sum::<f32>() / tensor.cols as f32;
-
-        // Compute variance
-        let variance: f32 =
-            row_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / tensor.cols as f32;
-
-        let std = (variance + eps).sqrt();
-
-        // Normalize, scale by gamma, shift by beta
-        for (i, &x) in row_data.iter().enumerate() {
-            result.push(((x - mean) / std) * gamma.data[i] + beta.data[i]);
-        }
-    }
-
-    Ok(Tensor2D {
-        data: result,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    })
+    let x = to_candle_2d(tensor)?;
+    let gamma = to_candle_1d(gamma)?;
+    let beta = to_candle_1d(beta)?;
+    from_candle_2d(&candle_ops::layer_norm(&x, &gamma, &beta, eps).map_err(candle_error)?)
 }
 
 // ============== Softmax ==============
@@ -426,27 +323,10 @@ pub fn layer_norm(
 ///
 /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
 pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
-    let mut result = Vec::with_capacity(tensor.data.len());
-
-    for row in 0..tensor.rows {
-        let row_start = row * tensor.cols;
-        let row_end = row_start + tensor.cols;
-        let row_data = &tensor.data[row_start..row_end];
-
-        // Numerical stability: subtract max
-        let max_val = row_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = row_data.iter().map(|x| (x - max_val).exp()).sum();
-
-        for &x in row_data {
-            result.push((x - max_val).exp() / exp_sum);
-        }
-    }
-
-    Tensor2D {
-        data: result,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    }
+    let result = to_candle_2d(tensor)
+        .and_then(|x| from_candle_2d(&candle_ops::softmax(&x, 1).map_err(candle_error)?))
+        .expect("GPU softmax failed");
+    result
 }
 
 /// Softmax for 1D tensor (single row of logits)
@@ -559,11 +439,6 @@ pub fn sample_greedy(logits: &Tensor1D) -> u32 {
 /// * `embedding_table` - [vocab_size, hidden_dim] embedding matrix
 /// * `tokens` - Token IDs to look up
 pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor2D> {
-    let hidden_dim = embedding_table.cols;
-    let seq_len = tokens.len();
-
-    let mut data = Vec::with_capacity(seq_len * hidden_dim);
-
     for &token in tokens {
         let token_idx = token as usize;
         if token_idx >= embedding_table.rows {
@@ -572,17 +447,11 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
                 token, embedding_table.rows
             )));
         }
-
-        let row_start = token_idx * hidden_dim;
-        let row_end = row_start + hidden_dim;
-        data.extend_from_slice(&embedding_table.data[row_start..row_end]);
     }
 
-    Ok(Tensor2D {
-        data,
-        rows: seq_len,
-        cols: hidden_dim,
-    })
+    let table = to_candle_2d(embedding_table)?;
+    let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), gpu_device()?).map_err(candle_error)?;
+    from_candle_2d(&table.embedding(&ids).map_err(candle_error)?)
 }
 
 // ============== Rotary Position Embedding (RoPE) ==============
@@ -605,44 +474,66 @@ pub fn apply_rope(
         )));
     }
 
-    let mut result = tensor.data.clone();
-    let half_dim = head_dim / 2;
+    if head_dim % 2 != 0 {
+        return Err(AgentError::Execution(format!(
+            "RoPE requires even head_dim, got {}",
+            head_dim
+        )));
+    }
+    if tensor.cols % head_dim != 0 {
+        return Err(AgentError::Execution(format!(
+            "RoPE head_dim {} does not divide tensor width {}",
+            head_dim, tensor.cols
+        )));
+    }
 
-    // Precompute inverse frequencies
+    let seq_len = tensor.rows;
+    let num_heads = tensor.cols / head_dim;
+    let half_dim = head_dim / 2;
+    let x = to_candle_2d(tensor)?
+        .reshape((seq_len, num_heads, head_dim))
+        .map_err(candle_error)?;
+    let x1 = x.narrow(2, 0, half_dim).map_err(candle_error)?;
+    let x2 = x.narrow(2, half_dim, half_dim).map_err(candle_error)?;
+
     let inv_freq: Vec<f32> = (0..half_dim)
         .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
         .collect();
+    let pos = CandleTensor::from_vec(
+        positions.iter().map(|p| *p as f32).collect::<Vec<_>>(),
+        (seq_len, 1),
+        gpu_device()?,
+    )
+    .map_err(candle_error)?;
+    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), gpu_device()?).map_err(candle_error)?;
+    let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
+    let cos = freqs
+        .cos()
+        .map_err(candle_error)?
+        .unsqueeze(1)
+        .map_err(candle_error)?
+        .expand((seq_len, num_heads, half_dim))
+        .map_err(candle_error)?;
+    let sin = freqs
+        .sin()
+        .map_err(candle_error)?
+        .unsqueeze(1)
+        .map_err(candle_error)?
+        .expand((seq_len, num_heads, half_dim))
+        .map_err(candle_error)?;
 
-    for (seq_idx, &pos) in positions.iter().enumerate() {
-        let pos_f = pos as f32;
-
-        // Apply RoPE to each head dimension pair
-        for d in 0..half_dim {
-            let freq = pos_f * inv_freq[d];
-            let cos_val = freq.cos();
-            let sin_val = freq.sin();
-
-            // For each column that should be rotated
-            for col_base in (0..tensor.cols).step_by(head_dim) {
-                let idx1 = seq_idx * tensor.cols + col_base + d;
-                let idx2 = seq_idx * tensor.cols + col_base + d + half_dim;
-
-                if idx2 < result.len() {
-                    let x1 = tensor.data[idx1];
-                    let x2 = tensor.data[idx2];
-
-                    result[idx1] = x1 * cos_val - x2 * sin_val;
-                    result[idx2] = x1 * sin_val + x2 * cos_val;
-                }
-            }
-        }
-    }
-
-    Ok(Tensor2D {
-        data: result,
-        rows: tensor.rows,
-        cols: tensor.cols,
-    })
+    let rot1 = x1
+        .broadcast_mul(&cos)
+        .map_err(candle_error)?
+        .broadcast_sub(&x2.broadcast_mul(&sin).map_err(candle_error)?)
+        .map_err(candle_error)?;
+    let rot2 = x1
+        .broadcast_mul(&sin)
+        .map_err(candle_error)?
+        .broadcast_add(&x2.broadcast_mul(&cos).map_err(candle_error)?)
+        .map_err(candle_error)?;
+    let rotated = CandleTensor::cat(&[&rot1, &rot2], 2).map_err(candle_error)?;
+    from_candle_2d(&rotated.reshape((seq_len, tensor.cols)).map_err(candle_error)?)
 }
 
 // ============== Conversion to/from ring_allreduce::Tensor ==============
@@ -669,11 +560,215 @@ impl Tensor2D {
     }
 }
 
+fn candle_error(err: candle_core::Error) -> AgentError {
+    AgentError::Execution(format!("GPU tensor backend error: {}", err))
+}
+
+pub(crate) fn gpu_device() -> Result<&'static Device> {
+    static DEVICE: OnceLock<std::result::Result<Device, String>> = OnceLock::new();
+    match DEVICE.get_or_init(|| init_gpu_device().map_err(|e| e.to_string())) {
+        Ok(device) => Ok(device),
+        Err(err) => Err(AgentError::Execution(format!(
+            "GPU execution backend unavailable: {}",
+            err
+        ))),
+    }
+}
+
+fn init_gpu_device() -> std::result::Result<Device, candle_core::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        Device::new_cuda(0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Device::new_metal(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(candle_core::Error::Msg(
+            "meshnet requires a GPU-backed candle device on this platform".to_string(),
+        ))
+    }
+}
+
+pub(crate) fn to_candle_2d(tensor: &Tensor2D) -> Result<CandleTensor> {
+    CandleTensor::from_vec(tensor.data.clone(), (tensor.rows, tensor.cols), gpu_device()?)
+        .map_err(candle_error)
+}
+
+pub(crate) fn to_candle_1d(tensor: &Tensor1D) -> Result<CandleTensor> {
+    CandleTensor::from_vec(tensor.data.clone(), tensor.len(), gpu_device()?).map_err(candle_error)
+}
+
+pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
+    let dims = tensor.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Expected 2D GPU tensor, got shape {:?}",
+            dims
+        )));
+    }
+    let data = tensor
+        .flatten_all()
+        .map_err(candle_error)?
+        .to_dtype(DType::F32)
+        .map_err(candle_error)?
+        .to_vec1::<f32>()
+        .map_err(candle_error)?;
+    Tensor2D::new(data, dims[0], dims[1])
+}
+
+pub(crate) fn rms_norm_candle(tensor: &CandleTensor, gamma: &CandleTensor, eps: f32) -> Result<CandleTensor> {
+    candle_ops::rms_norm(tensor, gamma, eps).map_err(candle_error)
+}
+
+pub(crate) fn silu_candle(tensor: &CandleTensor) -> Result<CandleTensor> {
+    candle_ops::silu(tensor).map_err(candle_error)
+}
+
+pub(crate) fn apply_rope_candle(
+    tensor: &CandleTensor,
+    rows: usize,
+    cols: usize,
+    positions: &[u32],
+    head_dim: usize,
+    base: f32,
+) -> Result<CandleTensor> {
+    if rows != positions.len() {
+        return Err(AgentError::Execution(format!(
+            "RoPE position count {} doesn't match sequence length {}",
+            positions.len(),
+            rows
+        )));
+    }
+    if head_dim % 2 != 0 {
+        return Err(AgentError::Execution(format!(
+            "RoPE requires even head_dim, got {}",
+            head_dim
+        )));
+    }
+    if cols % head_dim != 0 {
+        return Err(AgentError::Execution(format!(
+            "RoPE head_dim {} does not divide tensor width {}",
+            head_dim, cols
+        )));
+    }
+
+    let num_heads = cols / head_dim;
+    let half_dim = head_dim / 2;
+    let x = tensor
+        .reshape((rows, num_heads, head_dim))
+        .map_err(candle_error)?;
+    let x1 = x.narrow(2, 0, half_dim).map_err(candle_error)?;
+    let x2 = x.narrow(2, half_dim, half_dim).map_err(candle_error)?;
+
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
+        .collect();
+    let pos = CandleTensor::from_vec(
+        positions.iter().map(|p| *p as f32).collect::<Vec<_>>(),
+        (rows, 1),
+        gpu_device()?,
+    )
+    .map_err(candle_error)?;
+    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), gpu_device()?).map_err(candle_error)?;
+    let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
+    let cos = freqs
+        .cos()
+        .map_err(candle_error)?
+        .unsqueeze(1)
+        .map_err(candle_error)?
+        .expand((rows, num_heads, half_dim))
+        .map_err(candle_error)?;
+    let sin = freqs
+        .sin()
+        .map_err(candle_error)?
+        .unsqueeze(1)
+        .map_err(candle_error)?
+        .expand((rows, num_heads, half_dim))
+        .map_err(candle_error)?;
+
+    let rot1 = x1
+        .broadcast_mul(&cos)
+        .map_err(candle_error)?
+        .broadcast_sub(&x2.broadcast_mul(&sin).map_err(candle_error)?)
+        .map_err(candle_error)?;
+    let rot2 = x1
+        .broadcast_mul(&sin)
+        .map_err(candle_error)?
+        .broadcast_add(&x2.broadcast_mul(&cos).map_err(candle_error)?)
+        .map_err(candle_error)?;
+    CandleTensor::cat(&[&rot1, &rot2], 2)
+        .map_err(candle_error)?
+        .reshape((rows, cols))
+        .map_err(candle_error)
+}
+
+pub(crate) fn causal_self_attention_candle(
+    q_t: &CandleTensor,
+    k_t: &CandleTensor,
+    v_t: &CandleTensor,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+) -> Result<CandleTensor> {
+    let q_t = q_t.contiguous().map_err(candle_error)?;
+    let k_t = k_t
+        .transpose(0, 1)
+        .map_err(candle_error)?
+        .contiguous()
+        .map_err(candle_error)?;
+    let v_t = v_t.contiguous().map_err(candle_error)?;
+    let scores = q_t
+        .matmul(&k_t)
+        .map_err(candle_error)?;
+    let scores = scores.affine(scale as f64, 0.0).map_err(candle_error)?;
+
+    let mut mask = vec![0.0f32; rows * rows];
+    for i in 0..rows {
+        for j in (i + 1)..rows {
+            mask[i * rows + j] = f32::NEG_INFINITY;
+        }
+    }
+    let mask = CandleTensor::from_vec(mask, (rows, rows), gpu_device()?).map_err(candle_error)?;
+    let masked = scores.broadcast_add(&mask).map_err(candle_error)?;
+    let probs = candle_ops::softmax(&masked, 1).map_err(candle_error)?;
+    let probs = probs.contiguous().map_err(candle_error)?;
+    let output = probs.matmul(&v_t).map_err(candle_error)?;
+    let dims = output.dims();
+    if dims != [rows, cols] {
+        return Err(AgentError::Execution(format!(
+            "GPU attention output shape mismatch: expected [{}, {}], got {:?}",
+            rows, cols, dims
+        )));
+    }
+    Ok(output)
+}
+
+pub fn causal_self_attention_gpu(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -> Result<Tensor2D> {
+    if q.rows != k.rows || q.rows != v.rows || q.cols != k.cols || q.cols != v.cols {
+        return Err(AgentError::Execution(format!(
+            "Attention shape mismatch: q {}x{}, k {}x{}, v {}x{}",
+            q.rows, q.cols, k.rows, k.cols, v.rows, v.cols
+        )));
+    }
+
+    let q_t = to_candle_2d(q)?;
+    let k_t = to_candle_2d(k)?;
+    let v_t = to_candle_2d(v)?;
+    from_candle_2d(&causal_self_attention_candle(
+        &q_t, &k_t, &v_t, q.rows, q.cols, scale,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_tensor2d_creation() {
         let t = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
         assert_eq!(t.rows, 2);
@@ -683,6 +778,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_matmul() {
         // [2,3] @ [3,2] = [2,2]
         let a = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3).unwrap();
@@ -697,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_gelu() {
         let t = Tensor2D::new(vec![0.0, 1.0, -1.0, 2.0], 2, 2).unwrap();
         let result = gelu(&t);
@@ -708,6 +805,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_softmax() {
         let t = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4).unwrap();
         let result = softmax(&t);
@@ -722,6 +820,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_layer_norm() {
         let t = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
         let gamma = Tensor1D::new(vec![1.0, 1.0]);
@@ -735,6 +834,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sample_greedy() {
         let logits = Tensor1D::new(vec![1.0, 5.0, 2.0, 3.0]);
         let token = sample_greedy(&logits);
@@ -742,6 +842,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_column_slice() {
         let t = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3).unwrap();
         let slice = t.column_slice(1, 3).unwrap();
@@ -755,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_embed_tokens() {
         // 4 tokens x 3 dim embedding
         let embedding = Tensor2D::new(
@@ -775,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_transpose() {
         let t = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3).unwrap();
         let transposed = t.transpose();

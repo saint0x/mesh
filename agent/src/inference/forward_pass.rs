@@ -46,6 +46,7 @@
 
 use crate::errors::Result;
 use crate::executor::ring_allreduce::WorkerRing;
+use candle_core::Tensor as CandleTensor;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tracing::{debug, info};
@@ -53,8 +54,9 @@ use uuid::Uuid;
 
 use super::kv_cache::KVCache;
 use super::tensor_ops::{
-    apply_rope, embed_tokens, matmul, rms_norm, sample_greedy, sample_token, silu, Tensor1D,
-    Tensor2D,
+    apply_rope, apply_rope_candle, causal_self_attention_candle, causal_self_attention_gpu,
+    embed_tokens, from_candle_2d, matmul, rms_norm, rms_norm_candle, sample_greedy, sample_token,
+    silu, silu_candle, to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
 
 /// Weights for a single transformer layer (sharded)
@@ -256,44 +258,7 @@ fn partition_columns(total_columns: usize, worker_position: u32, total_workers: 
 }
 
 fn causal_self_attention(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -> Result<Tensor2D> {
-    if q.rows != k.rows || q.rows != v.rows || q.cols != k.cols || q.cols != v.cols {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Attention shape mismatch: q {}x{}, k {}x{}, v {}x{}",
-            q.rows, q.cols, k.rows, k.cols, v.rows, v.cols
-        )));
-    }
-
-    let seq_len = q.rows;
-    let head_dim = q.cols;
-    let mut output = Tensor2D::zeros(seq_len, head_dim);
-
-    for query_idx in 0..seq_len {
-        let mut scores = Vec::with_capacity(query_idx + 1);
-        for key_idx in 0..=query_idx {
-            let mut dot = 0.0f32;
-            let q_offset = query_idx * head_dim;
-            let k_offset = key_idx * head_dim;
-            for dim in 0..head_dim {
-                dot += q.data[q_offset + dim] * k.data[k_offset + dim];
-            }
-            scores.push(dot * scale);
-        }
-
-        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp_scores: Vec<f32> = scores.iter().map(|score| (score - max_score).exp()).collect();
-        let denom: f32 = exp_scores.iter().sum();
-
-        for (key_idx, weight) in exp_scores.iter().enumerate() {
-            let normalized = *weight / denom;
-            let v_offset = key_idx * head_dim;
-            let out_offset = query_idx * head_dim;
-            for dim in 0..head_dim {
-                output.data[out_offset + dim] += normalized * v.data[v_offset + dim];
-            }
-        }
-    }
-
-    Ok(output)
+    causal_self_attention_gpu(q, k, v, scale)
 }
 
 fn attention_output(
@@ -391,9 +356,58 @@ fn attention_output(
 }
 
 /// Forward pass state for tensor-parallel inference
+#[derive(Clone)]
+struct DeviceLayerWeights {
+    w_q: CandleTensor,
+    w_k: CandleTensor,
+    w_v: CandleTensor,
+    w_o: CandleTensor,
+    w_up: CandleTensor,
+    w_gate: CandleTensor,
+    w_down: CandleTensor,
+    attn_norm: CandleTensor,
+    mlp_norm: CandleTensor,
+}
+
+#[derive(Clone)]
+struct DeviceModelWeights {
+    embedding: CandleTensor,
+    layers: Vec<DeviceLayerWeights>,
+    final_norm: CandleTensor,
+    lm_head: CandleTensor,
+}
+
+impl DeviceModelWeights {
+    fn from_host(weights: &ModelWeights) -> Result<Self> {
+        let embedding = to_candle_2d(&weights.embedding)?;
+        let final_norm = to_candle_1d(&weights.final_norm)?;
+        let lm_head = to_candle_2d(&weights.lm_head)?;
+        let mut layers = Vec::with_capacity(weights.layers.len());
+        for layer in &weights.layers {
+            layers.push(DeviceLayerWeights {
+                w_q: to_candle_2d(&layer.w_q)?,
+                w_k: to_candle_2d(&layer.w_k)?,
+                w_v: to_candle_2d(&layer.w_v)?,
+                w_o: to_candle_2d(&layer.w_o)?,
+                w_up: to_candle_2d(&layer.w_up)?,
+                w_gate: to_candle_2d(&layer.w_gate)?,
+                w_down: to_candle_2d(&layer.w_down)?,
+                attn_norm: to_candle_1d(&layer.attn_norm)?,
+                mlp_norm: to_candle_1d(&layer.mlp_norm)?,
+            });
+        }
+        Ok(Self {
+            embedding,
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+}
+
 pub struct ForwardPass {
-    /// Model weights (sharded for this worker)
-    pub weights: ModelWeights,
+    device_weights: DeviceModelWeights,
+    config: ModelConfig,
 
     /// KV cache for attention
     pub kv_cache: KVCache,
@@ -420,28 +434,39 @@ impl ForwardPass {
         shard_start: usize,
         shard_end: usize,
         total_workers: u32,
-    ) -> Self {
+    ) -> Result<Self> {
+        let config = weights.config.clone();
         let kv_config = super::kv_cache::KVCacheConfig {
-            num_layers: weights.config.num_layers,
-            num_heads: weights.config.num_kv_heads,
-            head_dim: weights.config.hidden_dim / weights.config.num_heads,
+            num_layers: config.num_layers,
+            num_heads: config.num_kv_heads,
+            head_dim: config.hidden_dim / config.num_heads,
             max_seq_len: 4096,
         };
 
-        Self {
-            weights,
+        Ok(Self {
+            device_weights: DeviceModelWeights::from_host(&weights)?,
+            config,
             kv_cache: KVCache::new(kv_config),
             shard_start,
             shard_end,
             worker_position,
             total_workers,
             position: 0,
-        }
+        })
     }
 
     /// Embed input tokens
-    pub fn embed(&self, tokens: &[u32]) -> Result<Tensor2D> {
-        embed_tokens(&self.weights.embedding, tokens)
+    fn embed(&self, tokens: &[u32]) -> Result<CandleTensor> {
+        let ids = CandleTensor::from_vec(
+            tokens.to_vec(),
+            tokens.len(),
+            self.device_weights.embedding.device(),
+        )
+        .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        self.device_weights
+            .embedding
+            .embedding(&ids)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))
     }
 
     /// Run forward pass for a single layer with ring all-reduce
@@ -452,30 +477,39 @@ impl ForwardPass {
     /// 3. Apply activation and normalization
     pub async fn forward_layer(
         &mut self,
-        hidden: &Tensor2D,
+        hidden: &CandleTensor,
         layer_idx: usize,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor2D> {
-        let layer = self.weights.layers[layer_idx].clone();
-        let config = self.weights.config.clone();
+    ) -> Result<CandleTensor> {
+        let layer = self.device_weights.layers[layer_idx].clone();
+        let config = self.config.clone();
         let start = Instant::now();
+        let hidden_dims = hidden.dims();
+        let hidden_rows = hidden_dims[0];
+        let hidden_cols = hidden_dims[1];
 
         // 1. RMS Norm before attention
-        let normed = rms_norm(hidden, &layer.attn_norm, config.rms_norm_eps)?;
+        let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
 
         // 2. Compute partial QKV projections (my columns only)
-        let q_partial = matmul(&normed, &layer.w_q)?;
-        let k_partial = matmul(&normed, &layer.w_k)?;
-        let v_partial = matmul(&normed, &layer.w_v)?;
+        let q_partial = normed
+            .matmul(&layer.w_q)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        let k_partial = normed
+            .matmul(&layer.w_k)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        let v_partial = normed
+            .matmul(&layer.w_v)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         debug!(
             "Layer {} QKV partial computed: {}x{} -> {}x{}",
-            layer_idx, normed.rows, normed.cols, q_partial.rows, q_partial.cols
+            layer_idx, hidden_rows, hidden_cols, q_partial.dims()[0], q_partial.dims()[1]
         );
 
         // 3. Compute causal attention on local heads only
-        let attn_output = attention_output(
+        let attn_output = attention_output_device(
             &mut self.kv_cache,
             &config,
             self.worker_position,
@@ -487,37 +521,47 @@ impl ForwardPass {
         )?;
 
         // 6. Output projection (partial)
-        let o_partial = matmul(&attn_output, &layer.w_o)?;
+        let o_partial = attn_output
+            .matmul(&layer.w_o)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
         let o_full = self
-            .ring_allreduce_tensor(&o_partial, worker_ring, job_id, layer_idx as u32)
+            .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32)
             .await?;
 
         // 7. Residual connection
-        let post_attn = hidden.add(&o_full)?;
+        let post_attn = hidden
+            .broadcast_add(&o_full)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         // 8. MLP with SwiGLU
-        let mlp_normed = rms_norm(
-            &post_attn,
-            &layer.mlp_norm,
-            config.rms_norm_eps,
-        )?;
+        let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
 
         // Gate and up projections are column-parallel and stay local
-        let gate_partial = matmul(&mlp_normed, &layer.w_gate)?;
-        let up_partial = matmul(&mlp_normed, &layer.w_up)?;
+        let gate_partial = mlp_normed
+            .matmul(&layer.w_gate)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        let up_partial = mlp_normed
+            .matmul(&layer.w_up)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         // SwiGLU: silu(gate) * up
-        let gate_activated = silu(&gate_partial);
-        let mlp_hidden = gate_activated.mul(&up_partial)?;
+        let gate_activated = silu_candle(&gate_partial)?;
+        let mlp_hidden = gate_activated
+            .broadcast_mul(&up_partial)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         // Down projection (partial)
-        let down_partial = matmul(&mlp_hidden, &layer.w_down)?;
+        let down_partial = mlp_hidden
+            .matmul(&layer.w_down)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
         let down_full = self
-            .ring_allreduce_tensor(&down_partial, worker_ring, job_id, layer_idx as u32)
+            .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32)
             .await?;
 
         // 9. Final residual
-        let output = post_attn.add(&down_full)?;
+        let output = post_attn
+            .broadcast_add(&down_full)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         debug!(
             "Layer {} forward complete in {:?}",
@@ -529,23 +573,28 @@ impl ForwardPass {
     }
 
     /// Compute logits from final hidden states
-    pub fn compute_logits(&self, hidden: &Tensor2D) -> Result<Tensor1D> {
+    pub fn compute_logits(&self, hidden: &CandleTensor) -> Result<Tensor1D> {
         // Apply final RMS norm
-        let normed = rms_norm(
-            hidden,
-            &self.weights.final_norm,
-            self.weights.config.rms_norm_eps,
-        )?;
+        let normed = rms_norm_candle(hidden, &self.device_weights.final_norm, self.config.rms_norm_eps)?;
 
         // Take last token's hidden state
-        let last_row = normed.row(normed.rows - 1);
-        let last_hidden = Tensor2D::new(last_row.to_vec(), 1, normed.cols)?;
+        let last_hidden = normed
+            .narrow(0, normed.dims()[0] - 1, 1)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         // Project to vocabulary
-        let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
+        let logits_2d = last_hidden
+            .matmul(&self.device_weights.lm_head)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         // Flatten to 1D
-        Ok(Tensor1D::new(logits_2d.data))
+        Ok(Tensor1D::new(
+            logits_2d
+                .flatten_all()
+                .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?
+                .to_vec1::<f32>()
+                .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?,
+        ))
     }
 
     /// Sample next token from logits
@@ -563,35 +612,32 @@ impl ForwardPass {
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor2D> {
+    ) -> Result<CandleTensor> {
         let start = Instant::now();
         self.kv_cache.clear();
 
         // 1. Embed tokens
         let mut hidden = self.embed(tokens)?;
+        let hidden_dims = hidden.dims();
         debug!(
             "Embedded {} tokens -> {:?}",
             tokens.len(),
-            (hidden.rows, hidden.cols)
+            (hidden_dims[0], hidden_dims[1])
         );
 
         // 2. Run through all layers
-        for layer_idx in 0..self.weights.config.num_layers {
+        for layer_idx in 0..self.config.num_layers {
             hidden = self
                 .forward_layer(&hidden, layer_idx, worker_ring, job_id)
                 .await?;
         }
 
         // 3. Apply final norm
-        hidden = rms_norm(
-            &hidden,
-            &self.weights.final_norm,
-            self.weights.config.rms_norm_eps,
-        )?;
+        hidden = rms_norm_candle(&hidden, &self.device_weights.final_norm, self.config.rms_norm_eps)?;
 
         info!(
             "Full forward pass complete: {} layers in {:?}",
-            self.weights.config.num_layers,
+            self.config.num_layers,
             start.elapsed()
         );
 
@@ -623,21 +669,23 @@ impl ForwardPass {
     }
 
     /// Helper: Convert Tensor2D to ring all-reduce format and back
-    async fn ring_allreduce_tensor(
+    async fn ring_allreduce_candle(
         &self,
-        tensor: &Tensor2D,
+        tensor: &CandleTensor,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
-    ) -> Result<Tensor2D> {
+    ) -> Result<CandleTensor> {
         // Convert to flat tensor for all-reduce
-        let flat = tensor.to_allreduce_tensor();
+        let host = from_candle_2d(tensor)?;
+        let flat = host.to_allreduce_tensor();
 
         // Perform ring all-reduce
         let reduced = worker_ring.ring_all_reduce(flat, job_id, layer_idx).await?;
 
         // Convert back to 2D
-        Tensor2D::from_allreduce_tensor(&reduced)
+        let host = Tensor2D::from_allreduce_tensor(&reduced)?;
+        to_candle_2d(&host)
     }
 
     /// Clear KV cache (for new sequence)
@@ -650,6 +698,116 @@ impl ForwardPass {
     pub fn cache_memory_usage(&self) -> usize {
         self.kv_cache.memory_usage()
     }
+}
+
+fn attention_output_device(
+    kv_cache: &mut KVCache,
+    config: &ModelConfig,
+    worker_position: u32,
+    total_workers: u32,
+    layer_idx: usize,
+    q_local: CandleTensor,
+    k_local: CandleTensor,
+    v_local: CandleTensor,
+) -> Result<CandleTensor> {
+    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Unsupported attention geometry: hidden_dim {} num_heads {}",
+            config.hidden_dim, config.num_heads
+        )));
+    }
+    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+
+    let head_dim = config.hidden_dim / config.num_heads;
+    let kv_hidden_dim = config.num_kv_heads * head_dim;
+    let q_dims = q_local.dims();
+    let k_dims = k_local.dims();
+    let v_dims = v_local.dims();
+    let q_rows = q_dims[0];
+    let q_cols = q_dims[1];
+    let k_cols = k_dims[1];
+    let v_cols = v_dims[1];
+
+    if q_cols % head_dim != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local query projection width {} is not a multiple of head_dim {}",
+            q_cols, head_dim
+        )));
+    }
+    if k_cols % head_dim != 0 || v_cols % head_dim != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local KV projection widths must be multiples of head_dim {}: k={} v={}",
+            head_dim, k_cols, v_cols
+        )));
+    }
+    let expected_q_cols = partition_columns(config.hidden_dim, worker_position, total_workers);
+    if q_cols != expected_q_cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local query projection width mismatch: expected {}, got {}",
+            expected_q_cols, q_cols
+        )));
+    }
+    let expected_kv_cols = partition_columns(kv_hidden_dim, worker_position, total_workers);
+    if k_cols != expected_kv_cols || v_cols != expected_kv_cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local KV projection width mismatch: expected {}, got k={} v={}",
+            expected_kv_cols, k_cols, v_cols
+        )));
+    }
+
+    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
+    let q_head_start = partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
+    let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
+    let positions: Vec<u32> = (0..q_rows as u32).collect();
+    let q_rope = apply_rope_candle(&q_local, q_rows, q_cols, &positions, head_dim, config.rope_base)?;
+    let k_rope = apply_rope_candle(&k_local, q_rows, k_cols, &positions, head_dim, config.rope_base)?;
+
+    kv_cache.update_layer(
+        layer_idx,
+        from_candle_2d(&k_rope)?,
+        from_candle_2d(&v_local)?,
+    )?;
+
+    let local_q_heads = q_cols / head_dim;
+    let local_kv_heads = k_cols / head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut output_heads = Vec::with_capacity(local_q_heads);
+
+    for local_q_idx in 0..local_q_heads {
+        let global_q_head = q_head_start + local_q_idx;
+        let global_kv_head = global_q_head / q_heads_per_kv_head;
+        if global_kv_head < kv_head_start || global_kv_head >= kv_head_start + local_kv_heads {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Local KV head ownership mismatch: q_head {} maps to kv_head {}, local kv range {}..{}",
+                global_q_head,
+                global_kv_head,
+                kv_head_start,
+                kv_head_start + local_kv_heads
+            )));
+        }
+        let local_kv_idx = global_kv_head - kv_head_start;
+        let q_head = q_rope
+            .narrow(1, local_q_idx * head_dim, head_dim)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        let k_head = k_rope
+            .narrow(1, local_kv_idx * head_dim, head_dim)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        let v_head = v_local
+            .narrow(1, local_kv_idx * head_dim, head_dim)
+            .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+        output_heads.push(causal_self_attention_candle(
+            &q_head, &k_head, &v_head, q_rows, head_dim, scale,
+        )?);
+    }
+
+    let refs: Vec<&CandleTensor> = output_heads.iter().collect();
+    CandleTensor::cat(&refs, 1)
+        .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))
 }
 
 /// Simplified forward pass for testing without ring all-reduce
@@ -873,7 +1031,7 @@ mod tests {
     fn test_forward_pass_creation() {
         let config = create_test_config();
         let weights = create_test_weights(&config, 16);
-        let forward = ForwardPass::new(weights, 0, 0, 16, 4);
+        let forward = ForwardPass::new(weights, 0, 0, 16, 4).unwrap();
 
         assert_eq!(forward.worker_position, 0);
         assert_eq!(forward.shard_start, 0);

@@ -599,6 +599,7 @@ mod tests {
 
     fn test_message(size: usize) -> TensorMessage {
         TensorMessage {
+            sender_position: 0,
             job_id: uuid::Uuid::nil(),
             layer_idx: 0,
             phase: super::super::tensor_message::AllReducePhase::ReduceScatter,
