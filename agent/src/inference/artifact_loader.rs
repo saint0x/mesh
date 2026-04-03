@@ -386,6 +386,19 @@ fn validate_weight_shapes(
     lm_head: &Tensor2D,
     layers: &[LayerWeights],
 ) -> Result<()> {
+    if config.num_kv_heads != config.num_heads {
+        return Err(AgentError::Config(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+    if config.hidden_dim % config.num_heads != 0 {
+        return Err(AgentError::Config(format!(
+            "Unsupported attention geometry: hidden_dim {} num_heads {}",
+            config.hidden_dim, config.num_heads
+        )));
+    }
+
     if embedding.rows != config.vocab_size || embedding.cols != config.hidden_dim {
         return Err(AgentError::Config(format!(
             "Embedding shape mismatch: expected {}x{}, got {}x{}",

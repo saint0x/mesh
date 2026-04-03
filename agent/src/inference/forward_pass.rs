@@ -53,7 +53,8 @@ use uuid::Uuid;
 
 use super::kv_cache::KVCache;
 use super::tensor_ops::{
-    embed_tokens, matmul, rms_norm, sample_greedy, sample_token, silu, softmax, Tensor1D, Tensor2D,
+    apply_rope, embed_tokens, matmul, rms_norm, sample_greedy, sample_token, silu, Tensor1D,
+    Tensor2D,
 };
 
 /// Weights for a single transformer layer (sharded)
@@ -173,6 +174,139 @@ impl ModelWeights {
     }
 }
 
+fn split_heads(tensor: &Tensor2D, num_heads: usize, head_dim: usize) -> Result<Vec<Tensor2D>> {
+    if tensor.cols != num_heads * head_dim {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Head split mismatch: tensor cols {} vs num_heads {} * head_dim {}",
+            tensor.cols, num_heads, head_dim
+        )));
+    }
+
+    let mut heads = Vec::with_capacity(num_heads);
+    for head_idx in 0..num_heads {
+        let start = head_idx * head_dim;
+        heads.push(tensor.column_slice(start, start + head_dim)?);
+    }
+    Ok(heads)
+}
+
+fn merge_heads(heads: &[Tensor2D]) -> Result<Tensor2D> {
+    let Some(first) = heads.first() else {
+        return Ok(Tensor2D::zeros(0, 0));
+    };
+
+    let seq_len = first.rows;
+    let head_dim = first.cols;
+    let num_heads = heads.len();
+
+    for head in heads {
+        if head.rows != seq_len || head.cols != head_dim {
+            return Err(crate::errors::AgentError::Execution(
+                "Cannot merge attention heads with mismatched shapes".to_string(),
+            ));
+        }
+    }
+
+    let mut merged = Tensor2D::zeros(seq_len, num_heads * head_dim);
+    for row in 0..seq_len {
+        for (head_idx, head) in heads.iter().enumerate() {
+            let dst_offset = row * merged.cols + head_idx * head_dim;
+            let src_offset = row * head.cols;
+            merged.data[dst_offset..dst_offset + head_dim]
+                .copy_from_slice(&head.data[src_offset..src_offset + head_dim]);
+        }
+    }
+
+    Ok(merged)
+}
+
+fn causal_self_attention(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -> Result<Tensor2D> {
+    if q.rows != k.rows || q.rows != v.rows || q.cols != k.cols || q.cols != v.cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Attention shape mismatch: q {}x{}, k {}x{}, v {}x{}",
+            q.rows, q.cols, k.rows, k.cols, v.rows, v.cols
+        )));
+    }
+
+    let seq_len = q.rows;
+    let head_dim = q.cols;
+    let mut output = Tensor2D::zeros(seq_len, head_dim);
+
+    for query_idx in 0..seq_len {
+        let mut scores = Vec::with_capacity(query_idx + 1);
+        for key_idx in 0..=query_idx {
+            let mut dot = 0.0f32;
+            let q_offset = query_idx * head_dim;
+            let k_offset = key_idx * head_dim;
+            for dim in 0..head_dim {
+                dot += q.data[q_offset + dim] * k.data[k_offset + dim];
+            }
+            scores.push(dot * scale);
+        }
+
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_scores: Vec<f32> = scores.iter().map(|score| (score - max_score).exp()).collect();
+        let denom: f32 = exp_scores.iter().sum();
+
+        for (key_idx, weight) in exp_scores.iter().enumerate() {
+            let normalized = *weight / denom;
+            let v_offset = key_idx * head_dim;
+            let out_offset = query_idx * head_dim;
+            for dim in 0..head_dim {
+                output.data[out_offset + dim] += normalized * v.data[v_offset + dim];
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+fn attention_output(
+    kv_cache: &mut KVCache,
+    config: &ModelConfig,
+    layer_idx: usize,
+    q_full: Tensor2D,
+    k_full: Tensor2D,
+    v_full: Tensor2D,
+) -> Result<Tensor2D> {
+    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Unsupported attention geometry: hidden_dim {} num_heads {}",
+            config.hidden_dim, config.num_heads
+        )));
+    }
+    if config.num_kv_heads != config.num_heads {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+
+    let head_dim = config.hidden_dim / config.num_heads;
+    let positions: Vec<u32> = (0..q_full.rows as u32).collect();
+    let q_rope = apply_rope(&q_full, &positions, head_dim, config.rope_base)?;
+    let k_rope = apply_rope(&k_full, &positions, head_dim, config.rope_base)?;
+
+    kv_cache.update_layer(layer_idx, k_rope.clone(), v_full.clone())?;
+
+    let q_heads = split_heads(&q_rope, config.num_heads, head_dim)?;
+    let k_heads = split_heads(&k_rope, config.num_heads, head_dim)?;
+    let v_heads = split_heads(&v_full, config.num_heads, head_dim)?;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut output_heads = Vec::with_capacity(config.num_heads);
+    for head_idx in 0..config.num_heads {
+        output_heads.push(causal_self_attention(
+            &q_heads[head_idx],
+            &k_heads[head_idx],
+            &v_heads[head_idx],
+            scale,
+        )?);
+    }
+
+    merge_heads(&output_heads)
+}
+
 /// Forward pass state for tensor-parallel inference
 pub struct ForwardPass {
     /// Model weights (sharded for this worker)
@@ -235,8 +369,8 @@ impl ForwardPass {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<Tensor2D> {
-        let layer = &self.weights.layers[layer_idx];
-        let config = &self.weights.config;
+        let layer = self.weights.layers[layer_idx].clone();
+        let config = self.weights.config.clone();
         let start = Instant::now();
 
         // 1. RMS Norm before attention
@@ -263,17 +397,9 @@ impl ForwardPass {
             .ring_allreduce_tensor(&v_partial, worker_ring, job_id, layer_idx as u32)
             .await?;
 
-        // 4. Update KV cache
-        self.kv_cache
-            .update_layer(layer_idx, k_full.clone(), v_full.clone())?;
-
-        // 5. Compute attention (simplified - no heads split for clarity)
-        // In production, this would properly handle multi-head attention
-        let attn_scores = matmul(&q_full, &k_full.transpose())?;
-        let scale = 1.0 / (config.hidden_dim as f32 / config.num_heads as f32).sqrt();
-        let scaled_scores = attn_scores.scale(scale);
-        let attn_probs = softmax(&scaled_scores);
-        let attn_output = matmul(&attn_probs, &v_full)?;
+        // 4. Compute causal multi-head attention over the full sequence
+        let attn_output =
+            attention_output(&mut self.kv_cache, &config, layer_idx, q_full, k_full, v_full)?;
 
         // 6. Output projection (partial)
         let o_partial = matmul(&attn_output, &layer.w_o)?;
@@ -285,7 +411,11 @@ impl ForwardPass {
         let post_attn = hidden.add(&o_full)?;
 
         // 8. MLP with SwiGLU
-        let mlp_normed = rms_norm(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
+        let mlp_normed = rms_norm(
+            &post_attn,
+            &layer.mlp_norm,
+            config.rms_norm_eps,
+        )?;
 
         // Gate and up projections (partial)
         let gate_partial = matmul(&mlp_normed, &layer.w_gate)?;
@@ -358,6 +488,7 @@ impl ForwardPass {
         job_id: Uuid,
     ) -> Result<Tensor2D> {
         let start = Instant::now();
+        self.kv_cache.clear();
 
         // 1. Embed tokens
         let mut hidden = self.embed(tokens)?;
@@ -473,26 +604,33 @@ impl LocalForwardPass {
 
     /// Run forward pass without distribution (for testing)
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Tensor2D> {
+        self.kv_cache.clear();
         // Embed tokens
         let mut hidden = embed_tokens(&self.weights.embedding, tokens)?;
 
-        // Run through all layers (simplified - no attention for demo)
+        // Run through all layers with the same causal attention block used in distributed mode
         for layer_idx in 0..self.weights.config.num_layers {
             let layer = &self.weights.layers[layer_idx];
             let config = &self.weights.config;
 
-            // RMS Norm
+            // Attention block
             let normed = rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
+            let q_full = matmul(&normed, &layer.w_q)?;
+            let k_full = matmul(&normed, &layer.w_k)?;
+            let v_full = matmul(&normed, &layer.w_v)?;
+            let attn_output =
+                attention_output(&mut self.kv_cache, config, layer_idx, q_full, k_full, v_full)?;
+            let o_full = matmul(&attn_output, &layer.w_o)?;
+            let post_attn = hidden.add(&o_full)?;
 
-            // Simplified: just MLP (no real attention for testing)
-            let gate = matmul(&normed, &layer.w_gate)?;
-            let up = matmul(&normed, &layer.w_up)?;
+            // MLP block
+            let mlp_normed = rms_norm(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
+            let gate = matmul(&mlp_normed, &layer.w_gate)?;
+            let up = matmul(&mlp_normed, &layer.w_up)?;
             let gate_activated = silu(&gate);
             let mlp_hidden = gate_activated.mul(&up)?;
             let mlp_out = matmul(&mlp_hidden, &layer.w_down)?;
-
-            // Residual
-            hidden = hidden.add(&mlp_out)?;
+            hidden = post_attn.add(&mlp_out)?;
         }
 
         // Final norm
@@ -617,6 +755,17 @@ mod tests {
 
         assert_eq!(hidden.rows, 3); // seq_len
         assert_eq!(hidden.cols, 64); // hidden_dim
+    }
+
+    #[test]
+    fn test_local_forward_rejects_unsupported_gqa() {
+        let mut config = create_test_config();
+        config.num_kv_heads = 2;
+        let weights = create_test_weights(&config, 64);
+        let mut forward = LocalForwardPass::new(weights);
+
+        let err = forward.forward(&[1, 2, 3]).unwrap_err().to_string();
+        assert!(err.contains("Unsupported grouped-query attention geometry"));
     }
 
     #[test]
