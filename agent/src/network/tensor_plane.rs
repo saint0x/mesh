@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::collections::VecDeque;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -158,6 +159,7 @@ impl BandwidthLimiter {
 pub struct TensorPlane {
     state: Arc<TensorPlaneState>,
     inbound_rx: mpsc::Receiver<InboundTensorMessage>,
+    pending_inbound: VecDeque<InboundTensorMessage>,
     _accept_task: tokio::task::JoinHandle<()>,
 }
 
@@ -301,6 +303,7 @@ impl TensorPlane {
         Ok(Self {
             state: metrics_state,
             inbound_rx,
+            pending_inbound: VecDeque::new(),
             _accept_task: accept_task,
         })
     }
@@ -460,7 +463,27 @@ impl TensorPlane {
     }
 
     pub async fn recv(&mut self) -> Option<InboundTensorMessage> {
+        if let Some(message) = self.pending_inbound.pop_front() {
+            return Some(message);
+        }
         self.inbound_rx.recv().await
+    }
+
+    pub async fn recv_matching<F>(&mut self, mut predicate: F) -> Option<InboundTensorMessage>
+    where
+        F: FnMut(&InboundTensorMessage) -> bool,
+    {
+        if let Some(index) = self.pending_inbound.iter().position(&mut predicate) {
+            return self.pending_inbound.remove(index);
+        }
+
+        loop {
+            let inbound = self.inbound_rx.recv().await?;
+            if predicate(&inbound) {
+                return Some(inbound);
+            }
+            self.pending_inbound.push_back(inbound);
+        }
     }
 }
 
@@ -699,6 +722,35 @@ mod tests {
             .is_err());
         let snapshot = plane.metrics_snapshot();
         assert!(snapshot.inbound_byte_budget_rejections >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_recv_matching_buffers_nonmatching_messages() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default()).await.unwrap();
+        let addr = plane.local_addr();
+
+        let mut first = test_message(4);
+        first.step = 1;
+        let mut second = test_message(4);
+        second.step = 2;
+
+        plane.send(addr, &first).await.unwrap();
+        plane.send(addr, &second).await.unwrap();
+
+        let matched = timeout(
+            Duration::from_secs(1),
+            plane.recv_matching(|inbound| inbound.tensor.step == 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(matched.tensor.step, 2);
+
+        let buffered = timeout(Duration::from_secs(1), plane.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffered.tensor.step, 1);
     }
 
     #[test]

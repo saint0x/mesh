@@ -364,26 +364,31 @@ impl<'a> WorkerRing<'a> {
             self.right_neighbor, self.left_neighbor
         );
 
-        // Wait for message from left neighbor
-        loop {
-            if let Some(inbound) = self.tensor_plane.recv().await {
-                let tensor = inbound.tensor;
-                let expected_sender_position =
-                    (self.my_position + self.total_workers - 1) % self.total_workers;
-                if tensor.sender_position == expected_sender_position
+        let expected_sender_position = (self.my_position + self.total_workers - 1) % self.total_workers;
+        let inbound = self
+            .tensor_plane
+            .recv_matching(|inbound| {
+                let tensor = &inbound.tensor;
+                tensor.sender_position == expected_sender_position
                     && tensor.job_id == message.job_id
                     && tensor.layer_idx == message.layer_idx
                     && tensor.phase == message.phase
                     && tensor.step == message.step
-                {
-                    debug!(
-                        "Received tensor from left neighbor {}, phase={:?}, step={}, remote_addr={}",
-                        self.left_neighbor, tensor.phase, tensor.step, inbound.remote_addr
-                    );
-                    return Ok(tensor);
-                }
-            }
-        }
+            })
+            .await
+            .ok_or_else(|| {
+                AgentError::Network(format!(
+                    "Tensor plane closed while waiting for {:?} step {} from worker {}",
+                    message.phase, message.step, expected_sender_position
+                ))
+            })?;
+
+        let tensor = inbound.tensor;
+        debug!(
+            "Received tensor from left neighbor {}, phase={:?}, step={}, remote_addr={}",
+            self.left_neighbor, tensor.phase, tensor.step, inbound.remote_addr
+        );
+        Ok(tensor)
     }
 }
 
