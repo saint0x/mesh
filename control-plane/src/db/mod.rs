@@ -1,7 +1,7 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OptionalExtension;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod models;
@@ -86,17 +86,9 @@ impl Database {
             "#,
         )?;
 
-        // Read migration files and execute
-        // Use CARGO_MANIFEST_DIR to find migrations relative to crate root
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let migrations_dir = std::path::Path::new(&manifest_dir).join("migrations");
-
-        if !migrations_dir.exists() {
-            return Err(DbError::Config(format!(
-                "Migrations directory not found at: {}",
-                migrations_dir.display()
-            )));
-        }
+        // Resolve migrations relative to the installed binary or crate root so startup
+        // does not depend on the caller's current working directory.
+        let migrations_dir = locate_migrations_dir()?;
 
         // Get all .sql files
         let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)
@@ -175,6 +167,36 @@ impl Database {
 
         Ok(db_dir.join("control-plane.db"))
     }
+}
+
+fn locate_migrations_dir() -> Result<PathBuf> {
+    if let Ok(explicit_dir) = std::env::var("MESHNET_MIGRATIONS_DIR") {
+        let path = PathBuf::from(explicit_dir);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        for ancestor in exe_path.ancestors() {
+            candidates.push(ancestor.join("migrations"));
+            candidates.push(ancestor.join("control-plane").join("migrations"));
+        }
+    }
+
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"));
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(DbError::Config(
+        "Migrations directory not found near the executable or crate root".to_string(),
+    ))
 }
 
 fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -> Result<bool> {
@@ -412,6 +434,13 @@ mod tests {
             )
             .expect("Failed to count backfilled migrations");
         assert_eq!(recorded, 4);
+    }
+
+    #[test]
+    fn test_locate_migrations_dir_finds_real_directory() {
+        let path = locate_migrations_dir().expect("Should find migrations directory");
+        assert!(path.ends_with("migrations"));
+        assert!(path.join("001_create_networks.sql").exists());
     }
 
     #[test]
