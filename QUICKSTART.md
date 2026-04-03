@@ -1,6 +1,6 @@
 # Mesh Quickstart
 
-This guide covers the current local and multi-device bring-up flow for the repo as it exists today.
+This guide covers the current production runtime bring-up flow.
 
 ## Prerequisites
 
@@ -62,6 +62,13 @@ Terminal 5:
 ```bash
 mesh inference --prompt "Hello world" --max-tokens 10 --model-id llama-70b
 ```
+
+Before starting workers, place real shard artifacts for the selected `model_id` on each node:
+
+- `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.manifest.json`
+- `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.safetensors`
+
+The safetensors file must satisfy the loader contract in [agent/src/inference/artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
 
 ## Multi-Device LAN Pool Flow
 
@@ -143,8 +150,8 @@ cargo test --workspace
 - Durable inference dispatch is implemented.
 - The agent does poll and execute inference assignments from the control plane.
 - The hot path uses the dedicated tensor plane, not just generic control-plane messaging.
-- Mock-weight validation is still a major part of the current inference validation story.
-- The full Rust test suite still needs hardening because at least one connectivity test has shown intermittent whole-suite failure behavior.
+- The runtime no longer includes the older generic job executor or synthetic shard loader.
+- Real model quality still depends on shipping correct shard manifests, safetensors weights, and tokenizer assets.
 
 ## Troubleshooting
 
@@ -162,5 +169,6 @@ If control-plane calls fail:
 If relay connectivity fails:
 
 - confirm `mesh-relay` is running
+- confirm relay `advertised_addrs` point at the node's real reachable addresses
 - inspect relay logs
 - run the Fozzy relay runtime scenarios in `tests/`

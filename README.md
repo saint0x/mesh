@@ -6,7 +6,7 @@ Mesh is a Rust workspace for running cooperative inference over a mix of direct 
 
 - an `agent` daemon and CLI for device setup, pool management, ring participation, and inference execution
 - a `control-plane` service for device registration, topology management, durable inference dispatch, and job status
-- a `relay-server` for NAT traversal and fallback connectivity
+- a `relay-server` for NAT traversal and relayed connectivity
 
 The architecture is centered on a dedicated tensor data plane between workers and a separate control plane for orchestration.
 
@@ -20,12 +20,13 @@ What is implemented today:
 - LAN beacon discovery and pool membership flows
 - dedicated tensor-plane transport with bounded backpressure and bandwidth governance
 - checkpointing and bounded recovery inside the inference coordinator
+- safetensors-only shard loading for distributed inference
 - Fozzy scenarios for production dispatch and relay/direct-upgrade runtime coverage
 
 Important caveats:
 
-- the current inference path is still primarily validated with mock/Xavier-initialized weight flows
-- the repo has strong deterministic scenario coverage, but the full Rust test suite is not perfectly clean yet on every run
+- distributed inference requires real shard artifacts under `~/.meshnet/models/<model_id>/`
+- model quality is only as good as the supplied tokenizer, shard manifests, and safetensors weights
 - this project is a native distributed inference runtime, not a polished end-user mesh product
 
 ## Install
@@ -81,6 +82,13 @@ Terminal 5:
 mesh inference --prompt "Hello, world!" --max-tokens 10 --model-id llama-70b
 ```
 
+The runtime expects real shard packages for each worker:
+
+- `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.manifest.json`
+- `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.safetensors`
+
+The manifest SHA256 must match the safetensors payload, and the safetensors file must expose the metadata and tensor names the loader validates in [agent/src/inference/artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
+
 ## Architecture
 
 ### Control Plane
@@ -104,6 +112,7 @@ The agent provides:
 - worker ring participation
 - inference coordinator startup and assignment polling
 - dedicated tensor-plane transport for hot-path inference traffic
+- safetensors shard verification and local shard execution
 
 See [agent/src/main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [agent/src/inference/coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
 
@@ -112,7 +121,7 @@ See [agent/src/main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and 
 The relay server provides Circuit Relay v2 support for:
 
 - reservation-backed connectivity
-- relayed fallback paths
+- relayed worker connectivity
 - rendezvous for later direct upgrades
 
 See [relay-server/README.md](/Users/deepsaint/Desktop/meshnet/relay-server/README.md).
@@ -139,7 +148,16 @@ You should also run Rust tests:
 cargo test --workspace
 ```
 
-At the time of this documentation update, deterministic Fozzy checks were passing for the main production-dispatch scenario, while the full Rust workspace suite showed one intermittent connectivity failure when run as a whole. Treat that as an active hardening item, not a resolved issue.
+At the time of this documentation update, the production-only runtime passed:
+
+- `cargo test -p agent --quiet`
+- `cargo test -p control-plane --quiet`
+- `fozzy doctor --deep --scenario tests/production_dispatch.fozzy.json --runs 5 --seed 424242 --json`
+- `fozzy test --det --strict tests/production_dispatch.fozzy.json tests/live_relay_runtime.fozzy.json --json`
+- `fozzy run tests/production_dispatch.fozzy.json --det --record .fozzy/traces/production_dispatch.production_only.fozzy --json`
+- `fozzy trace verify .fozzy/traces/production_dispatch.production_only.fozzy --strict --json`
+- `fozzy replay .fozzy/traces/production_dispatch.production_only.fozzy --json`
+- `fozzy ci .fozzy/traces/production_dispatch.production_only.fozzy --json`
 
 ## Documentation
 
@@ -154,7 +172,7 @@ At the time of this documentation update, deterministic Fozzy checks were passin
 - anonymous public marketplace compute
 - tokenized or blockchain-based coordination
 - bidding and spot-pricing dynamics
-- pretending current mock-weight validation is the same thing as production model quality
+- carrying a parallel mock or synthetic execution path beside the production runtime
 
 ## License
 

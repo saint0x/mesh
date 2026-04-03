@@ -39,12 +39,17 @@ Submit a test inference request:
 mesh inference --prompt "Hello world" --max-tokens 10 --model-id llama-70b
 ```
 
+Ship real shard artifacts before starting the workers:
+
+- `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.manifest.json`
+- `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.safetensors`
+
 ## Reality Check
 
 - the dispatch and execution path is implemented
 - the dedicated tensor data plane is active
-- current validation still leans heavily on deterministic scenarios and mock-weight paths
-- full-suite Rust test stability is still an active hardening area
+- the runtime is production-only and no longer carries the older synthetic executor path
+- live model quality depends on valid shard artifacts and correct model packaging
 
 For more detail, use:
 
