@@ -1,5 +1,6 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::OptionalExtension;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -76,6 +77,14 @@ impl Database {
         tracing::info!("Running database migrations");
 
         let conn = self.pool.get()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                filename TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )?;
 
         // Read migration files and execute
         // Use CARGO_MANIFEST_DIR to find migrations relative to crate root
@@ -102,12 +111,36 @@ impl Database {
         // Execute each migration
         for entry in migration_files {
             let path = entry.path();
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| DbError::Config(format!("Invalid migration filename: {}", path.display())))?
+                .to_string();
+
+            let already_applied: Option<String> = conn
+                .query_row(
+                    "SELECT filename FROM schema_migrations WHERE filename = ?1",
+                    [&filename],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if already_applied.is_some() {
+                tracing::debug!(file = %filename, "Skipping previously applied migration");
+                continue;
+            }
+
             tracing::info!(file = %path.display(), "Applying migration");
 
             let sql = std::fs::read_to_string(&path)
                 .map_err(|e| DbError::Config(format!("Failed to read migration file: {}", e)))?;
 
-            conn.execute_batch(&sql)?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(&sql)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (filename) VALUES (?1)",
+                [&filename],
+            )?;
+            tx.commit()?;
         }
 
         tracing::info!("Migrations completed successfully");
@@ -152,6 +185,7 @@ pub(crate) fn create_test_db() -> Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_create_in_memory_db() {
@@ -186,6 +220,27 @@ mod tests {
         assert!(tables.contains(&"networks".to_string()));
         assert!(tables.contains(&"devices".to_string()));
         assert!(tables.contains(&"ledger_events".to_string()));
+        assert!(tables.contains(&"schema_migrations".to_string()));
+    }
+
+    #[test]
+    fn test_run_migrations_is_idempotent() {
+        let temp_db = NamedTempFile::new().expect("Failed to create temp database file");
+        let db = Database::new(
+            temp_db
+                .path()
+                .to_str()
+                .expect("Temp database path should be valid UTF-8"),
+        )
+        .expect("Failed to create database");
+        db.migrate().expect("Failed to run first migration pass");
+        db.migrate().expect("Failed to run second migration pass");
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
+            .expect("Failed to count applied migrations");
+        assert!(count >= 1);
     }
 
     #[test]
