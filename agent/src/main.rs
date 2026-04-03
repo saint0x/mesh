@@ -1980,12 +1980,14 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh init' first.")?;
     let control_plane_url = config.control_plane_url.clone();
-    let relay_addr = resolve_primary_mesh_endpoint(&config)?;
 
     println!("\n{}", "Device Identity:".bold());
     println!("  Device ID:     {}", config.device_id);
     println!("  Model ID:      {}", model_id);
-    println!("  Relay:         {}", relay_addr);
+    println!(
+        "  Connectivity:  {:?}",
+        config.connectivity.preferred_path
+    );
 
     // Connect to control plane
     println!("\n{}", "Requesting ring join...".dimmed());
