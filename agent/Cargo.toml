@@ -39,6 +39,8 @@ chrono = "0.4"
 socket2.workspace = true
 safetensors = "0.7"
 tokenizers = "0.20"
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
 
 # Platform-specific dependencies for memory locking
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
@@ -48,7 +50,7 @@ libc = "0.2"
 candle-core = { version = "0.10.2", features = ["cuda"] }
 candle-nn = { version = "0.10.2", features = ["cuda"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 candle-core = { version = "0.10.2", features = ["metal"] }
 candle-nn = { version = "0.10.2", features = ["metal"] }
 
