@@ -13,16 +13,31 @@ pub struct ModelManifest {
     pub total_model_bytes: u64,
     #[serde(default = "default_tokenizer_file")]
     pub tokenizer_file: String,
+    #[serde(default = "default_tokenizer_config_file")]
+    pub tokenizer_config_file: String,
 }
 
 fn default_tokenizer_file() -> String {
     "tokenizer.json".to_string()
 }
 
+fn default_tokenizer_config_file() -> String {
+    "tokenizer_config.json".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TokenizerConfig {
+    #[serde(default)]
+    chat_template: Option<String>,
+    #[serde(default)]
+    eos_token: Option<String>,
+}
+
 #[derive(Clone)]
 struct CachedModelAssets {
     manifest: ModelManifest,
     tokenizer: Arc<Tokenizer>,
+    tokenizer_config: Arc<TokenizerConfig>,
 }
 
 fn model_asset_cache() -> &'static RwLock<HashMap<String, CachedModelAssets>> {
@@ -88,13 +103,32 @@ fn load_tokenizer(path: &Path) -> Result<Tokenizer, ApiError> {
         .map_err(|e| ApiError::BadRequest(format!("Failed to load tokenizer {}: {}", path.display(), e)))
 }
 
+fn load_tokenizer_config(path: &Path) -> Result<TokenizerConfig, ApiError> {
+    let bytes = fs::read(path).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "Failed to read tokenizer config {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "Failed to parse tokenizer config {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
 fn load_model_assets_uncached(model_id: &str) -> Result<CachedModelAssets, ApiError> {
     let manifest = load_model_manifest_uncached(model_id)?;
     let path = tokenizer_path(model_id, &manifest);
     let tokenizer = load_tokenizer(&path)?;
+    let tokenizer_config = load_tokenizer_config(&tokenizer_config_path(model_id, &manifest))?;
     Ok(CachedModelAssets {
         manifest,
         tokenizer: Arc::new(tokenizer),
+        tokenizer_config: Arc::new(tokenizer_config),
     })
 }
 
@@ -131,11 +165,27 @@ fn tokenizer_path(model_id: &str, manifest: &ModelManifest) -> PathBuf {
     model_dir(model_id).join(&manifest.tokenizer_file)
 }
 
+fn tokenizer_config_path(model_id: &str, manifest: &ModelManifest) -> PathBuf {
+    model_dir(model_id).join(&manifest.tokenizer_config_file)
+}
+
+fn render_generation_prompt(prompt: &str, tokenizer_config: &TokenizerConfig) -> String {
+    match (&tokenizer_config.chat_template, tokenizer_config.eos_token.as_deref()) {
+        (Some(template), Some(eos))
+            if template.contains("<|user|>") && template.contains("<|assistant|>") =>
+        {
+            format!("<|user|>\n{prompt}{eos}\n<|assistant|>\n")
+        }
+        _ => prompt.to_string(),
+    }
+}
+
 pub fn tokenize_prompt(model_id: &str, prompt: &str) -> Result<Vec<u32>, ApiError> {
     let assets = get_model_assets(model_id)?;
+    let rendered_prompt = render_generation_prompt(prompt, &assets.tokenizer_config);
     let encoding = assets
         .tokenizer
-        .encode(prompt, true)
+        .encode(rendered_prompt, true)
         .map_err(|e| ApiError::BadRequest(format!("Failed to tokenize prompt for model {}: {}", model_id, e)))?;
     let ids = encoding
         .get_ids()
@@ -187,6 +237,7 @@ pub mod testsupport {
             tensor_parallelism_dim,
             total_model_bytes: 1024 * 1024,
             tokenizer_file: "tokenizer.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
         };
         atomic_write(
             &model_dir.join("model.json"),
@@ -195,11 +246,14 @@ pub mod testsupport {
 
         let mut vocab = HashMap::new();
         vocab.insert("[UNK]".to_string(), 0);
-        vocab.insert("hello".to_string(), 1);
-        vocab.insert("from".to_string(), 2);
-        vocab.insert("vast".to_string(), 3);
-        vocab.insert("live".to_string(), 4);
-        vocab.insert("mesh".to_string(), 5);
+        vocab.insert("<|user|>".to_string(), 1);
+        vocab.insert("<|assistant|>".to_string(), 2);
+        vocab.insert("</s>".to_string(), 3);
+        vocab.insert("hello".to_string(), 4);
+        vocab.insert("from".to_string(), 5);
+        vocab.insert("vast".to_string(), 6);
+        vocab.insert("live".to_string(), 7);
+        vocab.insert("mesh".to_string(), 8);
         let wordlevel = WordLevel::builder()
             .vocab(vocab)
             .unk_token("[UNK]".to_string())
@@ -212,6 +266,46 @@ pub mod testsupport {
         tokenizer.save(&tokenizer_tmp_path, false).unwrap();
         fs::rename(tokenizer_tmp_path, tokenizer_path).unwrap();
 
+        atomic_write(
+            &model_dir.join("tokenizer_config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "chat_template": "{% for message in messages %}{% if message['role'] == 'user' %}{{ '<|user|>\\n' + message['content'] + eos_token }}{% elif message['role'] == 'assistant' %}{{ '<|assistant|>\\n' + message['content'] + eos_token }}{% endif %}{% if loop.last and add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}{% endfor %}",
+                "eos_token": "</s>"
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+
         model_dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tokenize_prompt_applies_chat_template() {
+        testsupport::ensure_test_model("chat-template-test", 64);
+        clear_model_asset_cache();
+
+        let ids = tokenize_prompt("chat-template-test", "hello from vast").unwrap();
+        let assets = get_model_assets("chat-template-test").unwrap();
+        let expected_prompt = render_generation_prompt("hello from vast", &assets.tokenizer_config);
+        let expected_ids = assets
+            .tokenizer
+            .encode(expected_prompt, true)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        let raw_ids = assets
+            .tokenizer
+            .encode("hello from vast", true)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+
+        assert_eq!(ids, expected_ids);
+        assert_ne!(ids, raw_ids);
     }
 }
