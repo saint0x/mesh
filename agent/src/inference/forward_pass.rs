@@ -574,12 +574,9 @@ impl ForwardPass {
 
     /// Compute logits from final hidden states
     pub fn compute_logits(&self, hidden: &CandleTensor) -> Result<Tensor1D> {
-        // Apply final RMS norm
-        let normed = rms_norm_candle(hidden, &self.device_weights.final_norm, self.config.rms_norm_eps)?;
-
         // Take last token's hidden state
-        let last_hidden = normed
-            .narrow(0, normed.dims()[0] - 1, 1)
+        let last_hidden = hidden
+            .narrow(0, hidden.dims()[0] - 1, 1)
             .map_err(|e| crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
 
         // Project to vocabulary
@@ -1037,5 +1034,36 @@ mod tests {
         assert_eq!(forward.shard_start, 0);
         assert_eq!(forward.shard_end, 16);
         assert_eq!(forward.total_workers, 4);
+    }
+
+    #[test]
+    fn test_local_forward_and_logits_match_single_final_norm_path() {
+        let config = create_test_config();
+        let weights = create_test_weights(&config, config.hidden_dim);
+        let mut forward = LocalForwardPass::new(weights.clone());
+        let tokens = vec![1, 2, 3];
+
+        let hidden = forward.forward(&tokens).unwrap();
+        let last_row = hidden.row(hidden.rows - 1);
+        let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols).unwrap();
+        let logits_from_forward = matmul(&last_hidden, &weights.lm_head).unwrap();
+
+        let hidden_double_norm = rms_norm(
+            &hidden,
+            &weights.final_norm,
+            weights.config.rms_norm_eps,
+        )
+        .unwrap();
+        let last_row_double_norm = hidden_double_norm.row(hidden_double_norm.rows - 1);
+        let last_hidden_double_norm =
+            Tensor2D::new(last_row_double_norm.to_vec(), 1, hidden_double_norm.cols).unwrap();
+        let logits_double_norm = matmul(&last_hidden_double_norm, &weights.lm_head).unwrap();
+
+        assert_eq!(logits_from_forward.rows, logits_double_norm.rows);
+        assert_eq!(logits_from_forward.cols, logits_double_norm.cols);
+        assert_ne!(
+            logits_from_forward.data, logits_double_norm.data,
+            "Applying final norm twice should change logits and must not happen in the distributed path"
+        );
     }
 }

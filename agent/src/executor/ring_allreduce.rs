@@ -201,6 +201,7 @@ impl<'a> WorkerRing<'a> {
     ) -> Result<Tensor> {
         let n = self.total_workers as usize;
         let my_pos = self.my_position as usize;
+        let original_shape = partial_result.shape.clone();
 
         // Split tensor into n chunks
         let mut chunks = partial_result.chunk(n);
@@ -291,7 +292,7 @@ impl<'a> WorkerRing<'a> {
         // Concatenate chunks to get full tensor
         let full_tensor = Tensor::concat(chunks);
 
-        Ok(full_tensor)
+        Ok(Tensor::new(full_tensor.data, original_shape))
     }
 
     /// Ring all-reduce with timeout
@@ -474,6 +475,15 @@ mod tests {
 
         let result = Tensor::concat(vec![t1, t2, t3]);
         assert_eq!(result.data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_reconstruct_full_tensor_preserves_original_shape() {
+        let original = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let chunks = original.chunk(2);
+        let reconstructed = Tensor::new(Tensor::concat(chunks).data, original.shape.clone());
+        assert_eq!(reconstructed.shape, vec![2, 2]);
+        assert_eq!(reconstructed.data, original.data);
     }
 
     #[test]
