@@ -2796,7 +2796,7 @@ async fn cmd_pool_join(
 
     // Verify files were actually written
     let pool_config_file = pool_dir.join("config.toml");
-    let cert_file = pool_dir.join("membership_cert.pem");
+    let cert_file = pool_dir.join("membership.cert");
 
     if !pool_config_file.exists() {
         anyhow::bail!(
