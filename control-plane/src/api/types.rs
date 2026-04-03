@@ -452,4 +452,9 @@ pub struct InferenceJobAssignmentStatus {
     pub ring_position: u32,
     pub status: String,
     pub failure_reason: Option<String>,
+    pub shard_column_start: u32,
+    pub shard_column_end: u32,
+    pub assigned_capacity_units: u32,
+    pub execution_provider: Option<String>,
+    pub execution_time_ms: u64,
 }

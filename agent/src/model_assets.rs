@@ -41,7 +41,11 @@ pub fn model_dir(model_id: &str) -> PathBuf {
     model_store_dir().join(model_id)
 }
 
-fn validate_manifest(requested_model_id: &str, path: &Path, manifest: ModelManifest) -> Result<ModelManifest> {
+fn validate_manifest(
+    requested_model_id: &str,
+    path: &Path,
+    manifest: ModelManifest,
+) -> Result<ModelManifest> {
     if manifest.model_id != requested_model_id {
         return Err(AgentError::Config(format!(
             "Model manifest {} declares model_id {}, expected {}",
@@ -89,7 +93,11 @@ fn load_model_assets_uncached(model_id: &str) -> Result<CachedModelAssets> {
     let manifest = load_model_manifest_uncached(model_id)?;
     let path = model_dir(model_id).join(&manifest.tokenizer_file);
     let tokenizer = Tokenizer::from_file(&path).map_err(|e| {
-        AgentError::Config(format!("Failed to load tokenizer {}: {}", path.display(), e))
+        AgentError::Config(format!(
+            "Failed to load tokenizer {}: {}",
+            path.display(),
+            e
+        ))
     })?;
     Ok(CachedModelAssets {
         manifest,
@@ -105,9 +113,9 @@ fn get_model_assets(model_id: &str) -> Result<CachedModelAssets> {
     }
 
     let assets = load_model_assets_uncached(model_id)?;
-    let mut cache = model_asset_cache()
-        .write()
-        .map_err(|_| AgentError::Config("Failed to acquire model asset cache write lock".to_string()))?;
+    let mut cache = model_asset_cache().write().map_err(|_| {
+        AgentError::Config("Failed to acquire model asset cache write lock".to_string())
+    })?;
     let cached = cache
         .entry(model_id.to_string())
         .or_insert_with(|| assets.clone())
@@ -123,5 +131,10 @@ pub fn decode_tokens(model_id: &str, token_ids: &[u32]) -> Result<String> {
     get_model_assets(model_id)?
         .tokenizer
         .decode(token_ids, true)
-        .map_err(|e| AgentError::Config(format!("Failed to decode tokens for model {}: {}", model_id, e)))
+        .map_err(|e| {
+            AgentError::Config(format!(
+                "Failed to decode tokens for model {}: {}",
+                model_id, e
+            ))
+        })
 }

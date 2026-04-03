@@ -14,7 +14,10 @@ use crate::api::types::{
     InferenceJobStatusResponse, ReportInferenceAssignmentRequest, SubmitInferenceRequest,
     SubmitInferenceResponse,
 };
+use crate::connectivity::InferenceSchedulingPolicy;
+use crate::device::{DeviceCapabilities, Tier};
 use crate::model_assets;
+use crate::provider::ExecutionProviderKind;
 use crate::services::network_service;
 use crate::state::AppState;
 
@@ -44,6 +47,13 @@ struct PersistedJobContext {
     model_id: String,
     submitted_by_device_id: String,
     ring_worker_count: u32,
+}
+
+#[derive(Clone)]
+struct PersistedAssignmentAccounting {
+    assigned_capacity_units: u32,
+    shard_column_start: u32,
+    shard_column_end: u32,
 }
 
 #[instrument(skip(state))]
@@ -110,6 +120,9 @@ pub async fn submit_inference(
         let prompt_tokens_json = serde_json::to_string(&prompt_tokens)
             .map_err(|e| ApiError::Internal(format!("Failed to serialize prompt tokens: {}", e)))?;
 
+        let scheduling_policy =
+            network_service::load_network_settings(&db, &request.network_id)?.scheduling_policy;
+
         let tx = conn
             .transaction()
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -154,11 +167,18 @@ pub async fn submit_inference(
 
         for worker in &workers {
             let assignment_id = Uuid::new_v4().to_string();
+            let assignment_metadata = load_device_assignment_metadata(
+                &tx,
+                &request.network_id,
+                &worker.device_id,
+                &scheduling_policy,
+            )?;
             tx.execute(
                 r#"
                 INSERT INTO inference_job_assignments (
-                    assignment_id, job_id, network_id, device_id, ring_position, status, assigned_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                    assignment_id, job_id, network_id, device_id, ring_position, status, assigned_at,
+                    shard_column_start, shard_column_end, assigned_capacity_units, execution_provider
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                 "#,
                 params![
                     &assignment_id,
@@ -166,7 +186,11 @@ pub async fn submit_inference(
                     &request.network_id,
                     &worker.device_id,
                     worker.position as i64,
-                    &now
+                    &now,
+                    worker.shard.column_range.0 as i64,
+                    worker.shard.column_range.1 as i64,
+                    assignment_metadata.assigned_capacity_units as i64,
+                    assignment_metadata.execution_provider,
                 ],
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -311,6 +335,53 @@ fn validate_submit_request(req: &SubmitInferenceRequest) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+fn execution_provider_label(provider: ExecutionProviderKind) -> &'static str {
+    match provider {
+        ExecutionProviderKind::Cpu => "cpu",
+        ExecutionProviderKind::Metal => "metal",
+        ExecutionProviderKind::Cuda => "cuda",
+    }
+}
+
+fn capacity_units_for_tier(policy: &InferenceSchedulingPolicy, tier: Tier) -> u32 {
+    match tier {
+        Tier::Tier0 => policy.tier_capacity_units.tier0,
+        Tier::Tier1 => policy.tier_capacity_units.tier1,
+        Tier::Tier2 => policy.tier_capacity_units.tier2,
+        Tier::Tier3 => policy.tier_capacity_units.tier3,
+        Tier::Tier4 => policy.tier_capacity_units.tier4,
+    }
+}
+
+fn load_device_assignment_metadata(
+    conn: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    device_id: &str,
+    scheduling_policy: &InferenceSchedulingPolicy,
+) -> ApiResult<PersistedAssignmentAccountingMetadata> {
+    let capabilities_json: String = conn
+        .query_row(
+            "SELECT capabilities FROM devices WHERE network_id = ? AND device_id = ?",
+            params![network_id, device_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
+        .map_err(|e| ApiError::Internal(format!("Failed to parse device capabilities: {}", e)))?;
+
+    Ok(PersistedAssignmentAccountingMetadata {
+        assigned_capacity_units: capacity_units_for_tier(scheduling_policy, capabilities.tier),
+        execution_provider: execution_provider_label(capabilities.default_execution_provider)
+            .to_string(),
+    })
+}
+
+#[derive(Clone)]
+struct PersistedAssignmentAccountingMetadata {
+    assigned_capacity_units: u32,
+    execution_provider: String,
 }
 
 fn claim_assignment(
@@ -600,8 +671,13 @@ fn report_assignment_result(
     let assignment_states = load_assignment_states(&tx, job_id)?;
     let job_context = load_job_context(&tx, job_id)?;
     if req.success {
-        let earned_credits = load_device_tier_multiplier(&tx, &req.device_id)?
-            * (req.execution_time_ms as f64 / 1000.0);
+        let earned_credits = calculate_assignment_credits(
+            &tx,
+            job_id,
+            &job_context,
+            &req.device_id,
+            req.execution_time_ms,
+        )?;
         insert_ledger_event(
             &tx,
             &job_context.network_id,
@@ -623,13 +699,16 @@ fn report_assignment_result(
         .iter()
         .all(|(_, status, _)| status == "completed");
 
+    let authoritative_execution_time_ms =
+        compute_job_execution_time_ms(&tx, job_id, &now).unwrap_or(req.execution_time_ms);
+
     let (job_status, completion, completion_tokens, execution_time_ms, error, completed_at) =
         if let Some((_, _, failure_reason)) = failed {
             (
                 "failed",
                 None,
                 0_i64,
-                req.execution_time_ms as i64,
+                authoritative_execution_time_ms as i64,
                 failure_reason.clone().or_else(|| req.error.clone()),
                 Some(now.clone()),
             )
@@ -645,6 +724,7 @@ fn report_assignment_result(
                 serde_json::json!({
                     "model_id": job_context.model_id,
                     "ring_worker_count": job_context.ring_worker_count,
+                    "execution_time_ms": authoritative_execution_time_ms,
                 }),
             )?;
             insert_ledger_event(
@@ -657,13 +737,14 @@ fn report_assignment_result(
                 serde_json::json!({
                     "model_id": job_context.model_id,
                     "ring_worker_count": job_context.ring_worker_count,
+                    "execution_time_ms": authoritative_execution_time_ms,
                 }),
             )?;
             (
                 "completed",
                 req.completion.clone(),
                 req.completion_tokens.unwrap_or(0) as i64,
-                req.execution_time_ms as i64,
+                authoritative_execution_time_ms as i64,
                 None,
                 Some(now.clone()),
             )
@@ -732,7 +813,9 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT device_id, ring_position, status, failure_reason
+            SELECT device_id, ring_position, status, failure_reason,
+                   shard_column_start, shard_column_end, assigned_capacity_units,
+                   execution_provider, execution_time_ms
             FROM inference_job_assignments
             WHERE job_id = ?
             ORDER BY ring_position ASC
@@ -747,6 +830,11 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                 ring_position: row.get::<_, i64>(1)? as u32,
                 status: row.get(2)?,
                 failure_reason: row.get(3)?,
+                shard_column_start: row.get::<_, i64>(4)? as u32,
+                shard_column_end: row.get::<_, i64>(5)? as u32,
+                assigned_capacity_units: row.get::<_, i64>(6)? as u32,
+                execution_provider: row.get(7)?,
+                execution_time_ms: row.get::<_, i64>(8)? as u64,
             })
         })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
@@ -804,48 +892,79 @@ fn load_job_context(
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
-fn load_device_tier_multiplier(
+fn load_assignment_accounting(
     conn: &rusqlite::Transaction<'_>,
+    job_id: &str,
     device_id: &str,
-) -> ApiResult<f64> {
-    let tier: String = conn
-        .query_row(
-            "SELECT json_extract(capabilities, '$.tier') FROM devices WHERE device_id = ?",
-            params![device_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+) -> ApiResult<PersistedAssignmentAccounting> {
+    conn.query_row(
+        r#"
+        SELECT assigned_capacity_units, shard_column_start, shard_column_end
+        FROM inference_job_assignments
+        WHERE job_id = ? AND device_id = ?
+        "#,
+        params![job_id, device_id],
+        |row| {
+            Ok(PersistedAssignmentAccounting {
+                assigned_capacity_units: row.get::<_, i64>(0)? as u32,
+                shard_column_start: row.get::<_, i64>(1)? as u32,
+                shard_column_end: row.get::<_, i64>(2)? as u32,
+            })
+        },
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
 
-    Ok(match tier.as_str() {
-        "Tier0" => 1.0,
-        "Tier1" => 2.0,
-        "Tier2" => 4.0,
-        "Tier3" => 8.0,
-        "Tier4" => 16.0,
-        _ => 1.0,
-    })
+fn calculate_assignment_credits(
+    conn: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    job_context: &PersistedJobContext,
+    device_id: &str,
+    execution_time_ms: u64,
+) -> ApiResult<f64> {
+    let assignment = load_assignment_accounting(conn, job_id, device_id)?;
+    let total_columns = model_assets::load_model_manifest(&job_context.model_id)?
+        .tensor_parallelism_dim
+        .max(1);
+    let shard_columns = assignment
+        .shard_column_end
+        .saturating_sub(assignment.shard_column_start)
+        .max(1);
+    let shard_fraction = shard_columns as f64 / total_columns as f64;
+    Ok((execution_time_ms as f64 / 1000.0)
+        * f64::from(assignment.assigned_capacity_units.max(1))
+        * shard_fraction)
+}
+
+fn compute_job_execution_time_ms(
+    conn: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    completed_at: &str,
+) -> ApiResult<u64> {
+    conn.query_row(
+        r#"
+        SELECT COALESCE(
+            MAX(0, CAST(ROUND((julianday(?1) - julianday(started_at)) * 86400000.0) AS INTEGER)),
+            0
+        )
+        FROM inference_jobs
+        WHERE job_id = ?2
+          AND started_at IS NOT NULL
+        "#,
+        params![completed_at, job_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value.max(0) as u64)
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
 fn load_total_credits_earned(conn: &rusqlite::Transaction<'_>, job_id: &str) -> ApiResult<f64> {
     conn.query_row(
         r#"
-        SELECT COALESCE(SUM(
-            (assignment.execution_time_ms / 1000.0) *
-            CASE json_extract(device.capabilities, '$.tier')
-                WHEN 'Tier0' THEN 1.0
-                WHEN 'Tier1' THEN 2.0
-                WHEN 'Tier2' THEN 4.0
-                WHEN 'Tier3' THEN 8.0
-                WHEN 'Tier4' THEN 16.0
-                ELSE 1.0
-            END
-        ), 0.0)
-        FROM inference_job_assignments assignment
-        INNER JOIN devices device
-            ON device.device_id = assignment.device_id
-           AND device.network_id = assignment.network_id
-        WHERE assignment.job_id = ?
-          AND assignment.status = 'completed'
+        SELECT COALESCE(SUM(COALESCE(credits_amount, 0)), 0.0)
+        FROM ledger_events
+        WHERE job_id = ?
+          AND event_type = 'credits_earned'
         "#,
         params![job_id],
         |row| row.get(0),
@@ -1269,6 +1388,128 @@ mod tests {
         assert_eq!(summary.total_jobs_completed, 1);
         assert!(summary.total_credits_earned > 0.0);
         assert!(summary.total_credits_burned > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_job_status_exposes_assignment_accounting_metadata() {
+        let network_id = "test-network-assignment-metadata";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "metadata".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let status = get_inference_job_status(State(state), Path(submit.job_id))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(status.assignments.len(), 2);
+        assert!(status
+            .assignments
+            .iter()
+            .all(|assignment| assignment.execution_provider.is_some()));
+        assert!(status
+            .assignments
+            .iter()
+            .all(|assignment| assignment.assigned_capacity_units >= 1));
+        assert_eq!(status.assignments[0].shard_column_start, 0);
+        assert_eq!(
+            status
+                .assignments
+                .last()
+                .expect("expected final assignment")
+                .shard_column_end,
+            8192
+        );
+    }
+
+    #[tokio::test]
+    async fn test_completed_job_uses_authoritative_wall_clock_execution_time() {
+        let network_id = "test-network-authoritative-wall-clock";
+        let state = joined_state(&["worker-1"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "timing".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let started_at = format_time(OffsetDateTime::now_utc() - Duration::seconds(5)).unwrap();
+        let conn = state.db.get_conn().unwrap();
+        conn.execute(
+            "UPDATE inference_jobs SET started_at = ? WHERE job_id = ?",
+            params![started_at, &submit.job_id],
+        )
+        .unwrap();
+
+        let claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected assignment");
+
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(claim.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = report_inference_result(
+            State(state.clone()),
+            Path(claim.job_id.clone()),
+            Json(ReportInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                success: true,
+                completion: Some("done".into()),
+                completion_tokens: Some(1),
+                execution_time_ms: 25,
+                error: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let status = get_inference_job_status(State(state), Path(submit.job_id))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(status.status, "completed");
+        assert!(status.execution_time_ms >= 4_000);
     }
 
     #[tokio::test]

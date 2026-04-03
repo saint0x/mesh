@@ -48,7 +48,10 @@ impl Database {
         // If the path contains "?mode=memory", it's a unique in-memory DB, use as-is
         let is_memory = database_path == ":memory:" || database_path.contains("?mode=memory");
         let connection_string = if database_path == ":memory:" {
-            format!("file:meshnet-{}?mode=memory&cache=shared", uuid::Uuid::new_v4())
+            format!(
+                "file:meshnet-{}?mode=memory&cache=shared",
+                uuid::Uuid::new_v4()
+            )
         } else {
             database_path.to_string()
         };
@@ -106,7 +109,9 @@ impl Database {
             let filename = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .ok_or_else(|| DbError::Config(format!("Invalid migration filename: {}", path.display())))?
+                .ok_or_else(|| {
+                    DbError::Config(format!("Invalid migration filename: {}", path.display()))
+                })?
                 .to_string();
 
             let already_applied: Option<String> = conn
@@ -336,7 +341,9 @@ mod tests {
 
         let conn = db.get_conn().expect("Failed to get connection");
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
             .expect("Failed to count applied migrations");
         assert!(count >= 1);
     }

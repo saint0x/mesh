@@ -140,8 +140,9 @@ impl ArtifactShardLoader {
         assignment: &ShardAssignment,
         bytes: &[u8],
     ) -> Result<ModelWeights> {
-        let (_, metadata) = SafeTensors::read_metadata(bytes)
-            .map_err(|e| AgentError::Config(format!("Failed to read safetensors metadata: {}", e)))?;
+        let (_, metadata) = SafeTensors::read_metadata(bytes).map_err(|e| {
+            AgentError::Config(format!("Failed to read safetensors metadata: {}", e))
+        })?;
         let tensors = SafeTensors::deserialize(bytes)
             .map_err(|e| AgentError::Config(format!("Failed to open safetensors shard: {}", e)))?;
 
@@ -168,7 +169,14 @@ impl ArtifactShardLoader {
             });
         }
 
-        validate_weight_shapes(&config, assignment, &embedding, &final_norm, &lm_head, &layers)?;
+        validate_weight_shapes(
+            &config,
+            assignment,
+            &embedding,
+            &final_norm,
+            &lm_head,
+            &layers,
+        )?;
 
         Ok(ModelWeights {
             model_id: model_id.to_string(),
@@ -350,11 +358,7 @@ fn load_tensor_2d(tensors: &SafeTensors<'_>, name: &str) -> Result<Tensor2D> {
         )));
     }
 
-    Tensor2D::new(
-        bytes_to_f32_vec(tensor.data(), name)?,
-        shape[0],
-        shape[1],
-    )
+    Tensor2D::new(bytes_to_f32_vec(tensor.data(), name)?, shape[0], shape[1])
 }
 
 fn load_tensor_1d(tensors: &SafeTensors<'_>, name: &str) -> Result<Tensor1D> {
@@ -418,8 +422,11 @@ fn validate_weight_shapes(
     let expected_cols = assignment.num_columns() as usize;
     let head_dim = config.hidden_dim / config.num_heads;
     let kv_total_cols = config.num_kv_heads * head_dim;
-    let expected_kv_cols =
-        partition_columns(kv_total_cols, assignment.worker_position, assignment.total_workers);
+    let expected_kv_cols = partition_columns(
+        kv_total_cols,
+        assignment.worker_position,
+        assignment.total_workers,
+    );
     let expected_mlp_cols = partition_columns(
         config.intermediate_size,
         assignment.worker_position,
@@ -454,7 +461,13 @@ fn validate_weight_shapes(
     }
 
     for layer in layers {
-        validate_layer_shape(&layer.w_q, config.hidden_dim, expected_cols, "w_q", layer.layer_idx)?;
+        validate_layer_shape(
+            &layer.w_q,
+            config.hidden_dim,
+            expected_cols,
+            "w_q",
+            layer.layer_idx,
+        )?;
         validate_layer_shape(
             &layer.w_k,
             config.hidden_dim,
@@ -469,7 +482,13 @@ fn validate_weight_shapes(
             "w_v",
             layer.layer_idx,
         )?;
-        validate_layer_shape(&layer.w_o, expected_cols, config.hidden_dim, "w_o", layer.layer_idx)?;
+        validate_layer_shape(
+            &layer.w_o,
+            expected_cols,
+            config.hidden_dim,
+            "w_o",
+            layer.layer_idx,
+        )?;
         validate_layer_shape(
             &layer.w_up,
             config.hidden_dim,
@@ -492,8 +511,7 @@ fn validate_weight_shapes(
             layer.layer_idx,
         )?;
 
-        if layer.attn_norm.len() != config.hidden_dim || layer.mlp_norm.len() != config.hidden_dim
-        {
+        if layer.attn_norm.len() != config.hidden_dim || layer.mlp_norm.len() != config.hidden_dim {
             return Err(AgentError::Config(format!(
                 "Layer {} norm shape mismatch",
                 layer.layer_idx
@@ -552,7 +570,10 @@ mod tests {
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
     }
 
     fn tensor2(shape: [usize; 2], start: f32) -> TestTensor {
@@ -584,8 +605,11 @@ mod tests {
         let num_kv_heads = 2usize;
         let head_dim = hidden_dim / num_heads;
         let kv_total_cols = num_kv_heads * head_dim;
-        let kv_shard_cols =
-            partition_columns(kv_total_cols, assignment.worker_position, assignment.total_workers);
+        let kv_shard_cols = partition_columns(
+            kv_total_cols,
+            assignment.worker_position,
+            assignment.total_workers,
+        );
         let mlp_shard_cols = partition_columns(
             intermediate_size,
             assignment.worker_position,
@@ -605,19 +629,46 @@ mod tests {
         ));
 
         let mut tensors = vec![
-            ("embedding".to_string(), tensor2([vocab_size, hidden_dim], 0.0)),
+            (
+                "embedding".to_string(),
+                tensor2([vocab_size, hidden_dim], 0.0),
+            ),
             ("final_norm".to_string(), tensor1(hidden_dim, 1000.0)),
-            ("lm_head".to_string(), tensor2([hidden_dim, vocab_size], 2000.0)),
+            (
+                "lm_head".to_string(),
+                tensor2([hidden_dim, vocab_size], 2000.0),
+            ),
         ];
         for layer_idx in 0..num_layers {
             let prefix = format!("layers.{layer_idx}");
-            tensors.push((format!("{prefix}.w_q"), tensor2([hidden_dim, q_shard_cols], 10.0)));
-            tensors.push((format!("{prefix}.w_k"), tensor2([hidden_dim, kv_shard_cols], 20.0)));
-            tensors.push((format!("{prefix}.w_v"), tensor2([hidden_dim, kv_shard_cols], 30.0)));
-            tensors.push((format!("{prefix}.w_o"), tensor2([q_shard_cols, hidden_dim], 40.0)));
-            tensors.push((format!("{prefix}.w_up"), tensor2([hidden_dim, mlp_shard_cols], 50.0)));
-            tensors.push((format!("{prefix}.w_gate"), tensor2([hidden_dim, mlp_shard_cols], 60.0)));
-            tensors.push((format!("{prefix}.w_down"), tensor2([mlp_shard_cols, hidden_dim], 70.0)));
+            tensors.push((
+                format!("{prefix}.w_q"),
+                tensor2([hidden_dim, q_shard_cols], 10.0),
+            ));
+            tensors.push((
+                format!("{prefix}.w_k"),
+                tensor2([hidden_dim, kv_shard_cols], 20.0),
+            ));
+            tensors.push((
+                format!("{prefix}.w_v"),
+                tensor2([hidden_dim, kv_shard_cols], 30.0),
+            ));
+            tensors.push((
+                format!("{prefix}.w_o"),
+                tensor2([q_shard_cols, hidden_dim], 40.0),
+            ));
+            tensors.push((
+                format!("{prefix}.w_up"),
+                tensor2([hidden_dim, mlp_shard_cols], 50.0),
+            ));
+            tensors.push((
+                format!("{prefix}.w_gate"),
+                tensor2([hidden_dim, mlp_shard_cols], 60.0),
+            ));
+            tensors.push((
+                format!("{prefix}.w_down"),
+                tensor2([mlp_shard_cols, hidden_dim], 70.0),
+            ));
             tensors.push((format!("{prefix}.attn_norm"), tensor1(hidden_dim, 80.0)));
             tensors.push((format!("{prefix}.mlp_norm"), tensor1(hidden_dim, 90.0)));
         }
@@ -645,8 +696,11 @@ mod tests {
             ("mesh.rope_base".to_string(), "10000".to_string()),
         ]);
 
-        let bytes = serialize(tensors.iter().map(|(name, tensor)| (name.clone(), tensor)), Some(metadata))
-            .map_err(|e| AgentError::Config(format!("Failed to serialize test shard: {}", e)))?;
+        let bytes = serialize(
+            tensors.iter().map(|(name, tensor)| (name.clone(), tensor)),
+            Some(metadata),
+        )
+        .map_err(|e| AgentError::Config(format!("Failed to serialize test shard: {}", e)))?;
         fs::write(&artifact_path, &bytes)?;
 
         let manifest = ShardArtifactManifest {

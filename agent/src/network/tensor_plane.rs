@@ -1,9 +1,9 @@
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use std::collections::VecDeque;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -726,7 +726,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_recv_matching_buffers_nonmatching_messages() {
-        let mut plane = TensorPlane::bind(TensorPlaneConfig::default()).await.unwrap();
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
         let addr = plane.local_addr();
 
         let mut first = test_message(4);

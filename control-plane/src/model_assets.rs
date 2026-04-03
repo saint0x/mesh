@@ -91,16 +91,31 @@ fn validate_manifest(
 
 fn load_model_manifest_uncached(model_id: &str) -> Result<ModelManifest, ApiError> {
     let path = model_manifest_path(model_id);
-    let bytes = fs::read(&path)
-        .map_err(|e| ApiError::BadRequest(format!("Failed to read model manifest {}: {}", path.display(), e)))?;
-    let manifest: ModelManifest = serde_json::from_slice(&bytes)
-        .map_err(|e| ApiError::BadRequest(format!("Failed to parse model manifest {}: {}", path.display(), e)))?;
+    let bytes = fs::read(&path).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "Failed to read model manifest {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let manifest: ModelManifest = serde_json::from_slice(&bytes).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "Failed to parse model manifest {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
     validate_manifest(model_id, &path, manifest)
 }
 
 fn load_tokenizer(path: &Path) -> Result<Tokenizer, ApiError> {
-    Tokenizer::from_file(path)
-        .map_err(|e| ApiError::BadRequest(format!("Failed to load tokenizer {}: {}", path.display(), e)))
+    Tokenizer::from_file(path).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "Failed to load tokenizer {}: {}",
+            path.display(),
+            e
+        ))
+    })
 }
 
 fn load_tokenizer_config(path: &Path) -> Result<TokenizerConfig, ApiError> {
@@ -140,9 +155,9 @@ fn get_model_assets(model_id: &str) -> Result<CachedModelAssets, ApiError> {
     }
 
     let assets = load_model_assets_uncached(model_id)?;
-    let mut cache = model_asset_cache()
-        .write()
-        .map_err(|_| ApiError::Internal("Failed to acquire model asset cache write lock".to_string()))?;
+    let mut cache = model_asset_cache().write().map_err(|_| {
+        ApiError::Internal("Failed to acquire model asset cache write lock".to_string())
+    })?;
     let cached = cache
         .entry(model_id.to_string())
         .or_insert_with(|| assets.clone())
@@ -170,7 +185,10 @@ fn tokenizer_config_path(model_id: &str, manifest: &ModelManifest) -> PathBuf {
 }
 
 fn render_generation_prompt(prompt: &str, tokenizer_config: &TokenizerConfig) -> String {
-    match (&tokenizer_config.chat_template, tokenizer_config.eos_token.as_deref()) {
+    match (
+        &tokenizer_config.chat_template,
+        tokenizer_config.eos_token.as_deref(),
+    ) {
         (Some(template), Some(eos))
             if template.contains("<|user|>") && template.contains("<|assistant|>") =>
         {
@@ -186,12 +204,13 @@ pub fn tokenize_prompt(model_id: &str, prompt: &str) -> Result<Vec<u32>, ApiErro
     let encoding = assets
         .tokenizer
         .encode(rendered_prompt, true)
-        .map_err(|e| ApiError::BadRequest(format!("Failed to tokenize prompt for model {}: {}", model_id, e)))?;
-    let ids = encoding
-        .get_ids()
-        .iter()
-        .copied()
-        .collect::<Vec<u32>>();
+        .map_err(|e| {
+            ApiError::BadRequest(format!(
+                "Failed to tokenize prompt for model {}: {}",
+                model_id, e
+            ))
+        })?;
+    let ids = encoding.get_ids().iter().copied().collect::<Vec<u32>>();
     if ids.is_empty() {
         return Err(ApiError::BadRequest(format!(
             "Prompt tokenization produced zero tokens for model {}",

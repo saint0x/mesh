@@ -1,10 +1,12 @@
 use crate::api::error::{ApiError, ApiResult};
 use crate::connectivity::{
     ConnectivityPath, ConnectivityStatus, DeviceConnectivityState, DirectCandidateScope,
-    DirectPeerCandidate,
+    DirectPeerCandidate, InferenceSchedulingPolicy,
 };
 use crate::db::Database;
+use crate::device::{DeviceCapabilities, Tier};
 use crate::model_assets;
+use crate::services::network_service;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -120,6 +122,89 @@ pub struct RingTopologyManager {
     mutation_lock: Mutex<()>,
 }
 
+#[derive(Debug, Clone)]
+struct WorkerCapacityProfile {
+    tier: Tier,
+    contributed_memory: u64,
+    fallback_memory_mb: u64,
+}
+
+fn tier_capacity_units(policy: &InferenceSchedulingPolicy, tier: Tier) -> u32 {
+    match tier {
+        Tier::Tier0 => policy.tier_capacity_units.tier0,
+        Tier::Tier1 => policy.tier_capacity_units.tier1,
+        Tier::Tier2 => policy.tier_capacity_units.tier2,
+        Tier::Tier3 => policy.tier_capacity_units.tier3,
+        Tier::Tier4 => policy.tier_capacity_units.tier4,
+    }
+}
+
+fn effective_capacity_weight(
+    profile: &WorkerCapacityProfile,
+    scheduling_policy: &InferenceSchedulingPolicy,
+) -> u128 {
+    let memory_mb = if profile.contributed_memory > 0 {
+        (profile.contributed_memory / (1024 * 1024)).max(1)
+    } else {
+        profile.fallback_memory_mb.max(1)
+    };
+    u128::from(tier_capacity_units(scheduling_policy, profile.tier).max(1)) * u128::from(memory_mb)
+}
+
+fn allocate_weighted_column_ranges(
+    total_columns: u32,
+    profiles: &[WorkerCapacityProfile],
+    scheduling_policy: &InferenceSchedulingPolicy,
+) -> Vec<(u32, u32)> {
+    if profiles.is_empty() {
+        return Vec::new();
+    }
+
+    let weights: Vec<u128> = profiles
+        .iter()
+        .map(|profile| effective_capacity_weight(profile, scheduling_policy).max(1))
+        .collect();
+    let total_weight: u128 = weights.iter().sum::<u128>().max(1);
+
+    let mut widths: Vec<u32> = weights
+        .iter()
+        .map(|weight| ((u128::from(total_columns) * *weight) / total_weight) as u32)
+        .collect();
+    let assigned_columns: u32 = widths.iter().sum();
+    let mut remaining_columns = total_columns.saturating_sub(assigned_columns);
+
+    let mut remainders: Vec<(usize, u128)> = weights
+        .iter()
+        .enumerate()
+        .map(|(index, weight)| (index, (u128::from(total_columns) * *weight) % total_weight))
+        .collect();
+    remainders.sort_by(
+        |(left_index, left_remainder), (right_index, right_remainder)| {
+            right_remainder
+                .cmp(left_remainder)
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+
+    let mut cursor = 0usize;
+    while remaining_columns > 0 {
+        widths[remainders[cursor].0] += 1;
+        remaining_columns -= 1;
+        cursor = (cursor + 1) % remainders.len();
+    }
+
+    let mut start = 0u32;
+    widths
+        .into_iter()
+        .map(|width| {
+            let end = start + width;
+            let range = (start, end);
+            start = end;
+            range
+        })
+        .collect()
+}
+
 impl RingTopologyManager {
     /// Create a new RingTopologyManager
     pub fn new(db: Arc<Database>) -> Self {
@@ -188,7 +273,7 @@ impl RingTopologyManager {
 
     /// Add a worker to the ring topology
     ///
-    /// Assigns a sequential ring position, calculates shard column range,
+    /// Assigns a sequential ring position, recalculates weighted shard column ranges,
     /// updates all neighbors, and persists to database atomically.
     pub fn add_worker(&self, worker: Worker) -> ApiResult<RingPosition> {
         let _mutation_guard = self
@@ -196,7 +281,6 @@ impl RingTopologyManager {
             .lock()
             .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
 
-        // Validate worker
         if worker.device_id.is_empty() {
             return Err(ApiError::BadRequest(
                 "device_id cannot be empty".to_string(),
@@ -210,7 +294,6 @@ impl RingTopologyManager {
 
         let conn = self.db.get_conn()?;
 
-        // Verify device exists in database
         let device_exists: Option<String> = conn
             .query_row(
                 "SELECT device_id FROM devices WHERE device_id = ?",
@@ -227,7 +310,6 @@ impl RingTopologyManager {
             )));
         }
 
-        // Acquire write locks
         let mut workers_map = self
             .workers
             .write()
@@ -236,7 +318,6 @@ impl RingTopologyManager {
             ApiError::Internal("Failed to acquire ring_sequence write lock".to_string())
         })?;
 
-        // Check if worker already in ring
         if workers_map.contains_key(&worker.device_id) {
             return Err(ApiError::Conflict(format!(
                 "Worker {} already in ring",
@@ -244,72 +325,33 @@ impl RingTopologyManager {
             )));
         }
 
-        // Assign ring position (next sequential position)
         let new_position = ring_seq.len() as u32;
         let total_workers = ring_seq.len() + 1;
 
-        // Calculate shard assignment
-        let shard = self.assign_shard(&worker.model_id, new_position, total_workers as u32)?;
-
-        // Calculate neighbors (will be updated for all workers)
-        let (left_neighbor, right_neighbor) = if total_workers == 1 {
-            // Single worker: neighbors are itself
-            (worker.device_id.clone(), worker.device_id.clone())
-        } else {
-            let left_pos = if new_position == 0 {
-                total_workers as u32 - 1
-            } else {
-                new_position - 1
-            };
-            let right_pos = (new_position + 1) % total_workers as u32;
-
-            let left = ring_seq.get(left_pos as usize).cloned().unwrap_or_default();
-            let right = if right_pos == new_position {
-                worker.device_id.clone()
-            } else {
-                ring_seq
-                    .get(right_pos as usize)
-                    .cloned()
-                    .unwrap_or_default()
-            };
-            (left, right)
-        };
-
-        // Update worker with position
         let mut updated_worker = worker.clone();
         updated_worker.ring_position = Some(new_position);
-
-        // Add to in-memory structures
         ring_seq.push(worker.device_id.clone());
         workers_map.insert(worker.device_id.clone(), updated_worker);
 
-        // Persist to database atomically
-
-        // Begin transaction
         conn.execute("BEGIN TRANSACTION", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-        // Update the new worker
         let update_result = conn.execute(
             r#"
             UPDATE devices SET
                 ring_position = ?,
                 shard_model_id = ?,
-                shard_column_start = ?,
-                shard_column_end = ?,
+                shard_column_start = 0,
+                shard_column_end = 0,
                 contributed_memory = ?,
-                left_neighbor_id = ?,
-                right_neighbor_id = ?
+                left_neighbor_id = NULL,
+                right_neighbor_id = NULL
             WHERE device_id = ?
             "#,
             params![
                 new_position,
-                &shard.model_id,
-                shard.column_range.0,
-                shard.column_range.1,
+                &worker.model_id,
                 worker.contributed_memory as i64,
-                &left_neighbor,
-                &right_neighbor,
                 &worker.device_id
             ],
         );
@@ -321,16 +363,30 @@ impl RingTopologyManager {
             ))));
         }
 
-        // Update ring connections for all workers
-        if let Err(e) =
-            self.update_ring_connections_internal(&conn, &ring_seq, total_workers as u32)
-        {
-            conn.execute("ROLLBACK", []).ok();
-            return Err(e);
-        }
+        let assigned_shards = match self.update_ring_connections_internal(&conn, &ring_seq) {
+            Ok(assigned_shards) => assigned_shards,
+            Err(e) => {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(e);
+            }
+        };
 
-        // Commit transaction
         conn.execute("COMMIT", [])
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+        let shard = assigned_shards
+            .get(&worker.device_id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::Internal("Failed to resolve shard after ring update".to_string())
+            })?;
+
+        let (left_neighbor, right_neighbor): (String, String) = conn
+            .query_row(
+                "SELECT left_neighbor_id, right_neighbor_id FROM devices WHERE device_id = ?",
+                params![&worker.device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
         info!(
@@ -350,52 +406,122 @@ impl RingTopologyManager {
         })
     }
 
-    /// Calculate shard assignment for a given position
-    ///
-    /// Formula: columns_per_worker = tensor_parallelism_dim / total_workers
-    /// Worker N gets columns: [N * columns_per_worker, (N+1) * columns_per_worker)
-    pub fn assign_shard(
+    fn load_worker_capacity_profiles(
+        &self,
+        conn: &rusqlite::Connection,
+        ring_seq: &[DeviceId],
+    ) -> ApiResult<Vec<WorkerCapacityProfile>> {
+        let mut profiles = Vec::with_capacity(ring_seq.len());
+        for device_id in ring_seq {
+            let (capabilities_json, contributed_memory): (String, Option<i64>) = conn
+                .query_row(
+                    "SELECT capabilities, contributed_memory FROM devices WHERE device_id = ?",
+                    params![device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to parse device capabilities: {}", e))
+                })?;
+            profiles.push(WorkerCapacityProfile {
+                tier: capabilities.tier,
+                contributed_memory: contributed_memory.unwrap_or_default().max(0) as u64,
+                fallback_memory_mb: capabilities.ram_mb as u64
+                    + capabilities.gpu_vram_mb.unwrap_or_default() as u64,
+            });
+        }
+        Ok(profiles)
+    }
+
+    fn assign_shards_for_ring(
+        &self,
+        conn: &rusqlite::Connection,
+        ring_seq: &[DeviceId],
+    ) -> ApiResult<Vec<ModelShard>> {
+        if ring_seq.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (network_id, model_id): (String, String) = conn
+            .query_row(
+                "SELECT network_id, shard_model_id FROM devices WHERE device_id = ? AND shard_model_id IS NOT NULL",
+                params![&ring_seq[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+        for device_id in ring_seq.iter().skip(1) {
+            let candidate_model_id: String = conn
+                .query_row(
+                    "SELECT shard_model_id FROM devices WHERE device_id = ? AND shard_model_id IS NOT NULL",
+                    params![device_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            if candidate_model_id != model_id {
+                return Err(ApiError::Conflict(
+                    "Ring contains mixed model IDs; weighted shard assignment requires a single model ring"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let scheduling_policy =
+            network_service::load_network_settings(&self.db, &network_id)?.scheduling_policy;
+        let profiles = self.load_worker_capacity_profiles(conn, ring_seq)?;
+        let manifest = model_assets::load_model_manifest(&model_id)?;
+        let ranges = allocate_weighted_column_ranges(
+            manifest.tensor_parallelism_dim,
+            &profiles,
+            &scheduling_policy,
+        );
+
+        Ok(profiles
+            .into_iter()
+            .zip(ranges.into_iter())
+            .map(|(_profile, column_range)| ModelShard {
+                model_id: model_id.clone(),
+                estimated_memory: ((manifest.total_model_bytes as u128)
+                    * u128::from(column_range.1.saturating_sub(column_range.0))
+                    / u128::from(manifest.tensor_parallelism_dim.max(1)))
+                    as u64,
+                column_range,
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
+    fn assign_shard(
         &self,
         model_id: &str,
         position: u32,
         total_workers: u32,
     ) -> ApiResult<ModelShard> {
-        if total_workers == 0 {
-            return Ok(ModelShard {
-                model_id: model_id.to_string(),
-                column_range: (0, 0),
-                estimated_memory: 0,
-            });
-        }
-
         let manifest = model_assets::load_model_manifest(model_id)?;
-        let total_columns = manifest.tensor_parallelism_dim;
-
-        let columns_per_worker = total_columns / total_workers;
-        let remainder = total_columns % total_workers;
-
-        // Distribute remainder columns to the first 'remainder' workers
-        let start = if position < remainder {
-            position * (columns_per_worker + 1)
-        } else {
-            remainder * (columns_per_worker + 1) + (position - remainder) * columns_per_worker
-        };
-
-        let end = if position < remainder {
-            start + columns_per_worker + 1
-        } else {
-            start + columns_per_worker
-        };
-
-        // Estimate memory based on column count (rough estimate: 1MB per column)
-        let estimated_memory =
-            ((manifest.total_model_bytes as u128) * (end - start) as u128 / total_columns as u128)
-                as u64;
-
+        let profiles = (0..total_workers)
+            .map(|_| WorkerCapacityProfile {
+                tier: Tier::Tier1,
+                contributed_memory: 1,
+                fallback_memory_mb: 1,
+            })
+            .collect::<Vec<_>>();
+        let ranges = allocate_weighted_column_ranges(
+            manifest.tensor_parallelism_dim,
+            &profiles,
+            &InferenceSchedulingPolicy::default(),
+        );
+        let column_range = ranges
+            .get(position as usize)
+            .copied()
+            .ok_or_else(|| ApiError::BadRequest("invalid test shard position".to_string()))?;
         Ok(ModelShard {
             model_id: model_id.to_string(),
-            column_range: (start, end),
-            estimated_memory,
+            estimated_memory: ((manifest.total_model_bytes as u128)
+                * u128::from(column_range.1.saturating_sub(column_range.0))
+                / u128::from(manifest.tensor_parallelism_dim.max(1)))
+                as u64,
+            column_range,
         })
     }
 
@@ -415,24 +541,20 @@ impl RingTopologyManager {
             ApiError::Internal("Failed to acquire ring_sequence read lock".to_string())
         })?;
 
-        let total_workers = ring_seq.len() as u32;
-
-        // Begin transaction
         conn.execute("BEGIN TRANSACTION", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-        if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq, total_workers) {
+        if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq) {
             conn.execute("ROLLBACK", []).ok();
             return Err(e);
         }
 
-        // Commit transaction
         conn.execute("COMMIT", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
         info!(
             network_id = %network_id,
-            total_workers = total_workers,
+            total_workers = ring_seq.len(),
             "Ring connections updated"
         );
 
@@ -444,13 +566,18 @@ impl RingTopologyManager {
         &self,
         conn: &rusqlite::Connection,
         ring_seq: &[DeviceId],
-        total_workers: u32,
-    ) -> ApiResult<()> {
+    ) -> ApiResult<HashMap<DeviceId, ModelShard>> {
+        let total_workers = ring_seq.len() as u32;
         if total_workers == 0 {
-            return Ok(());
+            return Ok(HashMap::new());
         }
 
-        for (pos, device_id) in ring_seq.iter().enumerate() {
+        let assigned_shards = self.assign_shards_for_ring(conn, ring_seq)?;
+        let mut shard_map = HashMap::with_capacity(assigned_shards.len());
+
+        for ((pos, device_id), shard) in
+            ring_seq.iter().enumerate().zip(assigned_shards.into_iter())
+        {
             let position = pos as u32;
 
             let (left_neighbor, right_neighbor) = if total_workers == 1 {
@@ -462,7 +589,6 @@ impl RingTopologyManager {
                     position - 1
                 };
                 let right_pos = (position + 1) % total_workers;
-
                 let left = ring_seq.get(left_pos as usize).cloned().unwrap_or_default();
                 let right = ring_seq
                     .get(right_pos as usize)
@@ -470,16 +596,6 @@ impl RingTopologyManager {
                     .unwrap_or_default();
                 (left, right)
             };
-
-            // Recalculate shard for updated total
-            let model_id: String = conn
-                .query_row(
-                    "SELECT shard_model_id FROM devices WHERE device_id = ? AND shard_model_id IS NOT NULL",
-                    params![device_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            let shard = self.assign_shard(&model_id, position, total_workers)?;
 
             conn.execute(
                 r#"
@@ -503,9 +619,11 @@ impl RingTopologyManager {
                 ],
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+            shard_map.insert(device_id.clone(), shard);
         }
 
-        Ok(())
+        Ok(shard_map)
     }
 
     /// Handle worker failure (leave ring)
@@ -587,7 +705,7 @@ impl RingTopologyManager {
         }
 
         // Update ring connections for remaining workers
-        if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq, remaining_workers) {
+        if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq) {
             conn.execute("ROLLBACK", []).ok();
             return Err(e);
         }
@@ -979,6 +1097,67 @@ mod tests {
                 "Last shard should end at {}",
                 8192
             );
+        }
+    }
+
+    #[test]
+    fn test_allocate_weighted_column_ranges_biases_capacity() {
+        let ranges = allocate_weighted_column_ranges(
+            8192,
+            &[
+                WorkerCapacityProfile {
+                    tier: Tier::Tier4,
+                    contributed_memory: 16 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 16384,
+                },
+                WorkerCapacityProfile {
+                    tier: Tier::Tier0,
+                    contributed_memory: 2 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 2048,
+                },
+            ],
+            &InferenceSchedulingPolicy::default(),
+        );
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[1].1, 8192);
+        assert_eq!(ranges[0].1, ranges[1].0);
+
+        let first_width = ranges[0].1 - ranges[0].0;
+        let second_width = ranges[1].1 - ranges[1].0;
+        assert!(first_width > second_width);
+    }
+
+    #[test]
+    fn test_allocate_weighted_column_ranges_covers_full_tensor_parallel_space() {
+        let ranges = allocate_weighted_column_ranges(
+            8192,
+            &[
+                WorkerCapacityProfile {
+                    tier: Tier::Tier3,
+                    contributed_memory: 12 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 12288,
+                },
+                WorkerCapacityProfile {
+                    tier: Tier::Tier2,
+                    contributed_memory: 8 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 8192,
+                },
+                WorkerCapacityProfile {
+                    tier: Tier::Tier1,
+                    contributed_memory: 4 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 4096,
+                },
+            ],
+            &InferenceSchedulingPolicy::default(),
+        );
+
+        assert_eq!(ranges.first().copied(), Some((0, ranges[0].1)));
+        assert_eq!(ranges.last().map(|range| range.1), Some(8192));
+
+        for window in ranges.windows(2) {
+            assert_eq!(window[0].1, window[1].0);
         }
     }
 

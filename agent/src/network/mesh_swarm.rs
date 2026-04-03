@@ -390,11 +390,12 @@ impl MeshSwarm {
                                 })
                             );
                             if should_mark_relay {
-                                let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
-                                    active_path: ConnectivityPath::Relayed,
-                                    active_endpoint: Some(self.config.relay_addr.to_string()),
-                                    status: ConnectivityStatus::Connected,
-                                });
+                                let _ =
+                                    persist_runtime_connectivity_state(&DeviceConnectivityState {
+                                        active_path: ConnectivityPath::Relayed,
+                                        active_endpoint: Some(self.config.relay_addr.to_string()),
+                                        status: ConnectivityStatus::Connected,
+                                    });
                             }
                             return Some(MeshEvent::ReservationAccepted {
                                 relay_peer_id,
@@ -521,7 +522,9 @@ impl MeshSwarm {
                         status: ConnectivityStatus::Degraded,
                     });
                     if relay_closed {
-                        return Some(MeshEvent::RelayDisconnected { relay_peer_id: peer_id });
+                        return Some(MeshEvent::RelayDisconnected {
+                            relay_peer_id: peer_id,
+                        });
                     }
                     return Some(MeshEvent::PeerDisconnected { peer_id });
                 }

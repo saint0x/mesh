@@ -905,9 +905,7 @@ async fn cmd_start() -> Result<()> {
         // periodic endpoint and tensor-plane updates for ring coordination.
         let heartbeat_config = config.clone();
         tokio::spawn(async move {
-            let client = match RegistrationClient::new(
-                heartbeat_config.control_plane_url.clone(),
-            ) {
+            let client = match RegistrationClient::new(heartbeat_config.control_plane_url.clone()) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to create heartbeat client (non-fatal)");
@@ -1995,10 +1993,7 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
     println!("\n{}", "Device Identity:".bold());
     println!("  Device ID:     {}", config.device_id);
     println!("  Model ID:      {}", model_id);
-    println!(
-        "  Connectivity:  {:?}",
-        config.connectivity.preferred_path
-    );
+    println!("  Connectivity:  {:?}", config.connectivity.preferred_path);
 
     // Connect to control plane
     println!("\n{}", "Requesting ring join...".dimmed());

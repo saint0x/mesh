@@ -202,7 +202,11 @@ impl Tensor2D {
             return Tensor2D::new(data, self.rows, slice_cols);
         }
         let tensor = to_candle_2d(self)?;
-        from_candle_2d(&tensor.narrow(1, col_start, slice_cols).map_err(candle_error)?)
+        from_candle_2d(
+            &tensor
+                .narrow(1, col_start, slice_cols)
+                .map_err(candle_error)?,
+        )
     }
 }
 
@@ -315,14 +319,22 @@ pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
     let sqrt_2_over_pi = (2.0 / PI).sqrt() as f64;
     let result = (|| -> Result<Tensor2D> {
         let x = to_candle_2d(tensor)?;
-        let x3 = x.sqr().map_err(candle_error)?.broadcast_mul(&x).map_err(candle_error)?;
+        let x3 = x
+            .sqr()
+            .map_err(candle_error)?
+            .broadcast_mul(&x)
+            .map_err(candle_error)?;
         let inner = x
             .affine(0.044715, 0.0)
             .map_err(candle_error)?
             .broadcast_mul(&x3)
             .map_err(candle_error)?;
         let inner = x.broadcast_add(&inner).map_err(candle_error)?;
-        let inner = inner.affine(sqrt_2_over_pi, 0.0).map_err(candle_error)?.tanh().map_err(candle_error)?;
+        let inner = inner
+            .affine(sqrt_2_over_pi, 0.0)
+            .map_err(candle_error)?
+            .tanh()
+            .map_err(candle_error)?;
         let one_plus = inner.affine(1.0, 1.0).map_err(candle_error)?;
         let scaled = x.affine(0.5, 0.0).map_err(candle_error)?;
         from_candle_2d(&scaled.broadcast_mul(&one_plus).map_err(candle_error)?)
@@ -385,7 +397,8 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
         let mut out = vec![0.0; tensor.len()];
         for row in 0..tensor.rows {
             let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
-            let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / tensor.cols as f32;
+            let mean_square =
+                slice.iter().map(|value| value * value).sum::<f32>() / tensor.cols as f32;
             let inv_rms = 1.0 / (mean_square + eps).sqrt();
             for col in 0..tensor.cols {
                 out[row * tensor.cols + col] = slice[col] * inv_rms * gamma.data[col];
@@ -586,7 +599,8 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
     }
 
     let table = to_candle_2d(embedding_table)?;
-    let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), execution_device()?).map_err(candle_error)?;
+    let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), execution_device()?)
+        .map_err(candle_error)?;
     from_candle_2d(&table.embedding(&ids).map_err(candle_error)?)
 }
 
@@ -641,7 +655,8 @@ pub fn apply_rope(
         execution_device()?,
     )
     .map_err(candle_error)?;
-    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?).map_err(candle_error)?;
+    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?)
+        .map_err(candle_error)?;
     let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
     let cos = freqs
         .cos()
@@ -669,7 +684,11 @@ pub fn apply_rope(
         .broadcast_add(&x2.broadcast_mul(&cos).map_err(candle_error)?)
         .map_err(candle_error)?;
     let rotated = CandleTensor::cat(&[&rot1, &rot2], 2).map_err(candle_error)?;
-    from_candle_2d(&rotated.reshape((seq_len, tensor.cols)).map_err(candle_error)?)
+    from_candle_2d(
+        &rotated
+            .reshape((seq_len, tensor.cols))
+            .map_err(candle_error)?,
+    )
 }
 
 // ============== Conversion to/from ring_allreduce::Tensor ==============
@@ -751,12 +770,17 @@ fn init_execution_device() -> std::result::Result<Device, candle_core::Error> {
 }
 
 pub(crate) fn to_candle_2d(tensor: &Tensor2D) -> Result<CandleTensor> {
-    CandleTensor::from_vec(tensor.data.clone(), (tensor.rows, tensor.cols), execution_device()?)
-        .map_err(candle_error)
+    CandleTensor::from_vec(
+        tensor.data.clone(),
+        (tensor.rows, tensor.cols),
+        execution_device()?,
+    )
+    .map_err(candle_error)
 }
 
 pub(crate) fn to_candle_1d(tensor: &Tensor1D) -> Result<CandleTensor> {
-    CandleTensor::from_vec(tensor.data.clone(), tensor.len(), execution_device()?).map_err(candle_error)
+    CandleTensor::from_vec(tensor.data.clone(), tensor.len(), execution_device()?)
+        .map_err(candle_error)
 }
 
 pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
@@ -777,7 +801,11 @@ pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
     Tensor2D::new(data, dims[0], dims[1])
 }
 
-pub(crate) fn rms_norm_candle(tensor: &CandleTensor, gamma: &CandleTensor, eps: f32) -> Result<CandleTensor> {
+pub(crate) fn rms_norm_candle(
+    tensor: &CandleTensor,
+    gamma: &CandleTensor,
+    eps: f32,
+) -> Result<CandleTensor> {
     candle_ops::rms_norm(tensor, gamma, eps).map_err(candle_error)
 }
 
@@ -830,7 +858,8 @@ pub(crate) fn apply_rope_candle(
         execution_device()?,
     )
     .map_err(candle_error)?;
-    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?).map_err(candle_error)?;
+    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?)
+        .map_err(candle_error)?;
     let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
     let cos = freqs
         .cos()
@@ -878,9 +907,7 @@ pub(crate) fn causal_self_attention_candle(
         .contiguous()
         .map_err(candle_error)?;
     let v_t = v_t.contiguous().map_err(candle_error)?;
-    let scores = q_t
-        .matmul(&k_t)
-        .map_err(candle_error)?;
+    let scores = q_t.matmul(&k_t).map_err(candle_error)?;
     let scores = scores.affine(scale as f64, 0.0).map_err(candle_error)?;
 
     let mut mask = vec![0.0f32; rows * rows];
@@ -889,7 +916,8 @@ pub(crate) fn causal_self_attention_candle(
             mask[i * rows + j] = f32::NEG_INFINITY;
         }
     }
-    let mask = CandleTensor::from_vec(mask, (rows, rows), execution_device()?).map_err(candle_error)?;
+    let mask =
+        CandleTensor::from_vec(mask, (rows, rows), execution_device()?).map_err(candle_error)?;
     let masked = scores.broadcast_add(&mask).map_err(candle_error)?;
     let probs = candle_ops::softmax(&masked, 1).map_err(candle_error)?;
     let probs = probs.contiguous().map_err(candle_error)?;
@@ -904,7 +932,12 @@ pub(crate) fn causal_self_attention_candle(
     Ok(output)
 }
 
-pub fn causal_self_attention_gpu(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -> Result<Tensor2D> {
+pub fn causal_self_attention_gpu(
+    q: &Tensor2D,
+    k: &Tensor2D,
+    v: &Tensor2D,
+    scale: f32,
+) -> Result<Tensor2D> {
     if q.rows != k.rows || q.rows != v.rows || q.cols != k.cols || q.cols != v.cols {
         return Err(AgentError::Execution(format!(
             "Attention shape mismatch: q {}x{}, k {}x{}, v {}x{}",

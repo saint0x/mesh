@@ -364,7 +364,8 @@ impl<'a> WorkerRing<'a> {
             self.right_neighbor, self.left_neighbor
         );
 
-        let expected_sender_position = (self.my_position + self.total_workers - 1) % self.total_workers;
+        let expected_sender_position =
+            (self.my_position + self.total_workers - 1) % self.total_workers;
         let inbound = self
             .tensor_plane
             .recv_matching(|inbound| {
