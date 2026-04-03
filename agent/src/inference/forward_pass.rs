@@ -67,9 +67,9 @@ pub struct LayerWeights {
 
     /// Query projection weights [hidden_dim, shard_cols]
     pub w_q: Tensor2D,
-    /// Key projection weights [hidden_dim, shard_cols]
+    /// Key projection weights [hidden_dim, kv_shard_cols]
     pub w_k: Tensor2D,
-    /// Value projection weights [hidden_dim, shard_cols]
+    /// Value projection weights [hidden_dim, kv_shard_cols]
     pub w_v: Tensor2D,
     /// Output projection weights [shard_cols, hidden_dim]
     pub w_o: Tensor2D,
@@ -275,7 +275,7 @@ fn attention_output(
             config.hidden_dim, config.num_heads
         )));
     }
-    if config.num_kv_heads != config.num_heads {
+    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
             "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
             config.num_heads, config.num_kv_heads
@@ -283,6 +283,20 @@ fn attention_output(
     }
 
     let head_dim = config.hidden_dim / config.num_heads;
+    let kv_hidden_dim = config.num_kv_heads * head_dim;
+    if q_full.cols != config.hidden_dim {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Query projection width mismatch: expected {}, got {}",
+            config.hidden_dim, q_full.cols
+        )));
+    }
+    if k_full.cols != kv_hidden_dim || v_full.cols != kv_hidden_dim {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "KV projection width mismatch: expected {}, got k={} v={}",
+            kv_hidden_dim, k_full.cols, v_full.cols
+        )));
+    }
+
     let positions: Vec<u32> = (0..q_full.rows as u32).collect();
     let q_rope = apply_rope(&q_full, &positions, head_dim, config.rope_base)?;
     let k_rope = apply_rope(&k_full, &positions, head_dim, config.rope_base)?;
@@ -290,16 +304,18 @@ fn attention_output(
     kv_cache.update_layer(layer_idx, k_rope.clone(), v_full.clone())?;
 
     let q_heads = split_heads(&q_rope, config.num_heads, head_dim)?;
-    let k_heads = split_heads(&k_rope, config.num_heads, head_dim)?;
-    let v_heads = split_heads(&v_full, config.num_heads, head_dim)?;
+    let k_heads = split_heads(&k_rope, config.num_kv_heads, head_dim)?;
+    let v_heads = split_heads(&v_full, config.num_kv_heads, head_dim)?;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_repeat = config.num_heads / config.num_kv_heads;
 
     let mut output_heads = Vec::with_capacity(config.num_heads);
     for head_idx in 0..config.num_heads {
+        let kv_head_idx = head_idx / kv_repeat;
         output_heads.push(causal_self_attention(
             &q_heads[head_idx],
-            &k_heads[head_idx],
-            &v_heads[head_idx],
+            &k_heads[kv_head_idx],
+            &v_heads[kv_head_idx],
             scale,
         )?);
     }
@@ -336,7 +352,7 @@ impl ForwardPass {
     ) -> Self {
         let kv_config = super::kv_cache::KVCacheConfig {
             num_layers: weights.config.num_layers,
-            num_heads: weights.config.num_heads,
+            num_heads: weights.config.num_kv_heads,
             head_dim: weights.config.hidden_dim / weights.config.num_heads,
             max_seq_len: 4096,
         };
@@ -590,7 +606,7 @@ impl LocalForwardPass {
     pub fn new(weights: ModelWeights) -> Self {
         let kv_config = super::kv_cache::KVCacheConfig {
             num_layers: weights.config.num_layers,
-            num_heads: weights.config.num_heads,
+            num_heads: weights.config.num_kv_heads,
             head_dim: weights.config.hidden_dim / weights.config.num_heads,
             max_seq_len: 4096,
         };
@@ -691,12 +707,13 @@ mod tests {
     }
 
     fn create_test_weights(config: &ModelConfig, shard_cols: usize) -> ModelWeights {
+        let kv_shard_cols = config.num_kv_heads * (config.hidden_dim / config.num_heads);
         let layers = (0..config.num_layers)
             .map(|layer_idx| LayerWeights {
                 layer_idx,
                 w_q: Tensor2D::filled(config.hidden_dim, shard_cols, 0.1),
-                w_k: Tensor2D::filled(config.hidden_dim, shard_cols, 0.2),
-                w_v: Tensor2D::filled(config.hidden_dim, shard_cols, 0.3),
+                w_k: Tensor2D::filled(config.hidden_dim, kv_shard_cols, 0.2),
+                w_v: Tensor2D::filled(config.hidden_dim, kv_shard_cols, 0.3),
                 w_o: Tensor2D::filled(shard_cols, config.hidden_dim, 0.4),
                 w_up: Tensor2D::filled(config.hidden_dim, shard_cols, 0.5),
                 w_gate: Tensor2D::filled(config.hidden_dim, shard_cols, 0.6),
@@ -758,14 +775,15 @@ mod tests {
     }
 
     #[test]
-    fn test_local_forward_rejects_unsupported_gqa() {
+    fn test_local_forward_supports_gqa() {
         let mut config = create_test_config();
         config.num_kv_heads = 2;
         let weights = create_test_weights(&config, 64);
         let mut forward = LocalForwardPass::new(weights);
 
-        let err = forward.forward(&[1, 2, 3]).unwrap_err().to_string();
-        assert!(err.contains("Unsupported grouped-query attention geometry"));
+        let hidden = forward.forward(&[1, 2, 3]).unwrap();
+        assert_eq!(hidden.rows, 3);
+        assert_eq!(hidden.cols, 64);
     }
 
     #[test]

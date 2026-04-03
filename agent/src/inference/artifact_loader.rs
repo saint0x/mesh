@@ -168,8 +168,7 @@ impl ArtifactShardLoader {
             });
         }
 
-        let expected_cols = assignment.num_columns() as usize;
-        validate_weight_shapes(&config, expected_cols, &embedding, &final_norm, &lm_head, &layers)?;
+        validate_weight_shapes(&config, assignment, &embedding, &final_norm, &lm_head, &layers)?;
 
         Ok(ModelWeights {
             model_id: model_id.to_string(),
@@ -315,6 +314,23 @@ fn validate_metadata(
     Ok(())
 }
 
+fn partition_columns(total_columns: usize, worker_position: u32, total_workers: u32) -> usize {
+    if total_workers == 0 {
+        return total_columns;
+    }
+
+    let total_workers = total_workers as usize;
+    let worker_position = worker_position as usize;
+    let columns_per_worker = total_columns / total_workers;
+    let remainder = total_columns % total_workers;
+
+    if worker_position < remainder {
+        columns_per_worker + 1
+    } else {
+        columns_per_worker
+    }
+}
+
 fn load_tensor_2d(tensors: &SafeTensors<'_>, name: &str) -> Result<Tensor2D> {
     let tensor = tensors
         .tensor(name)
@@ -380,24 +396,30 @@ fn bytes_to_f32_vec(bytes: &[u8], name: &str) -> Result<Vec<f32>> {
 
 fn validate_weight_shapes(
     config: &ModelConfig,
-    expected_cols: usize,
+    assignment: &ShardAssignment,
     embedding: &Tensor2D,
     final_norm: &Tensor1D,
     lm_head: &Tensor2D,
     layers: &[LayerWeights],
 ) -> Result<()> {
-    if config.num_kv_heads != config.num_heads {
-        return Err(AgentError::Config(format!(
-            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
-            config.num_heads, config.num_kv_heads
-        )));
-    }
     if config.hidden_dim % config.num_heads != 0 {
         return Err(AgentError::Config(format!(
             "Unsupported attention geometry: hidden_dim {} num_heads {}",
             config.hidden_dim, config.num_heads
         )));
     }
+    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
+        return Err(AgentError::Config(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+
+    let expected_cols = assignment.num_columns() as usize;
+    let head_dim = config.hidden_dim / config.num_heads;
+    let kv_total_cols = config.num_kv_heads * head_dim;
+    let expected_kv_cols =
+        partition_columns(kv_total_cols, assignment.worker_position, assignment.total_workers);
 
     if embedding.rows != config.vocab_size || embedding.cols != config.hidden_dim {
         return Err(AgentError::Config(format!(
@@ -428,8 +450,20 @@ fn validate_weight_shapes(
 
     for layer in layers {
         validate_layer_shape(&layer.w_q, config.hidden_dim, expected_cols, "w_q", layer.layer_idx)?;
-        validate_layer_shape(&layer.w_k, config.hidden_dim, expected_cols, "w_k", layer.layer_idx)?;
-        validate_layer_shape(&layer.w_v, config.hidden_dim, expected_cols, "w_v", layer.layer_idx)?;
+        validate_layer_shape(
+            &layer.w_k,
+            config.hidden_dim,
+            expected_kv_cols,
+            "w_k",
+            layer.layer_idx,
+        )?;
+        validate_layer_shape(
+            &layer.w_v,
+            config.hidden_dim,
+            expected_kv_cols,
+            "w_v",
+            layer.layer_idx,
+        )?;
         validate_layer_shape(&layer.w_o, expected_cols, config.hidden_dim, "w_o", layer.layer_idx)?;
         validate_layer_shape(&layer.w_up, config.hidden_dim, expected_cols, "w_up", layer.layer_idx)?;
         validate_layer_shape(&layer.w_gate, config.hidden_dim, expected_cols, "w_gate", layer.layer_idx)?;
