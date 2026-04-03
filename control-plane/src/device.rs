@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
+
 /// Device hardware capabilities and tier classification
 /// (Mirrors agent::device::DeviceCapabilities)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -14,6 +16,9 @@ pub struct DeviceCapabilities {
     pub gpu_vram_mb: Option<usize>,
     pub os: String,
     pub arch: String,
+    #[serde(default)]
+    pub execution_providers: Vec<ExecutionProviderInfo>,
+    pub default_execution_provider: ExecutionProviderKind,
 }
 
 /// Device tier based on hardware capabilities

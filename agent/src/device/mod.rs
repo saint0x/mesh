@@ -5,6 +5,7 @@ pub use capabilities::{DeviceCapabilities, Tier};
 
 use crate::connectivity::NetworkConnectivity;
 use crate::errors::{AgentError, Result};
+use crate::provider::{resolve_requested_provider, ExecutionProviderKind};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -60,9 +61,21 @@ pub struct DeviceConfig {
     /// Device hardware capabilities
     pub capabilities: DeviceCapabilities,
 
+    /// Execution provider policy for this node.
+    #[serde(default)]
+    pub execution: ExecutionConfig,
+
     /// Runtime governance configuration
     #[serde(default)]
     pub governance: GovernanceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ExecutionConfig {
+    /// Explicit provider to run on this node. When omitted, MeshNet selects the
+    /// highest-priority available provider from the detected inventory.
+    pub preferred_provider: Option<ExecutionProviderKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,8 +164,16 @@ impl DeviceConfig {
                 attachments: Vec::new(),
             },
             capabilities,
+            execution: ExecutionConfig::default(),
             governance: GovernanceConfig::default(),
         }
+    }
+
+    pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderKind> {
+        resolve_requested_provider(
+            self.execution.preferred_provider,
+            &self.capabilities.execution_providers,
+        )
     }
 
     /// Get default configuration file path: `~/.meshnet/device.toml`
@@ -431,6 +452,12 @@ gpu_present = false
 gpu_vram_mb = 0
 os = "linux"
 arch = "x86_64"
+execution_providers = [
+  {{ kind = "cpu", available = true }},
+  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS" }},
+  {{ kind = "cuda", available = true }},
+]
+default_execution_provider = "cuda"
 "#
         );
 

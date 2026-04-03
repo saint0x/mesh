@@ -28,6 +28,35 @@ Mesh has one production execution path:
 
 There is no parallel mock or synthetic executor in this repo anymore.
 
+## Execution Providers
+
+Mesh now exposes one execution architecture with explicit provider selection underneath it:
+
+- `cpu`: baseline runtime for broad compatibility, including Intel Macs and CPU-only Linux machines
+- `metal`: native Apple path for Apple Silicon workers
+- `cuda`: native Linux/NVIDIA path for datacenter and workstation GPUs
+
+Provider choice is part of node configuration and capability reporting. Nodes advertise the providers they can actually run, the control plane stores that inventory, and the agent binds the tensor backend to the selected provider at startup. There is no silent provider fallback path.
+
+Default provider selection is simple:
+
+- prefer `metal` when available
+- otherwise prefer `cuda` when available
+- otherwise use `cpu`
+
+To pin a node to a provider, set it in `~/.meshnet/device.toml`:
+
+```toml
+[execution]
+preferred_provider = "cpu"
+```
+
+This is useful for:
+
+- running Intel Macs as CPU workers on a LAN mesh
+- forcing CPU parity checks on an Apple Silicon machine
+- forcing a known GPU backend during bring-up and debugging
+
 ## Install
 
 ```bash
@@ -84,6 +113,8 @@ Every worker needs real model assets under `~/.meshnet/models/<model_id>/`:
 
 `model.json` defines the real tensor-parallel dimension and total model size. The control plane uses it for shard assignment, and the workers use the tokenizer for output decoding. The shard loader validates safetensors payloads against their manifests in [artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
 
+The same canonical artifacts are used across providers. Provider choice changes execution, not model semantics.
+
 ## Core Components
 
 - `agent`: worker runtime and CLI for initialization, ring membership, shard loading, inference execution, and dataplane transport. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
@@ -102,6 +133,17 @@ fozzy trace verify /tmp/production_dispatch_trace.fozzy --strict --json
 fozzy replay /tmp/production_dispatch_trace.fozzy --json
 fozzy ci /tmp/production_dispatch_trace.fozzy --json
 cargo test --workspace
+```
+
+For provider work, validate both the runtime and the provider contract:
+
+```bash
+fozzy doctor --deep --scenario tests/production_dispatch.fozzy.json --runs 5 --seed 424242 --json
+fozzy test --det --strict tests/production_dispatch.fozzy.json tests/live_relay_runtime.fozzy.json --json
+fozzy run tests/production_dispatch.fozzy.json --det --record /tmp/production_dispatch_trace.fozzy --json
+fozzy trace verify /tmp/production_dispatch_trace.fozzy --strict --json
+fozzy replay /tmp/production_dispatch_trace.fozzy --json
+fozzy ci /tmp/production_dispatch_trace.fozzy --json
 ```
 
 ## More Docs

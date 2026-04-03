@@ -34,9 +34,10 @@ use agent::{
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
     parse_data_plane_endpoint, parse_memory_string, parse_tensor_plane_advertised_addr_env,
     parse_tensor_plane_bind_addr_env, persist_runtime_connectivity_state,
-    select_direct_dial_addrs_from_candidates, ConnectivityAttachmentKind, ConnectivityPath,
-    ConnectivityStatus, DeviceConfig, DeviceConnectivityState, MeshSwarmBuilder,
-    RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
+    select_direct_dial_addrs_from_candidates, set_selected_execution_provider,
+    ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus, DeviceConfig,
+    DeviceConnectivityState, MeshSwarmBuilder, RegistrationClient, ResourceManager, TensorPlane,
+    TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -310,6 +311,25 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     println!("   Tier: {:?}", config.capabilities.tier);
     println!("   CPU Cores: {}", config.capabilities.cpu_cores);
     println!("   RAM: {} MB", config.capabilities.ram_mb);
+    let available_providers = config
+        .capabilities
+        .execution_providers
+        .iter()
+        .filter(|provider| provider.available)
+        .map(|provider| provider.kind.as_str())
+        .collect::<Vec<_>>();
+    println!(
+        "   Execution Providers: {}",
+        if available_providers.is_empty() {
+            "none".to_string()
+        } else {
+            available_providers.join(", ")
+        }
+    );
+    println!(
+        "   Default Provider: {}",
+        config.capabilities.default_execution_provider.as_str()
+    );
 
     // Save configuration
     let config_path = DeviceConfig::default_path()?;
@@ -602,6 +622,9 @@ async fn cmd_start() -> Result<()> {
     println!("📋 Device: {} ({})", config.name, config.device_id);
     println!("   Network: {}", config.network_id);
     println!("   Tier: {:?}", config.capabilities.tier);
+    let selected_provider = config.resolve_execution_provider()?;
+    set_selected_execution_provider(selected_provider)?;
+    println!("   Execution Provider: {}", selected_provider.as_str());
 
     let runtime_endpoint = config.connectivity.runtime_endpoint()?;
 

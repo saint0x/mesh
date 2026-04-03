@@ -8,6 +8,7 @@
 //! - Token embedding lookup
 
 use crate::errors::{AgentError, Result};
+use crate::provider::{selected_execution_provider, ExecutionProviderKind};
 use candle_core::{DType, Device, Tensor as CandleTensor};
 use candle_nn::ops as candle_ops;
 use serde::{Deserialize, Serialize};
@@ -218,7 +219,7 @@ pub fn matvec(a: &Tensor2D, v: &Tensor1D) -> Result<Tensor1D> {
     }
 
     let lhs = to_candle_2d(a)?;
-    let rhs = CandleTensor::from_vec(v.data.clone(), (v.len(), 1), gpu_device()?)
+    let rhs = CandleTensor::from_vec(v.data.clone(), (v.len(), 1), execution_device()?)
         .map_err(candle_error)?;
     let result = lhs.matmul(&rhs).map_err(candle_error)?;
     Ok(Tensor1D {
@@ -450,7 +451,7 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
     }
 
     let table = to_candle_2d(embedding_table)?;
-    let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), gpu_device()?).map_err(candle_error)?;
+    let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), execution_device()?).map_err(candle_error)?;
     from_candle_2d(&table.embedding(&ids).map_err(candle_error)?)
 }
 
@@ -502,10 +503,10 @@ pub fn apply_rope(
     let pos = CandleTensor::from_vec(
         positions.iter().map(|p| *p as f32).collect::<Vec<_>>(),
         (seq_len, 1),
-        gpu_device()?,
+        execution_device()?,
     )
     .map_err(candle_error)?;
-    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), gpu_device()?).map_err(candle_error)?;
+    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?).map_err(candle_error)?;
     let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
     let cos = freqs
         .cos()
@@ -561,44 +562,58 @@ impl Tensor2D {
 }
 
 fn candle_error(err: candle_core::Error) -> AgentError {
-    AgentError::Execution(format!("GPU tensor backend error: {}", err))
+    AgentError::Execution(format!("Tensor backend error: {}", err))
 }
 
-pub(crate) fn gpu_device() -> Result<&'static Device> {
+pub(crate) fn execution_device() -> Result<&'static Device> {
     static DEVICE: OnceLock<std::result::Result<Device, String>> = OnceLock::new();
-    match DEVICE.get_or_init(|| init_gpu_device().map_err(|e| e.to_string())) {
+    match DEVICE.get_or_init(|| init_execution_device().map_err(|e| e.to_string())) {
         Ok(device) => Ok(device),
         Err(err) => Err(AgentError::Execution(format!(
-            "GPU execution backend unavailable: {}",
+            "Execution backend unavailable: {}",
             err
         ))),
     }
 }
 
-fn init_gpu_device() -> std::result::Result<Device, candle_core::Error> {
-    #[cfg(target_os = "linux")]
-    {
-        Device::new_cuda(0)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Device::new_metal(0)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err(candle_core::Error::Msg(
-            "meshnet requires a GPU-backed candle device on this platform".to_string(),
-        ))
+fn init_execution_device() -> std::result::Result<Device, candle_core::Error> {
+    let provider = selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu);
+    match provider {
+        ExecutionProviderKind::Cpu => Ok(Device::Cpu),
+        ExecutionProviderKind::Cuda => {
+            #[cfg(target_os = "linux")]
+            {
+                Device::new_cuda(0)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(candle_core::Error::Msg(
+                    "cuda provider is unavailable on this platform".to_string(),
+                ))
+            }
+        }
+        ExecutionProviderKind::Metal => {
+            #[cfg(target_os = "macos")]
+            {
+                Device::new_metal(0)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(candle_core::Error::Msg(
+                    "metal provider is unavailable on this platform".to_string(),
+                ))
+            }
+        }
     }
 }
 
 pub(crate) fn to_candle_2d(tensor: &Tensor2D) -> Result<CandleTensor> {
-    CandleTensor::from_vec(tensor.data.clone(), (tensor.rows, tensor.cols), gpu_device()?)
+    CandleTensor::from_vec(tensor.data.clone(), (tensor.rows, tensor.cols), execution_device()?)
         .map_err(candle_error)
 }
 
 pub(crate) fn to_candle_1d(tensor: &Tensor1D) -> Result<CandleTensor> {
-    CandleTensor::from_vec(tensor.data.clone(), tensor.len(), gpu_device()?).map_err(candle_error)
+    CandleTensor::from_vec(tensor.data.clone(), tensor.len(), execution_device()?).map_err(candle_error)
 }
 
 pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
@@ -669,10 +684,10 @@ pub(crate) fn apply_rope_candle(
     let pos = CandleTensor::from_vec(
         positions.iter().map(|p| *p as f32).collect::<Vec<_>>(),
         (rows, 1),
-        gpu_device()?,
+        execution_device()?,
     )
     .map_err(candle_error)?;
-    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), gpu_device()?).map_err(candle_error)?;
+    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?).map_err(candle_error)?;
     let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
     let cos = freqs
         .cos()
@@ -731,7 +746,7 @@ pub(crate) fn causal_self_attention_candle(
             mask[i * rows + j] = f32::NEG_INFINITY;
         }
     }
-    let mask = CandleTensor::from_vec(mask, (rows, rows), gpu_device()?).map_err(candle_error)?;
+    let mask = CandleTensor::from_vec(mask, (rows, rows), execution_device()?).map_err(candle_error)?;
     let masked = scores.broadcast_add(&mask).map_err(candle_error)?;
     let probs = candle_ops::softmax(&masked, 1).map_err(candle_error)?;
     let probs = probs.contiguous().map_err(candle_error)?;

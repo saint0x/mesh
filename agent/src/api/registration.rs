@@ -363,6 +363,7 @@ fn load_advertised_listen_addrs() -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use crate::device::{DeviceCapabilities, Tier};
+    use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
 
     /// Test helper to create device capabilities
     /// Used by integration tests in tests/ directory
@@ -375,6 +376,24 @@ mod tests {
             arch: "aarch64".to_string(),
             gpu_present: false,
             gpu_vram_mb: None,
+            execution_providers: vec![
+                ExecutionProviderInfo {
+                    kind: ExecutionProviderKind::Cpu,
+                    available: true,
+                    reason: None,
+                },
+                ExecutionProviderInfo {
+                    kind: ExecutionProviderKind::Metal,
+                    available: true,
+                    reason: None,
+                },
+                ExecutionProviderInfo {
+                    kind: ExecutionProviderKind::Cuda,
+                    available: false,
+                    reason: Some("cuda provider is only available on Linux builds".to_string()),
+                },
+            ],
+            default_execution_provider: ExecutionProviderKind::Metal,
             tier: Tier::Tier2,
         }
     }

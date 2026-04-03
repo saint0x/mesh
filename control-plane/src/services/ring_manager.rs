@@ -820,6 +820,7 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
+    use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::device_service;
 
@@ -843,6 +844,24 @@ mod tests {
             gpu_vram_mb: None,
             os: "macos".into(),
             arch: "aarch64".into(),
+            execution_providers: vec![
+                ExecutionProviderInfo {
+                    kind: ExecutionProviderKind::Cpu,
+                    available: true,
+                    reason: None,
+                },
+                ExecutionProviderInfo {
+                    kind: ExecutionProviderKind::Metal,
+                    available: true,
+                    reason: None,
+                },
+                ExecutionProviderInfo {
+                    kind: ExecutionProviderKind::Cuda,
+                    available: false,
+                    reason: Some("cuda provider is only available on Linux builds".into()),
+                },
+            ],
+            default_execution_provider: ExecutionProviderKind::Metal,
         }
     }
 

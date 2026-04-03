@@ -7,6 +7,10 @@ This guide covers the current production runtime bring-up flow.
 - Rust installed on each machine
 - this repository checked out on each machine
 - devices on the same LAN if you want beacon-based discovery
+- choose the execution provider each worker should use:
+  - Apple Silicon Mac: `metal`
+  - Linux with NVIDIA GPU: `cuda`
+  - Intel Mac or CPU-only host: `cpu`
 
 ## Install
 
@@ -44,6 +48,13 @@ mesh join-ring --model-id llama-70b
 mesh start
 ```
 
+`mesh init` now prints the detected execution providers and the node default. To pin a worker to a specific provider, edit `~/.meshnet/device.toml` before `mesh start`:
+
+```toml
+[execution]
+preferred_provider = "cpu"
+```
+
 ### 3. Add another worker
 
 Terminal 4:
@@ -54,6 +65,8 @@ mesh init --network-id demo --name "Worker 2"
 mesh join-ring --model-id llama-70b
 mesh start
 ```
+
+For a mixed LAN test with an Intel Mac, set that second node to `cpu` explicitly. Mesh uses the same execution flow across providers; only the local compute backend changes.
 
 ### 4. Submit an inference job
 
@@ -153,6 +166,7 @@ cargo test --workspace
 - The agent does poll and execute inference assignments from the control plane.
 - The hot path uses the dedicated tensor plane, not just generic control-plane messaging.
 - Ring joins are explicit and model-scoped.
+- Provider selection is explicit. Mesh does not silently downgrade from `metal` or `cuda` to `cpu`.
 - Real model quality still depends on shipping correct shard manifests, safetensors weights, and tokenizer assets.
 
 ## Troubleshooting

@@ -11,6 +11,7 @@ pub mod model_assets;
 pub mod network;
 pub mod observability;
 pub mod pki;
+pub mod provider;
 pub mod resource_manager;
 pub mod telemetry;
 
@@ -41,5 +42,10 @@ pub use network::{
     TensorPlaneConfig, TensorPlaneMetricsSnapshot,
 };
 pub use observability::{init_production_logging, init_simple_logging};
+pub use provider::{
+    default_execution_provider, detect_execution_providers, resolve_requested_provider,
+    selected_execution_provider, set_selected_execution_provider, ExecutionProviderInfo,
+    ExecutionProviderKind,
+};
 pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
 pub use telemetry::{calculate_credits, LedgerClient, LedgerEvent};

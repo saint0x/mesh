@@ -48,9 +48,9 @@ impl Database {
         // If the path contains "?mode=memory", it's a unique in-memory DB, use as-is
         let is_memory = database_path == ":memory:" || database_path.contains("?mode=memory");
         let connection_string = if database_path == ":memory:" {
-            "file::memory:?cache=shared"
+            format!("file:meshnet-{}?mode=memory&cache=shared", uuid::Uuid::new_v4())
         } else {
-            database_path
+            database_path.to_string()
         };
 
         // Create connection manager

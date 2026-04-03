@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
+use crate::provider::{
+    default_execution_provider, detect_execution_providers, ExecutionProviderInfo,
+    ExecutionProviderKind,
+};
+
 /// Device tier classification based on hardware specs.
 ///
 /// Tiers determine credit multipliers for job execution:
@@ -75,6 +80,13 @@ pub struct DeviceCapabilities {
 
     /// CPU architecture
     pub arch: String,
+
+    /// Execution providers detected on this node.
+    #[serde(default)]
+    pub execution_providers: Vec<ExecutionProviderInfo>,
+
+    /// Default execution provider for this node.
+    pub default_execution_provider: ExecutionProviderKind,
 }
 
 impl DeviceCapabilities {
@@ -109,6 +121,8 @@ impl DeviceCapabilities {
 
         let os = Self::detect_os();
         let arch = Self::detect_arch();
+        let execution_providers = detect_execution_providers();
+        let default_execution_provider = default_execution_provider(&execution_providers);
 
         Self {
             tier,
@@ -118,6 +132,8 @@ impl DeviceCapabilities {
             gpu_vram_mb,
             os,
             arch,
+            execution_providers,
+            default_execution_provider,
         }
     }
 
@@ -227,6 +243,12 @@ mod tests {
             gpu_vram_mb: Some(4096),
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
+            execution_providers: vec![ExecutionProviderInfo {
+                kind: ExecutionProviderKind::Cpu,
+                available: true,
+                reason: None,
+            }],
+            default_execution_provider: ExecutionProviderKind::Cpu,
         };
 
         let json = serde_json::to_string(&caps).unwrap();
