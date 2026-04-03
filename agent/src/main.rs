@@ -25,6 +25,8 @@
 //! - `shard-status` - Show this worker's shard assignment
 //! - `inference-stats` - Show inference statistics
 
+mod ui;
+
 use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
@@ -46,6 +48,7 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 use tracing::{error, info, warn};
+use ui::cmd_ui;
 use uuid::Uuid;
 
 /// Mesh AI Agent - Distributed compute sharing network
@@ -182,6 +185,17 @@ enum Commands {
         #[arg(long)]
         pool_id: String,
     },
+
+    /// Launch the local Mesh UI
+    Ui {
+        /// UI port to serve on
+        #[arg(long, default_value = "43110")]
+        port: u16,
+
+        /// Local API port to serve on
+        #[arg(long, default_value = "43111")]
+        api_port: u16,
+    },
 }
 
 #[tokio::main]
@@ -290,6 +304,10 @@ async fn main() -> Result<()> {
 
         Commands::PoolPeers { pool_id } => {
             cmd_pool_peers(pool_id).await?;
+        }
+
+        Commands::Ui { port, api_port } => {
+            cmd_ui(port, api_port).await?;
         }
     }
 

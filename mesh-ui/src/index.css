@@ -1,0 +1,131 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Instrument+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg: #050914;
+  --bg-alt: #09111f;
+  --panel: rgba(9, 15, 28, 0.9);
+  --panel-elevated: rgba(13, 21, 37, 0.92);
+  --text-strong: #edf7ff;
+  --text-soft: #b3c4d4;
+  --text-muted: #7691a7;
+  --accent: #66f0c0;
+  --accent-strong: #1c8f80;
+  --accent-warm: #ffbd59;
+  --line: rgba(255, 255, 255, 0.1);
+  --surface: rgba(255, 255, 255, 0.03);
+  --surface-strong: rgba(255, 255, 255, 0.05);
+  --shadow-strong: 0 24px 80px rgba(0, 0, 0, 0.32);
+  --page-glow-top: rgba(32, 126, 165, 0.26);
+  --page-glow-bottom: rgba(255, 189, 89, 0.1);
+
+  font-family: 'Instrument Sans', system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--text-soft);
+  background:
+    radial-gradient(circle at top, rgba(32, 126, 165, 0.26), transparent 28%),
+    radial-gradient(circle at bottom left, rgba(255, 189, 89, 0.1), transparent 26%),
+    linear-gradient(180deg, #06101b, #03060d 55%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f7fb;
+  --bg-alt: #eef3f9;
+  --panel: rgba(255, 255, 255, 0.9);
+  --panel-elevated: rgba(255, 255, 255, 0.96);
+  --text-strong: #152235;
+  --text-soft: #506176;
+  --text-muted: #70839a;
+  --accent: #158a8a;
+  --accent-strong: #0f6f73;
+  --accent-warm: #f0ad4e;
+  --line: rgba(21, 34, 53, 0.1);
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-strong: rgba(255, 255, 255, 0.96);
+  --shadow-strong: 0 24px 70px rgba(33, 58, 92, 0.12);
+  --page-glow-top: rgba(26, 149, 140, 0.12);
+  --page-glow-bottom: rgba(240, 173, 78, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top, var(--page-glow-top), transparent 26%),
+    linear-gradient(180deg, var(--bg-alt), var(--bg) 58%);
+  color: var(--text-soft);
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--text-strong) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--text-strong) 5%, transparent) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(circle at center, black, transparent 85%);
+  pointer-events: none;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button,
+a {
+  outline: none;
+}
+
+button:focus-visible,
+a:focus-visible {
+  box-shadow: 0 0 0 3px rgba(102, 240, 192, 0.22);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-family: 'Space Grotesk', 'Instrument Sans', sans-serif;
+  line-height: 0.98;
+  letter-spacing: -0.04em;
+}
+
+h1 {
+  font-size: clamp(3.4rem, 7vw, 5.8rem);
+}
+
+h2 {
+  font-size: clamp(1.9rem, 4vw, 3rem);
+}
+
+h3 {
+  font-size: clamp(1.25rem, 2.6vw, 1.8rem);
+}
+
+p {
+  margin: 0;
+}
+
+code {
+  font-family: 'SFMono-Regular', ui-monospace, monospace;
+}
+
+#root {
+  min-height: 100vh;
+}
