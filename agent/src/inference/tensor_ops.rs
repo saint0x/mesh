@@ -98,6 +98,16 @@ impl Tensor2D {
             )));
         }
 
+        if is_cpu_provider() {
+            let data = self
+                .data
+                .iter()
+                .zip(&other.data)
+                .map(|(lhs, rhs)| lhs + rhs)
+                .collect();
+            return Tensor2D::new(data, self.rows, self.cols);
+        }
+
         let lhs = to_candle_2d(self)?;
         let rhs = to_candle_2d(other)?;
         from_candle_2d(&lhs.broadcast_add(&rhs).map_err(candle_error)?)
@@ -112,6 +122,16 @@ impl Tensor2D {
             )));
         }
 
+        if is_cpu_provider() {
+            let data = self
+                .data
+                .iter()
+                .zip(&other.data)
+                .map(|(lhs, rhs)| lhs * rhs)
+                .collect();
+            return Tensor2D::new(data, self.rows, self.cols);
+        }
+
         let lhs = to_candle_2d(self)?;
         let rhs = to_candle_2d(other)?;
         from_candle_2d(&lhs.broadcast_mul(&rhs).map_err(candle_error)?)
@@ -119,6 +139,13 @@ impl Tensor2D {
 
     /// Scale by a scalar
     pub fn scale(&self, scalar: f32) -> Tensor2D {
+        if is_cpu_provider() {
+            return Tensor2D {
+                data: self.data.iter().map(|value| value * scalar).collect(),
+                rows: self.rows,
+                cols: self.cols,
+            };
+        }
         let tensor = to_candle_2d(self)
             .and_then(|x| from_candle_2d(&x.affine(scalar as f64, 0.0).map_err(candle_error)?))
             .expect("GPU tensor scaling failed");
@@ -127,6 +154,19 @@ impl Tensor2D {
 
     /// Transpose the tensor
     pub fn transpose(&self) -> Tensor2D {
+        if is_cpu_provider() {
+            let mut data = vec![0.0; self.len()];
+            for row in 0..self.rows {
+                for col in 0..self.cols {
+                    data[col * self.rows + row] = self.get(row, col);
+                }
+            }
+            return Tensor2D {
+                data,
+                rows: self.cols,
+                cols: self.rows,
+            };
+        }
         let tensor = to_candle_2d(self)
             .and_then(|x| from_candle_2d(&x.transpose(0, 1).map_err(candle_error)?))
             .expect("GPU tensor transpose failed");
@@ -152,6 +192,15 @@ impl Tensor2D {
         }
 
         let slice_cols = col_end - col_start;
+        if is_cpu_provider() {
+            let mut data = Vec::with_capacity(self.rows * slice_cols);
+            for row in 0..self.rows {
+                let start = row * self.cols + col_start;
+                let end = start + slice_cols;
+                data.extend_from_slice(&self.data[start..end]);
+            }
+            return Tensor2D::new(data, self.rows, slice_cols);
+        }
         let tensor = to_candle_2d(self)?;
         from_candle_2d(&tensor.narrow(1, col_start, slice_cols).map_err(candle_error)?)
     }
@@ -202,6 +251,22 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
         )));
     }
 
+    if is_cpu_provider() {
+        let mut out = vec![0.0; a.rows * b.cols];
+        for i in 0..a.rows {
+            let a_row = &a.data[i * a.cols..(i + 1) * a.cols];
+            for k in 0..a.cols {
+                let a_ik = a_row[k];
+                let b_row = &b.data[k * b.cols..(k + 1) * b.cols];
+                let out_row = &mut out[i * b.cols..(i + 1) * b.cols];
+                for j in 0..b.cols {
+                    out_row[j] += a_ik * b_row[j];
+                }
+            }
+        }
+        return Tensor2D::new(out, a.rows, b.cols);
+    }
+
     let lhs = to_candle_2d(a)?;
     let rhs = to_candle_2d(b)?;
     from_candle_2d(&lhs.matmul(&rhs).map_err(candle_error)?)
@@ -216,6 +281,15 @@ pub fn matvec(a: &Tensor2D, v: &Tensor1D) -> Result<Tensor1D> {
             a.cols,
             v.len()
         )));
+    }
+
+    if is_cpu_provider() {
+        let mut out = vec![0.0; a.rows];
+        for (row_idx, out_cell) in out.iter_mut().enumerate() {
+            let row = &a.data[row_idx * a.cols..(row_idx + 1) * a.cols];
+            *out_cell = row.iter().zip(&v.data).map(|(lhs, rhs)| lhs * rhs).sum();
+        }
+        return Ok(Tensor1D { data: out });
     }
 
     let lhs = to_candle_2d(a)?;
@@ -258,6 +332,13 @@ pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
 
 /// ReLU activation function
 pub fn relu(tensor: &Tensor2D) -> Tensor2D {
+    if is_cpu_provider() {
+        return Tensor2D {
+            data: tensor.data.iter().map(|value| value.max(0.0)).collect(),
+            rows: tensor.rows,
+            cols: tensor.cols,
+        };
+    }
     let result = to_candle_2d(tensor)
         .and_then(|x| from_candle_2d(&x.relu().map_err(candle_error)?))
         .expect("GPU ReLU failed");
@@ -269,6 +350,17 @@ pub fn relu(tensor: &Tensor2D) -> Tensor2D {
 /// Used in LLaMA and other modern models.
 /// silu(x) = x * sigmoid(x)
 pub fn silu(tensor: &Tensor2D) -> Tensor2D {
+    if is_cpu_provider() {
+        return Tensor2D {
+            data: tensor
+                .data
+                .iter()
+                .map(|value| value / (1.0 + (-value).exp()))
+                .collect(),
+            rows: tensor.rows,
+            cols: tensor.cols,
+        };
+    }
     let result = to_candle_2d(tensor)
         .and_then(|x| from_candle_2d(&candle_ops::silu(&x).map_err(candle_error)?))
         .expect("GPU SiLU failed");
@@ -287,6 +379,19 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
             tensor.cols,
             gamma.len()
         )));
+    }
+
+    if is_cpu_provider() {
+        let mut out = vec![0.0; tensor.len()];
+        for row in 0..tensor.rows {
+            let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
+            let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / tensor.cols as f32;
+            let inv_rms = 1.0 / (mean_square + eps).sqrt();
+            for col in 0..tensor.cols {
+                out[row * tensor.cols + col] = slice[col] * inv_rms * gamma.data[col];
+            }
+        }
+        return Tensor2D::new(out, tensor.rows, tensor.cols);
     }
 
     let x = to_candle_2d(tensor)?;
@@ -324,6 +429,25 @@ pub fn layer_norm(
 ///
 /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
 pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
+    if is_cpu_provider() {
+        let mut out = vec![0.0; tensor.len()];
+        for row in 0..tensor.rows {
+            let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
+            let max_val = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut exp_sum = 0.0f32;
+            for value in slice {
+                exp_sum += (value - max_val).exp();
+            }
+            for col in 0..tensor.cols {
+                out[row * tensor.cols + col] = (slice[col] - max_val).exp() / exp_sum;
+            }
+        }
+        return Tensor2D {
+            data: out,
+            rows: tensor.rows,
+            cols: tensor.cols,
+        };
+    }
     let result = to_candle_2d(tensor)
         .and_then(|x| from_candle_2d(&candle_ops::softmax(&x, 1).map_err(candle_error)?))
         .expect("GPU softmax failed");
@@ -450,6 +574,17 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
         }
     }
 
+    if is_cpu_provider() {
+        let mut data = Vec::with_capacity(tokens.len() * embedding_table.cols);
+        for &token in tokens {
+            let token_idx = token as usize;
+            let start = token_idx * embedding_table.cols;
+            let end = start + embedding_table.cols;
+            data.extend_from_slice(&embedding_table.data[start..end]);
+        }
+        return Tensor2D::new(data, tokens.len(), embedding_table.cols);
+    }
+
     let table = to_candle_2d(embedding_table)?;
     let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), execution_device()?).map_err(candle_error)?;
     from_candle_2d(&table.embedding(&ids).map_err(candle_error)?)
@@ -563,6 +698,14 @@ impl Tensor2D {
 
 fn candle_error(err: candle_core::Error) -> AgentError {
     AgentError::Execution(format!("Tensor backend error: {}", err))
+}
+
+#[inline]
+fn is_cpu_provider() -> bool {
+    matches!(
+        selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
+        ExecutionProviderKind::Cpu
+    )
 }
 
 pub(crate) fn execution_device() -> Result<&'static Device> {

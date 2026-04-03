@@ -12,8 +12,9 @@ use tracing::{debug, info, instrument, warn};
 use super::events::{ConnectionInfo, ConnectionType, MeshEvent};
 use crate::api::types::PeerPunchPlan;
 use crate::connectivity::{
-    persist_observed_reachability_addr, persist_runtime_connectivity_state,
-    select_direct_dial_multiaddrs, ConnectivityPath, ConnectivityStatus, DeviceConnectivityState,
+    load_runtime_connectivity_state, persist_observed_reachability_addr,
+    persist_runtime_connectivity_state, select_direct_dial_multiaddrs, ConnectivityPath,
+    ConnectivityStatus, DeviceConnectivityState,
 };
 use crate::errors::{AgentError, Result};
 
@@ -380,11 +381,21 @@ impl MeshSwarm {
                             } else {
                                 info!(relay = %relay_peer_id, limit = ?limit, "Relay reservation accepted");
                             }
-                            let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
-                                active_path: ConnectivityPath::Relayed,
-                                active_endpoint: Some(self.config.relay_addr.to_string()),
-                                status: ConnectivityStatus::Connected,
-                            });
+                            let should_mark_relay = !matches!(
+                                load_runtime_connectivity_state(),
+                                Some(DeviceConnectivityState {
+                                    active_path: ConnectivityPath::Direct,
+                                    status: ConnectivityStatus::Connected,
+                                    ..
+                                })
+                            );
+                            if should_mark_relay {
+                                let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
+                                    active_path: ConnectivityPath::Relayed,
+                                    active_endpoint: Some(self.config.relay_addr.to_string()),
+                                    status: ConnectivityStatus::Connected,
+                                });
+                            }
                             return Some(MeshEvent::ReservationAccepted {
                                 relay_peer_id,
                                 renewal_timeout: Duration::from_secs(30),

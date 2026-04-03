@@ -406,6 +406,15 @@ fn listen_addrs_path() -> Result<std::path::PathBuf> {
         .join("listen_addrs.json"))
 }
 
+fn reset_persisted_listen_addrs() -> Result<()> {
+    let path = listen_addrs_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, "[]")?;
+    Ok(())
+}
+
 fn persist_listen_addr(local_peer_id: libp2p::PeerId, address: &Multiaddr) -> Result<()> {
     let path = listen_addrs_path()?;
     if let Some(parent) = path.parent() {
@@ -627,6 +636,8 @@ async fn cmd_start() -> Result<()> {
     println!("   Execution Provider: {}", selected_provider.as_str());
 
     let runtime_endpoint = config.connectivity.runtime_endpoint()?;
+
+    reset_persisted_listen_addrs().context("Failed to reset persisted listen addresses")?;
 
     println!("\n🌐 Initializing mesh transport...");
     match &runtime_endpoint {
