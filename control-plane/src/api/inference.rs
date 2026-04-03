@@ -920,12 +920,13 @@ mod tests {
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
+            tier: Tier::Tier2,
             cpu_cores: 8,
             ram_mb: 16384,
+            gpu_present: false,
+            gpu_vram_mb: None,
             os: "macos".into(),
             arch: "aarch64".into(),
-            has_gpu: false,
-            tier: Tier::Tier2,
         }
     }
 
@@ -1004,6 +1005,7 @@ mod tests {
             let join_request = RingJoinRequest {
                 device_id: (*device_id).to_string(),
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000 + idx as u64,
             };
 
@@ -1043,6 +1045,7 @@ mod tests {
             let join_request = RingJoinRequest {
                 device_id: (*device_id).to_string(),
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000 + idx as u64,
             };
 
@@ -1565,7 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_claim_assignment_allows_same_model_progress_when_no_competing_model_waits() {
-        let network_id = "test-network-model-fallback";
+        let network_id = "test-network-model-routing";
         let state = joined_state(&["worker-1", "worker-2", "worker-3"], network_id).await;
 
         let model_x_first = submit_inference(

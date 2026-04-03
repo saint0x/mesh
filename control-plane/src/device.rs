@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 /// (Mirrors agent::device::DeviceCapabilities)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeviceCapabilities {
+    pub tier: Tier,
     pub cpu_cores: usize,
     pub ram_mb: usize,
+    pub gpu_present: bool,
+    pub gpu_vram_mb: Option<usize>,
     pub os: String,
     pub arch: String,
-    pub has_gpu: bool,
-    pub tier: Tier,
 }
 
 /// Device tier based on hardware capabilities

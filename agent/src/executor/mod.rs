@@ -1,19 +1,8 @@
 //! Job execution module for Mesh AI compute network
 //!
-//! This module provides workload executors for different AI tasks:
-//! - Embeddings: Text embedding generation using ONNX models
-//! - Ring All-Reduce: Distributed gradient aggregation for training
-//! - OCR: Optical character recognition (future)
-//! - Chat: Language model inference (future)
-//!
-//! The job_runner module integrates executors with the network layer.
+//! This module provides the tensor communication primitives used by the
+//! production distributed inference runtime.
 
-pub mod embeddings;
-pub mod job_runner;
 pub mod ring_allreduce;
-pub mod types;
 
-pub use embeddings::EmbeddingsExecutor;
-pub use job_runner::{AdmissionPolicy, JobRunner, JobStats};
 pub use ring_allreduce::{Tensor, WorkerRing};
-pub use types::{EmbeddingsInput, EmbeddingsOutput, ExecutorError, ExecutorResult};

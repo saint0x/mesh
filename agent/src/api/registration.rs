@@ -364,7 +364,7 @@ mod tests {
     use super::*;
     use crate::device::{DeviceCapabilities, Tier};
 
-    /// Test helper to create mock device capabilities
+    /// Test helper to create device capabilities
     /// Used by integration tests in tests/ directory
     #[allow(dead_code)]
     fn test_capabilities() -> DeviceCapabilities {
@@ -385,6 +385,5 @@ mod tests {
         assert_eq!(client.control_plane_url, "http://localhost:8080");
     }
 
-    // Note: Integration tests with mock server would go in tests/ directory
-    // using wiremock crate for HTTP mocking
+    // Integration tests for the HTTP registration surface belong in tests/.
 }

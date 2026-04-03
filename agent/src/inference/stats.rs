@@ -196,42 +196,24 @@ impl InferenceStats {
             .store(snapshot.bytes_sent, Ordering::Relaxed);
         self.tensor_bytes_received
             .store(snapshot.bytes_received, Ordering::Relaxed);
-        self.tensor_outbound_backpressure_wait_count.store(
-            snapshot.outbound_backpressure_wait_count,
-            Ordering::Relaxed,
-        );
-        self.tensor_outbound_backpressure_wait_ms.store(
-            snapshot.outbound_backpressure_wait_ms,
-            Ordering::Relaxed,
-        );
-        self.tensor_outbound_bandwidth_wait_count.store(
-            snapshot.outbound_bandwidth_wait_count,
-            Ordering::Relaxed,
-        );
-        self.tensor_outbound_bandwidth_wait_ms.store(
-            snapshot.outbound_bandwidth_wait_ms,
-            Ordering::Relaxed,
-        );
-        self.tensor_inbound_queue_full_rejections.store(
-            snapshot.inbound_queue_full_rejections,
-            Ordering::Relaxed,
-        );
-        self.tensor_inbound_byte_budget_rejections.store(
-            snapshot.inbound_byte_budget_rejections,
-            Ordering::Relaxed,
-        );
-        self.tensor_oversized_message_rejections.store(
-            snapshot.oversized_message_rejections,
-            Ordering::Relaxed,
-        );
-        self.tensor_current_inbound_queued_bytes.store(
-            snapshot.current_inbound_queued_bytes,
-            Ordering::Relaxed,
-        );
-        self.tensor_current_outbound_inflight_bytes.store(
-            snapshot.current_outbound_inflight_bytes,
-            Ordering::Relaxed,
-        );
+        self.tensor_outbound_backpressure_wait_count
+            .store(snapshot.outbound_backpressure_wait_count, Ordering::Relaxed);
+        self.tensor_outbound_backpressure_wait_ms
+            .store(snapshot.outbound_backpressure_wait_ms, Ordering::Relaxed);
+        self.tensor_outbound_bandwidth_wait_count
+            .store(snapshot.outbound_bandwidth_wait_count, Ordering::Relaxed);
+        self.tensor_outbound_bandwidth_wait_ms
+            .store(snapshot.outbound_bandwidth_wait_ms, Ordering::Relaxed);
+        self.tensor_inbound_queue_full_rejections
+            .store(snapshot.inbound_queue_full_rejections, Ordering::Relaxed);
+        self.tensor_inbound_byte_budget_rejections
+            .store(snapshot.inbound_byte_budget_rejections, Ordering::Relaxed);
+        self.tensor_oversized_message_rejections
+            .store(snapshot.oversized_message_rejections, Ordering::Relaxed);
+        self.tensor_current_inbound_queued_bytes
+            .store(snapshot.current_inbound_queued_bytes, Ordering::Relaxed);
+        self.tensor_current_outbound_inflight_bytes
+            .store(snapshot.current_outbound_inflight_bytes, Ordering::Relaxed);
     }
 
     /// Get total jobs (completed + failed)
@@ -441,18 +423,15 @@ impl InferenceStats {
         );
         println!(
             "  Recovery Cooldowns:  {}",
-            self.recovery_cooldown_rejections
-                .load(Ordering::Relaxed)
+            self.recovery_cooldown_rejections.load(Ordering::Relaxed)
         );
         println!(
             "  Recovery Budget Hit: {}",
-            self.recovery_budget_rejections
-                .load(Ordering::Relaxed)
+            self.recovery_budget_rejections.load(Ordering::Relaxed)
         );
         println!(
             "  Recovery Misses:     {}",
-            self.recovery_checkpoint_misses
-                .load(Ordering::Relaxed)
+            self.recovery_checkpoint_misses.load(Ordering::Relaxed)
         );
 
         println!("\n{}", "System:".bold());

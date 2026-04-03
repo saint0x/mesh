@@ -10,7 +10,6 @@ use sysinfo::System;
 /// - Tier3: 8.0x (high-end compute)
 /// - Tier4: 16.0x (server-grade)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Tier {
     Tier0,
     Tier1,
@@ -212,7 +211,7 @@ mod tests {
     fn test_tier_serialization() {
         let tier = Tier::Tier2;
         let json = serde_json::to_string(&tier).unwrap();
-        assert_eq!(json, "\"tier2\"");
+        assert_eq!(json, "\"Tier2\"");
 
         let deserialized: Tier = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, tier);

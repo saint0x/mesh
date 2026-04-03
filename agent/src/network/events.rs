@@ -1,11 +1,7 @@
 // Event types for mesh network operations
 
-use libp2p::request_response::ResponseChannel;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use super::job_protocol::{JobEnvelope, JobResult};
 
 /// High-level events emitted by the mesh swarm
 #[derive(Debug)]
@@ -65,32 +61,12 @@ pub enum MeshEvent {
     /// Relay reservation was denied
     ReservationDenied { relay_peer_id: PeerId },
 
-    /// Direct dialing failed and relay fallback was attempted for a peer
-    RelayFallbackToPeer { peer_id: PeerId },
-
     /// An explicit punched-path attempt was scheduled for a peer
     PunchPathAttemptInitiated {
         peer_id: PeerId,
         reason: String,
         candidate_count: usize,
         relay_rendezvous_required: bool,
-    },
-
-    /// Received a job request from a peer
-    JobReceived {
-        peer_id: PeerId,
-        job: JobEnvelope,
-        channel: ResponseChannel<JobResult>,
-    },
-
-    /// Received a job result from a peer
-    JobCompleted { peer_id: PeerId, result: JobResult },
-
-    /// Failed to send a job request
-    JobSendFailed {
-        peer_id: PeerId,
-        job_id: Uuid,
-        error: String,
     },
 }
 

@@ -4,7 +4,6 @@
 // for NAT traversal and DCUTR for direct connection upgrades.
 
 mod events;
-mod job_protocol;
 mod mesh_swarm;
 mod ring_gossip;
 mod ring_gossip_service;
@@ -12,7 +11,6 @@ mod tensor_message;
 mod tensor_plane;
 
 pub use events::{ConnectionInfo, ConnectionType, MeshEvent};
-pub use job_protocol::{JobEnvelope, JobProtocol, JobProtocolConfig, JobResult};
 pub use mesh_swarm::{MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections};
 pub use ring_gossip::{MemberStatus, RingGossipMessage, RingMember, RingState, RingTopology};
 pub use ring_gossip_service::RingGossipService;
@@ -22,6 +20,3 @@ pub use tensor_plane::{
     parse_tensor_plane_bind_addr_env, InboundTensorMessage, TensorPlane, TensorPlaneConfig,
     TensorPlaneMetricsSnapshot, DATA_PLANE_ENDPOINT_PREFIX,
 };
-
-// Re-export libp2p types needed for handling network events
-pub use libp2p::request_response::{OutboundRequestId, ResponseChannel};

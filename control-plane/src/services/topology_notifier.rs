@@ -111,6 +111,11 @@ impl TopologyNotification {
         self
     }
 
+    pub fn with_model(mut self, model_id: String) -> Self {
+        self.metadata.insert("model_id".to_string(), model_id);
+        self
+    }
+
     pub fn with_neighbors(mut self, left: String, right: String) -> Self {
         self.left_neighbor = Some(left);
         self.right_neighbor = Some(right);
@@ -546,6 +551,7 @@ impl TopologyNotifier {
         device_id: &str,
         position: u32,
         shard_range: (u32, u32),
+        model_id: String,
         left: &str,
         right: &str,
     ) -> TopologyNotification {
@@ -558,6 +564,7 @@ impl TopologyNotifier {
         .with_device(device_id.to_string())
         .with_position(position)
         .with_shard(shard_range.0, shard_range.1)
+        .with_model(model_id)
         .with_neighbors(left.to_string(), right.to_string())
     }
 
@@ -695,6 +702,7 @@ mod tests {
             "device-1",
             0,
             (0, 4096),
+            "test-model".to_string(),
             "device-3",
             "device-2",
         );

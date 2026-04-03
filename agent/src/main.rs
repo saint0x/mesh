@@ -1,19 +1,13 @@
 //! Mesh AI Agent - Command Line Interface
 //!
-//! The Mesh AI Agent is a distributed compute sharing daemon that allows devices
-//! to contribute spare compute resources for AI workloads (embeddings, OCR, etc.)
-//! and distributed tensor-parallel inference.
+//! The Mesh AI Agent is a production distributed inference daemon.
 //!
 //! ## Commands
 //!
 //! ### Device Management
 //! - `init` - Initialize device and register with control plane
-//! - `start` - Run agent daemon to process jobs
+//! - `start` - Run the agent daemon for ring participation and inference execution
 //! - `status` - Show device and network status
-//! - `metrics` - Show agent metrics and statistics
-//!
-//! ### Job Submission
-//! - `job` - Submit a job to the network (embeddings, OCR)
 //! - `inference` - Submit distributed inference job
 //!
 //! ### Ring Topology
@@ -40,16 +34,14 @@ use agent::{
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
     parse_data_plane_endpoint, parse_memory_string, parse_tensor_plane_advertised_addr_env,
     parse_tensor_plane_bind_addr_env, persist_runtime_connectivity_state,
-    select_direct_dial_addrs_from_candidates, AdmissionPolicy, ConnectivityAttachmentKind,
-    ConnectivityPath, ConnectivityStatus, DeviceConfig, DeviceConnectivityState,
-    EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, JobRunner, MeshSwarmBuilder,
+    select_direct_dial_addrs_from_candidates, ConnectivityAttachmentKind, ConnectivityPath,
+    ConnectivityStatus, DeviceConfig, DeviceConnectivityState, MeshSwarmBuilder,
     RegistrationClient, ResourceManager, TensorPlane, TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 use tracing::{error, info, warn};
@@ -89,34 +81,8 @@ enum Commands {
         log_level: String,
     },
 
-    /// Submit a job to the network
-    Job {
-        /// Job input text
-        #[arg(short, long)]
-        input: String,
-
-        /// Target peer ID (PeerId format)
-        #[arg(short, long)]
-        target: String,
-
-        /// Workload type (embeddings, ocr, chat)
-        #[arg(short, long, default_value = "embeddings")]
-        workload: String,
-
-        /// Job timeout in milliseconds
-        #[arg(long, default_value = "5000")]
-        timeout_ms: u64,
-
-        /// Log level
-        #[arg(long, default_value = "info")]
-        log_level: String,
-    },
-
     /// Show device and network status
     Status,
-
-    /// Show agent metrics and statistics
-    Metrics,
 
     /// Lock resources for pool contribution
     LockResources {
@@ -238,25 +204,9 @@ async fn main() -> Result<()> {
             cmd_start().await?;
         }
 
-        Commands::Job {
-            input,
-            target,
-            workload,
-            timeout_ms,
-            log_level,
-        } => {
-            init_simple_logging(&log_level)?;
-            cmd_job(input, target, workload, timeout_ms).await?;
-        }
-
         Commands::Status => {
             init_simple_logging("info")?;
             cmd_status().await?;
-        }
-
-        Commands::Metrics => {
-            // No logging for metrics (pure display)
-            cmd_metrics().await?;
         }
 
         Commands::LockResources { memory } => {
@@ -416,9 +366,8 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
     println!("\n✅ Device initialized successfully!");
     println!("\nNext steps:");
     println!("  1. Start the agent:  cargo run --bin agent -- start");
-    println!(
-        "  2. Submit a job:     cargo run --bin agent -- job --input \"Hello\" --target <peer-id>"
-    );
+    println!("  2. Join a ring:      cargo run --bin agent -- join-ring --model-id <model>");
+    println!("  3. Submit inference: cargo run --bin agent -- inference --prompt \"Hello\"");
 
     Ok(())
 }
@@ -686,83 +635,43 @@ async fn cmd_start() -> Result<()> {
         println!("   Waiting for relay connection...");
 
         let local_peer_id_for_events = local_peer_id.clone();
-        let relay_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(event) = swarm.next_event().await {
-                    match event {
-                        agent::MeshEvent::NewListenAddr { address } => {
-                            let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
-                        }
-                        agent::MeshEvent::RelayConnected { .. } => {
-                            return Ok(());
-                        }
-                        agent::MeshEvent::RelayConnectionFailed { error, .. } => {
-                            anyhow::bail!("Relay connection failed: {}", error);
-                        }
-                        _ => {}
+        let relay_peer_id = loop {
+            if let Some(event) = swarm.next_event().await {
+                match event {
+                    agent::MeshEvent::NewListenAddr { address } => {
+                        let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
                     }
+                    agent::MeshEvent::RelayConnected { relay_peer_id, .. } => {
+                        println!("   ✓ Connected to relay {}", relay_addr);
+                        break relay_peer_id;
+                    }
+                    agent::MeshEvent::RelayConnectionFailed { error, .. } => {
+                        anyhow::bail!("Relay connection failed: {}", error);
+                    }
+                    _ => {}
                 }
             }
-        })
-        .await;
-
-        match relay_result {
-            Ok(Ok(())) => {
-                println!("   ✓ Connected to relay {}", relay_addr);
-            }
-            Ok(Err(e)) => {
-                return Err(e);
-            }
-            Err(_timeout) => {
-                warn!("RelayConnected event timeout - checking libp2p connection");
-                if !swarm.connected_peers().is_empty() {
-                    println!("   ✓ Connected to relay (verified via libp2p)");
-                } else {
-                    anyhow::bail!("Relay connection timeout - no connection established");
-                }
-            }
-        }
-
-        let connected_peers = swarm.connected_peers();
-        let relay_peer_id = connected_peers
-            .first()
-            .copied()
-            .context("No relay peer connected")?;
+        };
 
         println!("   Creating relay reservation...");
         swarm.listen_on_relay(relay_peer_id)?;
 
         let local_peer_id_for_events = local_peer_id.clone();
-        let reservation_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(event) = swarm.next_event().await {
-                    match event {
-                        agent::MeshEvent::NewListenAddr { address } => {
-                            let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
-                        }
-                        agent::MeshEvent::ReservationAccepted { .. } => {
-                            return Ok(());
-                        }
-                        agent::MeshEvent::ReservationDenied { .. } => {
-                            anyhow::bail!("Relay reservation denied");
-                        }
-                        _ => {}
+        loop {
+            if let Some(event) = swarm.next_event().await {
+                match event {
+                    agent::MeshEvent::NewListenAddr { address } => {
+                        let _ = persist_listen_addr(local_peer_id_for_events.clone(), &address);
                     }
+                    agent::MeshEvent::ReservationAccepted { .. } => {
+                        println!("   ✓ Relay reservation accepted");
+                        break;
+                    }
+                    agent::MeshEvent::ReservationDenied { .. } => {
+                        anyhow::bail!("Relay reservation denied");
+                    }
+                    _ => {}
                 }
-            }
-        })
-        .await;
-
-        match reservation_result {
-            Ok(Ok(())) => {
-                println!("   ✓ Relay reservation accepted");
-            }
-            Ok(Err(e)) => {
-                return Err(e);
-            }
-            Err(_timeout) => {
-                warn!("ReservationAccepted event timeout - proceeding anyway");
-                println!("   ⚠️  Relay reservation (event timeout, proceeding)");
             }
         }
     } else {
@@ -957,35 +866,33 @@ async fn cmd_start() -> Result<()> {
             }
         }
 
-        // Start heartbeat (in background) ONLY if pools exist
-        // This prevents 404 errors for devices that only joined pools without init
-        if has_pools {
-            let heartbeat_config = config.clone();
-            tokio::spawn(async move {
-                let client = match RegistrationClient::new(
-                    heartbeat_config.control_plane_url.clone(),
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to create heartbeat client (non-fatal)");
-                        return;
-                    }
-                };
-
-                // Wait for beacon listener to be ready before starting heartbeat
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-                loop {
-                    if let Err(e) = client.heartbeat(&heartbeat_config).await {
-                        // Downgrade to WARN (not ERROR) since this is non-fatal for LAN-only operation
-                        tracing::warn!(error = %e, "Heartbeat failed (control plane may be offline)");
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // Always heartbeat when the agent is started from a registered device config.
+        // Pools enable LAN discovery, but control-plane deployments still require
+        // periodic endpoint and tensor-plane updates for ring coordination.
+        let heartbeat_config = config.clone();
+        tokio::spawn(async move {
+            let client = match RegistrationClient::new(
+                heartbeat_config.control_plane_url.clone(),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to create heartbeat client (non-fatal)");
+                    return;
                 }
-            });
-        } else {
-            tracing::info!("Skipping heartbeat (no pools configured, LAN-only mode)");
-        }
+            };
+
+            // Give transport and optional beacon services a moment to publish endpoints
+            // before the first heartbeat snapshot is sent.
+            let initial_delay_secs = if has_pools { 3 } else { 1 };
+            tokio::time::sleep(tokio::time::Duration::from_secs(initial_delay_secs)).await;
+
+            loop {
+                if let Err(e) = client.heartbeat(&heartbeat_config).await {
+                    tracing::warn!(error = %e, "Heartbeat failed (control plane may be offline)");
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        });
     }
 
     // Start inference coordinator (in background)
@@ -1037,12 +944,36 @@ async fn cmd_start() -> Result<()> {
                 return;
             }
 
-            let mut relay_connected = false;
-            while !relay_connected {
+            let relay_peer_id = loop {
                 if let Some(event) = inference_swarm.next_event().await {
-                    if matches!(event, agent::MeshEvent::RelayConnected { .. }) {
-                        info!("Inference swarm connected to relay");
-                        relay_connected = true;
+                    match event {
+                        agent::MeshEvent::RelayConnected { relay_peer_id, .. } => {
+                            info!("Inference swarm connected to relay");
+                            break relay_peer_id;
+                        }
+                        agent::MeshEvent::RelayConnectionFailed { error, .. } => {
+                            error!(error = %error, "Inference swarm relay connection failed");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            };
+
+            if let Err(e) = inference_swarm.listen_on_relay(relay_peer_id) {
+                error!(error = %e, "Failed to create inference swarm relay reservation");
+                return;
+            }
+
+            loop {
+                if let Some(event) = inference_swarm.next_event().await {
+                    match event {
+                        agent::MeshEvent::ReservationAccepted { .. } => break,
+                        agent::MeshEvent::ReservationDenied { .. } => {
+                            error!("Inference swarm relay reservation denied");
+                            return;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1294,190 +1225,79 @@ async fn cmd_start() -> Result<()> {
         }
     });
 
-    // Create executor
-    let executor = EmbeddingsExecutor::new()?;
-    println!("\n🤖 Executor initialized");
-    println!("   Model: {}", executor.model_name());
-    println!("   Dimensions: {}", executor.dimensions());
-
-    // Create and run job runner
-    println!("\n✅ Agent ready - waiting for jobs...");
+    println!("\n✅ Agent ready - participating in mesh inference...");
     println!("   Press Ctrl+C to stop\n");
 
-    let runner = JobRunner::new(swarm, executor)
-        .with_max_concurrent_jobs(config.governance.max_concurrent_jobs)
-        .with_max_pending_jobs(config.governance.max_pending_jobs)
-        .with_admission_policy(AdmissionPolicy::new(
-            config.network_id.clone(),
-            config.governance.max_concurrent_jobs_per_peer,
-            config.governance.max_job_timeout_ms,
-            config.governance.allowed_workloads.clone(),
-            config.governance.workload_concurrency_limits.clone(),
-            config.governance.peer_priority_weights.clone(),
-            config.governance.workload_priority_weights.clone(),
-            config.governance.trusted_peer_ids.clone(),
-            config.governance.blocked_peer_ids.clone(),
-        ));
-    runner.run().await?;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received");
+                break;
+            }
+            event = swarm.next_event() => {
+                let Some(event) = event else {
+                    break;
+                };
 
-    Ok(())
-}
-
-/// Submit a job to the network
-async fn cmd_job(input: String, target: String, workload: String, timeout_ms: u64) -> Result<()> {
-    println!("📤 Submitting job to network...\n");
-
-    // Load device configuration
-    let config_path = DeviceConfig::default_path()?;
-    let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
-
-    // Parse target peer ID
-    let target_peer: PeerId = PeerId::from_str(&target).context("Invalid peer ID format")?;
-
-    println!("📋 Job Details:");
-    println!("   Workload: {}", workload);
-    println!("   Input: \"{}\"", input);
-    println!("   Target: {}", target_peer);
-    println!("   Timeout: {}ms", timeout_ms);
-
-    let runtime_endpoint = config.connectivity.runtime_endpoint()?;
-
-    // Create ephemeral swarm for job submission
-    let libp2p_keypair = agent::device::keypair::to_libp2p_keypair(&config.keypair);
-    let mut swarm_builder = MeshSwarmBuilder::new(libp2p_keypair);
-    if let Some(endpoint) = runtime_endpoint.clone() {
-        swarm_builder = swarm_builder.with_relay_addr(endpoint);
-    }
-    let mut swarm = swarm_builder.build()?;
-    swarm.listen_on_direct_addrs()?;
-
-    println!("\n🌐 Resolving peer connectivity...");
-    let client = reqwest::Client::new();
-    let topology_url = format!(
-        "{}/api/ring/topology?network_id={}",
-        config.control_plane_url.trim_end_matches('/'),
-        config.network_id
-    );
-    let topology = client
-        .get(&topology_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<RingTopologyResponse>()
-        .await?;
-
-    let worker = topology
-        .workers
-        .iter()
-        .find(|worker| worker.peer_id == target_peer.to_string())
-        .cloned()
-        .context("Target peer not found in topology")?;
-
-    let punch_plan = find_peer_punch_plan(&topology, &config.device_id, &worker.device_id);
-    let target_addrs =
-        resolve_target_direct_addrs(&topology, &config.device_id, &worker, target_peer);
-    if !target_addrs.is_empty() {
-        if let Some(plan) = punch_plan.as_ref() {
-            swarm.dial_direct_peer_with_punch_plan(target_peer, plan)?;
-            println!(
-                "   ✓ Applying punched-path plan ({:?}, {} candidates)",
-                plan.reason,
-                plan.target_candidates.len()
-            );
-        } else {
-            swarm.dial_direct_peer(target_peer, &target_addrs)?;
-            println!("   ✓ Dialing target directly");
-        }
-    } else if matches!(
-        config.connectivity.preferred_path,
-        ConnectivityPath::Relayed
-    ) {
-        println!("   ⚠️  No viable direct addresses advertised; falling back to relay");
-        swarm.connect_to_relay()?;
-        swarm.dial_peer(target_peer)?;
-        println!("   ✓ Dialing target through relay");
-    } else {
-        anyhow::bail!("Target peer has no viable direct addresses");
-    }
-
-    // Create job envelope
-    let embeddings_input = EmbeddingsInput::new(input.clone());
-    let payload = embeddings_input.to_cbor()?;
-
-    let job = agent::network::JobEnvelope {
-        job_id: Uuid::new_v4(),
-        network_id: config.network_id.clone(),
-        workload_id: workload.clone(),
-        payload,
-        timeout_ms,
-        auth_signature: vec![], // TODO: implement signature
-        created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-    };
-
-    println!("   Job ID: {}", job.job_id);
-
-    // Send job
-    println!("\n📡 Sending job...");
-    swarm.send_job(target_peer, job.clone())?;
-
-    // Wait for result
-    println!("   Waiting for result (timeout: {}ms)...", timeout_ms);
-
-    let start = std::time::Instant::now();
-    let deadline = std::time::Duration::from_millis(timeout_ms + 5000); // Add 5s buffer
-
-    while start.elapsed() < deadline {
-        if let Some(event) = swarm.next_event().await {
-            match event {
-                agent::MeshEvent::JobCompleted { result, .. } => {
-                    if result.job_id == job.job_id {
-                        if result.success {
-                            println!("\n✅ Job completed successfully!");
-                            println!("   Execution time: {}ms", result.execution_time_ms);
-
-                            if let Some(result_bytes) = result.result {
-                                match EmbeddingsOutput::from_cbor(&result_bytes) {
-                                    Ok(output) => {
-                                        let preview: Vec<f32> =
-                                            output.embedding.iter().take(5).copied().collect();
-                                        println!("   Model: {}", output.model);
-                                        println!("   Dimensions: {}", output.dimensions);
-                                        println!(
-                                            "   Embedding preview: [{:.3}, {:.3}, {:.3}, ...]",
-                                            preview.first().unwrap_or(&0.0),
-                                            preview.get(1).unwrap_or(&0.0),
-                                            preview.get(2).unwrap_or(&0.0),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("   Warning: Failed to parse result: {}", e);
-                                    }
-                                }
-                            }
-                        } else {
-                            println!("\n✗ Job failed!");
-                            if let Some(error) = result.error {
-                                println!("   Error: {}", error);
-                            }
-                        }
-
-                        return Ok(());
+                match event {
+                    agent::MeshEvent::NewListenAddr { address } => {
+                        let _ = persist_listen_addr(local_peer_id, &address);
                     }
-                }
-                agent::MeshEvent::JobSendFailed { job_id, error, .. } => {
-                    if job_id == job.job_id {
-                        error!(error = %error, "Job send failed");
-                        anyhow::bail!("Failed to send job: {}", error);
+                    agent::MeshEvent::PeerConnected { peer_id, connection_info } => {
+                        info!(
+                            peer_id = %peer_id,
+                            connection_type = ?connection_info.connection_type,
+                            remote_addr = %connection_info.remote_addr,
+                            "Primary swarm peer connected"
+                        );
                     }
+                    agent::MeshEvent::PeerDisconnected { peer_id } => {
+                        info!(peer_id = %peer_id, "Primary swarm peer disconnected");
+                    }
+                    agent::MeshEvent::DirectConnectionUpgraded { peer_id } => {
+                        info!(peer_id = %peer_id, "Primary swarm upgraded to direct connectivity");
+                    }
+                    agent::MeshEvent::DirectConnectionUpgradeFailed { peer_id, error } => {
+                        warn!(peer_id = %peer_id, error = %error, "Primary swarm direct upgrade failed");
+                    }
+                    agent::MeshEvent::RelayDisconnected { relay_peer_id } => {
+                        warn!(relay_peer_id = %relay_peer_id, "Relay disconnected");
+                    }
+                    agent::MeshEvent::RelayConnectionFailed { relay_addr, error } => {
+                        warn!(relay_addr = %relay_addr, error = %error, "Relay connection failed");
+                    }
+                    agent::MeshEvent::ReservationDenied { relay_peer_id } => {
+                        warn!(relay_peer_id = %relay_peer_id, "Relay reservation denied");
+                    }
+                    agent::MeshEvent::ExternalAddrCandidateDiscovered { address } => {
+                        debug!(address = %address, "Observed external address candidate");
+                    }
+                    agent::MeshEvent::ExternalAddrConfirmed { address } => {
+                        info!(address = %address, "Confirmed external address");
+                    }
+                    agent::MeshEvent::PunchPathAttemptInitiated {
+                        peer_id,
+                        reason,
+                        candidate_count,
+                        relay_rendezvous_required,
+                    } => {
+                        info!(
+                            peer_id = %peer_id,
+                            reason = %reason,
+                            candidate_count,
+                            relay_rendezvous_required,
+                            "Punch-path attempt initiated"
+                        );
+                    }
+                    agent::MeshEvent::PeerIdentified { .. }
+                    | agent::MeshEvent::RelayConnected { .. }
+                    | agent::MeshEvent::ReservationAccepted { .. } => {}
                 }
-                _ => {}
             }
         }
     }
 
-    eprintln!("\n✗ Job timed out after {}ms", deadline.as_millis());
-    anyhow::bail!("Job timed out");
+    Ok(())
 }
 
 /// Show device and network status
@@ -1565,130 +1385,6 @@ async fn cmd_status() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Display agent metrics
-async fn cmd_metrics() -> Result<()> {
-    use colored::Colorize;
-    use std::fs;
-    use std::path::PathBuf;
-
-    // Stats file path
-    let stats_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".meshnet")
-        .join("stats.json");
-
-    if !stats_path.exists() {
-        println!("{}", "No metrics available".yellow());
-        println!("\nThe agent hasn't been started yet, or metrics haven't been saved.");
-        println!("Run 'mesh start' to begin collecting metrics.\n");
-        return Ok(());
-    }
-
-    // Read stats file
-    let stats_json = fs::read_to_string(&stats_path).context("Failed to read stats file")?;
-
-    let stats: SavedStats =
-        serde_json::from_str(&stats_json).context("Failed to parse stats file")?;
-
-    // Display metrics
-    println!("\n{}", "Agent Metrics".bold().cyan());
-    println!("{}", "=============".cyan());
-
-    println!("\n{}", "Job Statistics:".bold());
-    println!("  Total Jobs:       {}", stats.total_jobs);
-    println!(
-        "  Completed:        {}",
-        stats.completed.to_string().green()
-    );
-    println!("  Failed:           {}", stats.failed.to_string().red());
-    println!("  Active:           {}", stats.active);
-    println!("  Success Rate:     {:.1}%", stats.success_rate);
-
-    println!("\n{}", "Performance:".bold());
-    println!("  Avg Execution:    {:.2}ms", stats.avg_execution_time_ms);
-    println!("  Total CPU Time:   {}ms", stats.total_execution_time_ms);
-
-    println!("\n{}", "System:".bold());
-    println!("  Uptime:           {}", stats.uptime);
-    println!("  Last Updated:     {}", stats.last_updated);
-
-    println!("\n{}", "Connectivity:".bold());
-    println!(
-        "  Direct Peers:     {}",
-        stats.connectivity.direct_peer_connections
-    );
-    println!(
-        "  Relayed Peers:    {}",
-        stats.connectivity.relayed_peer_connections
-    );
-    println!("  Relay Fallbacks:  {}", stats.connectivity.relay_fallbacks);
-    println!(
-        "  DCUTR Successes:  {}",
-        stats.connectivity.direct_upgrade_successes
-    );
-    println!(
-        "  DCUTR Failures:   {}",
-        stats.connectivity.direct_upgrade_failures
-    );
-    println!(
-        "  Ext Candidates:   {}",
-        stats.connectivity.external_addr_candidates
-    );
-    println!(
-        "  Ext Confirmed:    {}",
-        stats.connectivity.external_addr_confirmed
-    );
-    println!(
-        "  Punch Attempts:   {}",
-        stats.connectivity.punch_path_attempts
-    );
-    println!(
-        "  Punch Direct:     {}",
-        stats.connectivity.punch_assisted_direct_peer_connections
-    );
-    println!(
-        "  Punch Upgrades:   {}",
-        stats.connectivity.punch_assisted_upgrade_successes
-    );
-    println!(
-        "  Punch Failures:   {}",
-        stats.connectivity.punch_assisted_upgrade_failures
-    );
-    println!();
-
-    Ok(())
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SavedStats {
-    total_jobs: u64,
-    completed: u64,
-    failed: u64,
-    active: u64,
-    success_rate: f64,
-    avg_execution_time_ms: f64,
-    total_execution_time_ms: u64,
-    uptime: String,
-    #[serde(default)]
-    connectivity: SavedConnectivityStats,
-    last_updated: String,
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SavedConnectivityStats {
-    direct_peer_connections: u64,
-    relayed_peer_connections: u64,
-    relay_fallbacks: u64,
-    direct_upgrade_successes: u64,
-    direct_upgrade_failures: u64,
-    external_addr_candidates: u64,
-    external_addr_confirmed: u64,
-    punch_path_attempts: u64,
-    punch_assisted_direct_peer_connections: u64,
-    punch_assisted_upgrade_successes: u64,
-    punch_assisted_upgrade_failures: u64,
 }
 
 /// Lock resources for pool contribution
@@ -2267,12 +1963,14 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
     struct JoinRingRequest {
         device_id: String,
         network_id: String,
+        model_id: String,
         contributed_memory: u64,
     }
 
     let request = JoinRingRequest {
         device_id: config.device_id.to_string(),
         network_id: config.network_id.clone(),
+        model_id,
         contributed_memory: 8_000_000_000, // 8GB default
     };
 

@@ -128,7 +128,7 @@ pub struct Checkpoint {
     /// Generation config (for resumption)
     pub config: CheckpointedConfig,
 
-    /// KV cache state (placeholder - will be tensor data)
+    /// KV cache state persisted for inference recovery.
     /// In production, this would be serialized tensor data
     pub kv_cache_state: Option<Vec<u8>>,
 

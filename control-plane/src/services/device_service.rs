@@ -214,12 +214,13 @@ mod tests {
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
+            tier: Tier::Tier2,
             cpu_cores: 8,
             ram_mb: 16384,
+            gpu_present: false,
+            gpu_vram_mb: None,
             os: "macos".into(),
             arch: "aarch64".into(),
-            has_gpu: false,
-            tier: Tier::Tier2,
         }
     }
 

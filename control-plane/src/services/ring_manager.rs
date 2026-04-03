@@ -39,6 +39,7 @@ pub struct RingPosition {
 pub struct Worker {
     pub device_id: DeviceId,
     pub network_id: String,
+    pub model_id: String,
     pub contributed_memory: u64,
     pub ring_position: Option<u32>,
     pub status: String,
@@ -139,7 +140,7 @@ impl RingTopologyManager {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT device_id, network_id, contributed_memory, ring_position, status
+                SELECT device_id, network_id, COALESCE(shard_model_id, ?), contributed_memory, ring_position, status
                 FROM devices
                 WHERE network_id = ? AND ring_position IS NOT NULL
                 ORDER BY ring_position
@@ -148,13 +149,14 @@ impl RingTopologyManager {
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
         let workers_iter = stmt
-            .query_map(params![network_id], |row| {
+            .query_map(params![&self.default_model_id, network_id], |row| {
                 Ok(Worker {
                     device_id: row.get(0)?,
                     network_id: row.get(1)?,
-                    contributed_memory: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
-                    ring_position: row.get(3)?,
-                    status: row.get(4)?,
+                    model_id: row.get(2)?,
+                    contributed_memory: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                    ring_position: row.get(4)?,
+                    status: row.get(5)?,
                 })
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -244,7 +246,7 @@ impl RingTopologyManager {
         let total_workers = ring_seq.len() + 1;
 
         // Calculate shard assignment
-        let shard = self.assign_shard(new_position, total_workers as u32);
+        let shard = self.assign_shard(&worker.model_id, new_position, total_workers as u32);
 
         // Calculate neighbors (will be updated for all workers)
         let (left_neighbor, right_neighbor) = if total_workers == 1 {
@@ -289,6 +291,7 @@ impl RingTopologyManager {
             r#"
             UPDATE devices SET
                 ring_position = ?,
+                shard_model_id = ?,
                 shard_column_start = ?,
                 shard_column_end = ?,
                 contributed_memory = ?,
@@ -298,6 +301,7 @@ impl RingTopologyManager {
             "#,
             params![
                 new_position,
+                &shard.model_id,
                 shard.column_range.0,
                 shard.column_range.1,
                 worker.contributed_memory as i64,
@@ -347,10 +351,10 @@ impl RingTopologyManager {
     ///
     /// Formula: columns_per_worker = 8192 / total_workers
     /// Worker N gets columns: [N * columns_per_worker, (N+1) * columns_per_worker)
-    pub fn assign_shard(&self, position: u32, total_workers: u32) -> ModelShard {
+    pub fn assign_shard(&self, model_id: &str, position: u32, total_workers: u32) -> ModelShard {
         if total_workers == 0 {
             return ModelShard {
-                model_id: self.default_model_id.clone(),
+                model_id: model_id.to_string(),
                 column_range: (0, 0),
                 estimated_memory: 0,
             };
@@ -376,7 +380,7 @@ impl RingTopologyManager {
         let estimated_memory = (end - start) as u64 * 1_000_000;
 
         ModelShard {
-            model_id: self.default_model_id.clone(),
+            model_id: model_id.to_string(),
             column_range: (start, end),
             estimated_memory,
         }
@@ -450,12 +454,20 @@ impl RingTopologyManager {
             };
 
             // Recalculate shard for updated total
-            let shard = self.assign_shard(position, total_workers);
+            let model_id: String = conn
+                .query_row(
+                    "SELECT COALESCE(shard_model_id, ?) FROM devices WHERE device_id = ?",
+                    params![&self.default_model_id, device_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let shard = self.assign_shard(&model_id, position, total_workers);
 
             conn.execute(
                 r#"
                 UPDATE devices SET
                     ring_position = ?,
+                    shard_model_id = ?,
                     shard_column_start = ?,
                     shard_column_end = ?,
                     left_neighbor_id = ?,
@@ -464,6 +476,7 @@ impl RingTopologyManager {
                 "#,
                 params![
                     position,
+                    &shard.model_id,
                     shard.column_range.0,
                     shard.column_range.1,
                     &left_neighbor,
@@ -533,6 +546,7 @@ impl RingTopologyManager {
             UPDATE devices SET
                 status = 'offline',
                 ring_position = NULL,
+                shard_model_id = NULL,
                 left_neighbor_id = NULL,
                 right_neighbor_id = NULL,
                 shard_column_start = NULL,
@@ -581,7 +595,7 @@ impl RingTopologyManager {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT device_id, ring_position, shard_column_start, shard_column_end,
+                SELECT device_id, ring_position, shard_model_id, shard_column_start, shard_column_end,
                        left_neighbor_id, right_neighbor_id, status, contributed_memory, connectivity_state,
                        peer_id, listen_addrs, direct_candidates
                 FROM devices
@@ -595,43 +609,46 @@ impl RingTopologyManager {
             .query_map(params![network_id], |row| {
                 let device_id: String = row.get(0)?;
                 let position: u32 = row.get(1)?;
-                let shard_start: u32 = row.get(2)?;
-                let shard_end: u32 = row.get(3)?;
-                let left_neighbor: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-                let right_neighbor: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
-                let status: String = row.get(6)?;
-                let contributed_memory = row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64;
+                let shard_model_id = row
+                    .get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| self.default_model_id.clone());
+                let shard_start: u32 = row.get(3)?;
+                let shard_end: u32 = row.get(4)?;
+                let left_neighbor: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+                let right_neighbor: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+                let status: String = row.get(7)?;
+                let contributed_memory = row.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64;
                 let connectivity_state = row
-                    .get::<_, Option<String>>(8)?
+                    .get::<_, Option<String>>(9)?
                     .map(|json| serde_json::from_str(&json))
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            8,
+                            9,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
                     })?;
-                let peer_id: String = row.get(9)?;
+                let peer_id: String = row.get(10)?;
                 let listen_addrs = row
-                    .get::<_, Option<String>>(10)?
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            10,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?
-                    .unwrap_or_default();
-                let direct_candidates = row
                     .get::<_, Option<String>>(11)?
                     .map(|json| serde_json::from_str(&json))
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             11,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .unwrap_or_default();
+                let direct_candidates = row
+                    .get::<_, Option<String>>(12)?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -645,7 +662,7 @@ impl RingTopologyManager {
                     status,
                     contributed_memory,
                     shard: ModelShard {
-                        model_id: String::new(), // Will be filled in
+                        model_id: shard_model_id,
                         column_range: (shard_start, shard_end),
                         estimated_memory: (shard_end - shard_start) as u64 * 1_000_000,
                     },
@@ -660,9 +677,8 @@ impl RingTopologyManager {
 
         let mut workers = Vec::new();
         for worker_result in workers_iter {
-            let mut worker = worker_result
+            let worker = worker_result
                 .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            worker.shard.model_id = self.default_model_id.clone();
             workers.push(worker);
         }
 
@@ -794,12 +810,13 @@ mod tests {
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
+            tier: Tier::Tier2,
             cpu_cores: 8,
             ram_mb: 16384,
+            gpu_present: false,
+            gpu_vram_mb: None,
             os: "macos".into(),
             arch: "aarch64".into(),
-            has_gpu: false,
-            tier: Tier::Tier2,
         }
     }
 
@@ -846,7 +863,7 @@ mod tests {
     #[test]
     fn test_assign_shard_single_worker() {
         let (manager, _db) = create_test_ring_manager();
-        let shard = manager.assign_shard(0, 1);
+        let shard = manager.assign_shard("test-model", 0, 1);
 
         assert_eq!(shard.column_range, (0, TOTAL_SHARD_COLUMNS));
         assert_eq!(shard.model_id, "test-model");
@@ -856,8 +873,8 @@ mod tests {
     fn test_assign_shard_two_workers() {
         let (manager, _db) = create_test_ring_manager();
 
-        let shard0 = manager.assign_shard(0, 2);
-        let shard1 = manager.assign_shard(1, 2);
+        let shard0 = manager.assign_shard("test-model", 0, 2);
+        let shard1 = manager.assign_shard("test-model", 1, 2);
 
         assert_eq!(shard0.column_range, (0, 4096));
         assert_eq!(shard1.column_range, (4096, 8192));
@@ -867,9 +884,9 @@ mod tests {
     fn test_assign_shard_three_workers() {
         let (manager, _db) = create_test_ring_manager();
 
-        let shard0 = manager.assign_shard(0, 3);
-        let shard1 = manager.assign_shard(1, 3);
-        let shard2 = manager.assign_shard(2, 3);
+        let shard0 = manager.assign_shard("test-model", 0, 3);
+        let shard1 = manager.assign_shard("test-model", 1, 3);
+        let shard2 = manager.assign_shard("test-model", 2, 3);
 
         // 8192 / 3 = 2730 remainder 2
         // Worker 0: 0-2731 (2731 columns)
@@ -890,7 +907,7 @@ mod tests {
         for total in 1..=20 {
             let mut ranges: Vec<(u32, u32)> = Vec::new();
             for pos in 0..total {
-                let shard = manager.assign_shard(pos, total);
+                let shard = manager.assign_shard("test-model", pos, total);
                 ranges.push(shard.column_range);
             }
 
@@ -931,6 +948,7 @@ mod tests {
         let worker = Worker {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
             ring_position: None,
             status: "online".to_string(),
@@ -960,6 +978,7 @@ mod tests {
             let worker = Worker {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000,
                 ring_position: None,
                 status: "online".to_string(),
@@ -999,6 +1018,7 @@ mod tests {
         let worker = Worker {
             device_id: "nonexistent".to_string(),
             network_id: "test-network".to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
             ring_position: None,
             status: "online".to_string(),
@@ -1020,6 +1040,7 @@ mod tests {
         let worker = Worker {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
             ring_position: None,
             status: "online".to_string(),
@@ -1045,6 +1066,7 @@ mod tests {
             let worker = Worker {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000,
                 ring_position: None,
                 status: "online".to_string(),
@@ -1113,6 +1135,7 @@ mod tests {
         let worker = Worker {
             device_id: "device-1".to_string(),
             network_id: network_id.to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
             ring_position: None,
             status: "online".to_string(),
@@ -1135,6 +1158,7 @@ mod tests {
             let worker = Worker {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000,
                 ring_position: None,
                 status: "online".to_string(),
@@ -1167,6 +1191,7 @@ mod tests {
             let worker = Worker {
                 device_id: format!("device-{}", i),
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000,
                 ring_position: None,
                 status: "online".to_string(),
@@ -1258,6 +1283,7 @@ mod tests {
                 .add_worker(Worker {
                     device_id,
                     network_id: network_id.to_string(),
+                    model_id: "test-model".to_string(),
                     contributed_memory: 8_000_000_000,
                     ring_position: None,
                     status: "online".to_string(),

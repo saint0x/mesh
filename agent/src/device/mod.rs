@@ -71,33 +71,6 @@ pub struct GovernanceConfig {
     /// Maximum number of jobs that may execute concurrently on this agent.
     pub max_concurrent_jobs: usize,
 
-    /// Maximum number of admitted jobs allowed to wait in the local scheduler queue.
-    pub max_pending_jobs: usize,
-
-    /// Maximum number of concurrent jobs a single peer may hold on this agent.
-    pub max_concurrent_jobs_per_peer: usize,
-
-    /// Maximum job timeout this agent will admit for execution.
-    pub max_job_timeout_ms: u64,
-
-    /// Workloads this agent will admit in the production runtime path.
-    pub allowed_workloads: Vec<String>,
-
-    /// Workload-specific concurrency caps enforced within the local runner.
-    pub workload_concurrency_limits: Vec<WorkloadConcurrencyLimit>,
-
-    /// Relative peer weights for deterministic scheduler fairness under contention.
-    pub peer_priority_weights: Vec<PeerPriorityWeight>,
-
-    /// Relative workload weights for deterministic scheduler fairness under contention.
-    pub workload_priority_weights: Vec<WorkloadPriorityWeight>,
-
-    /// If non-empty, only these peers may submit mesh jobs to this agent.
-    pub trusted_peer_ids: Vec<String>,
-
-    /// These peers are always denied mesh job admission.
-    pub blocked_peer_ids: Vec<String>,
-
     /// Maximum serialized tensor message size admitted by the data plane.
     pub tensor_plane_max_message_bytes: usize,
 
@@ -123,64 +96,10 @@ pub struct GovernanceConfig {
     pub recovery_max_checkpoint_loads_per_minute: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkloadConcurrencyLimit {
-    /// Workload identifier this cap applies to.
-    pub workload_id: String,
-
-    /// Maximum concurrent jobs of this workload allowed on the agent.
-    pub max_concurrent_jobs: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerPriorityWeight {
-    /// Peer identifier this weight applies to.
-    pub peer_id: String,
-
-    /// Relative weight used by the scheduler. Higher means more preferred under contention.
-    pub weight: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkloadPriorityWeight {
-    /// Workload identifier this weight applies to.
-    pub workload_id: String,
-
-    /// Relative weight used by the scheduler. Higher means more preferred under contention.
-    pub weight: u32,
-}
-
 impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
             max_concurrent_jobs: 2,
-            max_pending_jobs: 8,
-            max_concurrent_jobs_per_peer: 1,
-            max_job_timeout_ms: 300_000,
-            allowed_workloads: vec!["embeddings".to_string(), "embeddings-v1".to_string()],
-            workload_concurrency_limits: vec![
-                WorkloadConcurrencyLimit {
-                    workload_id: "embeddings".to_string(),
-                    max_concurrent_jobs: 1,
-                },
-                WorkloadConcurrencyLimit {
-                    workload_id: "embeddings-v1".to_string(),
-                    max_concurrent_jobs: 1,
-                },
-            ],
-            peer_priority_weights: Vec::new(),
-            workload_priority_weights: vec![
-                WorkloadPriorityWeight {
-                    workload_id: "embeddings".to_string(),
-                    weight: 100,
-                },
-                WorkloadPriorityWeight {
-                    workload_id: "embeddings-v1".to_string(),
-                    weight: 100,
-                },
-            ],
-            trusted_peer_ids: Vec::new(),
-            blocked_peer_ids: Vec::new(),
             tensor_plane_max_message_bytes: 10 * 1024 * 1024,
             tensor_plane_max_inbound_messages: 64,
             tensor_plane_max_inbound_queued_bytes: 64 * 1024 * 1024,
@@ -461,43 +380,10 @@ mod tests {
         assert!(config.connectivity.attachments.is_empty());
         assert!(config.capabilities.cpu_cores > 0);
         assert_eq!(config.governance.max_concurrent_jobs, 2);
-        assert_eq!(config.governance.max_pending_jobs, 8);
-        assert_eq!(config.governance.max_concurrent_jobs_per_peer, 1);
-        assert_eq!(config.governance.max_job_timeout_ms, 300_000);
         assert_eq!(
-            config.governance.allowed_workloads,
-            vec!["embeddings".to_string(), "embeddings-v1".to_string()]
+            config.governance.tensor_plane_max_message_bytes,
+            10 * 1024 * 1024
         );
-        assert_eq!(
-            config.governance.workload_concurrency_limits,
-            vec![
-                WorkloadConcurrencyLimit {
-                    workload_id: "embeddings".to_string(),
-                    max_concurrent_jobs: 1
-                },
-                WorkloadConcurrencyLimit {
-                    workload_id: "embeddings-v1".to_string(),
-                    max_concurrent_jobs: 1
-                }
-            ]
-        );
-        assert!(config.governance.peer_priority_weights.is_empty());
-        assert_eq!(
-            config.governance.workload_priority_weights,
-            vec![
-                WorkloadPriorityWeight {
-                    workload_id: "embeddings".to_string(),
-                    weight: 100
-                },
-                WorkloadPriorityWeight {
-                    workload_id: "embeddings-v1".to_string(),
-                    weight: 100
-                }
-            ]
-        );
-        assert!(config.governance.trusted_peer_ids.is_empty());
-        assert!(config.governance.blocked_peer_ids.is_empty());
-        assert_eq!(config.governance.tensor_plane_max_message_bytes, 10 * 1024 * 1024);
         assert_eq!(config.governance.tensor_plane_max_inbound_messages, 64);
         assert_eq!(
             config.governance.tensor_plane_max_inbound_queued_bytes,
@@ -508,7 +394,9 @@ mod tests {
             64 * 1024 * 1024
         );
         assert_eq!(
-            config.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
+            config
+                .governance
+                .tensor_plane_max_send_bandwidth_bytes_per_sec,
             10 * 1024 * 1024
         );
         assert_eq!(config.governance.recovery_max_attempts_per_job, 2);
@@ -520,13 +408,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_config_defaults_governance() {
+    fn test_load_config_defaults_governance() {
         let keypair = keypair::generate_keypair();
         let encoded_keypair = multibase::encode(multibase::Base::Base58Btc, keypair.to_bytes());
-        let legacy_toml = format!(
+        let config_toml = format!(
             r#"
 device_id = "11111111-1111-1111-1111-111111111111"
-name = "legacy-device"
+name = "test-device"
 keypair = "{encoded_keypair}"
 network_id = "test-network"
 control_plane_url = "http://localhost:8080"
@@ -536,7 +424,7 @@ preferred_path = "direct"
 attachments = []
 
 [capabilities]
-tier = "tier2"
+tier = "Tier2"
 cpu_cores = 8
 ram_mb = 16384
 gpu_present = false
@@ -546,45 +434,12 @@ arch = "x86_64"
 "#
         );
 
-        let loaded: DeviceConfig = toml::from_str(&legacy_toml).unwrap();
+        let loaded: DeviceConfig = toml::from_str(&config_toml).unwrap();
         assert_eq!(loaded.governance.max_concurrent_jobs, 2);
-        assert_eq!(loaded.governance.max_pending_jobs, 8);
-        assert_eq!(loaded.governance.max_concurrent_jobs_per_peer, 1);
-        assert_eq!(loaded.governance.max_job_timeout_ms, 300_000);
         assert_eq!(
-            loaded.governance.allowed_workloads,
-            vec!["embeddings".to_string(), "embeddings-v1".to_string()]
+            loaded.governance.tensor_plane_max_message_bytes,
+            10 * 1024 * 1024
         );
-        assert_eq!(
-            loaded.governance.workload_concurrency_limits,
-            vec![
-                WorkloadConcurrencyLimit {
-                    workload_id: "embeddings".to_string(),
-                    max_concurrent_jobs: 1
-                },
-                WorkloadConcurrencyLimit {
-                    workload_id: "embeddings-v1".to_string(),
-                    max_concurrent_jobs: 1
-                }
-            ]
-        );
-        assert!(loaded.governance.peer_priority_weights.is_empty());
-        assert_eq!(
-            loaded.governance.workload_priority_weights,
-            vec![
-                WorkloadPriorityWeight {
-                    workload_id: "embeddings".to_string(),
-                    weight: 100
-                },
-                WorkloadPriorityWeight {
-                    workload_id: "embeddings-v1".to_string(),
-                    weight: 100
-                }
-            ]
-        );
-        assert!(loaded.governance.trusted_peer_ids.is_empty());
-        assert!(loaded.governance.blocked_peer_ids.is_empty());
-        assert_eq!(loaded.governance.tensor_plane_max_message_bytes, 10 * 1024 * 1024);
         assert_eq!(loaded.governance.tensor_plane_max_inbound_messages, 64);
         assert_eq!(
             loaded.governance.tensor_plane_max_inbound_queued_bytes,
@@ -595,7 +450,9 @@ arch = "x86_64"
             64 * 1024 * 1024
         );
         assert_eq!(
-            loaded.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
+            loaded
+                .governance
+                .tensor_plane_max_send_bandwidth_bytes_per_sec,
             10 * 1024 * 1024
         );
         assert_eq!(loaded.governance.recovery_max_attempts_per_job, 2);
@@ -637,42 +494,6 @@ arch = "x86_64"
             loaded.governance.max_concurrent_jobs
         );
         assert_eq!(
-            original.governance.max_pending_jobs,
-            loaded.governance.max_pending_jobs
-        );
-        assert_eq!(
-            original.governance.max_job_timeout_ms,
-            loaded.governance.max_job_timeout_ms
-        );
-        assert_eq!(
-            original.governance.max_concurrent_jobs_per_peer,
-            loaded.governance.max_concurrent_jobs_per_peer
-        );
-        assert_eq!(
-            original.governance.allowed_workloads,
-            loaded.governance.allowed_workloads
-        );
-        assert_eq!(
-            original.governance.workload_concurrency_limits,
-            loaded.governance.workload_concurrency_limits
-        );
-        assert_eq!(
-            original.governance.peer_priority_weights,
-            loaded.governance.peer_priority_weights
-        );
-        assert_eq!(
-            original.governance.workload_priority_weights,
-            loaded.governance.workload_priority_weights
-        );
-        assert_eq!(
-            original.governance.trusted_peer_ids,
-            loaded.governance.trusted_peer_ids
-        );
-        assert_eq!(
-            original.governance.blocked_peer_ids,
-            loaded.governance.blocked_peer_ids
-        );
-        assert_eq!(
             original.governance.tensor_plane_max_message_bytes,
             loaded.governance.tensor_plane_max_message_bytes
         );
@@ -689,8 +510,12 @@ arch = "x86_64"
             loaded.governance.tensor_plane_max_outbound_inflight_bytes
         );
         assert_eq!(
-            original.governance.tensor_plane_max_send_bandwidth_bytes_per_sec,
-            loaded.governance.tensor_plane_max_send_bandwidth_bytes_per_sec
+            original
+                .governance
+                .tensor_plane_max_send_bandwidth_bytes_per_sec,
+            loaded
+                .governance
+                .tensor_plane_max_send_bandwidth_bytes_per_sec
         );
         assert_eq!(
             original.governance.recovery_max_attempts_per_job,

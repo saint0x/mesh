@@ -120,6 +120,8 @@ pub struct RingJoinRequest {
     pub device_id: String,
     /// Network ID
     pub network_id: String,
+    /// Model ID associated with this ring membership
+    pub model_id: String,
     /// Memory contributed to the pool (bytes)
     pub contributed_memory: u64,
 }

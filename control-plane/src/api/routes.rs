@@ -61,6 +61,7 @@ pub async fn register_device(
         let worker = Worker {
             device_id: device_id.clone(),
             network_id: network_id.clone(),
+            model_id: "default-model".to_string(),
             contributed_memory: memory,
             ring_position: None,
             status: "online".to_string(),
@@ -174,11 +175,11 @@ pub async fn heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectivity::{InferenceSchedulingPolicy, NetworkConnectivity};
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState,
     };
+    use crate::connectivity::{InferenceSchedulingPolicy, NetworkConnectivity};
     use crate::device::{DeviceCapabilities, Tier};
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::network_service;
@@ -186,12 +187,13 @@ mod tests {
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
+            tier: Tier::Tier2,
             cpu_cores: 8,
             ram_mb: 16384,
+            gpu_present: false,
+            gpu_vram_mb: None,
             os: "macos".into(),
             arch: "aarch64".into(),
-            has_gpu: false,
-            tier: Tier::Tier2,
         }
     }
 

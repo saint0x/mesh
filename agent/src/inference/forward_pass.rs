@@ -87,22 +87,6 @@ pub struct LayerWeights {
 }
 
 impl LayerWeights {
-    /// Create placeholder weights for testing
-    pub fn placeholder(layer_idx: usize, hidden_dim: usize, shard_cols: usize) -> Self {
-        Self {
-            layer_idx,
-            w_q: Tensor2D::filled(hidden_dim, shard_cols, 0.01),
-            w_k: Tensor2D::filled(hidden_dim, shard_cols, 0.01),
-            w_v: Tensor2D::filled(hidden_dim, shard_cols, 0.01),
-            w_o: Tensor2D::filled(shard_cols, hidden_dim, 0.01),
-            w_up: Tensor2D::filled(hidden_dim, shard_cols, 0.01),
-            w_gate: Tensor2D::filled(hidden_dim, shard_cols, 0.01),
-            w_down: Tensor2D::filled(shard_cols, hidden_dim, 0.01),
-            attn_norm: Tensor1D::new(vec![1.0; hidden_dim]),
-            mlp_norm: Tensor1D::new(vec![1.0; hidden_dim]),
-        }
-    }
-
     /// Get memory usage in bytes
     pub fn memory_usage(&self) -> usize {
         (self.w_q.len()
@@ -179,22 +163,6 @@ impl Default for ModelConfig {
 }
 
 impl ModelWeights {
-    /// Create placeholder weights for testing
-    pub fn placeholder(config: ModelConfig, shard_cols: usize) -> Self {
-        let layers = (0..config.num_layers)
-            .map(|i| LayerWeights::placeholder(i, config.hidden_dim, shard_cols))
-            .collect();
-
-        Self {
-            model_id: "placeholder".to_string(),
-            embedding: Tensor2D::filled(config.vocab_size, config.hidden_dim, 0.01),
-            layers,
-            final_norm: Tensor1D::new(vec![1.0; config.hidden_dim]),
-            lm_head: Tensor2D::filled(config.hidden_dim, config.vocab_size, 0.01),
-            config,
-        }
-    }
-
     /// Get total memory usage in bytes
     pub fn memory_usage(&self) -> usize {
         let layer_mem: usize = self.layers.iter().map(|l| l.memory_usage()).sum();
@@ -584,10 +552,36 @@ mod tests {
         }
     }
 
+    fn create_test_weights(config: &ModelConfig, shard_cols: usize) -> ModelWeights {
+        let layers = (0..config.num_layers)
+            .map(|layer_idx| LayerWeights {
+                layer_idx,
+                w_q: Tensor2D::filled(config.hidden_dim, shard_cols, 0.1),
+                w_k: Tensor2D::filled(config.hidden_dim, shard_cols, 0.2),
+                w_v: Tensor2D::filled(config.hidden_dim, shard_cols, 0.3),
+                w_o: Tensor2D::filled(shard_cols, config.hidden_dim, 0.4),
+                w_up: Tensor2D::filled(config.hidden_dim, shard_cols, 0.5),
+                w_gate: Tensor2D::filled(config.hidden_dim, shard_cols, 0.6),
+                w_down: Tensor2D::filled(shard_cols, config.hidden_dim, 0.7),
+                attn_norm: Tensor1D::new(vec![1.0; config.hidden_dim]),
+                mlp_norm: Tensor1D::new(vec![1.0; config.hidden_dim]),
+            })
+            .collect();
+
+        ModelWeights {
+            model_id: "test-model".to_string(),
+            embedding: Tensor2D::filled(config.vocab_size, config.hidden_dim, 0.05),
+            layers,
+            final_norm: Tensor1D::new(vec![1.0; config.hidden_dim]),
+            lm_head: Tensor2D::filled(config.hidden_dim, config.vocab_size, 0.08),
+            config: config.clone(),
+        }
+    }
+
     #[test]
-    fn test_placeholder_weights() {
+    fn test_weight_memory_accounting() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config.clone(), 32);
+        let weights = create_test_weights(&config, 32);
 
         assert_eq!(weights.layers.len(), config.num_layers);
         assert!(weights.memory_usage() > 0);
@@ -595,17 +589,27 @@ mod tests {
 
     #[test]
     fn test_layer_weights_memory() {
-        let layer = LayerWeights::placeholder(0, 64, 32);
+        let layer = LayerWeights {
+            layer_idx: 0,
+            w_q: Tensor2D::filled(64, 32, 0.1),
+            w_k: Tensor2D::filled(64, 32, 0.1),
+            w_v: Tensor2D::filled(64, 32, 0.1),
+            w_o: Tensor2D::filled(32, 64, 0.1),
+            w_up: Tensor2D::filled(64, 32, 0.1),
+            w_gate: Tensor2D::filled(64, 32, 0.1),
+            w_down: Tensor2D::filled(32, 64, 0.1),
+            attn_norm: Tensor1D::new(vec![1.0; 64]),
+            mlp_norm: Tensor1D::new(vec![1.0; 64]),
+        };
         let mem = layer.memory_usage();
 
-        // Should be roughly: 7 matrices * 64 * 32 * 4 + 2 norms * 64 * 4
         assert!(mem > 0);
     }
 
     #[test]
     fn test_local_forward_pass() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config, 64); // Full width for local
+        let weights = create_test_weights(&config, 64);
         let mut forward = LocalForwardPass::new(weights);
 
         let tokens = vec![1, 2, 3];
@@ -618,7 +622,7 @@ mod tests {
     #[test]
     fn test_local_generate() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config, 64);
+        let weights = create_test_weights(&config, 64);
         let mut forward = LocalForwardPass::new(weights);
 
         let tokens = vec![1, 2, 3];
@@ -631,7 +635,7 @@ mod tests {
     #[test]
     fn test_forward_pass_creation() {
         let config = create_test_config();
-        let weights = ModelWeights::placeholder(config, 16);
+        let weights = create_test_weights(&config, 16);
         let forward = ForwardPass::new(weights, 0, 16, 4);
 
         assert_eq!(forward.shard_start, 0);

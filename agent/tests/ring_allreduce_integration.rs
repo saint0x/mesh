@@ -492,8 +492,15 @@ async fn wait_for_peer_connected(swarm: &mut MeshSwarm) -> libp2p::PeerId {
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_secs(2), swarm.next_event()).await
         {
-            if let MeshEvent::PeerConnected { peer_id, .. } = event {
-                return peer_id;
+            match event {
+                MeshEvent::PeerConnected { peer_id, .. }
+                | MeshEvent::RelayConnected {
+                    relay_peer_id: peer_id,
+                    ..
+                } => {
+                    return peer_id;
+                }
+                _ => {}
             }
         }
     }
@@ -531,6 +538,11 @@ async fn wait_for_runtime_connections(swarms: &mut [(&mut MeshSwarm, Vec<libp2p:
                 continue;
             }
 
+            pending_peers.retain(|peer_id| !swarm.is_connected(peer_id));
+            if pending_peers.is_empty() {
+                continue;
+            }
+
             if let Ok(Some(event)) =
                 tokio::time::timeout(Duration::from_millis(250), swarm.next_event()).await
             {
@@ -562,6 +574,9 @@ async fn wait_for_relay_then_direct_upgrade(
 
     while tokio::time::Instant::now() < deadline {
         for (swarm, target_peer) in swarms.iter_mut() {
+            if swarm.is_connected(target_peer) {
+                saw_relay_connection = true;
+            }
             if let Ok(Some(event)) =
                 tokio::time::timeout(Duration::from_millis(250), swarm.next_event()).await
             {
@@ -588,7 +603,7 @@ async fn wait_for_relay_then_direct_upgrade(
             }
         }
 
-        if saw_relay_connection && saw_direct_upgrade {
+        if saw_direct_upgrade {
             return;
         }
     }

@@ -135,13 +135,6 @@ impl From<libp2p::swarm::ListenError> for AgentError {
     }
 }
 
-// Implement From for executor errors
-impl From<crate::executor::ExecutorError> for AgentError {
-    fn from(e: crate::executor::ExecutorError) -> Self {
-        AgentError::Execution(e.to_string())
-    }
-}
-
 /// Pretty error display module for CLI
 pub mod display {
     use super::AgentError;

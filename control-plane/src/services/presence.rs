@@ -91,12 +91,13 @@ mod tests {
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
+            tier: Tier::Tier1,
             cpu_cores: 4,
             ram_mb: 8192,
+            gpu_present: false,
+            gpu_vram_mb: None,
             os: "linux".into(),
             arch: "x86_64".into(),
-            has_gpu: false,
-            tier: Tier::Tier1,
         }
     }
 

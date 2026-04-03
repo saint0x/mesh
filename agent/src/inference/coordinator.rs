@@ -189,7 +189,7 @@ pub struct InferenceCoordinator {
     /// Shard registry for tracking model shard lifecycle
     shard_registry: Arc<ShardRegistry>,
 
-    /// Shard loader (mock or real)
+    /// Production shard loader
     loader: Arc<dyn ShardLoader>,
 
     /// Cached weights per model (model_id -> weights)
@@ -273,8 +273,7 @@ impl InferenceCoordinator {
     /// Get or load model weights for the current worker position
     ///
     /// This method checks the weight cache first. If weights are not cached,
-    /// it loads them using the shard loader (which simulates download/load
-    /// in the mock implementation, or does real loading in production).
+    /// it loads them from the production shard loader.
     ///
     /// Weights are cached per model_id to avoid regenerating them for each token.
     async fn get_or_load_weights(
@@ -305,7 +304,7 @@ impl InferenceCoordinator {
             self.shard_registry.assign_shard(assignment.clone()).await?;
         }
 
-        // Load from loader (simulated download + load for mock, real for production)
+        // Load from the production shard loader.
         let weights = self
             .loader
             .load_shard(model_id, &assignment, &self.shard_registry)

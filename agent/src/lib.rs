@@ -27,10 +27,7 @@ pub use connectivity::{
 };
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
 pub use errors::{AgentError, Result};
-pub use executor::{
-    AdmissionPolicy, EmbeddingsExecutor, EmbeddingsInput, EmbeddingsOutput, ExecutorError,
-    JobRunner, JobStats, Tensor, WorkerRing,
-};
+pub use executor::{Tensor, WorkerRing};
 pub use inference::{
     GenerationConfig, InferenceConfig, InferenceCoordinator, InferenceJob, InferenceRequest,
     InferenceResult, InferenceStats,

@@ -46,6 +46,9 @@ pub async fn join_ring(
             "network_id cannot be empty".to_string(),
         ));
     }
+    if req.model_id.is_empty() {
+        return Err(ApiError::BadRequest("model_id cannot be empty".to_string()));
+    }
 
     network_service::require_network_exists(&state.db, &req.network_id)?;
 
@@ -56,6 +59,7 @@ pub async fn join_ring(
     let worker = Worker {
         device_id: req.device_id.clone(),
         network_id: req.network_id.clone(),
+        model_id: req.model_id.clone(),
         contributed_memory: req.contributed_memory,
         ring_position: None,
         status: "online".to_string(),
@@ -73,6 +77,7 @@ pub async fn join_ring(
         &req.device_id,
         position.position,
         position.shard.column_range,
+        position.shard.model_id.clone(),
         &position.left_neighbor,
         &position.right_neighbor,
     );
@@ -502,12 +507,13 @@ mod tests {
 
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
+            tier: Tier::Tier2,
             cpu_cores: 8,
             ram_mb: 16384,
+            gpu_present: false,
+            gpu_vram_mb: None,
             os: "macos".into(),
             arch: "aarch64".into(),
-            has_gpu: false,
-            tier: Tier::Tier2,
         }
     }
 
@@ -574,6 +580,7 @@ mod tests {
         let request = RingJoinRequest {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
         };
 
@@ -596,6 +603,7 @@ mod tests {
         let request = RingJoinRequest {
             device_id: "nonexistent".to_string(),
             network_id: "test-network".to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
         };
 
@@ -644,6 +652,7 @@ mod tests {
             let join_request = RingJoinRequest {
                 device_id,
                 network_id: network_id.to_string(),
+                model_id: "test-model".to_string(),
                 contributed_memory: 8_000_000_000,
             };
 
@@ -709,6 +718,7 @@ mod tests {
         let join_request = RingJoinRequest {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
+            model_id: "test-model".to_string(),
             contributed_memory: 8_000_000_000,
         };
 
@@ -783,6 +793,7 @@ mod tests {
                 let request = RingJoinRequest {
                     device_id: format!("device-{}", i),
                     network_id,
+                    model_id: "test-model".to_string(),
                     contributed_memory: 8_000_000_000,
                 };
                 join_ring(axum::extract::State(state), axum::Json(request)).await
