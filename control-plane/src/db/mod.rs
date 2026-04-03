@@ -129,6 +129,18 @@ impl Database {
                 continue;
             }
 
+            if migration_is_already_effective(&conn, &filename)? {
+                tracing::info!(
+                    file = %filename,
+                    "Backfilling previously applied migration from existing schema"
+                );
+                conn.execute(
+                    "INSERT INTO schema_migrations (filename) VALUES (?1)",
+                    [&filename],
+                )?;
+                continue;
+            }
+
             tracing::info!(file = %path.display(), "Applying migration");
 
             let sql = std::fs::read_to_string(&path)
@@ -163,6 +175,70 @@ impl Database {
 
         Ok(db_dir.join("control-plane.db"))
     }
+}
+
+fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -> Result<bool> {
+    Ok(match filename {
+        "001_create_networks.sql" => table_exists(conn, "networks")?,
+        "002_create_devices.sql" => table_exists(conn, "devices")?,
+        "003_create_ledger_events.sql" => table_exists(conn, "ledger_events")?,
+        "004_add_ring_topology.sql" => {
+            table_exists(conn, "resource_locks")?
+                && table_exists(conn, "pools")?
+                && column_exists(conn, "devices", "ring_position")?
+                && column_exists(conn, "devices", "left_neighbor_id")?
+                && column_exists(conn, "devices", "right_neighbor_id")?
+                && column_exists(conn, "devices", "shard_column_start")?
+                && column_exists(conn, "devices", "shard_column_end")?
+                && column_exists(conn, "devices", "contributed_memory")?
+                && column_exists(conn, "devices", "lock_status")?
+                && column_exists(conn, "devices", "lock_timestamp")?
+                && column_exists(conn, "devices", "unlock_requested_at")?
+        }
+        "005_create_inference_dispatch.sql" => {
+            table_exists(conn, "inference_jobs")?
+                && table_exists(conn, "inference_job_assignments")?
+        }
+        "006_add_device_connectivity_state.sql" => {
+            column_exists(conn, "devices", "connectivity_state")?
+        }
+        "007_add_device_peer_metadata.sql" => {
+            column_exists(conn, "devices", "peer_id")?
+                && column_exists(conn, "devices", "listen_addrs")?
+        }
+        "008_add_device_direct_candidates.sql" => {
+            column_exists(conn, "devices", "direct_candidates")?
+        }
+        "009_add_inference_assignment_metrics.sql" => {
+            column_exists(conn, "inference_job_assignments", "execution_time_ms")?
+        }
+        "010_add_ring_model_id.sql" => column_exists(conn, "devices", "shard_model_id")?,
+        _ => false,
+    })
+}
+
+fn table_exists(conn: &rusqlite::Connection, table_name: &str) -> Result<bool> {
+    let table = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(table.is_some())
+}
+
+fn column_exists(conn: &rusqlite::Connection, table_name: &str, column_name: &str) -> Result<bool> {
+    let pragma = format!("PRAGMA table_info({})", table_name);
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let existing: String = row.get(1)?;
+        if existing == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -241,6 +317,101 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .expect("Failed to count applied migrations");
         assert!(count >= 1);
+    }
+
+    #[test]
+    fn test_run_migrations_backfills_legacy_schema_history() {
+        let temp_db = NamedTempFile::new().expect("Failed to create temp database file");
+        let db = Database::new(
+            temp_db
+                .path()
+                .to_str()
+                .expect("Temp database path should be valid UTF-8"),
+        )
+        .expect("Failed to create database");
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE networks (
+                network_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                settings TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY,
+                network_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                capabilities TEXT NOT NULL,
+                certificate BLOB,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen TEXT,
+                status TEXT NOT NULL DEFAULT 'offline',
+                ring_position INTEGER,
+                left_neighbor_id TEXT,
+                right_neighbor_id TEXT,
+                shard_column_start INTEGER,
+                shard_column_end INTEGER,
+                contributed_memory INTEGER,
+                lock_status TEXT DEFAULT 'unlocked',
+                lock_timestamp TEXT,
+                unlock_requested_at TEXT
+            );
+            CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                network_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                job_id TEXT,
+                device_id TEXT,
+                user_id TEXT,
+                credits_amount REAL,
+                metadata TEXT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE resource_locks (
+                device_id TEXT PRIMARY KEY,
+                memory_bytes INTEGER NOT NULL,
+                lock_timestamp TEXT NOT NULL,
+                cooldown_hours INTEGER NOT NULL DEFAULT 24,
+                unlock_requested_at TEXT,
+                status TEXT NOT NULL DEFAULT 'locked'
+            );
+            CREATE TABLE pools (
+                pool_id TEXT PRIMARY KEY,
+                network_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                ring_stable BOOLEAN DEFAULT FALSE,
+                total_workers INTEGER,
+                active_workers INTEGER,
+                status TEXT DEFAULT 'initializing',
+                last_checkpoint_token INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .expect("Failed to seed legacy schema");
+        drop(conn);
+
+        db.migrate()
+            .expect("Failed to backfill migrations on legacy schema");
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE filename IN (?1, ?2, ?3, ?4)",
+                [
+                    "001_create_networks.sql",
+                    "002_create_devices.sql",
+                    "003_create_ledger_events.sql",
+                    "004_add_ring_topology.sql",
+                ],
+                |row| row.get(0),
+            )
+            .expect("Failed to count backfilled migrations");
+        assert_eq!(recorded, 4);
     }
 
     #[test]
