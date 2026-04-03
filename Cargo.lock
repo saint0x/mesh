@@ -780,6 +780,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "tempfile",
  "thiserror 2.0.17",
  "time",
  "tokenizers 0.20.4",
