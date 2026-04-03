@@ -220,6 +220,41 @@ fn merge_heads(heads: &[Tensor2D]) -> Result<Tensor2D> {
     Ok(merged)
 }
 
+fn partition_start(total_columns: usize, worker_position: u32, total_workers: u32) -> usize {
+    if total_workers == 0 {
+        return 0;
+    }
+
+    let total_workers = total_workers as usize;
+    let worker_position = worker_position as usize;
+    let columns_per_worker = total_columns / total_workers;
+    let remainder = total_columns % total_workers;
+
+    if worker_position < remainder {
+        worker_position * (columns_per_worker + 1)
+    } else {
+        remainder * (columns_per_worker + 1)
+            + (worker_position - remainder) * columns_per_worker
+    }
+}
+
+fn partition_columns(total_columns: usize, worker_position: u32, total_workers: u32) -> usize {
+    if total_workers == 0 {
+        return total_columns;
+    }
+
+    let total_workers = total_workers as usize;
+    let worker_position = worker_position as usize;
+    let columns_per_worker = total_columns / total_workers;
+    let remainder = total_columns % total_workers;
+
+    if worker_position < remainder {
+        columns_per_worker + 1
+    } else {
+        columns_per_worker
+    }
+}
+
 fn causal_self_attention(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -> Result<Tensor2D> {
     if q.rows != k.rows || q.rows != v.rows || q.cols != k.cols || q.cols != v.cols {
         return Err(crate::errors::AgentError::Execution(format!(
@@ -264,10 +299,12 @@ fn causal_self_attention(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -
 fn attention_output(
     kv_cache: &mut KVCache,
     config: &ModelConfig,
+    worker_position: u32,
+    total_workers: u32,
     layer_idx: usize,
-    q_full: Tensor2D,
-    k_full: Tensor2D,
-    v_full: Tensor2D,
+    q_local: Tensor2D,
+    k_local: Tensor2D,
+    v_local: Tensor2D,
 ) -> Result<Tensor2D> {
     if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
@@ -284,38 +321,68 @@ fn attention_output(
 
     let head_dim = config.hidden_dim / config.num_heads;
     let kv_hidden_dim = config.num_kv_heads * head_dim;
-    if q_full.cols != config.hidden_dim {
+    if q_local.cols % head_dim != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
-            "Query projection width mismatch: expected {}, got {}",
-            config.hidden_dim, q_full.cols
+            "Local query projection width {} is not a multiple of head_dim {}",
+            q_local.cols, head_dim
         )));
     }
-    if k_full.cols != kv_hidden_dim || v_full.cols != kv_hidden_dim {
+    if k_local.cols % head_dim != 0 || v_local.cols % head_dim != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
-            "KV projection width mismatch: expected {}, got k={} v={}",
-            kv_hidden_dim, k_full.cols, v_full.cols
+            "Local KV projection widths must be multiples of head_dim {}: k={} v={}",
+            head_dim, k_local.cols, v_local.cols
+        )));
+    }
+    let expected_q_cols = partition_columns(config.hidden_dim, worker_position, total_workers);
+    if q_local.cols != expected_q_cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local query projection width mismatch: expected {}, got {}",
+            expected_q_cols, q_local.cols
+        )));
+    }
+    let expected_kv_cols = partition_columns(kv_hidden_dim, worker_position, total_workers);
+    if k_local.cols != expected_kv_cols || v_local.cols != expected_kv_cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local KV projection width mismatch: expected {}, got k={} v={}",
+            expected_kv_cols, k_local.cols, v_local.cols
         )));
     }
 
-    let positions: Vec<u32> = (0..q_full.rows as u32).collect();
-    let q_rope = apply_rope(&q_full, &positions, head_dim, config.rope_base)?;
-    let k_rope = apply_rope(&k_full, &positions, head_dim, config.rope_base)?;
+    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
+    let q_head_start = partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
+    let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
 
-    kv_cache.update_layer(layer_idx, k_rope.clone(), v_full.clone())?;
+    let positions: Vec<u32> = (0..q_local.rows as u32).collect();
+    let q_rope = apply_rope(&q_local, &positions, head_dim, config.rope_base)?;
+    let k_rope = apply_rope(&k_local, &positions, head_dim, config.rope_base)?;
 
-    let q_heads = split_heads(&q_rope, config.num_heads, head_dim)?;
-    let k_heads = split_heads(&k_rope, config.num_kv_heads, head_dim)?;
-    let v_heads = split_heads(&v_full, config.num_kv_heads, head_dim)?;
+    kv_cache.update_layer(layer_idx, k_rope.clone(), v_local.clone())?;
+
+    let local_q_heads = q_local.cols / head_dim;
+    let local_kv_heads = k_local.cols / head_dim;
+    let q_heads = split_heads(&q_rope, local_q_heads, head_dim)?;
+    let k_heads = split_heads(&k_rope, local_kv_heads, head_dim)?;
+    let v_heads = split_heads(&v_local, local_kv_heads, head_dim)?;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let kv_repeat = config.num_heads / config.num_kv_heads;
 
-    let mut output_heads = Vec::with_capacity(config.num_heads);
-    for head_idx in 0..config.num_heads {
-        let kv_head_idx = head_idx / kv_repeat;
+    let mut output_heads = Vec::with_capacity(local_q_heads);
+    for (local_q_idx, q_head) in q_heads.iter().enumerate() {
+        let global_q_head = q_head_start + local_q_idx;
+        let global_kv_head = global_q_head / q_heads_per_kv_head;
+        if global_kv_head < kv_head_start || global_kv_head >= kv_head_start + local_kv_heads {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Local KV head ownership mismatch: q_head {} maps to kv_head {}, local kv range {}..{}",
+                global_q_head,
+                global_kv_head,
+                kv_head_start,
+                kv_head_start + local_kv_heads
+            )));
+        }
+        let local_kv_idx = global_kv_head - kv_head_start;
         output_heads.push(causal_self_attention(
-            &q_heads[head_idx],
-            &k_heads[kv_head_idx],
-            &v_heads[kv_head_idx],
+            q_head,
+            &k_heads[local_kv_idx],
+            &v_heads[local_kv_idx],
             scale,
         )?);
     }
@@ -335,6 +402,9 @@ pub struct ForwardPass {
     pub shard_start: usize,
     pub shard_end: usize,
 
+    /// This worker's position in the tensor-parallel ring
+    pub worker_position: u32,
+
     /// Total workers in ring
     pub total_workers: u32,
 
@@ -346,6 +416,7 @@ impl ForwardPass {
     /// Create a new forward pass state
     pub fn new(
         weights: ModelWeights,
+        worker_position: u32,
         shard_start: usize,
         shard_end: usize,
         total_workers: u32,
@@ -362,6 +433,7 @@ impl ForwardPass {
             kv_cache: KVCache::new(kv_config),
             shard_start,
             shard_end,
+            worker_position,
             total_workers,
             position: 0,
         }
@@ -402,20 +474,17 @@ impl ForwardPass {
             layer_idx, normed.rows, normed.cols, q_partial.rows, q_partial.cols
         );
 
-        // 3. Ring all-reduce to get full QKV
-        let q_full = self
-            .ring_allreduce_tensor(&q_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-        let k_full = self
-            .ring_allreduce_tensor(&k_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-        let v_full = self
-            .ring_allreduce_tensor(&v_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-
-        // 4. Compute causal multi-head attention over the full sequence
-        let attn_output =
-            attention_output(&mut self.kv_cache, &config, layer_idx, q_full, k_full, v_full)?;
+        // 3. Compute causal attention on local heads only
+        let attn_output = attention_output(
+            &mut self.kv_cache,
+            &config,
+            self.worker_position,
+            self.total_workers,
+            layer_idx,
+            q_partial,
+            k_partial,
+            v_partial,
+        )?;
 
         // 6. Output projection (partial)
         let o_partial = matmul(&attn_output, &layer.w_o)?;
@@ -433,21 +502,13 @@ impl ForwardPass {
             config.rms_norm_eps,
         )?;
 
-        // Gate and up projections (partial)
+        // Gate and up projections are column-parallel and stay local
         let gate_partial = matmul(&mlp_normed, &layer.w_gate)?;
         let up_partial = matmul(&mlp_normed, &layer.w_up)?;
 
-        // All-reduce gate and up
-        let gate_full = self
-            .ring_allreduce_tensor(&gate_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-        let up_full = self
-            .ring_allreduce_tensor(&up_partial, worker_ring, job_id, layer_idx as u32)
-            .await?;
-
         // SwiGLU: silu(gate) * up
-        let gate_activated = silu(&gate_full);
-        let mlp_hidden = gate_activated.mul(&up_full)?;
+        let gate_activated = silu(&gate_partial);
+        let mlp_hidden = gate_activated.mul(&up_partial)?;
 
         // Down projection (partial)
         let down_partial = matmul(&mlp_hidden, &layer.w_down)?;
@@ -631,20 +692,28 @@ impl LocalForwardPass {
 
             // Attention block
             let normed = rms_norm(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
-            let q_full = matmul(&normed, &layer.w_q)?;
-            let k_full = matmul(&normed, &layer.w_k)?;
-            let v_full = matmul(&normed, &layer.w_v)?;
-            let attn_output =
-                attention_output(&mut self.kv_cache, config, layer_idx, q_full, k_full, v_full)?;
-            let o_full = matmul(&attn_output, &layer.w_o)?;
-            let post_attn = hidden.add(&o_full)?;
+            let q_local = matmul(&normed, &layer.w_q)?;
+            let k_local = matmul(&normed, &layer.w_k)?;
+            let v_local = matmul(&normed, &layer.w_v)?;
+            let attn_output = attention_output(
+                &mut self.kv_cache,
+                config,
+                0,
+                1,
+                layer_idx,
+                q_local,
+                k_local,
+                v_local,
+            )?;
+            let o_partial = matmul(&attn_output, &layer.w_o)?;
+            let post_attn = hidden.add(&o_partial)?;
 
             // MLP block
             let mlp_normed = rms_norm(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
-            let gate = matmul(&mlp_normed, &layer.w_gate)?;
-            let up = matmul(&mlp_normed, &layer.w_up)?;
-            let gate_activated = silu(&gate);
-            let mlp_hidden = gate_activated.mul(&up)?;
+            let gate_partial = matmul(&mlp_normed, &layer.w_gate)?;
+            let up_partial = matmul(&mlp_normed, &layer.w_up)?;
+            let gate_activated = silu(&gate_partial);
+            let mlp_hidden = gate_activated.mul(&up_partial)?;
             let mlp_out = matmul(&mlp_hidden, &layer.w_down)?;
             hidden = post_attn.add(&mlp_out)?;
         }
@@ -707,6 +776,7 @@ mod tests {
     }
 
     fn create_test_weights(config: &ModelConfig, shard_cols: usize) -> ModelWeights {
+        let mlp_shard_cols = shard_cols * config.intermediate_size / config.hidden_dim;
         let kv_shard_cols = config.num_kv_heads * (config.hidden_dim / config.num_heads);
         let layers = (0..config.num_layers)
             .map(|layer_idx| LayerWeights {
@@ -715,9 +785,9 @@ mod tests {
                 w_k: Tensor2D::filled(config.hidden_dim, kv_shard_cols, 0.2),
                 w_v: Tensor2D::filled(config.hidden_dim, kv_shard_cols, 0.3),
                 w_o: Tensor2D::filled(shard_cols, config.hidden_dim, 0.4),
-                w_up: Tensor2D::filled(config.hidden_dim, shard_cols, 0.5),
-                w_gate: Tensor2D::filled(config.hidden_dim, shard_cols, 0.6),
-                w_down: Tensor2D::filled(shard_cols, config.hidden_dim, 0.7),
+                w_up: Tensor2D::filled(config.hidden_dim, mlp_shard_cols, 0.5),
+                w_gate: Tensor2D::filled(config.hidden_dim, mlp_shard_cols, 0.6),
+                w_down: Tensor2D::filled(mlp_shard_cols, config.hidden_dim, 0.7),
                 attn_norm: Tensor1D::new(vec![1.0; config.hidden_dim]),
                 mlp_norm: Tensor1D::new(vec![1.0; config.hidden_dim]),
             })
@@ -750,9 +820,9 @@ mod tests {
             w_k: Tensor2D::filled(64, 32, 0.1),
             w_v: Tensor2D::filled(64, 32, 0.1),
             w_o: Tensor2D::filled(32, 64, 0.1),
-            w_up: Tensor2D::filled(64, 32, 0.1),
-            w_gate: Tensor2D::filled(64, 32, 0.1),
-            w_down: Tensor2D::filled(32, 64, 0.1),
+            w_up: Tensor2D::filled(64, 64, 0.1),
+            w_gate: Tensor2D::filled(64, 64, 0.1),
+            w_down: Tensor2D::filled(64, 64, 0.1),
             attn_norm: Tensor1D::new(vec![1.0; 64]),
             mlp_norm: Tensor1D::new(vec![1.0; 64]),
         };
@@ -803,8 +873,9 @@ mod tests {
     fn test_forward_pass_creation() {
         let config = create_test_config();
         let weights = create_test_weights(&config, 16);
-        let forward = ForwardPass::new(weights, 0, 16, 4);
+        let forward = ForwardPass::new(weights, 0, 0, 16, 4);
 
+        assert_eq!(forward.worker_position, 0);
         assert_eq!(forward.shard_start, 0);
         assert_eq!(forward.shard_end, 16);
         assert_eq!(forward.total_workers, 4);

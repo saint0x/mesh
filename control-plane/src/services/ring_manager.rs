@@ -8,7 +8,7 @@ use crate::model_assets;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -116,6 +116,8 @@ pub struct RingTopologyManager {
     workers: RwLock<HashMap<DeviceId, Worker>>,
     /// Ordered list of device IDs in ring order
     ring_sequence: RwLock<Vec<DeviceId>>,
+    /// Serializes topology mutations so ring position updates remain atomic under contention.
+    mutation_lock: Mutex<()>,
 }
 
 impl RingTopologyManager {
@@ -125,6 +127,7 @@ impl RingTopologyManager {
             db,
             workers: RwLock::new(HashMap::new()),
             ring_sequence: RwLock::new(Vec::new()),
+            mutation_lock: Mutex::new(()),
         }
     }
 
@@ -188,6 +191,11 @@ impl RingTopologyManager {
     /// Assigns a sequential ring position, calculates shard column range,
     /// updates all neighbors, and persists to database atomically.
     pub fn add_worker(&self, worker: Worker) -> ApiResult<RingPosition> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
+
         // Validate worker
         if worker.device_id.is_empty() {
             return Err(ApiError::BadRequest(
@@ -396,6 +404,11 @@ impl RingTopologyManager {
     /// Updates left_neighbor and right_neighbor for all workers in the ring.
     /// Handles wraparound: Worker 0's left = Worker N-1
     pub fn update_ring_connections(&self, network_id: &str) -> ApiResult<()> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
+
         let conn = self.db.get_conn()?;
 
         let ring_seq = self.ring_sequence.read().map_err(|_| {
@@ -499,6 +512,11 @@ impl RingTopologyManager {
     ///
     /// Marks worker as offline, removes from ring, and triggers redistribution.
     pub fn handle_worker_failure(&self, failed_worker_id: DeviceId) -> ApiResult<()> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
+
         if failed_worker_id.is_empty() {
             return Err(ApiError::BadRequest(
                 "device_id cannot be empty".to_string(),

@@ -528,7 +528,12 @@ mod tests {
         }
     }
 
+    fn ensure_test_model_assets() {
+        crate::model_assets::testsupport::ensure_test_model("test-model", 8192);
+    }
+
     fn register_test_device(db: &crate::db::Database, device_id: &str, network_id: &str) {
+        ensure_test_model_assets();
         let _ = crate::services::network_service::create_network(
             db,
             network_id.to_string(),

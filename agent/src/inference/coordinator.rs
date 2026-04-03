@@ -560,6 +560,7 @@ impl InferenceCoordinator {
         if self.active_forward_pass.is_none() {
             self.active_forward_pass = Some(ForwardPass::new(
                 (*weights).clone(),
+                position.position,
                 position.shard_column_range.0 as usize,
                 position.shard_column_range.1 as usize,
                 position.total_workers,
@@ -660,6 +661,7 @@ impl InferenceCoordinator {
 
                     let mut forward_pass = ForwardPass::new(
                         (*weights).clone(),
+                        position.position,
                         position.shard_column_range.0 as usize,
                         position.shard_column_range.1 as usize,
                         position.total_workers,

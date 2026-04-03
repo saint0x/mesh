@@ -420,6 +420,11 @@ fn validate_weight_shapes(
     let kv_total_cols = config.num_kv_heads * head_dim;
     let expected_kv_cols =
         partition_columns(kv_total_cols, assignment.worker_position, assignment.total_workers);
+    let expected_mlp_cols = partition_columns(
+        config.intermediate_size,
+        assignment.worker_position,
+        assignment.total_workers,
+    );
 
     if embedding.rows != config.vocab_size || embedding.cols != config.hidden_dim {
         return Err(AgentError::Config(format!(
@@ -465,9 +470,27 @@ fn validate_weight_shapes(
             layer.layer_idx,
         )?;
         validate_layer_shape(&layer.w_o, expected_cols, config.hidden_dim, "w_o", layer.layer_idx)?;
-        validate_layer_shape(&layer.w_up, config.hidden_dim, expected_cols, "w_up", layer.layer_idx)?;
-        validate_layer_shape(&layer.w_gate, config.hidden_dim, expected_cols, "w_gate", layer.layer_idx)?;
-        validate_layer_shape(&layer.w_down, expected_cols, config.hidden_dim, "w_down", layer.layer_idx)?;
+        validate_layer_shape(
+            &layer.w_up,
+            config.hidden_dim,
+            expected_mlp_cols,
+            "w_up",
+            layer.layer_idx,
+        )?;
+        validate_layer_shape(
+            &layer.w_gate,
+            config.hidden_dim,
+            expected_mlp_cols,
+            "w_gate",
+            layer.layer_idx,
+        )?;
+        validate_layer_shape(
+            &layer.w_down,
+            expected_mlp_cols,
+            config.hidden_dim,
+            "w_down",
+            layer.layer_idx,
+        )?;
 
         if layer.attn_norm.len() != config.hidden_dim || layer.mlp_norm.len() != config.hidden_dim
         {
@@ -553,10 +576,21 @@ mod tests {
 
     fn write_test_shard(root: &Path, assignment: &ShardAssignment) -> Result<()> {
         let hidden_dim = 8usize;
-        let shard_cols = assignment.num_columns() as usize;
+        let q_shard_cols = assignment.num_columns() as usize;
         let vocab_size = 16usize;
         let intermediate_size = 16usize;
         let num_layers = 2usize;
+        let num_heads = 2usize;
+        let num_kv_heads = 2usize;
+        let head_dim = hidden_dim / num_heads;
+        let kv_total_cols = num_kv_heads * head_dim;
+        let kv_shard_cols =
+            partition_columns(kv_total_cols, assignment.worker_position, assignment.total_workers);
+        let mlp_shard_cols = partition_columns(
+            intermediate_size,
+            assignment.worker_position,
+            assignment.total_workers,
+        );
 
         let model_dir = root.join(&assignment.model_id);
         fs::create_dir_all(&model_dir)?;
@@ -577,13 +611,13 @@ mod tests {
         ];
         for layer_idx in 0..num_layers {
             let prefix = format!("layers.{layer_idx}");
-            tensors.push((format!("{prefix}.w_q"), tensor2([hidden_dim, shard_cols], 10.0)));
-            tensors.push((format!("{prefix}.w_k"), tensor2([hidden_dim, shard_cols], 20.0)));
-            tensors.push((format!("{prefix}.w_v"), tensor2([hidden_dim, shard_cols], 30.0)));
-            tensors.push((format!("{prefix}.w_o"), tensor2([shard_cols, hidden_dim], 40.0)));
-            tensors.push((format!("{prefix}.w_up"), tensor2([hidden_dim, shard_cols], 50.0)));
-            tensors.push((format!("{prefix}.w_gate"), tensor2([hidden_dim, shard_cols], 60.0)));
-            tensors.push((format!("{prefix}.w_down"), tensor2([shard_cols, hidden_dim], 70.0)));
+            tensors.push((format!("{prefix}.w_q"), tensor2([hidden_dim, q_shard_cols], 10.0)));
+            tensors.push((format!("{prefix}.w_k"), tensor2([hidden_dim, kv_shard_cols], 20.0)));
+            tensors.push((format!("{prefix}.w_v"), tensor2([hidden_dim, kv_shard_cols], 30.0)));
+            tensors.push((format!("{prefix}.w_o"), tensor2([q_shard_cols, hidden_dim], 40.0)));
+            tensors.push((format!("{prefix}.w_up"), tensor2([hidden_dim, mlp_shard_cols], 50.0)));
+            tensors.push((format!("{prefix}.w_gate"), tensor2([hidden_dim, mlp_shard_cols], 60.0)));
+            tensors.push((format!("{prefix}.w_down"), tensor2([mlp_shard_cols, hidden_dim], 70.0)));
             tensors.push((format!("{prefix}.attn_norm"), tensor1(hidden_dim, 80.0)));
             tensors.push((format!("{prefix}.mlp_norm"), tensor1(hidden_dim, 90.0)));
         }
@@ -599,8 +633,8 @@ mod tests {
                 assignment.total_workers.to_string(),
             ),
             ("mesh.hidden_dim".to_string(), hidden_dim.to_string()),
-            ("mesh.num_heads".to_string(), "2".to_string()),
-            ("mesh.num_kv_heads".to_string(), "2".to_string()),
+            ("mesh.num_heads".to_string(), num_heads.to_string()),
+            ("mesh.num_kv_heads".to_string(), num_kv_heads.to_string()),
             ("mesh.num_layers".to_string(), num_layers.to_string()),
             ("mesh.vocab_size".to_string(), vocab_size.to_string()),
             (
