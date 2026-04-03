@@ -70,6 +70,8 @@ Before starting workers, place real shard artifacts for the selected `model_id` 
 
 The safetensors file must satisfy the loader contract in [agent/src/inference/artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
 
+Ring membership is explicit. `mesh init` registers the device, and `mesh join-ring --model-id ...` is the only supported way to place a worker into a model ring.
+
 ## Multi-Device LAN Pool Flow
 
 ### Device 1
@@ -150,7 +152,7 @@ cargo test --workspace
 - Durable inference dispatch is implemented.
 - The agent does poll and execute inference assignments from the control plane.
 - The hot path uses the dedicated tensor plane, not just generic control-plane messaging.
-- The runtime no longer includes the older generic job executor or synthetic shard loader.
+- Ring joins are explicit and model-scoped.
 - Real model quality still depends on shipping correct shard manifests, safetensors weights, and tokenizer assets.
 
 ## Troubleshooting

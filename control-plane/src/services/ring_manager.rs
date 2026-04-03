@@ -4,15 +4,13 @@ use crate::connectivity::{
     DirectPeerCandidate,
 };
 use crate::db::Database;
+use crate::model_assets;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
-
-/// Total number of columns in the model shard space (fixed at 8192)
-const TOTAL_SHARD_COLUMNS: u32 = 8192;
 
 /// Unique identifier for a device in the ring
 pub type DeviceId = String;
@@ -118,18 +116,15 @@ pub struct RingTopologyManager {
     workers: RwLock<HashMap<DeviceId, Worker>>,
     /// Ordered list of device IDs in ring order
     ring_sequence: RwLock<Vec<DeviceId>>,
-    /// Default model ID for shard assignment
-    default_model_id: String,
 }
 
 impl RingTopologyManager {
     /// Create a new RingTopologyManager
-    pub fn new(db: Arc<Database>, default_model_id: String) -> Self {
+    pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
             workers: RwLock::new(HashMap::new()),
             ring_sequence: RwLock::new(Vec::new()),
-            default_model_id,
         }
     }
 
@@ -140,16 +135,16 @@ impl RingTopologyManager {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT device_id, network_id, COALESCE(shard_model_id, ?), contributed_memory, ring_position, status
+                SELECT device_id, network_id, shard_model_id, contributed_memory, ring_position, status
                 FROM devices
-                WHERE network_id = ? AND ring_position IS NOT NULL
+                WHERE network_id = ? AND ring_position IS NOT NULL AND shard_model_id IS NOT NULL
                 ORDER BY ring_position
                 "#,
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
         let workers_iter = stmt
-            .query_map(params![&self.default_model_id, network_id], |row| {
+            .query_map(params![network_id], |row| {
                 Ok(Worker {
                     device_id: row.get(0)?,
                     network_id: row.get(1)?,
@@ -246,7 +241,7 @@ impl RingTopologyManager {
         let total_workers = ring_seq.len() + 1;
 
         // Calculate shard assignment
-        let shard = self.assign_shard(&worker.model_id, new_position, total_workers as u32);
+        let shard = self.assign_shard(&worker.model_id, new_position, total_workers as u32)?;
 
         // Calculate neighbors (will be updated for all workers)
         let (left_neighbor, right_neighbor) = if total_workers == 1 {
@@ -349,19 +344,27 @@ impl RingTopologyManager {
 
     /// Calculate shard assignment for a given position
     ///
-    /// Formula: columns_per_worker = 8192 / total_workers
+    /// Formula: columns_per_worker = tensor_parallelism_dim / total_workers
     /// Worker N gets columns: [N * columns_per_worker, (N+1) * columns_per_worker)
-    pub fn assign_shard(&self, model_id: &str, position: u32, total_workers: u32) -> ModelShard {
+    pub fn assign_shard(
+        &self,
+        model_id: &str,
+        position: u32,
+        total_workers: u32,
+    ) -> ApiResult<ModelShard> {
         if total_workers == 0 {
-            return ModelShard {
+            return Ok(ModelShard {
                 model_id: model_id.to_string(),
                 column_range: (0, 0),
                 estimated_memory: 0,
-            };
+            });
         }
 
-        let columns_per_worker = TOTAL_SHARD_COLUMNS / total_workers;
-        let remainder = TOTAL_SHARD_COLUMNS % total_workers;
+        let manifest = model_assets::load_model_manifest(model_id)?;
+        let total_columns = manifest.tensor_parallelism_dim;
+
+        let columns_per_worker = total_columns / total_workers;
+        let remainder = total_columns % total_workers;
 
         // Distribute remainder columns to the first 'remainder' workers
         let start = if position < remainder {
@@ -377,13 +380,15 @@ impl RingTopologyManager {
         };
 
         // Estimate memory based on column count (rough estimate: 1MB per column)
-        let estimated_memory = (end - start) as u64 * 1_000_000;
+        let estimated_memory =
+            ((manifest.total_model_bytes as u128) * (end - start) as u128 / total_columns as u128)
+                as u64;
 
-        ModelShard {
+        Ok(ModelShard {
             model_id: model_id.to_string(),
             column_range: (start, end),
             estimated_memory,
-        }
+        })
     }
 
     /// Update ring connections for all workers
@@ -456,12 +461,12 @@ impl RingTopologyManager {
             // Recalculate shard for updated total
             let model_id: String = conn
                 .query_row(
-                    "SELECT COALESCE(shard_model_id, ?) FROM devices WHERE device_id = ?",
-                    params![&self.default_model_id, device_id],
+                    "SELECT shard_model_id FROM devices WHERE device_id = ? AND shard_model_id IS NOT NULL",
+                    params![device_id],
                     |row| row.get(0),
                 )
                 .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            let shard = self.assign_shard(&model_id, position, total_workers);
+            let shard = self.assign_shard(&model_id, position, total_workers)?;
 
             conn.execute(
                 r#"
@@ -609,9 +614,7 @@ impl RingTopologyManager {
             .query_map(params![network_id], |row| {
                 let device_id: String = row.get(0)?;
                 let position: u32 = row.get(1)?;
-                let shard_model_id = row
-                    .get::<_, Option<String>>(2)?
-                    .unwrap_or_else(|| self.default_model_id.clone());
+                let shard_model_id = row.get::<_, String>(2)?;
                 let shard_start: u32 = row.get(3)?;
                 let shard_end: u32 = row.get(4)?;
                 let left_neighbor: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
@@ -664,7 +667,7 @@ impl RingTopologyManager {
                     shard: ModelShard {
                         model_id: shard_model_id,
                         column_range: (shard_start, shard_end),
-                        estimated_memory: (shard_end - shard_start) as u64 * 1_000_000,
+                        estimated_memory: contributed_memory,
                     },
                     left_neighbor,
                     right_neighbor,
@@ -802,9 +805,14 @@ mod tests {
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::device_service;
 
+    fn ensure_test_model_assets() {
+        crate::model_assets::testsupport::ensure_test_model("test-model", 8192);
+    }
+
     fn create_test_ring_manager() -> (RingTopologyManager, Database) {
+        ensure_test_model_assets();
         let db = create_test_db();
-        let manager = RingTopologyManager::new(Arc::new(db.clone()), "test-model".to_string());
+        let manager = RingTopologyManager::new(Arc::new(db.clone()));
         (manager, db)
     }
 
@@ -863,9 +871,9 @@ mod tests {
     #[test]
     fn test_assign_shard_single_worker() {
         let (manager, _db) = create_test_ring_manager();
-        let shard = manager.assign_shard("test-model", 0, 1);
+        let shard = manager.assign_shard("test-model", 0, 1).unwrap();
 
-        assert_eq!(shard.column_range, (0, TOTAL_SHARD_COLUMNS));
+        assert_eq!(shard.column_range, (0, 8192));
         assert_eq!(shard.model_id, "test-model");
     }
 
@@ -873,8 +881,8 @@ mod tests {
     fn test_assign_shard_two_workers() {
         let (manager, _db) = create_test_ring_manager();
 
-        let shard0 = manager.assign_shard("test-model", 0, 2);
-        let shard1 = manager.assign_shard("test-model", 1, 2);
+        let shard0 = manager.assign_shard("test-model", 0, 2).unwrap();
+        let shard1 = manager.assign_shard("test-model", 1, 2).unwrap();
 
         assert_eq!(shard0.column_range, (0, 4096));
         assert_eq!(shard1.column_range, (4096, 8192));
@@ -884,16 +892,16 @@ mod tests {
     fn test_assign_shard_three_workers() {
         let (manager, _db) = create_test_ring_manager();
 
-        let shard0 = manager.assign_shard("test-model", 0, 3);
-        let shard1 = manager.assign_shard("test-model", 1, 3);
-        let shard2 = manager.assign_shard("test-model", 2, 3);
+        let shard0 = manager.assign_shard("test-model", 0, 3).unwrap();
+        let shard1 = manager.assign_shard("test-model", 1, 3).unwrap();
+        let shard2 = manager.assign_shard("test-model", 2, 3).unwrap();
 
         // 8192 / 3 = 2730 remainder 2
         // Worker 0: 0-2731 (2731 columns)
         // Worker 1: 2731-5462 (2731 columns)
         // Worker 2: 5462-8192 (2730 columns)
         assert_eq!(shard0.column_range.0, 0);
-        assert_eq!(shard2.column_range.1, TOTAL_SHARD_COLUMNS);
+        assert_eq!(shard2.column_range.1, 8192);
 
         // Verify no gaps
         assert_eq!(shard0.column_range.1, shard1.column_range.0);
@@ -907,7 +915,7 @@ mod tests {
         for total in 1..=20 {
             let mut ranges: Vec<(u32, u32)> = Vec::new();
             for pos in 0..total {
-                let shard = manager.assign_shard("test-model", pos, total);
+                let shard = manager.assign_shard("test-model", pos, total).unwrap();
                 ranges.push(shard.column_range);
             }
 
@@ -930,9 +938,9 @@ mod tests {
             assert_eq!(ranges[0].0, 0, "First shard should start at 0");
             assert_eq!(
                 ranges.last().unwrap().1,
-                TOTAL_SHARD_COLUMNS,
+                8192,
                 "Last shard should end at {}",
-                TOTAL_SHARD_COLUMNS
+                8192
             );
         }
     }
@@ -959,7 +967,7 @@ mod tests {
         assert_eq!(position.position, 0);
         assert_eq!(position.left_neighbor, device_id);
         assert_eq!(position.right_neighbor, device_id);
-        assert_eq!(position.shard.column_range, (0, TOTAL_SHARD_COLUMNS));
+        assert_eq!(position.shard.column_range, (0, 8192));
     }
 
     #[test]
@@ -1235,7 +1243,7 @@ mod tests {
 
         // First should start at 0, last should end at 8192
         assert_eq!(all_ranges[0].0, 0);
-        assert_eq!(all_ranges[9].1, TOTAL_SHARD_COLUMNS);
+        assert_eq!(all_ranges[9].1, 8192);
 
         // No gaps between ranges
         for i in 0..9 {

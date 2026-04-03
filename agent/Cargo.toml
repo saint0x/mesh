@@ -38,6 +38,7 @@ colored = "2.1"
 chrono = "0.4"
 socket2.workspace = true
 safetensors = "0.7"
+tokenizers = "0.20"
 
 # Platform-specific dependencies for memory locking
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

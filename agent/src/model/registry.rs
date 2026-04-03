@@ -334,7 +334,7 @@ mod tests {
     async fn test_assign_shard() {
         let (registry, _temp) = create_test_registry().await;
 
-        let assignment = ShardAssignment::new("llama-70b".to_string(), 0, 10);
+        let assignment = ShardAssignment::new("llama-70b".to_string(), 0, 10, 8192);
         registry.assign_shard(assignment).await.unwrap();
 
         let shard = registry.get_shard("llama-70b").await;
@@ -349,7 +349,7 @@ mod tests {
         let (registry, _temp) = create_test_registry().await;
 
         // Assign
-        let assignment = ShardAssignment::new("model".to_string(), 0, 10);
+        let assignment = ShardAssignment::new("model".to_string(), 0, 10, 8192);
         registry.assign_shard(assignment).await.unwrap();
         assert_eq!(
             registry.get_shard_status("model").await,
@@ -400,7 +400,7 @@ mod tests {
         // Create registry and add shard
         {
             let registry = ShardRegistry::new(temp_dir.path().to_path_buf()).unwrap();
-            let assignment = ShardAssignment::new("model".to_string(), 5, 10);
+            let assignment = ShardAssignment::new("model".to_string(), 5, 10, 8192);
             registry.assign_shard(assignment).await.unwrap();
         }
 
@@ -420,8 +420,8 @@ mod tests {
         let (registry, _temp) = create_test_registry().await;
 
         // Add two shards
-        let a1 = ShardAssignment::new("model1".to_string(), 0, 10);
-        let a2 = ShardAssignment::new("model2".to_string(), 0, 10);
+        let a1 = ShardAssignment::new("model1".to_string(), 0, 10, 8192);
+        let a2 = ShardAssignment::new("model2".to_string(), 0, 10, 8192);
 
         registry.assign_shard(a1).await.unwrap();
         registry.assign_shard(a2).await.unwrap();
@@ -441,8 +441,8 @@ mod tests {
     async fn test_ready_shards() {
         let (registry, _temp) = create_test_registry().await;
 
-        let a1 = ShardAssignment::new("model1".to_string(), 0, 10);
-        let a2 = ShardAssignment::new("model2".to_string(), 0, 10);
+        let a1 = ShardAssignment::new("model1".to_string(), 0, 10, 8192);
+        let a2 = ShardAssignment::new("model2".to_string(), 0, 10, 8192);
 
         registry.assign_shard(a1).await.unwrap();
         registry.assign_shard(a2).await.unwrap();
@@ -464,6 +464,7 @@ mod tests {
             name: "LLaMA 70B".to_string(),
             num_layers: 80,
             hidden_dim: 8192,
+            tensor_parallelism_dim: 8192,
             num_heads: 64,
             vocab_size: 32000,
             total_size_bytes: 140_000_000_000,

@@ -293,10 +293,12 @@ impl InferenceCoordinator {
         debug!(model_id = %model_id, "Cache miss, loading weights");
 
         // Create shard assignment for this worker
-        let assignment = ShardAssignment::new(
+        let assignment = ShardAssignment::from_column_range(
             model_id.to_string(),
             position.position,
             position.total_workers,
+            position.shard_column_range.0,
+            position.shard_column_range.1,
         );
 
         // Assign shard to registry if not already assigned

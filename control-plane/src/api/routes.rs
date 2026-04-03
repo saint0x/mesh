@@ -4,15 +4,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
     CreateNetworkRequest, CreateNetworkResponse, HeartbeatRequest, HeartbeatResponse,
-    ListNetworksResponse, RegisterDeviceRequest, RegisterDeviceResponse, RingPositionInfo,
-    ShardInfo,
+    ListNetworksResponse, RegisterDeviceRequest, RegisterDeviceResponse,
 };
-use crate::services::ring_manager::Worker;
 use crate::services::{device_service, network_service};
 use crate::state::AppState;
 
@@ -28,11 +26,6 @@ pub async fn register_device(
     State(state): State<AppState>,
     Json(req): Json<RegisterDeviceRequest>,
 ) -> ApiResult<Json<RegisterDeviceResponse>> {
-    // Extract ring join info before moving req
-    let device_id = req.device_id.clone();
-    let network_id = req.network_id.clone();
-    let contributed_memory = req.contributed_memory;
-
     // Execute blocking database operation in thread pool
     let db = state.db.clone();
     let keypair = state.keypair.clone();
@@ -52,54 +45,12 @@ pub async fn register_device(
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
-    // If contributed_memory is provided, automatically join the ring
-    let ring_position = if let Some(memory) = contributed_memory {
-        // Get or create ring manager for this network
-        let ring_manager = state.get_ring_manager(&network_id)?;
-
-        // Create worker from registration
-        let worker = Worker {
-            device_id: device_id.clone(),
-            network_id: network_id.clone(),
-            model_id: "default-model".to_string(),
-            contributed_memory: memory,
-            ring_position: None,
-            status: "online".to_string(),
-        };
-
-        // Join the ring
-        let position = tokio::task::spawn_blocking(move || ring_manager.add_worker(worker))
-            .await
-            .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
-
-        info!(
-            device_id = %device_id,
-            network_id = %network_id,
-            ring_position = position.position,
-            "Device automatically joined ring after registration"
-        );
-
-        Some(RingPositionInfo {
-            position: position.position,
-            shard: ShardInfo {
-                model_id: position.shard.model_id,
-                column_start: position.shard.column_range.0,
-                column_end: position.shard.column_range.1,
-                estimated_memory: position.shard.estimated_memory,
-            },
-            left_neighbor: position.left_neighbor,
-            right_neighbor: position.right_neighbor,
-        })
-    } else {
-        None
-    };
-
     Ok(Json(RegisterDeviceResponse {
         success: true,
         certificate: Some(result.0),
         connectivity: result.1,
         message: Some("Device registered successfully".to_string()),
-        ring_position,
+        ring_position: None,
     }))
 }
 
@@ -339,8 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_device_with_ring_join() {
-        // Test registration with automatic ring joining
+    async fn test_register_device_requires_explicit_ring_join() {
         let db = crate::db::create_test_db();
         network_service::create_network(
             &db,
@@ -356,10 +306,10 @@ mod tests {
         let state = AppState::new(db, keypair);
 
         let request = RegisterDeviceRequest {
-            device_id: "test-device-ring".to_string(),
+            device_id: "test-device-explicit-ring".to_string(),
             network_id: "test-network".to_string(),
             name: "Test Device".to_string(),
-            public_key: vec![43u8; 32], // Different key to avoid conflicts
+            public_key: vec![43u8; 32],
             peer_id: "12D3KooWQ6routepeer333333333333333333333333333333".to_string(),
             capabilities: test_capabilities(),
             contributed_memory: Some(8_000_000_000),
@@ -376,13 +326,7 @@ mod tests {
             response.connectivity.preferred_path,
             ConnectivityPath::Relayed
         );
-
-        // Should have ring position info
-        assert!(response.ring_position.is_some());
-        let ring_pos = response.ring_position.unwrap();
-        assert_eq!(ring_pos.position, 0); // First worker
-        assert_eq!(ring_pos.left_neighbor, "test-device-ring");
-        assert_eq!(ring_pos.right_neighbor, "test-device-ring");
+        assert!(response.ring_position.is_none());
     }
 
     #[tokio::test]

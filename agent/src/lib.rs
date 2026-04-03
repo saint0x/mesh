@@ -7,6 +7,7 @@ pub mod errors;
 pub mod executor;
 pub mod inference;
 pub mod model;
+pub mod model_assets;
 pub mod network;
 pub mod observability;
 pub mod pki;

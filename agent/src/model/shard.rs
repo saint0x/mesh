@@ -5,9 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Total number of columns in the shard space (fixed)
-pub const TOTAL_COLUMNS: u32 = 8192;
-
 /// Information about a model available for inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -22,6 +19,9 @@ pub struct ModelInfo {
 
     /// Hidden dimension size
     pub hidden_dim: u32,
+
+    /// Tensor-parallel column dimension for shard assignment
+    pub tensor_parallelism_dim: u32,
 
     /// Number of attention heads
     pub num_heads: u32,
@@ -67,9 +67,9 @@ impl ModelInfo {
     /// Calculate columns per worker for a given number of workers
     pub fn columns_per_worker(&self, num_workers: u32) -> u32 {
         if num_workers == 0 {
-            return TOTAL_COLUMNS;
+            return self.tensor_parallelism_dim;
         }
-        TOTAL_COLUMNS / num_workers
+        self.tensor_parallelism_dim / num_workers
     }
 
     /// Check if the given number of workers can run this model
@@ -99,16 +99,37 @@ pub struct ShardAssignment {
 
 impl ShardAssignment {
     /// Create a new shard assignment
-    pub fn new(model_id: String, worker_position: u32, total_workers: u32) -> Self {
+    pub fn new(
+        model_id: String,
+        worker_position: u32,
+        total_workers: u32,
+        total_columns: u32,
+    ) -> Self {
         // Calculate column range for this worker
-        let cols_per_worker = TOTAL_COLUMNS / total_workers;
+        let cols_per_worker = total_columns / total_workers;
         let column_start = worker_position * cols_per_worker;
         let column_end = if worker_position == total_workers - 1 {
-            TOTAL_COLUMNS // Last worker gets any remainder
+            total_columns // Last worker gets any remainder
         } else {
             (worker_position + 1) * cols_per_worker
         };
 
+        Self {
+            model_id,
+            worker_position,
+            total_workers,
+            column_start,
+            column_end,
+        }
+    }
+
+    pub fn from_column_range(
+        model_id: String,
+        worker_position: u32,
+        total_workers: u32,
+        column_start: u32,
+        column_end: u32,
+    ) -> Self {
         Self {
             model_id,
             worker_position,
@@ -215,6 +236,7 @@ mod tests {
             name: "LLaMA 70B".to_string(),
             num_layers: 80,
             hidden_dim: 8192,
+            tensor_parallelism_dim: 8192,
             num_heads: 64,
             vocab_size: 32000,
             total_size_bytes: 140_000_000_000, // ~140GB
@@ -244,6 +266,7 @@ mod tests {
             name: "Test".to_string(),
             num_layers: 10,
             hidden_dim: 8192,
+            tensor_parallelism_dim: 8192,
             num_heads: 32,
             vocab_size: 32000,
             total_size_bytes: 10_000_000_000,
@@ -262,25 +285,25 @@ mod tests {
     #[test]
     fn test_shard_assignment_new() {
         // 10 workers, position 0
-        let shard = ShardAssignment::new("llama-70b".to_string(), 0, 10);
+        let shard = ShardAssignment::new("llama-70b".to_string(), 0, 10, 8192);
         assert_eq!(shard.column_start, 0);
         assert_eq!(shard.column_end, 819);
         assert_eq!(shard.num_columns(), 819);
 
         // 10 workers, position 5 (middle)
-        let shard = ShardAssignment::new("llama-70b".to_string(), 5, 10);
+        let shard = ShardAssignment::new("llama-70b".to_string(), 5, 10, 8192);
         assert_eq!(shard.column_start, 4095);
         assert_eq!(shard.column_end, 4914);
 
         // 10 workers, position 9 (last)
-        let shard = ShardAssignment::new("llama-70b".to_string(), 9, 10);
+        let shard = ShardAssignment::new("llama-70b".to_string(), 9, 10, 8192);
         assert_eq!(shard.column_start, 7371);
         assert_eq!(shard.column_end, 8192); // Gets remainder
     }
 
     #[test]
     fn test_shard_assignment_contains_column() {
-        let shard = ShardAssignment::new("model".to_string(), 1, 4);
+        let shard = ShardAssignment::new("model".to_string(), 1, 4, 8192);
         // Worker 1 of 4 = columns 2048-4095
 
         assert!(!shard.contains_column(0));
@@ -293,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_shard_info_lifecycle() {
-        let assignment = ShardAssignment::new("model".to_string(), 0, 10);
+        let assignment = ShardAssignment::new("model".to_string(), 0, 10, 8192);
         let mut shard = ShardInfo::new(assignment);
 
         // Initially not ready
@@ -325,10 +348,10 @@ mod tests {
     #[test]
     fn test_full_column_coverage() {
         // Verify that 10 workers cover all 8192 columns with no gaps
-        let mut all_columns = vec![false; TOTAL_COLUMNS as usize];
+        let mut all_columns = vec![false; 8192usize];
 
         for position in 0..10 {
-            let shard = ShardAssignment::new("model".to_string(), position, 10);
+            let shard = ShardAssignment::new("model".to_string(), position, 10, 8192);
             for col in shard.column_start..shard.column_end {
                 all_columns[col as usize] = true;
             }

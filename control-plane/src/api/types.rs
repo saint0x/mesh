@@ -19,8 +19,7 @@ pub struct RegisterDeviceRequest {
     pub peer_id: String,
     /// Device hardware capabilities
     pub capabilities: DeviceCapabilities,
-    /// Optional: Memory to contribute to the pool (bytes).
-    /// If provided, device will automatically join the ring.
+    /// Optional: Memory the device can contribute once it explicitly joins a model ring.
     #[serde(default)]
     pub contributed_memory: Option<u64>,
 }
@@ -36,7 +35,7 @@ pub struct RegisterDeviceResponse {
     pub connectivity: NetworkConnectivity,
     /// Error or success message
     pub message: Option<String>,
-    /// Ring position info (if device joined ring)
+    /// Ring position info for explicit ring membership flows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ring_position: Option<RingPositionInfo>,
 }

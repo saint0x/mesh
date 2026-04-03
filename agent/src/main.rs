@@ -1183,10 +1183,20 @@ async fn cmd_start() -> Result<()> {
 
             match coordinator.process_inference(request).await {
                 Ok(result) => {
-                    let completion = result
-                        .generated_tokens
-                        .as_ref()
-                        .map(|tokens| format!("{:?}", tokens));
+                    let completion = result.generated_tokens.as_ref().and_then(|tokens| {
+                        match agent::model_assets::decode_tokens(&assignment.model_id, tokens) {
+                            Ok(text) => Some(text),
+                            Err(e) => {
+                                warn!(
+                                    job_id = %job_id,
+                                    model_id = %assignment.model_id,
+                                    error = %e,
+                                    "Failed to decode generated tokens with model tokenizer"
+                                );
+                                None
+                            }
+                        }
+                    });
 
                     if let Err(e) = registration_client
                         .report_inference_result(

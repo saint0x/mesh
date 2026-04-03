@@ -6,9 +6,6 @@ use crate::services::topology_notifier::TopologyNotifier;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Default model ID for ring topology
-const DEFAULT_MODEL_ID: &str = "default-model";
-
 /// Axum application state shared across all request handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -58,10 +55,7 @@ impl AppState {
         }
 
         // Create new manager
-        let manager = Arc::new(RingTopologyManager::new(
-            Arc::new(self.db.clone()),
-            DEFAULT_MODEL_ID.to_string(),
-        ));
+        let manager = Arc::new(RingTopologyManager::new(Arc::new(self.db.clone())));
 
         // Load existing topology from database
         manager.load_from_db(network_id)?;

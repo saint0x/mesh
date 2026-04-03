@@ -582,7 +582,7 @@ mod tests {
     async fn loads_verified_safetensors_artifact() {
         let temp_dir = TempDir::new().unwrap();
         let registry = ShardRegistry::new(temp_dir.path().join("registry")).unwrap();
-        let assignment = ShardAssignment::new("tinyllama-1.1b".into(), 0, 2);
+        let assignment = ShardAssignment::new("tinyllama-1.1b".into(), 0, 2, 8);
         registry.assign_shard(assignment.clone()).await.unwrap();
         write_test_shard(temp_dir.path(), &assignment).unwrap();
 
@@ -596,6 +596,6 @@ mod tests {
         assert_eq!(loaded.config.num_layers, 2);
         assert_eq!(loaded.layers.len(), 2);
         assert_eq!(loaded.layers[0].w_q.rows, 8);
-        assert_eq!(loaded.layers[0].w_q.cols, 4096);
+        assert_eq!(loaded.layers[0].w_q.cols, 4);
     }
 }

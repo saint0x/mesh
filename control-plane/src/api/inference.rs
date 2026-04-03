@@ -14,6 +14,7 @@ use crate::api::types::{
     InferenceJobStatusResponse, ReportInferenceAssignmentRequest, SubmitInferenceRequest,
     SubmitInferenceResponse,
 };
+use crate::model_assets;
 use crate::services::network_service;
 use crate::state::AppState;
 
@@ -78,12 +79,7 @@ pub async fn submit_inference(
         ));
     }
 
-    let prompt_tokens: Vec<u32> = req.prompt.chars().map(|c| c as u32).collect();
-    if prompt_tokens.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Prompt tokenization failed".to_string(),
-        ));
-    }
+    let prompt_tokens = model_assets::tokenize_prompt(&req.model_id, &req.prompt)?;
 
     let db = state.db.clone();
     let request = req.clone();
@@ -918,6 +914,18 @@ mod tests {
     use crate::services::device_service;
     use std::sync::Arc;
 
+    fn ensure_test_models() {
+        for model_id in [
+            "test-model",
+            "llama-70b",
+            "model-x",
+            "model-y",
+            "tinyllama-1.1b",
+        ] {
+            crate::model_assets::testsupport::ensure_test_model(model_id, 8192);
+        }
+    }
+
     fn test_capabilities() -> DeviceCapabilities {
         DeviceCapabilities {
             tier: Tier::Tier2,
@@ -987,6 +995,7 @@ mod tests {
         network_id: &str,
         scheduling_policy: InferenceSchedulingPolicy,
     ) -> AppState {
+        ensure_test_models();
         let db = create_test_db();
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
         let state = AppState::new(db.clone(), keypair);
@@ -1022,6 +1031,7 @@ mod tests {
         network_id: &str,
         scheduling_policy: InferenceSchedulingPolicy,
     ) -> AppState {
+        ensure_test_models();
         let db = create_test_db();
         let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
         let state = AppState::new(db.clone(), keypair);
