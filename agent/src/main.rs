@@ -966,10 +966,24 @@ async fn cmd_start() -> Result<()> {
 
         info!("Initializing inference coordinator");
 
+        let mut inference_runtime_config = InferenceConfig::default();
+        inference_runtime_config.recovery_max_attempts_per_job = inference_config_task
+            .governance
+            .recovery_max_attempts_per_job;
+        inference_runtime_config.recovery_cooldown =
+            std::time::Duration::from_millis(inference_config_task.governance.recovery_cooldown_ms);
+        inference_runtime_config.recovery_max_checkpoint_loads_per_minute = inference_config_task
+            .governance
+            .recovery_max_checkpoint_loads_per_minute;
+        let inference_swarm_keep_alive = inference_runtime_config.job_timeout
+            + inference_runtime_config.allreduce_timeout
+            + std::time::Duration::from_secs(60);
+
         // Create separate swarm for inference coordination (P2P communication during all-reduce)
         let libp2p_keypair =
             agent::device::keypair::to_libp2p_keypair(&inference_config_task.keypair);
-        let mut swarm_builder = MeshSwarmBuilder::new(libp2p_keypair);
+        let mut swarm_builder =
+            MeshSwarmBuilder::new(libp2p_keypair).with_keep_alive(inference_swarm_keep_alive);
         if let Some(endpoint) = runtime_endpoint_clone.clone() {
             swarm_builder = swarm_builder.with_relay_addr(endpoint);
         }
@@ -1068,18 +1082,8 @@ async fn cmd_start() -> Result<()> {
             );
         }
 
-        // Create inference coordinator
-        let mut inference_config = InferenceConfig::default();
-        inference_config.recovery_max_attempts_per_job = inference_config_task
-            .governance
-            .recovery_max_attempts_per_job;
-        inference_config.recovery_cooldown =
-            std::time::Duration::from_millis(inference_config_task.governance.recovery_cooldown_ms);
-        inference_config.recovery_max_checkpoint_loads_per_minute = inference_config_task
-            .governance
-            .recovery_max_checkpoint_loads_per_minute;
         let mut coordinator =
-            InferenceCoordinator::new(inference_swarm, tensor_plane, inference_config);
+            InferenceCoordinator::new(inference_swarm, tensor_plane, inference_runtime_config);
 
         info!("Inference coordinator initialized - starting assignment loop");
 

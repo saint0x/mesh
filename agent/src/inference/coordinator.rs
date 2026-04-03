@@ -564,6 +564,7 @@ impl InferenceCoordinator {
                 position.shard_column_range.0 as usize,
                 position.shard_column_range.1 as usize,
                 position.total_workers,
+                self.config.allreduce_timeout,
             )?);
         }
 
@@ -665,6 +666,7 @@ impl InferenceCoordinator {
                         position.shard_column_range.0 as usize,
                         position.shard_column_range.1 as usize,
                         position.total_workers,
+                        self.config.allreduce_timeout,
                     )?;
 
                     if let Some(kv_cache) = manager.load_checkpoint_kv_cache(job_id).await? {

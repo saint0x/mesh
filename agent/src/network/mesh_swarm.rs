@@ -512,14 +512,19 @@ impl MeshSwarm {
                     } else {
                         info!(peer_id = %peer_id, remaining = num_established, "Connection closed");
                     }
+                    let has_live_peers = self.swarm.connected_peers().next().is_some();
                     let _ = persist_runtime_connectivity_state(&DeviceConnectivityState {
-                        active_path: if self.relay_peer_id.is_some() {
+                        active_path: if self.relay_peer_id.is_some() && !has_live_peers {
                             ConnectivityPath::Relayed
                         } else {
                             ConnectivityPath::Direct
                         },
                         active_endpoint: None,
-                        status: ConnectivityStatus::Degraded,
+                        status: if has_live_peers {
+                            ConnectivityStatus::Connected
+                        } else {
+                            ConnectivityStatus::Degraded
+                        },
                     });
                     if relay_closed {
                         return Some(MeshEvent::RelayDisconnected {

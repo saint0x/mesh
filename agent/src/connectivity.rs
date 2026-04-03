@@ -7,6 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const OBSERVED_CANDIDATE_MAX_AGE_MS: u64 = 5 * 60 * 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectivityPath {
@@ -192,7 +194,25 @@ pub fn persist_observed_reachability_addr(address: &Multiaddr) -> Result<()> {
     }
 
     let mut records = load_observed_reachability_records().unwrap_or_default();
+    prune_stale_observed_records(&mut records);
     let address = address.to_string();
+    let Some(candidate) = address
+        .parse::<Multiaddr>()
+        .ok()
+        .and_then(|addr| classify_direct_addr(&addr))
+    else {
+        fs::write(path, serde_json::to_string_pretty(&records)?)?;
+        return Ok(());
+    };
+
+    if !matches!(
+        candidate.scope,
+        DirectCandidateScope::Public | DirectCandidateScope::Dns
+    ) {
+        fs::write(path, serde_json::to_string_pretty(&records)?)?;
+        return Ok(());
+    }
+
     if let Some(existing) = records.iter_mut().find(|record| record.endpoint == address) {
         existing.last_updated_ms = now_epoch_ms();
     } else {
@@ -246,7 +266,9 @@ pub fn load_direct_candidate_seed_addrs() -> Option<Vec<String>> {
 
 pub fn load_observed_reachability_records() -> Option<Vec<DirectCandidateSeed>> {
     let observed_path = meshnet_state_path("observed_addrs.json")?;
-    load_json_seed_vec(&observed_path)
+    let mut records = load_json_seed_vec(&observed_path)?;
+    prune_stale_observed_records(&mut records);
+    Some(records)
 }
 
 pub fn load_observed_reachability_addrs() -> Option<Vec<String>> {
@@ -315,8 +337,10 @@ pub fn build_direct_peer_candidates_from_records(
     peer_id: PeerId,
     seeds: &[DirectCandidateSeed],
 ) -> Vec<DirectPeerCandidate> {
+    let now_ms = now_epoch_ms();
     let parsed = seeds
         .iter()
+        .filter(|seed| direct_candidate_seed_is_fresh(seed, now_ms))
         .filter_map(|seed| {
             seed.endpoint
                 .parse::<Multiaddr>()
@@ -329,12 +353,16 @@ pub fn build_direct_peer_candidates_from_records(
         .iter()
         .filter_map(|(seed, addr)| {
             classify_direct_addr(addr).map(|mut candidate| {
+                if matches!(candidate.scope, DirectCandidateScope::Loopback) {
+                    return None;
+                }
                 candidate.endpoint = canonical_direct_addr(addr, peer_id).to_string();
                 candidate.source = seed.source.clone();
                 candidate.last_updated_ms = seed.last_updated_ms;
-                candidate
+                Some(candidate)
             })
         })
+        .flatten()
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
@@ -440,6 +468,23 @@ fn candidate_source_rank(source: &DirectCandidateSource) -> u8 {
         DirectCandidateSource::ObservedExternal => 0,
         DirectCandidateSource::LocalListen => 1,
     }
+}
+
+fn direct_candidate_seed_is_fresh(seed: &DirectCandidateSeed, now_ms: u64) -> bool {
+    match seed.source {
+        DirectCandidateSource::LocalListen => true,
+        DirectCandidateSource::ObservedExternal => {
+            now_ms.saturating_sub(seed.last_updated_ms) <= OBSERVED_CANDIDATE_MAX_AGE_MS
+        }
+    }
+}
+
+fn prune_stale_observed_records(records: &mut Vec<DirectCandidateSeed>) {
+    let now_ms = now_epoch_ms();
+    records.retain(|record| {
+        record.source == DirectCandidateSource::ObservedExternal
+            && direct_candidate_seed_is_fresh(record, now_ms)
+    });
 }
 
 fn now_epoch_ms() -> u64 {
@@ -642,5 +687,66 @@ mod tests {
             DirectCandidateSource::ObservedExternal
         );
         assert_eq!(candidates[0].last_updated_ms, now);
+    }
+
+    #[test]
+    fn persist_observed_reachability_addr_ignores_private_and_loopback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("MESHNET_HOME");
+        std::env::set_var("MESHNET_HOME", tempdir.path());
+
+        persist_observed_reachability_addr(
+            &"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap(),
+        )
+        .unwrap();
+        persist_observed_reachability_addr(
+            &"/ip4/192.168.1.5/tcp/4001".parse::<Multiaddr>().unwrap(),
+        )
+        .unwrap();
+        persist_observed_reachability_addr(
+            &"/ip4/34.120.0.10/tcp/4001".parse::<Multiaddr>().unwrap(),
+        )
+        .unwrap();
+
+        let observed = load_observed_reachability_records().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].endpoint, "/ip4/34.120.0.10/tcp/4001");
+
+        match previous {
+            Some(value) => std::env::set_var("MESHNET_HOME", value),
+            None => std::env::remove_var("MESHNET_HOME"),
+        }
+    }
+
+    #[test]
+    fn build_direct_peer_candidates_excludes_loopback_and_stale_observed() {
+        let peer_id = PeerId::random();
+        let now = now_epoch_ms();
+        let seeds = vec![
+            DirectCandidateSeed {
+                endpoint: "/ip4/127.0.0.1/tcp/4001".to_string(),
+                source: DirectCandidateSource::LocalListen,
+                last_updated_ms: now,
+            },
+            DirectCandidateSeed {
+                endpoint: "/ip4/34.120.0.10/tcp/4001".to_string(),
+                source: DirectCandidateSource::ObservedExternal,
+                last_updated_ms: now - OBSERVED_CANDIDATE_MAX_AGE_MS - 1,
+            },
+            DirectCandidateSeed {
+                endpoint: "/ip4/192.168.1.44/tcp/4001".to_string(),
+                source: DirectCandidateSource::LocalListen,
+                last_updated_ms: now,
+            },
+        ];
+
+        let candidates = build_direct_peer_candidates_from_records(peer_id, &seeds);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].scope, DirectCandidateScope::Private);
+        assert_eq!(
+            candidates[0].endpoint,
+            format!("/ip4/192.168.1.44/tcp/4001/p2p/{}", peer_id)
+        );
     }
 }

@@ -408,6 +408,7 @@ impl DeviceModelWeights {
 pub struct ForwardPass {
     device_weights: DeviceModelWeights,
     config: ModelConfig,
+    allreduce_timeout: std::time::Duration,
 
     /// KV cache for attention
     pub kv_cache: KVCache,
@@ -434,6 +435,7 @@ impl ForwardPass {
         shard_start: usize,
         shard_end: usize,
         total_workers: u32,
+        allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         let config = weights.config.clone();
         let kv_config = super::kv_cache::KVCacheConfig {
@@ -446,6 +448,7 @@ impl ForwardPass {
         Ok(Self {
             device_weights: DeviceModelWeights::from_host(&weights)?,
             config,
+            allreduce_timeout,
             kv_cache: KVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -693,7 +696,9 @@ impl ForwardPass {
         let flat = host.to_allreduce_tensor();
 
         // Perform ring all-reduce
-        let reduced = worker_ring.ring_all_reduce(flat, job_id, layer_idx).await?;
+        let reduced = worker_ring
+            .ring_all_reduce_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
+            .await?;
 
         // Convert back to 2D
         let host = Tensor2D::from_allreduce_tensor(&reduced)?;
@@ -1065,7 +1070,8 @@ mod tests {
     fn test_forward_pass_creation() {
         let config = create_test_config();
         let weights = create_test_weights(&config, 16);
-        let forward = ForwardPass::new(weights, 0, 0, 16, 4).unwrap();
+        let forward =
+            ForwardPass::new(weights, 0, 0, 16, 4, std::time::Duration::from_secs(30)).unwrap();
 
         assert_eq!(forward.worker_position, 0);
         assert_eq!(forward.shard_start, 0);
