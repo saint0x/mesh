@@ -1,32 +1,77 @@
 # Mesh
 
-Mesh is an open source Rust runtime for distributed model execution across multiple machines. It is built for running one real inference job through a coordinated worker ring, with explicit model membership, durable control-plane state, and a dedicated tensor transport between workers.
+Mesh is a Rust system for sharing model execution across machines on a local network, with a control plane coordinating device registration, ring membership, job dispatch, status, and accounting.
 
-## What It Does
+The core idea is simple:
+- workers on the same LAN contribute compute
+- workers join a model ring for the model they serve
+- jobs are dispatched through the control plane
+- tensors move directly between workers on the dataplane
+- results and credits are recorded durably by the control plane
 
-- runs a control plane for device registration, ring topology, job dispatch, status, and ledger events
-- runs an agent on each worker for model shard loading, assignment polling, execution, and dataplane transport
-- runs a relay for environments where peers cannot connect directly
-- executes real shard artifacts from disk with safetensors manifests and model-specific tokenizers
-- records durable distributed job lifecycle state instead of treating submit as success
+Mesh has one production execution path. There is no mock or synthetic executor in this repo.
 
-## Good Fits
+## How It Works
 
-- small operator-managed inference meshes across a few trusted machines
-- native apps or protocols that want a low-latency inference substrate rather than a hosted SaaS API
-- experiments with explicit worker rings, credit accounting, and topology-aware dispatch
-- environments where model shards live on the worker and control traffic stays separate from tensor traffic
+Mesh is split into two layers:
 
-## Runtime Model
+- local worker mesh:
+  - agents run on each device
+  - devices discover peers, join pools, and participate in a model ring
+  - workers load real shard artifacts from disk
+  - workers exchange tensor data directly over the dataplane
+- control plane:
+  - registers devices
+  - stores network, ring, job, and ledger state
+  - assigns distributed jobs to the active ring
+  - exposes topology, status, and accounting APIs
 
-Mesh has one production execution path:
-- devices register with the control plane
-- devices explicitly join a model ring
-- each worker serves a real shard for that model
-- inference is submitted against that model
-- workers execute through the dedicated tensor plane and report durable results back to the control plane
+For constrained networks, Mesh can also use a relay for peer connectivity, but the intended fast path is direct local-network connectivity.
 
-There is no parallel mock or synthetic executor in this repo anymore.
+## Functionality
+
+- local-network compute sharing across multiple workers
+- explicit model-ring membership and shard ownership
+- distributed inference job submission and tracking
+- direct tensor transport between workers
+- durable control-plane state for jobs, topology, and ledger events
+- explicit execution providers:
+  - `cpu`
+  - `metal`
+  - `cuda`
+- pool creation and LAN peer discovery
+- credit accounting tied to real worker participation
+
+## CLI Surface
+
+Mesh ships one grouped CLI:
+
+- `mesh device`
+  - initialize device identity
+  - start the agent
+  - inspect local device status
+- `mesh resource`
+  - lock, unlock, and inspect committed resources
+- `mesh ring`
+  - join a model ring
+  - leave a ring
+  - inspect ring status, topology, and shard assignment
+- `mesh job`
+  - submit a distributed inference job
+  - fetch job status
+  - watch a job
+  - inspect local runtime stats
+- `mesh ledger`
+  - inspect summary and event history for the current network
+- `mesh pool`
+  - create pools
+  - join pools
+  - list pools and peers
+  - inspect LAN discovery state
+- `mesh doctor`
+  - verify local setup and control-plane reachability
+- `mesh ui`
+  - launch the local UI
 
 ## Execution Providers
 
@@ -102,6 +147,19 @@ Submit inference:
 mesh job run --prompt "hello from mesh" --max-tokens 16 --model-id tinyllama-1.1b
 ```
 
+Useful checks:
+
+```bash
+mesh doctor
+mesh ring status
+mesh ring topology
+mesh ring shard
+mesh pool list
+mesh pool peers --pool-id <POOL_ID>
+mesh ledger summary
+mesh ledger events
+```
+
 ## Model Assets
 
 Every worker needs real model assets under `~/.meshnet/models/<model_id>/`:
@@ -117,9 +175,9 @@ The same canonical artifacts are used across providers. Provider choice changes 
 
 ## Core Components
 
-- `agent`: worker runtime and CLI for initialization, ring membership, shard loading, inference execution, and dataplane transport. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
-- `control-plane`: durable coordinator for registration, ring topology, inference dispatch, status polling, and ledger events. See [inference.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/api/inference.rs) and [ring_manager.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/services/ring_manager.rs).
-- `relay-server`: relay path for constrained networks that cannot keep the worker mesh fully direct. See [relay-server/README.md](/Users/deepsaint/Desktop/meshnet/relay-server/README.md).
+- `agent`: worker runtime and CLI for device bring-up, pool participation, ring membership, shard loading, inference execution, and dataplane transport. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
+- `control-plane`: durable coordinator for registration, topology, distributed job dispatch, status polling, and ledger events. See [inference.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/api/inference.rs) and [ring_manager.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/services/ring_manager.rs).
+- `relay-server`: optional connectivity layer for environments that cannot keep workers directly connected. See [relay-server/README.md](/Users/deepsaint/Desktop/meshnet/relay-server/README.md).
 
 ## Verification
 
