@@ -1,6 +1,6 @@
 # Mesh
 
-Mesh is a Rust system for sharing model execution across machines on a local network, with a control plane coordinating device registration, ring membership, job dispatch, status, and accounting.
+Mesh is a distributed network for sharing model execution across machines on a local network, with a control plane coordinating device registration, ring membership, job dispatch, status, and accounting.
 
 The core idea is simple:
 - workers on the same LAN contribute compute
