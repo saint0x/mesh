@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
                 name,
                 control_plane_url,
             } => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_init(network_id, name, control_plane_url).await?;
             }
             DeviceCommands::Start { log_level } => {
@@ -306,11 +306,11 @@ async fn main() -> Result<()> {
         },
         Commands::Resource { command } => match command {
             ResourceCommands::Lock { memory } => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_lock_resources(memory).await?;
             }
             ResourceCommands::Unlock => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_unlock_resources().await?;
             }
             ResourceCommands::Status => {
@@ -319,11 +319,11 @@ async fn main() -> Result<()> {
         },
         Commands::Ring { command } => match command {
             RingCommands::Join { model_id, memory } => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_join_ring(model_id, memory).await?;
             }
             RingCommands::Leave => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_leave_ring().await?;
             }
             RingCommands::Status => {
@@ -344,7 +344,7 @@ async fn main() -> Result<()> {
                 temperature,
                 top_p,
             } => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_inference(prompt, model_id, max_tokens, temperature, top_p).await?;
             }
             JobCommands::Status { job_id } => {
@@ -370,7 +370,7 @@ async fn main() -> Result<()> {
         },
         Commands::Pool { command } => match command {
             PoolCommands::Create { name } => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_pool_create(name).await?;
             }
             PoolCommands::Join {
@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
                 pool_root_pubkey,
                 name,
             } => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_pool_join(pool_id, pool_root_pubkey, name).await?;
             }
             PoolCommands::List => {
@@ -388,7 +388,7 @@ async fn main() -> Result<()> {
                 cmd_pool_peers(pool_id).await?;
             }
             PoolCommands::Status => {
-                init_simple_logging("info")?;
+                init_simple_logging("warn")?;
                 cmd_pool_status().await?;
             }
         },
@@ -396,7 +396,7 @@ async fn main() -> Result<()> {
             cmd_doctor().await?;
         }
         Commands::Ui { port, api_port } => {
-            init_simple_logging("info")?;
+            init_simple_logging("warn")?;
             cmd_ui(port, api_port).await?;
         }
     }

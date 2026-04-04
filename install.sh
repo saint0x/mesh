@@ -80,6 +80,7 @@ success "Build complete: $TARGET_DIR"
 
 # Determine installation directory
 INSTALL_DIR="$HOME/.local/bin"
+PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 
 # Create installation directory if it doesn't exist
 if [ ! -d "$INSTALL_DIR" ]; then
@@ -103,43 +104,51 @@ success "  - mesh-control-plane (control plane)"
 # Add to PATH if needed
 add_to_path() {
     local shell_rc="$1"
-    local path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
 
-    if [ -f "$shell_rc" ]; then
-        if ! grep -q ".local/bin" "$shell_rc"; then
-            info "Adding $INSTALL_DIR to PATH in $shell_rc"
-            echo "" >> "$shell_rc"
-            echo "# Meshnet installation" >> "$shell_rc"
-            echo "$path_line" >> "$shell_rc"
-            success "Updated $shell_rc"
-            return 0
-        else
-            info "$shell_rc already contains .local/bin in PATH"
-            return 1
-        fi
+    if [ ! -f "$shell_rc" ]; then
+        info "Creating shell config: $shell_rc"
+        touch "$shell_rc"
     fi
-    return 1
+
+    if ! grep -q '\.local/bin' "$shell_rc"; then
+        info "Adding $INSTALL_DIR to PATH in $shell_rc"
+        echo "" >> "$shell_rc"
+        echo "# Meshnet installation" >> "$shell_rc"
+        echo "$PATH_LINE" >> "$shell_rc"
+        success "Updated $shell_rc"
+        return 0
+    else
+        info "$shell_rc already contains .local/bin in PATH"
+        return 1
+    fi
 }
 
-# Check current shell and update appropriate RC file
+# Check current shell and update appropriate RC files
 UPDATED=0
 CURRENT_SHELL=$(basename "$SHELL")
 
 case "$CURRENT_SHELL" in
     zsh)
-        if add_to_path "$HOME/.zshrc"; then
-            UPDATED=1
-        fi
+        add_to_path "$HOME/.zshrc" && UPDATED=1 || true
+        add_to_path "$HOME/.zprofile" && UPDATED=1 || true
+        add_to_path "$HOME/.profile" && UPDATED=1 || true
         ;;
     bash)
-        if add_to_path "$HOME/.bash_profile"; then
-            UPDATED=1
-        elif add_to_path "$HOME/.bashrc"; then
-            UPDATED=1
-        fi
+        add_to_path "$HOME/.bash_profile" && UPDATED=1 || true
+        add_to_path "$HOME/.bashrc" && UPDATED=1 || true
+        add_to_path "$HOME/.profile" && UPDATED=1 || true
         ;;
     *)
         warn "Unknown shell: $CURRENT_SHELL"
+        add_to_path "$HOME/.profile" && UPDATED=1 || true
+        ;;
+esac
+
+case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *)
+        export PATH="$INSTALL_DIR:$PATH"
+        info "Added $INSTALL_DIR to PATH for this installer session"
         ;;
 esac
 
@@ -147,10 +156,10 @@ esac
 echo ""
 info "Verifying installation..."
 
-if [ -x "$INSTALL_DIR/mesh" ]; then
-    success "Binary is executable"
+if [ -x "$INSTALL_DIR/mesh" ] && [ -x "$INSTALL_DIR/mesh-control-plane" ] && [ -x "$INSTALL_DIR/mesh-relay" ]; then
+    success "Installed binaries are executable"
 else
-    error "Binary is not executable"
+    error "One or more installed binaries are not executable"
     exit 1
 fi
 
@@ -161,6 +170,8 @@ echo -e "${GREEN}║${NC}  Installation Complete! 🎉             ${GREEN}║${
 echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
 echo ""
 echo "The 'mesh' command has been installed to: $INSTALL_DIR/mesh"
+echo "The 'mesh-control-plane' command has been installed to: $INSTALL_DIR/mesh-control-plane"
+echo "The 'mesh-relay' command has been installed to: $INSTALL_DIR/mesh-relay"
 echo ""
 
 if [ $UPDATED -eq 1 ]; then
@@ -170,22 +181,25 @@ if [ $UPDATED -eq 1 ]; then
 fi
 
 echo "Quick start:"
-echo "  1. Initialize device:   mesh init --network-id test --name \"My Device\""
-echo "  2. Create a pool:       mesh pool-create --name \"My Pool\""
-echo "  3. Start agent:         mesh start"
+echo "  1. Initialize device:   mesh device init --network-id test --name \"My Device\""
+echo "  2. Create a pool:       mesh pool create --name \"My Pool\""
+echo "  3. Join a ring:         mesh ring join --model-id tinyllama-1.1b"
+echo "  4. Start agent:         mesh device start"
 echo ""
 echo "Device automation scripts:"
 echo "  ./device1.sh  - Start Device 1 (admin) - runs relay, control plane, and agent"
 echo "  ./device2.sh  - Start Device 2 (member) - joins pool and runs agent"
 echo ""
 
-# Test if mesh is immediately available
-if command -v mesh &> /dev/null; then
-    success "The 'mesh' command is ready to use!"
+# Test if commands are immediately available
+if command -v mesh &> /dev/null && command -v mesh-control-plane &> /dev/null && command -v mesh-relay &> /dev/null; then
+    success "Mesh commands are ready to use!"
     echo ""
     mesh --version 2>/dev/null || true
+    mesh-control-plane --version 2>/dev/null || true
+    mesh-relay --version 2>/dev/null || true
 else
-    warn "The 'mesh' command is not yet in your PATH"
+    warn "Mesh commands are not yet all visible in your PATH"
     echo "Please restart your shell or run: export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
