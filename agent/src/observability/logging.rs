@@ -2,19 +2,21 @@ use std::path::PathBuf;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+fn meshnet_home_dir() -> PathBuf {
+    std::env::var_os("MESHNET_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Initialize production logging with file rotation
 ///
 /// This sets up dual output:
-/// - Daily rotating log files in ~/.meshnet/logs/agent.log
+/// - Daily rotating log files in $MESHNET_HOME/.meshnet/logs/agent.log (or ~/.meshnet/logs/agent.log)
 /// - Stdout with pretty formatting
 /// - Configurable via RUST_LOG environment variable
 pub fn init_production_logging(level: &str, log_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let log_dir = log_dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".meshnet")
-            .join("logs")
-    });
+    let log_dir = log_dir.unwrap_or_else(|| meshnet_home_dir().join(".meshnet").join("logs"));
 
     // Create log directory
     std::fs::create_dir_all(&log_dir)?;

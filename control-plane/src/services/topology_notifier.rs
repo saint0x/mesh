@@ -226,7 +226,6 @@ pub struct WorkerCallback {
 
 /// Topology Notifier service
 pub struct TopologyNotifier {
-    db: Arc<Database>,
     /// Current topology version per network
     versions: RwLock<HashMap<String, u64>>,
     /// Registered worker callbacks
@@ -241,14 +240,13 @@ pub struct TopologyNotifier {
 
 impl TopologyNotifier {
     /// Create a new TopologyNotifier
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new(_db: Arc<Database>) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
-            db,
             versions: RwLock::new(HashMap::new()),
             callbacks: RwLock::new(HashMap::new()),
             handoffs: RwLock::new(HashMap::new()),

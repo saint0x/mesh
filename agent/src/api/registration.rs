@@ -4,7 +4,8 @@ use crate::api::types::{
     RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentRequest,
 };
 use crate::connectivity::{
-    build_direct_peer_candidates_from_records, load_direct_candidate_seed_records,
+    build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
+    load_direct_candidate_seed_records,
 };
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
@@ -156,7 +157,8 @@ impl RegistrationClient {
             .client
             .post(&url)
             .json(&{
-                let listen_addrs = load_advertised_listen_addrs().unwrap_or_default();
+                let listen_addrs =
+                    filter_peer_advertisable_addrs(&load_advertised_listen_addrs().unwrap_or_default());
                 let candidate_seed_records =
                     load_direct_candidate_seed_records().unwrap_or_else(|| {
                         let now_ms = current_epoch_ms();

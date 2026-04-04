@@ -4,26 +4,34 @@
 //!
 //! ## Commands
 //!
-//! ### Device Management
-//! - `init` - Initialize device and register with control plane
-//! - `start` - Run the agent daemon for ring participation and inference execution
-//! - `status` - Show device and network status
-//! - `inference` - Submit distributed inference job
+//! ### Device
+//! - `mesh device init`
+//! - `mesh device start`
+//! - `mesh device status`
 //!
-//! ### Ring Topology
-//! - `join-ring` - Join ring topology for distributed inference
-//! - `leave-ring` - Leave ring topology
-//! - `ring-status` - Show ring topology and worker position
-//! - `pool-status` - Show pool status (all workers)
+//! ### Ring
+//! - `mesh ring join`
+//! - `mesh ring leave`
+//! - `mesh ring status`
+//! - `mesh ring topology`
+//! - `mesh ring shard`
 //!
-//! ### Resource Management
-//! - `lock-resources` - Lock resources for pool contribution
-//! - `unlock-resources` - Request unlock (requires 24h cooldown)
-//! - `resource-status` - Show resource lock status
+//! ### Jobs and Ledger
+//! - `mesh job run`
+//! - `mesh job status`
+//! - `mesh job watch`
+//! - `mesh ledger summary`
+//! - `mesh ledger events`
 //!
-//! ### Model Shards
-//! - `shard-status` - Show this worker's shard assignment
-//! - `inference-stats` - Show inference statistics
+//! ### Resources and Pools
+//! - `mesh resource lock`
+//! - `mesh resource unlock`
+//! - `mesh resource status`
+//! - `mesh pool create`
+//! - `mesh pool join`
+//! - `mesh pool list`
+//! - `mesh pool peers`
+//! - `mesh pool status`
 
 mod ui;
 
@@ -54,7 +62,7 @@ use uuid::Uuid;
 /// Mesh AI Agent - Distributed compute sharing network
 #[derive(Parser, Debug)]
 #[command(name = "mesh")]
-#[command(about = "Mesh AI distributed compute agent", long_about = None)]
+#[command(about = "MeshNet production CLI", long_about = None)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -63,128 +71,44 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize device and register with control plane
-    Init {
-        /// Network ID to join
-        #[arg(short, long)]
-        network_id: String,
-
-        /// Device name (e.g., "My Laptop")
-        #[arg(short = 'd', long, default_value = "My Device")]
-        name: String,
-
-        /// Control plane URL
-        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
-        control_plane_url: String,
+    /// Device lifecycle and daemon operations
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommands,
     },
 
-    /// Run agent daemon to process jobs
-    Start {
-        /// Log level (trace, debug, info, warn, error)
-        #[arg(short, long, default_value = "info")]
-        log_level: String,
+    /// Resource commitment for ring participation
+    Resource {
+        #[command(subcommand)]
+        command: ResourceCommands,
     },
 
-    /// Show device and network status
-    Status,
-
-    /// Lock resources for pool contribution
-    LockResources {
-        /// Amount of memory to lock (e.g., "7GB", "512MB", or bytes)
-        #[arg(short, long)]
-        memory: String,
+    /// Model ring membership and topology
+    Ring {
+        #[command(subcommand)]
+        command: RingCommands,
     },
 
-    /// Request unlock (requires 24h cooldown)
-    UnlockResources,
-
-    /// Show resource lock status
-    ResourceStatus,
-
-    /// Show ring topology and worker position
-    RingStatus,
-
-    /// Show this worker's shard assignment
-    ShardStatus,
-
-    /// Show inference statistics
-    InferenceStats,
-
-    /// Show pool status (all workers in the ring)
-    PoolStatus,
-
-    /// Join ring topology for distributed inference
-    JoinRing {
-        /// Model ID (e.g., "llama-70b")
-        #[arg(short, long)]
-        model_id: String,
-
-        /// Log level
-        #[arg(short, long, default_value = "info")]
-        log_level: String,
+    /// Distributed job submission and tracking
+    Job {
+        #[command(subcommand)]
+        command: JobCommands,
     },
 
-    /// Leave ring topology
-    LeaveRing,
-
-    /// Submit distributed inference job
-    Inference {
-        /// Prompt text
-        #[arg(short, long)]
-        prompt: String,
-
-        /// Model ID
-        #[arg(short, long, default_value = "llama-70b")]
-        model_id: String,
-
-        /// Max tokens to generate
-        #[arg(short = 'n', long, default_value = "100")]
-        max_tokens: u32,
-
-        /// Temperature (0.0-2.0)
-        #[arg(short, long, default_value = "1.0")]
-        temperature: f32,
-
-        /// Top-p sampling threshold
-        #[arg(long, default_value = "0.9")]
-        top_p: f32,
-
-        /// Log level
-        #[arg(short, long, default_value = "info")]
-        log_level: String,
+    /// Credit and ledger surfaces
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommands,
     },
 
-    /// Create a new pool (become admin)
-    PoolCreate {
-        /// Pool name
-        #[arg(short, long)]
-        name: String,
+    /// Pool management and LAN discovery
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommands,
     },
 
-    /// Join an existing pool
-    PoolJoin {
-        /// Pool ID (hex)
-        #[arg(long)]
-        pool_id: String,
-
-        /// Pool root public key (hex)
-        #[arg(long)]
-        pool_root_pubkey: String,
-
-        /// Pool name (optional)
-        #[arg(short, long)]
-        name: Option<String>,
-    },
-
-    /// List all pools
-    PoolList,
-
-    /// Show discovered peers in a pool
-    PoolPeers {
-        /// Pool ID (hex)
-        #[arg(long)]
-        pool_id: String,
-    },
+    /// Verify local setup and control-plane reachability
+    Doctor,
 
     /// Launch the local Mesh UI
     Ui {
@@ -198,115 +122,281 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum DeviceCommands {
+    /// Initialize device identity and register with the control plane
+    Init {
+        /// Network ID to join
+        #[arg(short, long)]
+        network_id: String,
+
+        /// Device name
+        #[arg(short = 'd', long, default_value = "My Device")]
+        name: String,
+
+        /// Control plane URL
+        #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
+        control_plane_url: String,
+    },
+    /// Run the production agent daemon
+    Start {
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(short, long, default_value = "info")]
+        log_level: String,
+    },
+    /// Show local device/runtime status
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum ResourceCommands {
+    /// Lock resources for ring contribution
+    Lock {
+        /// Amount of memory to lock (for example `7GB`)
+        #[arg(short, long)]
+        memory: String,
+    },
+    /// Unlock resources after cooldown
+    Unlock,
+    /// Show resource lock status
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum RingCommands {
+    /// Join a model ring
+    Join {
+        /// Model ID to serve
+        #[arg(short, long)]
+        model_id: String,
+
+        /// Contributed memory for this ring membership (for example `8GB`)
+        #[arg(short, long)]
+        memory: Option<String>,
+    },
+    /// Leave the current ring membership
+    Leave,
+    /// Show this device's ring status
+    Status,
+    /// Show full ring topology
+    Topology,
+    /// Show this worker's shard assignment
+    Shard,
+}
+
+#[derive(Subcommand, Debug)]
+enum JobCommands {
+    /// Submit a distributed inference job and watch it to completion
+    Run {
+        /// Prompt text
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Model ID
+        #[arg(short, long, default_value = "tinyllama-1.1b-chat-v1.0")]
+        model_id: String,
+
+        /// Max tokens to generate
+        #[arg(short = 'n', long, default_value = "100")]
+        max_tokens: u32,
+
+        /// Temperature (0.0-2.0)
+        #[arg(short, long, default_value = "1.0")]
+        temperature: f32,
+
+        /// Top-p sampling threshold
+        #[arg(long, default_value = "0.9")]
+        top_p: f32,
+    },
+    /// Fetch one job status snapshot
+    Status {
+        /// Job ID
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Watch a distributed job until it reaches a terminal state
+    Watch {
+        /// Job ID
+        #[arg(long)]
+        job_id: String,
+
+        /// Poll interval in milliseconds
+        #[arg(long, default_value = "2000")]
+        poll_interval_ms: u64,
+    },
+    /// Show local inference runtime statistics
+    Stats,
+}
+
+#[derive(Subcommand, Debug)]
+enum LedgerCommands {
+    /// Show ledger summary for the current network
+    Summary {
+        /// Optional job ID filter
+        #[arg(long)]
+        job_id: Option<String>,
+    },
+    /// List recent ledger events for the current network
+    Events {
+        /// Optional job ID filter
+        #[arg(long)]
+        job_id: Option<String>,
+
+        /// Maximum number of events to print
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PoolCommands {
+    /// Create a new pool and become admin
+    Create {
+        /// Pool name
+        #[arg(short, long)]
+        name: String,
+    },
+    /// Join an existing pool
+    Join {
+        /// Pool ID (hex)
+        #[arg(long)]
+        pool_id: String,
+
+        /// Pool root public key (hex)
+        #[arg(long)]
+        pool_root_pubkey: String,
+
+        /// Pool name (optional)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// List configured pools
+    List,
+    /// Show discovered peers in a pool
+    Peers {
+        /// Pool ID (hex)
+        #[arg(long)]
+        pool_id: String,
+    },
+    /// Show pool/ring status for the current network
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init {
-            network_id,
-            name,
-            control_plane_url,
-        } => {
-            // Simple logging for init command
-            init_simple_logging("info")?;
-            cmd_init(network_id, name, control_plane_url).await?;
+        Commands::Device { command } => match command {
+            DeviceCommands::Init {
+                network_id,
+                name,
+                control_plane_url,
+            } => {
+                init_simple_logging("info")?;
+                cmd_init(network_id, name, control_plane_url).await?;
+            }
+            DeviceCommands::Start { log_level } => {
+                init_production_logging(&log_level, None)?;
+                cmd_start().await?;
+            }
+            DeviceCommands::Status => {
+                cmd_status().await?;
+            }
+        },
+        Commands::Resource { command } => match command {
+            ResourceCommands::Lock { memory } => {
+                init_simple_logging("info")?;
+                cmd_lock_resources(memory).await?;
+            }
+            ResourceCommands::Unlock => {
+                init_simple_logging("info")?;
+                cmd_unlock_resources().await?;
+            }
+            ResourceCommands::Status => {
+                cmd_resource_status().await?;
+            }
+        },
+        Commands::Ring { command } => match command {
+            RingCommands::Join { model_id, memory } => {
+                init_simple_logging("info")?;
+                cmd_join_ring(model_id, memory).await?;
+            }
+            RingCommands::Leave => {
+                init_simple_logging("info")?;
+                cmd_leave_ring().await?;
+            }
+            RingCommands::Status => {
+                cmd_ring_status().await?;
+            }
+            RingCommands::Topology => {
+                cmd_topology().await?;
+            }
+            RingCommands::Shard => {
+                cmd_shard_status().await?;
+            }
+        },
+        Commands::Job { command } => match command {
+            JobCommands::Run {
+                prompt,
+                model_id,
+                max_tokens,
+                temperature,
+                top_p,
+            } => {
+                init_simple_logging("info")?;
+                cmd_inference(prompt, model_id, max_tokens, temperature, top_p).await?;
+            }
+            JobCommands::Status { job_id } => {
+                cmd_job_status(&job_id, false, 0).await?;
+            }
+            JobCommands::Watch {
+                job_id,
+                poll_interval_ms,
+            } => {
+                cmd_job_status(&job_id, true, poll_interval_ms).await?;
+            }
+            JobCommands::Stats => {
+                cmd_inference_stats().await?;
+            }
+        },
+        Commands::Ledger { command } => match command {
+            LedgerCommands::Summary { job_id } => {
+                cmd_ledger_summary(job_id.as_deref()).await?;
+            }
+            LedgerCommands::Events { job_id, limit } => {
+                cmd_ledger_events(job_id.as_deref(), limit).await?;
+            }
+        },
+        Commands::Pool { command } => match command {
+            PoolCommands::Create { name } => {
+                init_simple_logging("info")?;
+                cmd_pool_create(name).await?;
+            }
+            PoolCommands::Join {
+                pool_id,
+                pool_root_pubkey,
+                name,
+            } => {
+                init_simple_logging("info")?;
+                cmd_pool_join(pool_id, pool_root_pubkey, name).await?;
+            }
+            PoolCommands::List => {
+                cmd_pool_list().await?;
+            }
+            PoolCommands::Peers { pool_id } => {
+                cmd_pool_peers(pool_id).await?;
+            }
+            PoolCommands::Status => {
+                init_simple_logging("info")?;
+                cmd_pool_status().await?;
+            }
+        },
+        Commands::Doctor => {
+            cmd_doctor().await?;
         }
-
-        Commands::Start { log_level } => {
-            // Production logging with file rotation for daemon
-            init_production_logging(&log_level, None)?;
-            cmd_start().await?;
-        }
-
-        Commands::Status => {
-            init_simple_logging("info")?;
-            cmd_status().await?;
-        }
-
-        Commands::LockResources { memory } => {
-            init_simple_logging("info")?;
-            cmd_lock_resources(memory).await?;
-        }
-
-        Commands::UnlockResources => {
-            init_simple_logging("info")?;
-            cmd_unlock_resources().await?;
-        }
-
-        Commands::ResourceStatus => {
-            // No logging for status (pure display)
-            cmd_resource_status().await?;
-        }
-
-        Commands::RingStatus => {
-            // No logging for status (pure display)
-            cmd_ring_status().await?;
-        }
-
-        Commands::ShardStatus => {
-            // No logging for status (pure display)
-            cmd_shard_status().await?;
-        }
-
-        Commands::InferenceStats => {
-            // No logging for stats (pure display)
-            cmd_inference_stats().await?;
-        }
-
-        Commands::PoolStatus => {
-            init_simple_logging("info")?;
-            cmd_pool_status().await?;
-        }
-
-        Commands::JoinRing {
-            model_id,
-            log_level,
-        } => {
-            init_simple_logging(&log_level)?;
-            cmd_join_ring(model_id).await?;
-        }
-
-        Commands::LeaveRing => {
-            init_simple_logging("info")?;
-            cmd_leave_ring().await?;
-        }
-
-        Commands::Inference {
-            prompt,
-            model_id,
-            max_tokens,
-            temperature,
-            top_p,
-            log_level,
-        } => {
-            init_simple_logging(&log_level)?;
-            cmd_inference(prompt, model_id, max_tokens, temperature, top_p).await?;
-        }
-
-        Commands::PoolCreate { name } => {
-            init_simple_logging("info")?;
-            cmd_pool_create(name).await?;
-        }
-
-        Commands::PoolJoin {
-            pool_id,
-            pool_root_pubkey,
-            name,
-        } => {
-            init_simple_logging("info")?;
-            cmd_pool_join(pool_id, pool_root_pubkey, name).await?;
-        }
-
-        Commands::PoolList => {
-            cmd_pool_list().await?;
-        }
-
-        Commands::PoolPeers { pool_id } => {
-            cmd_pool_peers(pool_id).await?;
-        }
-
         Commands::Ui { port, api_port } => {
+            init_simple_logging("info")?;
             cmd_ui(port, api_port).await?;
         }
     }
@@ -403,18 +493,11 @@ async fn cmd_init(network_id: String, name: String, control_plane_url: String) -
 
     println!("\n✅ Device initialized successfully!");
     println!("\nNext steps:");
-    println!("  1. Start the agent:  cargo run --bin agent -- start");
-    println!("  2. Join a ring:      cargo run --bin agent -- join-ring --model-id <model>");
-    println!("  3. Submit inference: cargo run --bin agent -- inference --prompt \"Hello\"");
+    println!("  1. Start the agent:  mesh device start");
+    println!("  2. Join a ring:      mesh ring join --model-id <model>");
+    println!("  3. Submit inference: mesh job run --prompt \"Hello\"");
 
     Ok(())
-}
-
-fn resolve_primary_mesh_endpoint(config: &DeviceConfig) -> Result<Multiaddr> {
-    config
-        .connectivity
-        .resolve_primary_endpoint()
-        .map_err(Into::into)
 }
 
 fn listen_addrs_path() -> Result<std::path::PathBuf> {
@@ -630,6 +713,87 @@ async fn fetch_ring_topology(config: &DeviceConfig) -> Result<RingTopologyRespon
         .map_err(Into::into)
 }
 
+fn resolve_ring_contributed_memory(config: &DeviceConfig, memory: Option<&str>) -> Result<u64> {
+    if let Some(memory) = memory {
+        return parse_memory_string(memory).context("Invalid memory format for ring join");
+    }
+
+    if let Ok(mut manager) = ResourceManager::new() {
+        if manager.load_config().is_ok() && manager.is_locked() {
+            return Ok(manager.locked_memory());
+        }
+    }
+
+    if let Some(gpu_vram_mb) = config.capabilities.gpu_vram_mb {
+        return Ok(gpu_vram_mb as u64 * 1024 * 1024);
+    }
+
+    Ok(config.capabilities.ram_mb as u64 * 1024 * 1024)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InferenceJobStatusResponse {
+    success: bool,
+    job_id: String,
+    network_id: String,
+    model_id: String,
+    status: String,
+    completion: Option<String>,
+    completion_tokens: u32,
+    execution_time_ms: u64,
+    error: Option<String>,
+    assignments: Vec<InferenceJobAssignmentStatus>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InferenceJobAssignmentStatus {
+    device_id: String,
+    ring_position: u32,
+    status: String,
+    failure_reason: Option<String>,
+    shard_column_start: u32,
+    shard_column_end: u32,
+    assigned_capacity_units: u32,
+    execution_provider: String,
+    execution_time_ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LedgerSummaryResponse {
+    network_id: String,
+    job_id: Option<String>,
+    total_events: u64,
+    total_credits_earned: f64,
+    total_credits_burned: f64,
+    total_jobs_started: u64,
+    total_jobs_completed: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LedgerEventsResponse {
+    events: Vec<LedgerEventRecord>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LedgerEventRecord {
+    event_id: String,
+    network_id: String,
+    event_type: String,
+    job_id: Option<String>,
+    device_id: Option<String>,
+    credits_amount: Option<f64>,
+    metadata: serde_json::Value,
+    created_at: String,
+}
+
+fn control_plane_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
+fn control_plane_url(config: &DeviceConfig, path: &str) -> String {
+    format!("{}{}", config.control_plane_url.trim_end_matches('/'), path)
+}
+
 /// Run agent daemon
 async fn cmd_start() -> Result<()> {
     println!("🚀 Starting Mesh AI agent daemon...\n");
@@ -637,7 +801,7 @@ async fn cmd_start() -> Result<()> {
     // Load device configuration
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
 
     info!(
         device_id = %config.device_id,
@@ -911,7 +1075,7 @@ async fn cmd_start() -> Result<()> {
             }
             Ok(_) => {
                 info!("No pools configured - LAN discovery disabled");
-                println!("\n💡 No pools configured. Use 'pool-create' or 'pool-join' to enable LAN discovery.");
+                println!("\n💡 No pools configured. Use 'mesh pool create' or 'mesh pool join' to enable LAN discovery.");
             }
             Err(e) => {
                 error!("Failed to list pools: {}", e);
@@ -1127,7 +1291,7 @@ async fn cmd_start() -> Result<()> {
         }
 
         if ring_position.is_none() {
-            warn!("No ring position found - worker must join ring first via 'join-ring' command");
+            warn!("No ring position found - worker must join ring first via 'mesh ring join'");
             warn!("Inference jobs will be logged but not executed");
         }
 
@@ -1386,7 +1550,7 @@ async fn cmd_status() -> Result<()> {
             if config.has_certificate() {
                 println!("\n✅ Certificate: Present");
             } else {
-                println!("\n⚠️  Certificate: Missing (run 'mesh init' again)");
+                println!("\n⚠️  Certificate: Missing (run 'mesh device init' again)");
             }
 
             println!("\n📡 Control Plane: {}", config.control_plane_url);
@@ -1444,7 +1608,7 @@ async fn cmd_status() -> Result<()> {
         }
         Err(_) => {
             println!("⚠️  Device not initialized");
-            println!("\nRun 'mesh init' to set up this device.");
+            println!("\nRun 'mesh device init' to set up this device.");
         }
     }
 
@@ -1507,7 +1671,7 @@ async fn cmd_lock_resources(memory: String) -> Result<()> {
             );
             println!(
                 "{}",
-                "Use 'mesh resource-status' to check lock status.".yellow()
+                "Use 'mesh resource status' to check lock status.".yellow()
             );
         }
         Err(e) => {
@@ -1643,7 +1807,7 @@ async fn cmd_ring_status() -> Result<()> {
         Ok(c) => c,
         Err(_) => {
             println!("\n{}", "Device not initialized".yellow());
-            println!("Run 'mesh init' to set up this device.\n");
+            println!("Run 'mesh device init' to set up this device.\n");
             return Ok(());
         }
     };
@@ -1669,12 +1833,101 @@ async fn cmd_ring_status() -> Result<()> {
                 println!("  Status:        {}", "NOT JOINED".yellow());
                 println!(
                     "\n{}",
-                    "Use 'mesh join-ring <model>' to join the production ring.".dimmed()
+                    "Use 'mesh ring join --model-id <model>' to join the production ring.".dimmed()
                 );
             }
         }
         Err(e) => {
             println!("\n{}", format!("Failed to load topology: {}", e).yellow());
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+async fn cmd_topology() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Ring Topology".bold().cyan());
+    println!("{}", "=============".cyan());
+
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
+    let topology = fetch_ring_topology(&config).await?;
+
+    println!("\n{}", "Network:".bold());
+    println!("  Network ID:    {}", config.network_id);
+    println!(
+        "  Ring Stable:   {}",
+        if topology.ring_stable {
+            "yes".green()
+        } else {
+            "no".yellow()
+        }
+    );
+    println!("  Workers:       {}", topology.workers.len());
+    println!("  Punch Plans:   {}", topology.peer_punch_plans.len());
+
+    if topology.workers.is_empty() {
+        println!("\n{}", "No workers are currently present in the ring.".yellow());
+        return Ok(());
+    }
+
+    println!("\n{}", "Workers:".bold());
+    for worker in &topology.workers {
+        let marker = if worker.device_id == config.device_id.to_string() {
+            "→"
+        } else {
+            " "
+        };
+        let connectivity = worker
+            .connectivity_state
+            .as_ref()
+            .map(|state| format!("{:?}/{:?}", state.active_path, state.status))
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "{} pos={} device={} status={} provider_candidates={} shard={}..{} connectivity={}",
+            marker,
+            worker.position,
+            worker.device_id,
+            worker.status,
+            worker.direct_candidates.len(),
+            worker.shard.column_start,
+            worker.shard.column_end,
+            connectivity
+        );
+        if let Some(best) = worker.direct_candidates.first() {
+            println!(
+                "    best-direct {:?}/{:?}/{:?} priority={} age={}s {}",
+                best.scope,
+                best.transport,
+                best.source,
+                best.priority,
+                direct_candidate_age_seconds(best.last_updated_ms),
+                best.endpoint
+            );
+        }
+    }
+
+    if !topology.peer_punch_plans.is_empty() {
+        println!("\n{}", "Punch Plans:".bold());
+        for plan in topology.peer_punch_plans.iter().take(10) {
+            println!(
+                "  {} -> {} reason={:?} candidates={} relay_rendezvous={}",
+                plan.source_device_id,
+                plan.target_device_id,
+                plan.reason,
+                plan.target_candidates.len(),
+                plan.relay_rendezvous_required
+            );
+        }
+        if topology.peer_punch_plans.len() > 10 {
+            println!(
+                "  ... {} more punch plans",
+                topology.peer_punch_plans.len() - 10
+            );
         }
     }
 
@@ -1890,6 +2143,244 @@ async fn cmd_inference_stats() -> Result<()> {
     Ok(())
 }
 
+async fn fetch_job_status(config: &DeviceConfig, job_id: &str) -> Result<InferenceJobStatusResponse> {
+    let url = control_plane_url(config, &format!("/api/inference/jobs/{}", job_id));
+    control_plane_client()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<InferenceJobStatusResponse>()
+        .await
+        .map_err(Into::into)
+}
+
+fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
+    use colored::Colorize;
+
+    println!("\n{}", "Job Status".bold().cyan());
+    println!("{}", "==========".cyan());
+    println!("  Job ID:          {}", status.job_id);
+    println!("  Network ID:      {}", status.network_id);
+    println!("  Model ID:        {}", status.model_id);
+    println!("  Success Flag:    {}", status.success);
+    println!("  Status:          {}", status.status);
+    println!("  Tokens:          {}", status.completion_tokens);
+    println!("  Execution Time:  {}ms", status.execution_time_ms);
+    if let Some(error) = &status.error {
+        println!("  Error:           {}", error.red());
+    }
+
+    println!("\n{}", "Assignments:".bold());
+    for assignment in &status.assignments {
+        println!(
+            "  pos={} device={} status={} provider={} shard={}..{} capacity={} time={}ms",
+            assignment.ring_position,
+            assignment.device_id,
+            assignment.status,
+            assignment.execution_provider,
+            assignment.shard_column_start,
+            assignment.shard_column_end,
+            assignment.assigned_capacity_units,
+            assignment.execution_time_ms
+        );
+        if let Some(reason) = &assignment.failure_reason {
+            println!("    failure: {}", reason);
+        }
+    }
+
+    if let Some(completion) = &status.completion {
+        println!("\n{}", "Completion:".bold());
+        println!("{}", completion);
+    }
+}
+
+async fn cmd_job_status(job_id: &str, watch: bool, poll_interval_ms: u64) -> Result<()> {
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
+
+    if !watch {
+        let status = fetch_job_status(&config, job_id).await?;
+        print_job_status_snapshot(&status);
+        println!();
+        return Ok(());
+    }
+
+    let poll_interval = std::time::Duration::from_millis(poll_interval_ms.max(250));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut last_status = None::<String>;
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("Timed out waiting for job {}", job_id);
+        }
+
+        let status = fetch_job_status(&config, job_id).await?;
+        if last_status.as_deref() != Some(status.status.as_str()) {
+            println!("  Status: {}", status.status);
+            last_status = Some(status.status.clone());
+        }
+
+        match status.status.as_str() {
+            "completed" => {
+                print_job_status_snapshot(&status);
+                println!();
+                return Ok(());
+            }
+            "failed" => {
+                print_job_status_snapshot(&status);
+                anyhow::bail!(
+                    "Job {} failed: {}",
+                    job_id,
+                    status.error.unwrap_or_else(|| "unknown job failure".to_string())
+                );
+            }
+            _ => tokio::time::sleep(poll_interval).await,
+        }
+    }
+}
+
+async fn cmd_ledger_summary(job_id: Option<&str>) -> Result<()> {
+    use colored::Colorize;
+
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
+    let mut url = control_plane_url(&config, &format!("/api/ledger/summary?network_id={}", config.network_id));
+    if let Some(job_id) = job_id {
+        url.push_str("&job_id=");
+        url.push_str(job_id);
+    }
+
+    let summary = control_plane_client()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<LedgerSummaryResponse>()
+        .await?;
+
+    println!("\n{}", "Ledger Summary".bold().cyan());
+    println!("{}", "==============".cyan());
+    println!("  Network ID:      {}", summary.network_id);
+    println!(
+        "  Job ID:          {}",
+        summary.job_id.unwrap_or_else(|| "all jobs".to_string())
+    );
+    println!("  Total Events:    {}", summary.total_events);
+    println!("  Jobs Started:    {}", summary.total_jobs_started);
+    println!("  Jobs Completed:  {}", summary.total_jobs_completed);
+    println!("  Credits Earned:  {:.3}", summary.total_credits_earned);
+    println!("  Credits Burned:  {:.3}", summary.total_credits_burned);
+    println!();
+    Ok(())
+}
+
+async fn cmd_ledger_events(job_id: Option<&str>, limit: usize) -> Result<()> {
+    use colored::Colorize;
+
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
+    let mut url = control_plane_url(&config, &format!("/api/ledger/events?network_id={}", config.network_id));
+    if let Some(job_id) = job_id {
+        url.push_str("&job_id=");
+        url.push_str(job_id);
+    }
+
+    let events = control_plane_client()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<LedgerEventsResponse>()
+        .await?;
+
+    println!("\n{}", "Ledger Events".bold().cyan());
+    println!("{}", "=============".cyan());
+    for event in events.events.iter().take(limit) {
+        println!(
+            "  {} {} network={} job={} device={} credits={} event_id={}",
+            event.created_at,
+            event.event_type,
+            event.network_id,
+            event.job_id.as_deref().unwrap_or("-"),
+            event.device_id.as_deref().unwrap_or("-"),
+            event
+                .credits_amount
+                .map(|value| format!("{:.3}", value))
+                .unwrap_or_else(|| "-".to_string()),
+            event.event_id
+        );
+        if event.metadata != serde_json::Value::Null && event.metadata != serde_json::json!({}) {
+            println!("    metadata: {}", event.metadata);
+        }
+    }
+    if events.events.len() > limit {
+        println!("  ... {} more events", events.events.len() - limit);
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_doctor() -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n{}", "Mesh Doctor".bold().cyan());
+    println!("{}", "===========".cyan());
+
+    let config_path = DeviceConfig::default_path()?;
+    let config = match DeviceConfig::load(&config_path) {
+        Ok(config) => config,
+        Err(_) => {
+            println!("  {} no device config found", "FAIL".red().bold());
+            println!("  Run `mesh device init` first.\n");
+            return Ok(());
+        }
+    };
+
+    println!("  {} device config loaded", "OK".green().bold());
+    println!("    path: {}", config_path.display());
+    println!("  {} certificate {}", 
+        if config.has_certificate() { "OK".green().bold().to_string() } else { "FAIL".red().bold().to_string() },
+        if config.has_certificate() { "present" } else { "missing" }
+    );
+
+    let provider = config.resolve_execution_provider()?;
+    println!("  {} execution provider {}", "OK".green().bold(), provider.as_str());
+
+    match fetch_ring_topology(&config).await {
+        Ok(topology) => {
+            println!(
+                "  {} control plane reachable, workers={}, ring_stable={}",
+                "OK".green().bold(),
+                topology.workers.len(),
+                topology.ring_stable
+            );
+        }
+        Err(error) => {
+            println!("  {} control plane unreachable: {}", "FAIL".red().bold(), error);
+        }
+    }
+
+    let candidate_seed_records = load_direct_candidate_seed_records().unwrap_or_default();
+    let local_peer_id = agent::device::keypair::to_libp2p_keypair(&config.keypair)
+        .public()
+        .to_peer_id();
+    let direct_candidates =
+        build_direct_peer_candidates_from_records(local_peer_id, &candidate_seed_records);
+    println!(
+        "  {} direct candidates={} observed_addrs={} listen_addrs={}",
+        "OK".green().bold(),
+        direct_candidates.len(),
+        load_observed_reachability_addrs().unwrap_or_default().len(),
+        load_local_listen_addrs().len()
+    );
+    println!();
+    Ok(())
+}
+
 /// Show pool status (all workers from control plane)
 async fn cmd_pool_status() -> Result<()> {
     use colored::Colorize;
@@ -1903,22 +2394,16 @@ async fn cmd_pool_status() -> Result<()> {
         Ok(c) => c,
         Err(_) => {
             println!("\n{}", "Device not initialized".yellow());
-            println!("Run 'mesh init' to set up this device.\n");
+            println!("Run 'mesh device init' to set up this device.\n");
             return Ok(());
         }
     };
 
-    let control_plane_url = config.control_plane_url.clone();
-
     println!("\n{}", "Fetching pool status...".dimmed());
 
     // Fetch ring topology from control plane
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/ring/topology?network_id={}",
-        control_plane_url.trim_end_matches('/'),
-        config.network_id
-    );
+    let client = control_plane_client();
+    let url = control_plane_url(&config, &format!("/api/ring/topology?network_id={}", config.network_id));
 
     match client.get(&url).send().await {
         Ok(response) => {
@@ -2000,7 +2485,7 @@ async fn cmd_pool_status() -> Result<()> {
 }
 
 /// Join ring topology for distributed inference
-async fn cmd_join_ring(model_id: String) -> Result<()> {
+async fn cmd_join_ring(model_id: String, memory: Option<String>) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Joining Ring Topology".bold().cyan());
@@ -2009,18 +2494,22 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
     // Load device configuration
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
-    let control_plane_url = config.control_plane_url.clone();
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
 
     println!("\n{}", "Device Identity:".bold());
     println!("  Device ID:     {}", config.device_id);
     println!("  Model ID:      {}", model_id);
     println!("  Connectivity:  {:?}", config.connectivity.preferred_path);
+    let contributed_memory = resolve_ring_contributed_memory(&config, memory.as_deref())?;
+    println!(
+        "  Contribution:  {}",
+        format_bytes(contributed_memory)
+    );
 
     // Connect to control plane
     println!("\n{}", "Requesting ring join...".dimmed());
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/ring/join", control_plane_url.trim_end_matches('/'));
+    let client = control_plane_client();
+    let url = control_plane_url(&config, "/api/ring/join");
 
     #[derive(serde::Serialize)]
     struct JoinRingRequest {
@@ -2034,7 +2523,7 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
         device_id: config.device_id.to_string(),
         network_id: config.network_id.clone(),
         model_id,
-        contributed_memory: 8_000_000_000, // 8GB default
+        contributed_memory,
     };
 
     match client.post(&url).json(&request).send().await {
@@ -2061,8 +2550,8 @@ async fn cmd_join_ring(model_id: String) -> Result<()> {
                     }
 
                     println!("\n{}", "Next steps:".bold());
-                    println!("  1. Start the agent:     cargo run --bin agent -- start");
-                    println!("  2. Submit inference:    cargo run --bin agent -- inference --prompt \"Hello\"");
+                    println!("  1. Start the agent:     mesh device start");
+                    println!("  2. Submit inference:    mesh job run --prompt \"Hello\"");
                 }
             } else {
                 println!(
@@ -2285,16 +2774,10 @@ async fn cmd_leave_ring() -> Result<()> {
     // Load device configuration
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
-    let control_plane_url = config.control_plane_url.clone();
-
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
     println!("\n{}", "Requesting ring leave...".dimmed());
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/ring/leave/{}",
-        control_plane_url.trim_end_matches('/'),
-        config.device_id
-    );
+    let client = control_plane_client();
+    let url = control_plane_url(&config, &format!("/api/ring/leave/{}", config.device_id));
 
     match client.delete(&url).send().await {
         Ok(response) => {
@@ -2337,8 +2820,7 @@ async fn cmd_inference(
     // Load device configuration
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
-    let control_plane_url = config.control_plane_url.clone();
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
 
     println!("\n{}", "Job Configuration:".bold());
     println!("  Model:           {}", model_id);
@@ -2371,11 +2853,8 @@ async fn cmd_inference(
 
     // Submit to control plane
     println!("\n{}", "Submitting job...".dimmed());
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/inference/submit",
-        control_plane_url.trim_end_matches('/')
-    );
+    let client = control_plane_client();
+    let url = control_plane_url(&config, "/api/inference/submit");
 
     match client.post(&url).json(&request).send().await {
         Ok(response) => {
@@ -2391,100 +2870,8 @@ async fn cmd_inference(
 
                 println!("\n{}", "✓ Inference submitted".green().bold());
                 println!("  Job ID:          {}", job_id);
-                println!("{}", "Polling distributed job status...".dimmed());
-
-                let status_url = format!(
-                    "{}/api/inference/jobs/{}",
-                    control_plane_url.trim_end_matches('/'),
-                    job_id
-                );
-                let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-                let mut last_status = None::<String>;
-
-                loop {
-                    if std::time::Instant::now() > poll_deadline {
-                        anyhow::bail!("Timed out waiting for distributed inference completion");
-                    }
-
-                    let status_response = client
-                        .get(&status_url)
-                        .send()
-                        .await
-                        .context("Failed to fetch inference status")?
-                        .error_for_status()
-                        .context("Inference status request failed")?;
-                    let status = status_response
-                        .json::<serde_json::Value>()
-                        .await
-                        .context("Failed to parse inference status response")?;
-
-                    let state = status
-                        .get("status")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    if last_status.as_deref() != Some(state.as_str()) {
-                        println!("  Status:          {}", state);
-                        last_status = Some(state.clone());
-                    }
-
-                    if state == "completed" {
-                        println!("\n{}", "✓ Inference completed!".green().bold());
-                        if let Some(tokens_generated) = status
-                            .get("completion_tokens")
-                            .and_then(|value| value.as_u64())
-                        {
-                            println!("  Tokens Generated: {}", tokens_generated);
-                        }
-                        if let Some(exec_time) = status
-                            .get("execution_time_ms")
-                            .and_then(|value| value.as_u64())
-                        {
-                            println!("  Execution Time:   {}ms", exec_time);
-                        }
-                        if let Some(assignments) =
-                            status.get("assignments").and_then(|value| value.as_array())
-                        {
-                            println!("\n{}", "Assignments:".bold());
-                            for assignment in assignments {
-                                let device_id = assignment
-                                    .get("device_id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("unknown");
-                                let assignment_status = assignment
-                                    .get("status")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("unknown");
-                                let ring_position = assignment
-                                    .get("ring_position")
-                                    .and_then(|value| value.as_u64())
-                                    .unwrap_or(0);
-                                println!(
-                                    "  Worker {} ({}) -> {}",
-                                    ring_position, device_id, assignment_status
-                                );
-                            }
-                        }
-                        if let Some(completion) =
-                            status.get("completion").and_then(|value| value.as_str())
-                        {
-                            println!("\n{}", "Completion:".bold());
-                            println!("{}", completion);
-                        }
-                        break;
-                    }
-
-                    if state == "failed" {
-                        let error_message = status
-                            .get("error")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("unknown inference failure");
-                        anyhow::bail!("Distributed inference failed: {}", error_message);
-                    }
-
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                }
+                println!("{}", "Watching distributed job...".dimmed());
+                cmd_job_status(job_id, true, 2_000).await?;
             } else {
                 println!(
                     "  {}",
@@ -2517,7 +2904,7 @@ async fn cmd_pool_create(name: String) -> Result<()> {
     // Load device configuration
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
 
     // Create device keypair from config
     let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
@@ -2551,13 +2938,13 @@ async fn cmd_pool_create(name: String) -> Result<()> {
 
     println!("\n{}", "Next steps:".bold());
     println!("  1. Share the Pool ID and Pool Root Public Key with team members");
-    println!("  2. Team members run: cargo run --bin agent -- pool-join \\");
+    println!("  2. Team members run: mesh pool join \\");
     println!("       --pool-id {} \\", pool_config.pool_id.to_hex());
     println!(
         "       --pool-root-pubkey {}",
         hex::encode(pool_root.public)
     );
-    println!("  3. Start the agent to begin LAN discovery: cargo run --bin agent -- start");
+    println!("  3. Start the agent to begin LAN discovery: mesh device start");
 
     println!();
     Ok(())
@@ -2704,7 +3091,7 @@ async fn cmd_pool_join(
     // Load device configuration
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
 
     // Create device keypair from config
     let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
@@ -2890,7 +3277,7 @@ async fn cmd_pool_list() -> Result<()> {
     // Load device config to get node ID
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
-        .context("Failed to load device config. Run 'mesh init' first.")?;
+        .context("Failed to load device config. Run 'mesh device init' first.")?;
 
     let device_keypair = DeviceKeyPair::from_private_bytes(config.keypair.to_bytes())?;
     let node_id = device_keypair.node_id();
@@ -2901,9 +3288,9 @@ async fn cmd_pool_list() -> Result<()> {
     if pools.is_empty() {
         println!("\n{}", "No pools configured.".yellow());
         println!("\n{}", "Create a new pool:".bold());
-        println!("  cargo run --bin agent -- pool-create --name \"My Pool\"");
+        println!("  mesh pool create --name \"My Pool\"");
         println!("\n{}", "Or join an existing pool:".bold());
-        println!("  cargo run --bin agent -- pool-join --pool-id <id> --pool-root-pubkey <pubkey>");
+        println!("  mesh pool join --pool-id <id> --pool-root-pubkey <pubkey>");
         println!();
         return Ok(());
     }
@@ -2946,8 +3333,8 @@ async fn cmd_pool_list() -> Result<()> {
     }
 
     println!("{}", "Commands:".bold());
-    println!("  View peers:      cargo run --bin agent -- pool-peers --pool-id <pool-id>");
-    println!("  Start discovery: cargo run --bin agent -- start");
+    println!("  View peers:      mesh pool peers --pool-id <pool-id>");
+    println!("  Start discovery: mesh device start");
 
     println!();
     Ok(())
@@ -2965,7 +3352,7 @@ async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
 
     // Load pool config
     let (pool_config, _) = PoolConfig::load(&pool_id)
-        .context("Pool not found. Run 'pool-join' or 'pool-create' first.")?;
+        .context("Pool not found. Run 'mesh pool join' or 'mesh pool create' first.")?;
 
     println!("\n{}", format!("Pool: {}", pool_config.name).bold());
     println!("  Pool ID: {}", pool_id.to_hex().dimmed());
@@ -2978,7 +3365,7 @@ async fn cmd_pool_peers(pool_id_hex: String) -> Result<()> {
     if peers.is_empty() {
         println!("\n{}", "No peers discovered yet.".yellow());
         println!("\n{}", "Start the agent to begin LAN discovery:".bold());
-        println!("  cargo run --bin agent -- start");
+        println!("  mesh device start");
         println!(
             "\n{}",
             "Make sure other devices are on the same LAN and running the agent.".dimmed()

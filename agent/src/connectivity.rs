@@ -267,7 +267,11 @@ pub fn load_direct_candidate_seed_addrs() -> Option<Vec<String>> {
 pub fn load_observed_reachability_records() -> Option<Vec<DirectCandidateSeed>> {
     let observed_path = meshnet_state_path("observed_addrs.json")?;
     let mut records = load_json_seed_vec(&observed_path)?;
+    let original_len = records.len();
     prune_stale_observed_records(&mut records);
+    if records.len() != original_len {
+        let _ = fs::write(&observed_path, serde_json::to_string_pretty(&records).ok()?);
+    }
     Some(records)
 }
 
@@ -388,6 +392,26 @@ pub fn select_direct_dial_addrs_from_candidates(
         .filter_map(|candidate| candidate.endpoint.parse::<Multiaddr>().ok())
         .map(|addr| canonical_direct_addr(&addr, peer_id))
         .filter(|addr| seen.insert(addr.to_string()))
+        .collect()
+}
+
+pub fn filter_peer_advertisable_addrs(addrs: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    addrs.iter()
+        .filter_map(|addr| {
+            if addr.starts_with("dataplane://") {
+                return Some(addr.clone());
+            }
+
+            let parsed = addr.parse::<Multiaddr>().ok()?;
+            let candidate = classify_direct_addr(&parsed)?;
+            if matches!(candidate.scope, DirectCandidateScope::Loopback) {
+                return None;
+            }
+
+            Some(addr.clone())
+        })
+        .filter(|addr| seen.insert(addr.clone()))
         .collect()
 }
 

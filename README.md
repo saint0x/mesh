@@ -82,24 +82,24 @@ mesh-control-plane
 Start worker 1:
 
 ```bash
-mesh init --network-id demo --name "Worker 1"
-mesh join-ring --model-id tinyllama-1.1b
-mesh start
+mesh device init --network-id demo --name "Worker 1"
+mesh ring join --model-id tinyllama-1.1b
+mesh device start
 ```
 
 Start worker 2:
 
 ```bash
 export MESHNET_HOME=~/.meshnet-worker2
-mesh init --network-id demo --name "Worker 2"
-mesh join-ring --model-id tinyllama-1.1b
-mesh start
+mesh device init --network-id demo --name "Worker 2"
+mesh ring join --model-id tinyllama-1.1b
+mesh device start
 ```
 
 Submit inference:
 
 ```bash
-mesh inference --prompt "hello from mesh" --max-tokens 16 --model-id tinyllama-1.1b
+mesh job run --prompt "hello from mesh" --max-tokens 16 --model-id tinyllama-1.1b
 ```
 
 ## Model Assets

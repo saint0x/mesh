@@ -43,12 +43,12 @@ mesh-control-plane
 Terminal 3:
 
 ```bash
-mesh init --network-id demo --name "Worker 1"
-mesh join-ring --model-id llama-70b
-mesh start
+mesh device init --network-id demo --name "Worker 1"
+mesh ring join --model-id llama-70b
+mesh device start
 ```
 
-`mesh init` now prints the detected execution providers and the node default. To pin a worker to a specific provider, edit `~/.meshnet/device.toml` before `mesh start`:
+`mesh device init` now prints the detected execution providers and the node default. To pin a worker to a specific provider, edit `~/.meshnet/device.toml` before `mesh device start`:
 
 ```toml
 [execution]
@@ -61,9 +61,9 @@ Terminal 4:
 
 ```bash
 export MESHNET_HOME=~/.meshnet-worker2
-mesh init --network-id demo --name "Worker 2"
-mesh join-ring --model-id llama-70b
-mesh start
+mesh device init --network-id demo --name "Worker 2"
+mesh ring join --model-id llama-70b
+mesh device start
 ```
 
 For a mixed LAN test with an Intel Mac, set that second node to `cpu` explicitly. Mesh uses the same execution flow across providers; only the local compute backend changes.
@@ -73,7 +73,7 @@ For a mixed LAN test with an Intel Mac, set that second node to `cpu` explicitly
 Terminal 5:
 
 ```bash
-mesh inference --prompt "Hello world" --max-tokens 10 --model-id llama-70b
+mesh job run --prompt "Hello world" --max-tokens 10 --model-id llama-70b
 ```
 
 Before starting workers, place real shard artifacts for the selected `model_id` on each node:
@@ -83,16 +83,16 @@ Before starting workers, place real shard artifacts for the selected `model_id` 
 
 The safetensors file must satisfy the loader contract in [agent/src/inference/artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
 
-Ring membership is explicit. `mesh init` registers the device, and `mesh join-ring --model-id ...` is the only supported way to place a worker into a model ring.
+Ring membership is explicit. `mesh device init` registers the device, and `mesh ring join --model-id ...` is the only supported way to place a worker into a model ring.
 
 ## Multi-Device LAN Pool Flow
 
 ### Device 1
 
 ```bash
-mesh init --network-id test-network --name "Device 1"
-mesh pool-create --name "LAN Test Pool"
-mesh start
+mesh device init --network-id test-network --name "Device 1"
+mesh pool create --name "LAN Test Pool"
+mesh device start
 ```
 
 Save the printed:
@@ -103,9 +103,9 @@ Save the printed:
 ### Device 2+
 
 ```bash
-mesh init --network-id test-network --name "Device 2"
-mesh pool-join --pool-id <POOL_ID> --pool-root-pubkey <POOL_ROOT_PUBKEY> --name "LAN Test Pool"
-mesh start
+mesh device init --network-id test-network --name "Device 2"
+mesh pool join --pool-id <POOL_ID> --pool-root-pubkey <POOL_ROOT_PUBKEY> --name "LAN Test Pool"
+mesh device start
 ```
 
 ## Useful Checks
@@ -113,27 +113,28 @@ mesh start
 List pools:
 
 ```bash
-mesh pool-list
+mesh pool list
 ```
 
 Show discovered peers in a pool:
 
 ```bash
-mesh pool-peers --pool-id <POOL_ID>
+mesh pool peers --pool-id <POOL_ID>
 ```
 
 Show ring topology:
 
 ```bash
-mesh ring-status
-mesh pool-status
+mesh ring status
+mesh ring topology
+mesh pool status
 ```
 
 Show shard assignment and stats:
 
 ```bash
-mesh shard-status
-mesh inference-stats
+mesh ring shard
+mesh job stats
 ```
 
 ## Testing The Current Runtime
