@@ -1,5 +1,6 @@
 pub mod api;
 pub mod connectivity;
+pub mod credit_policy;
 pub mod db;
 pub mod device;
 pub mod model_assets;

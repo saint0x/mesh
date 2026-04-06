@@ -1,6 +1,6 @@
-## Version Control: TL Client (Timelapse)
+## Version Control: TL (Timelapse)
 
-**USE `./tl-client.sh` FOR ALL VERSION CONTROL - NOT GIT**
+**USE `tl` FOR ALL VERSION CONTROL - NOT GIT**
 
 TL replaces git completely. Automatic checkpoints + JJ integration for remote push/pull.
 
@@ -23,17 +23,17 @@ TL replaces git completely. Automatic checkpoints + JJ integration for remote pu
 
 ### Workflow
 
-1. `./tl-client.sh setup` - Once per repo
+1. `tl init` - Once per repo
 2. Make changes
-3. `./tl-client.sh save` - Checkpoint
-4. `./tl-client.sh publish HEAD` - Prepare for push
-5. `./tl-client.sh push` - Push to remote
+3. `tl flush` - Checkpoint
+4. `tl publish HEAD` - Prepare for push
+5. `tl push` - Push to remote
 
 ### Restore Workflow
 
 ```
-./tl-client.sh log           # Find checkpoint
-./tl-client.sh restore <id>  # Restore
+tl log           # Find checkpoint
+tl restore <id>  # Restore
 ```
 
 ### Key Facts

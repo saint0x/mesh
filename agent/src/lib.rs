@@ -48,4 +48,4 @@ pub use provider::{
     ExecutionProviderKind,
 };
 pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
-pub use telemetry::{calculate_credits, LedgerClient, LedgerEvent};
+pub use telemetry::{LedgerClient, LedgerEvent};

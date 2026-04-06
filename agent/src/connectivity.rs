@@ -397,7 +397,8 @@ pub fn select_direct_dial_addrs_from_candidates(
 
 pub fn filter_peer_advertisable_addrs(addrs: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
-    addrs.iter()
+    addrs
+        .iter()
         .filter_map(|addr| {
             if addr.starts_with("dataplane://") {
                 return Some(addr.clone());

@@ -36,16 +36,3 @@ pub enum Tier {
     /// Server-class device (16+ cores, 32GB+ RAM)
     Tier4,
 }
-
-impl Tier {
-    /// Get credit multiplier for this tier
-    pub fn credit_multiplier(&self) -> f64 {
-        match self {
-            Tier::Tier0 => 1.0,
-            Tier::Tier1 => 2.0,
-            Tier::Tier2 => 4.0,
-            Tier::Tier3 => 8.0,
-            Tier::Tier4 => 16.0,
-        }
-    }
-}

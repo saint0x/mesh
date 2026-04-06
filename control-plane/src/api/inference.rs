@@ -3,6 +3,7 @@ use axum::{
     Json,
 };
 use rusqlite::{params, OptionalExtension};
+use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -15,6 +16,9 @@ use crate::api::types::{
     SubmitInferenceResponse,
 };
 use crate::connectivity::InferenceSchedulingPolicy;
+use crate::credit_policy::{
+    compute_credit_policy, AssignmentCreditInput, AssignmentCreditOutput, CreditPolicyInput,
+};
 use crate::device::{DeviceCapabilities, Tier};
 use crate::model_assets;
 use crate::provider::ExecutionProviderKind;
@@ -47,13 +51,18 @@ struct PersistedJobContext {
     model_id: String,
     submitted_by_device_id: String,
     ring_worker_count: u32,
+    prompt_tokens: u32,
 }
 
 #[derive(Clone)]
-struct PersistedAssignmentAccounting {
+struct PersistedCompletedAssignmentCreditInput {
+    device_id: String,
+    execution_provider: String,
+    execution_time_ms: u64,
     assigned_capacity_units: u32,
     shard_column_start: u32,
     shard_column_end: u32,
+    available_memory_bytes: u64,
 }
 
 #[instrument(skip(state))]
@@ -670,27 +679,6 @@ fn report_assignment_result(
 
     let assignment_states = load_assignment_states(&tx, job_id)?;
     let job_context = load_job_context(&tx, job_id)?;
-    if req.success {
-        let earned_credits = calculate_assignment_credits(
-            &tx,
-            job_id,
-            &job_context,
-            &req.device_id,
-            req.execution_time_ms,
-        )?;
-        insert_ledger_event(
-            &tx,
-            &job_context.network_id,
-            "credits_earned",
-            Some(job_id),
-            Some(&req.device_id),
-            Some(earned_credits),
-            serde_json::json!({
-                "model_id": job_context.model_id,
-                "execution_time_ms": req.execution_time_ms,
-            }),
-        )?;
-    }
 
     let failed = assignment_states
         .iter()
@@ -713,7 +701,43 @@ fn report_assignment_result(
                 Some(now.clone()),
             )
         } else if all_completed {
-            let total_credits_burned = load_total_credits_earned(&tx, job_id)?;
+            let credit_plan = calculate_job_credit_plan(
+                &tx,
+                job_id,
+                &job_context,
+                req.completion_tokens.unwrap_or(0),
+            )?;
+            let assignment_inputs = load_completed_assignment_credit_inputs(&tx, job_id)?;
+            let assignment_inputs_by_device = assignment_inputs
+                .iter()
+                .map(|assignment| (assignment.device_id.as_str(), assignment))
+                .collect::<HashMap<_, _>>();
+
+            for assignment in &credit_plan.assignments {
+                let input = assignment_inputs_by_device
+                    .get(assignment.device_id.as_str())
+                    .ok_or_else(|| {
+                        ApiError::Internal(format!(
+                            "Missing credit input for completed assignment {}",
+                            assignment.device_id
+                        ))
+                    })?;
+                insert_ledger_event(
+                    &tx,
+                    &job_context.network_id,
+                    "credits_earned",
+                    Some(job_id),
+                    Some(&assignment.device_id),
+                    Some(assignment.credits),
+                    earned_credit_metadata(&job_context, &credit_plan, assignment, input),
+                )?;
+            }
+
+            let total_credits_burned = credit_plan
+                .assignments
+                .iter()
+                .map(|assignment| assignment.credits)
+                .sum::<f64>();
             insert_ledger_event(
                 &tx,
                 &job_context.network_id,
@@ -722,9 +746,11 @@ fn report_assignment_result(
                 Some(&job_context.submitted_by_device_id),
                 None,
                 serde_json::json!({
+                    "credit_model": "contribution_v1",
                     "model_id": job_context.model_id,
                     "ring_worker_count": job_context.ring_worker_count,
                     "execution_time_ms": authoritative_execution_time_ms,
+                    "job_credit_budget": credit_plan.job_credit_budget,
                 }),
             )?;
             insert_ledger_event(
@@ -735,9 +761,11 @@ fn report_assignment_result(
                 Some(&job_context.submitted_by_device_id),
                 Some(-total_credits_burned),
                 serde_json::json!({
+                    "credit_model": "contribution_v1",
                     "model_id": job_context.model_id,
                     "ring_worker_count": job_context.ring_worker_count,
                     "execution_time_ms": authoritative_execution_time_ms,
+                    "job_credit_budget": credit_plan.job_credit_budget,
                 }),
             )?;
             (
@@ -875,65 +903,149 @@ fn load_job_context(
 ) -> ApiResult<PersistedJobContext> {
     conn.query_row(
         r#"
-        SELECT network_id, model_id, submitted_by_device_id, ring_worker_count
+        SELECT network_id, model_id, submitted_by_device_id, ring_worker_count, prompt_tokens
         FROM inference_jobs
         WHERE job_id = ?
         "#,
         params![job_id],
         |row| {
+            let prompt_tokens_json: String = row.get(4)?;
+            let prompt_tokens =
+                serde_json::from_str::<Vec<u32>>(&prompt_tokens_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             Ok(PersistedJobContext {
                 network_id: row.get(0)?,
                 model_id: row.get(1)?,
                 submitted_by_device_id: row.get(2)?,
                 ring_worker_count: row.get::<_, i64>(3)? as u32,
+                prompt_tokens: prompt_tokens.len() as u32,
             })
         },
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
-fn load_assignment_accounting(
+fn load_completed_assignment_credit_inputs(
     conn: &rusqlite::Transaction<'_>,
     job_id: &str,
-    device_id: &str,
-) -> ApiResult<PersistedAssignmentAccounting> {
-    conn.query_row(
-        r#"
-        SELECT assigned_capacity_units, shard_column_start, shard_column_end
-        FROM inference_job_assignments
-        WHERE job_id = ? AND device_id = ?
-        "#,
-        params![job_id, device_id],
-        |row| {
-            Ok(PersistedAssignmentAccounting {
-                assigned_capacity_units: row.get::<_, i64>(0)? as u32,
-                shard_column_start: row.get::<_, i64>(1)? as u32,
-                shard_column_end: row.get::<_, i64>(2)? as u32,
+) -> ApiResult<Vec<PersistedCompletedAssignmentCreditInput>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                a.device_id,
+                a.execution_provider,
+                a.execution_time_ms,
+                a.assigned_capacity_units,
+                a.shard_column_start,
+                a.shard_column_end,
+                d.capabilities,
+                d.contributed_memory
+            FROM inference_job_assignments a
+            INNER JOIN devices d
+                ON d.device_id = a.device_id
+               AND d.network_id = a.network_id
+            WHERE a.job_id = ?
+              AND a.status = 'completed'
+            ORDER BY a.ring_position ASC, a.assignment_id ASC
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let rows = stmt
+        .query_map(params![job_id], |row| {
+            let capabilities_json: String = row.get(6)?;
+            let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+            let contributed_memory =
+                row.get::<_, Option<i64>>(7)?.unwrap_or_default().max(0) as u64;
+            let available_memory_bytes = if contributed_memory > 0 {
+                contributed_memory.max(1)
+            } else {
+                ((capabilities.ram_mb + capabilities.gpu_vram_mb.unwrap_or_default()) as u64
+                    * 1024
+                    * 1024)
+                    .max(1)
+            };
+
+            Ok(PersistedCompletedAssignmentCreditInput {
+                device_id: row.get(0)?,
+                execution_provider: row.get(1)?,
+                execution_time_ms: row.get::<_, i64>(2)? as u64,
+                assigned_capacity_units: row.get::<_, i64>(3)? as u32,
+                shard_column_start: row.get::<_, i64>(4)? as u32,
+                shard_column_end: row.get::<_, i64>(5)? as u32,
+                available_memory_bytes,
             })
-        },
-    )
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+        })
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
-fn calculate_assignment_credits(
+fn calculate_job_credit_plan(
     conn: &rusqlite::Transaction<'_>,
     job_id: &str,
     job_context: &PersistedJobContext,
-    device_id: &str,
-    execution_time_ms: u64,
-) -> ApiResult<f64> {
-    let assignment = load_assignment_accounting(conn, job_id, device_id)?;
-    let total_columns = model_assets::load_model_manifest(&job_context.model_id)?
-        .tensor_parallelism_dim
-        .max(1);
-    let shard_columns = assignment
-        .shard_column_end
-        .saturating_sub(assignment.shard_column_start)
-        .max(1);
-    let shard_fraction = shard_columns as f64 / total_columns as f64;
-    Ok((execution_time_ms as f64 / 1000.0)
-        * f64::from(assignment.assigned_capacity_units.max(1))
-        * shard_fraction)
+    completion_tokens: u32,
+) -> ApiResult<crate::credit_policy::CreditPolicyOutput> {
+    let manifest = model_assets::load_model_manifest(&job_context.model_id)?;
+    let assignments = load_completed_assignment_credit_inputs(conn, job_id)?
+        .into_iter()
+        .map(|assignment| AssignmentCreditInput {
+            device_id: assignment.device_id,
+            execution_time_ms: assignment.execution_time_ms,
+            assigned_capacity_units: assignment.assigned_capacity_units,
+            shard_column_start: assignment.shard_column_start,
+            shard_column_end: assignment.shard_column_end,
+            available_memory_bytes: assignment.available_memory_bytes,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(compute_credit_policy(CreditPolicyInput {
+        prompt_tokens: job_context.prompt_tokens,
+        completion_tokens,
+        total_model_bytes: manifest.total_model_bytes,
+        total_columns: manifest.tensor_parallelism_dim,
+        assignments,
+    }))
+}
+
+fn earned_credit_metadata(
+    job_context: &PersistedJobContext,
+    credit_plan: &crate::credit_policy::CreditPolicyOutput,
+    assignment: &AssignmentCreditOutput,
+    assignment_input: &PersistedCompletedAssignmentCreditInput,
+) -> serde_json::Value {
+    serde_json::json!({
+        "credit_model": "contribution_v1",
+        "model_id": job_context.model_id,
+        "job_credit_budget": credit_plan.job_credit_budget,
+        "execution_provider": assignment_input.execution_provider,
+        "execution_time_ms": assignment_input.execution_time_ms,
+        "assigned_capacity_units": assignment_input.assigned_capacity_units,
+        "shard_column_start": assignment_input.shard_column_start,
+        "shard_column_end": assignment_input.shard_column_end,
+        "compute_share": assignment.compute_share,
+        "throughput_multiplier": assignment.throughput_multiplier,
+        "resource_pressure_multiplier": assignment.resource_pressure_multiplier,
+        "normalized_contribution_share": assignment.normalized_contribution_share,
+        "measured_service_rate": assignment.measured_service_rate,
+        "reference_service_rate": assignment.reference_service_rate,
+        "memory_pressure": assignment.memory_pressure,
+    })
 }
 
 fn compute_job_execution_time_ms(
@@ -955,20 +1067,6 @@ fn compute_job_execution_time_ms(
         |row| row.get::<_, i64>(0),
     )
     .map(|value| value.max(0) as u64)
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
-}
-
-fn load_total_credits_earned(conn: &rusqlite::Transaction<'_>, job_id: &str) -> ApiResult<f64> {
-    conn.query_row(
-        r#"
-        SELECT COALESCE(SUM(COALESCE(credits_amount, 0)), 0.0)
-        FROM ledger_events
-        WHERE job_id = ?
-          AND event_type = 'credits_earned'
-        "#,
-        params![job_id],
-        |row| row.get(0),
-    )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
@@ -1388,6 +1486,119 @@ mod tests {
         assert_eq!(summary.total_jobs_completed, 1);
         assert!(summary.total_credits_earned > 0.0);
         assert!(summary.total_credits_burned > 0.0);
+        assert!((summary.total_credits_earned - summary.total_credits_burned).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_credit_policy_rewards_faster_contributor_for_equal_assignment_work() {
+        let network_id = "test-network-credit-throughput";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "throughput".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        for (device_id, execution_time_ms) in [("worker-1", 200_u64), ("worker-2", 800_u64)] {
+            let claim = claim_inference_assignment(
+                State(state.clone()),
+                Json(ClaimInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    network_id: network_id.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .assignment
+            .expect("expected assignment");
+
+            let _ = acknowledge_inference_assignment(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(AcknowledgeInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let _ = report_inference_result(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(ReportInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    success: true,
+                    completion: Some(format!("completion-from-{}", device_id)),
+                    completion_tokens: Some(4),
+                    execution_time_ms,
+                    error: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let events = crate::api::ledger::list_ledger_events(
+            State(state.clone()),
+            axum::extract::Query(crate::api::ledger::ListLedgerEventsQuery {
+                network_id: Some(network_id.into()),
+                job_id: Some(Uuid::parse_str(&submit.job_id).unwrap()),
+                device_id: None,
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let earned = events
+            .events
+            .iter()
+            .filter(|event| event.event_type == "credits_earned")
+            .collect::<Vec<_>>();
+        assert_eq!(earned.len(), 2);
+
+        let by_device = earned
+            .iter()
+            .map(|event| {
+                (
+                    event
+                        .metadata
+                        .get("execution_time_ms")
+                        .and_then(|value| value.as_u64())
+                        .expect("expected execution_time_ms metadata"),
+                    event.credits_amount.expect("expected earned credits"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let fast_credits = by_device.get(&200).copied().expect("expected fast credits");
+        let slow_credits = by_device.get(&800).copied().expect("expected slow credits");
+        assert!(fast_credits > slow_credits);
+
+        let summary = crate::api::ledger::get_ledger_summary(
+            State(state),
+            axum::extract::Query(crate::api::ledger::LedgerSummaryQuery {
+                network_id: network_id.into(),
+                job_id: Some(Uuid::parse_str(&submit.job_id).unwrap()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!((summary.total_credits_earned - summary.total_credits_burned).abs() < 1e-9);
     }
 
     #[tokio::test]

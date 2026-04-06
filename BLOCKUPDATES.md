@@ -474,6 +474,61 @@ We should be honest about that and fix it.
 
 ## Concrete Upgrades We Should Consider
 
+## Zeitgesit Core Adoption Decision
+
+We should treat the protocol layer as a foundational architectural decision, not as an optional compatibility shim.
+
+The protocol name for this effort is `Zeitgesit`.
+
+That means:
+
+- implement Zeitgesit from the core of the runtime architecture
+- do not build it as a backwards-compat wrapper around the old execution path
+- do not preserve old protocol assumptions just to ease migration internally
+- do not let “temporary compatibility” become a permanent architectural tax
+
+### What this implies
+
+If we commit to Zeitgesit, we should make it the canonical execution and interoperability layer for the product:
+
+- canonical capability negotiation
+- canonical model identity
+- canonical tensor interchange
+- canonical cache interchange
+- canonical backend/plugin model
+- canonical execution planning contract
+
+In other words, this should become the real center of the runtime, not a sidecar.
+
+### Why no backwards compat
+
+Backwards compatibility at the protocol-core layer would likely hurt us more than help us because:
+
+- it preserves incorrect assumptions from earlier runtime phases
+- it complicates planning and negotiation logic
+- it creates dual execution semantics
+- it slows down backend interoperability work
+- it makes conformance and certification harder
+- it creates a long-lived maintenance tax exactly where we need clarity
+
+If we are serious about open-sourcing Zeitgesit as a real protocol, the cleanest move is:
+
+- pick the architecture
+- define the protocol
+- make it canonical
+- migrate the product onto it directly
+
+### Recommended stance
+
+We should be willing to break old internal assumptions in order to get:
+
+- one protocol truth
+- one execution truth
+- one plugin model
+- one capability model
+
+That is the only way this becomes an actual platform instead of another transitional layer.
+
 ## Tier 1: Immediate High-Value DX Work
 
 - Create a much tighter top-level CLI happy path.

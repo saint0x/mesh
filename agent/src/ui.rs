@@ -3,13 +3,7 @@ use agent::{
     ExecutionProviderInfo,
 };
 use anyhow::{anyhow, Context, Result};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use control_plane::{
     api::types::RingTopologyResponse, connectivity::InferenceSchedulingPolicy, Database,
 };
@@ -342,9 +336,7 @@ pub async fn cmd_ui(port: u16, api_port: u16) -> Result<()> {
         .route("/api/local/dashboard", get(get_dashboard))
         .with_state(api_state)
         .layer(CorsLayer::permissive());
-    let api_task = tokio::spawn(async move {
-        axum::serve(listener, api_router).await
-    });
+    let api_task = tokio::spawn(async move { axum::serve(listener, api_router).await });
 
     let ui_url = format!("http://127.0.0.1:{port}");
     let api_url = format!("http://127.0.0.1:{api_port}");
@@ -412,7 +404,11 @@ async fn load_dashboard_snapshot(state: &UiState) -> Result<DashboardSnapshot> {
     )
     .await;
     let models = load_models(&state.mesh_home, &devices)?;
-    let settings = load_settings(&state.mesh_home, &state.local_device_config, &Database::default_path()?)?;
+    let settings = load_settings(
+        &state.mesh_home,
+        &state.local_device_config,
+        &Database::default_path()?,
+    )?;
 
     Ok(DashboardSnapshot {
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -449,7 +445,10 @@ fn ensure_mesh_ui_dependencies(ui_dir: &Path) -> Result<()> {
 fn build_mesh_ui(ui_dir: &Path, api_port: u16) -> Result<()> {
     let status = Command::new("pnpm")
         .arg("build")
-        .env("VITE_MESH_UI_API_BASE", format!("http://127.0.0.1:{api_port}"))
+        .env(
+            "VITE_MESH_UI_API_BASE",
+            format!("http://127.0.0.1:{api_port}"),
+        )
         .current_dir(ui_dir)
         .status()
         .context("Failed to build mesh-ui")?;
@@ -468,7 +467,8 @@ fn load_networks(db: &Database) -> Result<Vec<UiNetwork>> {
             name: record.name,
             owner: record.owner_user_id,
             created_at: record.created_at,
-            preferred_path: format!("{:?}", record.connectivity.preferred_path).to_ascii_lowercase(),
+            preferred_path: format!("{:?}", record.connectivity.preferred_path)
+                .to_ascii_lowercase(),
             attachments: record
                 .connectivity
                 .attachments
@@ -484,7 +484,10 @@ fn load_networks(db: &Database) -> Result<Vec<UiNetwork>> {
         .collect())
 }
 
-fn load_devices(db: &Database, local_device_config: Option<&DeviceConfig>) -> Result<Vec<UiDevice>> {
+fn load_devices(
+    db: &Database,
+    local_device_config: Option<&DeviceConfig>,
+) -> Result<Vec<UiDevice>> {
     let conn = db.get_conn()?;
     let local_device_id = local_device_config.map(|config| config.device_id.to_string());
     let mut stmt = conn.prepare(
@@ -515,15 +518,17 @@ fn load_devices(db: &Database, local_device_config: Option<&DeviceConfig>) -> Re
 
     let rows = stmt.query_map([], |row| {
         let capabilities_json: String = row.get(16)?;
-        let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                capabilities_json.len(),
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        let connectivity_state = parse_optional_json::<DeviceConnectivityState>(row.get::<_, Option<String>>(13)?)
-            .map_err(to_sql_error)?;
+        let capabilities: DeviceCapabilities =
+            serde_json::from_str(&capabilities_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    capabilities_json.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        let connectivity_state =
+            parse_optional_json::<DeviceConnectivityState>(row.get::<_, Option<String>>(13)?)
+                .map_err(to_sql_error)?;
         let listen_addrs = parse_optional_json::<Vec<String>>(row.get::<_, Option<String>>(14)?)
             .map_err(to_sql_error)?
             .unwrap_or_default();
@@ -539,7 +544,10 @@ fn load_devices(db: &Database, local_device_config: Option<&DeviceConfig>) -> Re
             name: row.get(2)?,
             peer_id: row.get(3)?,
             status: row.get(4)?,
-            health: health_label(row.get::<_, String>(4)?.as_str(), connectivity_state.as_ref()),
+            health: health_label(
+                row.get::<_, String>(4)?.as_str(),
+                connectivity_state.as_ref(),
+            ),
             last_seen: row.get(5)?,
             ring_position: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
             left_neighbor_id: row.get(7)?,
@@ -569,7 +577,10 @@ fn load_devices(db: &Database, local_device_config: Option<&DeviceConfig>) -> Re
                 os: capabilities.os,
                 arch: capabilities.arch,
                 execution_providers: capabilities.execution_providers,
-                default_execution_provider: capabilities.default_execution_provider.as_str().to_string(),
+                default_execution_provider: capabilities
+                    .default_execution_provider
+                    .as_str()
+                    .to_string(),
             },
             certificate_status: if certificate.is_some() {
                 "present".to_string()
@@ -593,9 +604,14 @@ fn load_devices(db: &Database, local_device_config: Option<&DeviceConfig>) -> Re
 
 fn load_jobs(db: &Database, devices: &[UiDevice], networks: &[UiNetwork]) -> Result<Vec<UiJob>> {
     let conn = db.get_conn()?;
-    let device_by_id: HashMap<&str, &UiDevice> = devices.iter().map(|device| (device.id.as_str(), device)).collect();
-    let network_by_id: HashMap<&str, &UiNetwork> =
-        networks.iter().map(|network| (network.id.as_str(), network)).collect();
+    let device_by_id: HashMap<&str, &UiDevice> = devices
+        .iter()
+        .map(|device| (device.id.as_str(), device))
+        .collect();
+    let network_by_id: HashMap<&str, &UiNetwork> = networks
+        .iter()
+        .map(|network| (network.id.as_str(), network))
+        .collect();
 
     let mut job_stmt = conn.prepare(
         r#"
@@ -630,7 +646,9 @@ fn load_jobs(db: &Database, devices: &[UiDevice], networks: &[UiNetwork]) -> Res
                 &id,
                 &network_id,
                 &device_by_id,
-                network_by_id.get(network_id.as_str()).map(|network| &network.scheduling_policy),
+                network_by_id
+                    .get(network_id.as_str())
+                    .map(|network| &network.scheduling_policy),
             )
             .map_err(to_sql_error)?;
 
@@ -690,7 +708,9 @@ fn load_assignments(
             let device_id: String = row.get(1)?;
             let device = device_by_id.get(device_id.as_str()).copied();
             let assigned_capacity_units = device
-                .and_then(|device| policy.map(|policy| capacity_units(policy, device.capabilities.tier.as_str())))
+                .and_then(|device| {
+                    policy.map(|policy| capacity_units(policy, device.capabilities.tier.as_str()))
+                })
                 .unwrap_or(1);
 
             Ok(UiAssignment {
@@ -710,7 +730,8 @@ fn load_assignments(
                 shard_column_start: device.and_then(|device| device.shard_column_start),
                 shard_column_end: device.and_then(|device| device.shard_column_end),
                 assigned_capacity_units,
-                execution_provider: device.map(|device| device.capabilities.default_execution_provider.clone()),
+                execution_provider: device
+                    .map(|device| device.capabilities.default_execution_provider.clone()),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -768,7 +789,10 @@ async fn load_topologies(
     let device_by_network: HashMap<&str, Vec<&UiDevice>> = {
         let mut grouped: HashMap<&str, Vec<&UiDevice>> = HashMap::new();
         for device in devices {
-            grouped.entry(device.network_id.as_str()).or_default().push(device);
+            grouped
+                .entry(device.network_id.as_str())
+                .or_default()
+                .push(device);
         }
         grouped
     };
@@ -827,8 +851,15 @@ async fn load_topologies(
     topologies
 }
 
-fn from_live_topology(network_id: String, topology: RingTopologyResponse, devices: &[UiDevice]) -> UiTopology {
-    let devices_by_id: HashMap<&str, &UiDevice> = devices.iter().map(|device| (device.id.as_str(), device)).collect();
+fn from_live_topology(
+    network_id: String,
+    topology: RingTopologyResponse,
+    devices: &[UiDevice],
+) -> UiTopology {
+    let devices_by_id: HashMap<&str, &UiDevice> = devices
+        .iter()
+        .map(|device| (device.id.as_str(), device))
+        .collect();
     UiTopology {
         network_id,
         source: "control_plane".to_string(),
@@ -855,7 +886,9 @@ fn from_live_topology(network_id: String, topology: RingTopologyResponse, device
                         .connectivity_state
                         .as_ref()
                         .map(|state| format!("{:?}", state.active_path).to_ascii_lowercase()),
-                    active_endpoint: worker.connectivity_state.and_then(|state| state.active_endpoint),
+                    active_endpoint: worker
+                        .connectivity_state
+                        .and_then(|state| state.active_endpoint),
                     tensor_plane_endpoints: device
                         .map(|device| device.tensor_plane_endpoints.clone())
                         .unwrap_or_default(),
@@ -922,10 +955,13 @@ fn load_models(mesh_home: &Path, devices: &[UiDevice]) -> Result<Vec<UiModel>> {
                 .and_then(|content| serde_json::from_str::<ModelManifest>(&content).ok());
             let manifest_count = count_matching_files(&model_dir, ".manifest.json")?;
             let weights_count = count_matching_files(&model_dir, ".safetensors")?;
-            let tokenizer_ready =
-                model_dir.join("tokenizer.json").exists() && model_dir.join("tokenizer_config.json").exists();
+            let tokenizer_ready = model_dir.join("tokenizer.json").exists()
+                && model_dir.join("tokenizer_config.json").exists();
             let registry = shard_registry.get(&model_id);
-            let participants = participants_by_model.get(&model_id).cloned().unwrap_or_default();
+            let participants = participants_by_model
+                .get(&model_id)
+                .cloned()
+                .unwrap_or_default();
             let provider_compatibility = participants
                 .iter()
                 .flat_map(|device| {
@@ -953,8 +989,13 @@ fn load_models(mesh_home: &Path, devices: &[UiDevice]) -> Result<Vec<UiModel>> {
                     .into_iter()
                     .collect(),
                 total_model_bytes: manifest.as_ref().map(|manifest| manifest.total_model_bytes),
-                tensor_parallelism_dim: manifest.as_ref().map(|manifest| manifest.tensor_parallelism_dim),
-                artifact_ready: manifest.is_some() && tokenizer_ready && manifest_count > 0 && weights_count > 0,
+                tensor_parallelism_dim: manifest
+                    .as_ref()
+                    .map(|manifest| manifest.tensor_parallelism_dim),
+                artifact_ready: manifest.is_some()
+                    && tokenizer_ready
+                    && manifest_count > 0
+                    && weights_count > 0,
                 tokenizer_ready,
                 manifest_count,
                 weights_count,
@@ -993,10 +1034,15 @@ fn load_settings(
         control_plane_url: local_device_config
             .as_ref()
             .map(|config| config.control_plane_url.clone()),
-        local_device_name: local_device_config.as_ref().map(|config| config.name.clone()),
-        preferred_provider: local_device_config
+        local_device_name: local_device_config
             .as_ref()
-            .and_then(|config| config.execution.preferred_provider.map(|provider| provider.as_str().to_string())),
+            .map(|config| config.name.clone()),
+        preferred_provider: local_device_config.as_ref().and_then(|config| {
+            config
+                .execution
+                .preferred_provider
+                .map(|provider| provider.as_str().to_string())
+        }),
         governance: local_device_config
             .as_ref()
             .map(|config| serde_json::to_value(&config.governance))
@@ -1005,10 +1051,16 @@ fn load_settings(
         relay,
         config_paths: UiConfigPaths {
             device_config: DeviceConfig::default_path()?.display().to_string(),
-            device_certificate: DeviceConfig::default_certificate_path()?.display().to_string(),
+            device_certificate: DeviceConfig::default_certificate_path()?
+                .display()
+                .to_string(),
             relay_config: relay_path.display().to_string(),
             control_plane_db: db_path.display().to_string(),
-            shard_registry: mesh_home.join("shards").join("registry.json").display().to_string(),
+            shard_registry: mesh_home
+                .join("shards")
+                .join("registry.json")
+                .display()
+                .to_string(),
         },
     })
 }
@@ -1079,12 +1131,7 @@ fn ledger_detail(event_type: &str, metadata: &Value) -> String {
 fn count_matching_files(dir: &Path, suffix: &str) -> Result<usize> {
     Ok(fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(suffix)
-        })
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(suffix))
         .count())
 }
 

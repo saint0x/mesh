@@ -42,17 +42,6 @@ impl Tier {
             _ => Tier::Tier0,
         }
     }
-
-    /// Get the credit multiplier for this tier.
-    pub fn credit_multiplier(&self) -> f64 {
-        match self {
-            Tier::Tier0 => 1.0,
-            Tier::Tier1 => 2.0,
-            Tier::Tier2 => 4.0,
-            Tier::Tier3 => 8.0,
-            Tier::Tier4 => 16.0,
-        }
-    }
 }
 
 /// Device hardware capabilities.
@@ -102,7 +91,6 @@ impl DeviceCapabilities {
     ///
     /// let caps = DeviceCapabilities::detect();
     /// println!("Device tier: {:?}", caps.tier);
-    /// println!("Credit multiplier: {}", caps.tier.credit_multiplier());
     /// ```
     pub fn detect() -> Self {
         let mut sys = System::new_all();
@@ -195,15 +183,6 @@ mod tests {
         // Tier 4
         assert_eq!(Tier::from_specs(32, 32), Tier::Tier4);
         assert_eq!(Tier::from_specs(64, 64), Tier::Tier4);
-    }
-
-    #[test]
-    fn test_credit_multipliers() {
-        assert_eq!(Tier::Tier0.credit_multiplier(), 1.0);
-        assert_eq!(Tier::Tier1.credit_multiplier(), 2.0);
-        assert_eq!(Tier::Tier2.credit_multiplier(), 4.0);
-        assert_eq!(Tier::Tier3.credit_multiplier(), 8.0);
-        assert_eq!(Tier::Tier4.credit_multiplier(), 16.0);
     }
 
     #[test]

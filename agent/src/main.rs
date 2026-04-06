@@ -1871,7 +1871,10 @@ async fn cmd_topology() -> Result<()> {
     println!("  Punch Plans:   {}", topology.peer_punch_plans.len());
 
     if topology.workers.is_empty() {
-        println!("\n{}", "No workers are currently present in the ring.".yellow());
+        println!(
+            "\n{}",
+            "No workers are currently present in the ring.".yellow()
+        );
         return Ok(());
     }
 
@@ -2143,7 +2146,10 @@ async fn cmd_inference_stats() -> Result<()> {
     Ok(())
 }
 
-async fn fetch_job_status(config: &DeviceConfig, job_id: &str) -> Result<InferenceJobStatusResponse> {
+async fn fetch_job_status(
+    config: &DeviceConfig,
+    job_id: &str,
+) -> Result<InferenceJobStatusResponse> {
     let url = control_plane_url(config, &format!("/api/inference/jobs/{}", job_id));
     control_plane_client()
         .get(url)
@@ -2233,7 +2239,9 @@ async fn cmd_job_status(job_id: &str, watch: bool, poll_interval_ms: u64) -> Res
                 anyhow::bail!(
                     "Job {} failed: {}",
                     job_id,
-                    status.error.unwrap_or_else(|| "unknown job failure".to_string())
+                    status
+                        .error
+                        .unwrap_or_else(|| "unknown job failure".to_string())
                 );
             }
             _ => tokio::time::sleep(poll_interval).await,
@@ -2247,7 +2255,10 @@ async fn cmd_ledger_summary(job_id: Option<&str>) -> Result<()> {
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh device init' first.")?;
-    let mut url = control_plane_url(&config, &format!("/api/ledger/summary?network_id={}", config.network_id));
+    let mut url = control_plane_url(
+        &config,
+        &format!("/api/ledger/summary?network_id={}", config.network_id),
+    );
     if let Some(job_id) = job_id {
         url.push_str("&job_id=");
         url.push_str(job_id);
@@ -2283,7 +2294,10 @@ async fn cmd_ledger_events(job_id: Option<&str>, limit: usize) -> Result<()> {
     let config_path = DeviceConfig::default_path()?;
     let config = DeviceConfig::load(&config_path)
         .context("Failed to load device config. Run 'mesh device init' first.")?;
-    let mut url = control_plane_url(&config, &format!("/api/ledger/events?network_id={}", config.network_id));
+    let mut url = control_plane_url(
+        &config,
+        &format!("/api/ledger/events?network_id={}", config.network_id),
+    );
     if let Some(job_id) = job_id {
         url.push_str("&job_id=");
         url.push_str(job_id);
@@ -2342,13 +2356,26 @@ async fn cmd_doctor() -> Result<()> {
 
     println!("  {} device config loaded", "OK".green().bold());
     println!("    path: {}", config_path.display());
-    println!("  {} certificate {}", 
-        if config.has_certificate() { "OK".green().bold().to_string() } else { "FAIL".red().bold().to_string() },
-        if config.has_certificate() { "present" } else { "missing" }
+    println!(
+        "  {} certificate {}",
+        if config.has_certificate() {
+            "OK".green().bold().to_string()
+        } else {
+            "FAIL".red().bold().to_string()
+        },
+        if config.has_certificate() {
+            "present"
+        } else {
+            "missing"
+        }
     );
 
     let provider = config.resolve_execution_provider()?;
-    println!("  {} execution provider {}", "OK".green().bold(), provider.as_str());
+    println!(
+        "  {} execution provider {}",
+        "OK".green().bold(),
+        provider.as_str()
+    );
 
     match fetch_ring_topology(&config).await {
         Ok(topology) => {
@@ -2360,7 +2387,11 @@ async fn cmd_doctor() -> Result<()> {
             );
         }
         Err(error) => {
-            println!("  {} control plane unreachable: {}", "FAIL".red().bold(), error);
+            println!(
+                "  {} control plane unreachable: {}",
+                "FAIL".red().bold(),
+                error
+            );
         }
     }
 
@@ -2403,7 +2434,10 @@ async fn cmd_pool_status() -> Result<()> {
 
     // Fetch ring topology from control plane
     let client = control_plane_client();
-    let url = control_plane_url(&config, &format!("/api/ring/topology?network_id={}", config.network_id));
+    let url = control_plane_url(
+        &config,
+        &format!("/api/ring/topology?network_id={}", config.network_id),
+    );
 
     match client.get(&url).send().await {
         Ok(response) => {
@@ -2501,10 +2535,7 @@ async fn cmd_join_ring(model_id: String, memory: Option<String>) -> Result<()> {
     println!("  Model ID:      {}", model_id);
     println!("  Connectivity:  {:?}", config.connectivity.preferred_path);
     let contributed_memory = resolve_ring_contributed_memory(&config, memory.as_deref())?;
-    println!(
-        "  Contribution:  {}",
-        format_bytes(contributed_memory)
-    );
+    println!("  Contribution:  {}", format_bytes(contributed_memory));
 
     // Connect to control plane
     println!("\n{}", "Requesting ring join...".dimmed());

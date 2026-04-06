@@ -4,7 +4,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::device::Tier;
 use crate::errors::{AgentError, Result};
 
 /// Ledger event for job execution tracking
@@ -141,50 +140,9 @@ impl Clone for LedgerClient {
     }
 }
 
-/// Calculate credits earned for job execution
-///
-/// Credits = (execution_time_ms / 1000.0) * tier_multiplier
-///
-/// # Tier Multipliers
-/// - Tier0 (Low-end): 1.0x
-/// - Tier1 (Budget): 2.0x
-/// - Tier2 (Mid-range): 4.0x
-/// - Tier3 (High-end): 8.0x
-/// - Tier4 (Workstation): 16.0x
-pub fn calculate_credits(execution_time_ms: u64, tier: &Tier) -> f64 {
-    let base_rate = match tier {
-        Tier::Tier0 => 1.0,
-        Tier::Tier1 => 2.0,
-        Tier::Tier2 => 4.0,
-        Tier::Tier3 => 8.0,
-        Tier::Tier4 => 16.0,
-    };
-
-    // Convert milliseconds to seconds and multiply by tier rate
-    (execution_time_ms as f64 / 1000.0) * base_rate
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_calculate_credits_tier0() {
-        let credits = calculate_credits(1000, &Tier::Tier0);
-        assert_eq!(credits, 1.0); // 1 second * 1.0x
-    }
-
-    #[test]
-    fn test_calculate_credits_tier2() {
-        let credits = calculate_credits(2000, &Tier::Tier2);
-        assert_eq!(credits, 8.0); // 2 seconds * 4.0x
-    }
-
-    #[test]
-    fn test_calculate_credits_tier4() {
-        let credits = calculate_credits(500, &Tier::Tier4);
-        assert_eq!(credits, 8.0); // 0.5 seconds * 16.0x
-    }
 
     #[test]
     fn test_ledger_event_serialization() {
