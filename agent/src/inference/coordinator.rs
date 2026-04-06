@@ -17,6 +17,7 @@ use crate::model::shard::ShardAssignment;
 use crate::network::{MeshSwarm, TensorPlane};
 use libp2p::PeerId;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -379,6 +380,20 @@ impl InferenceCoordinator {
         &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResult> {
+        self.process_inference_with_progress(request, |_, _| async { Ok(()) })
+            .await
+    }
+
+    #[instrument(skip(self, request, on_progress), fields(job_id = %request.job_id))]
+    pub async fn process_inference_with_progress<F, Fut>(
+        &mut self,
+        request: InferenceRequest,
+        mut on_progress: F,
+    ) -> Result<InferenceResult>
+    where
+        F: FnMut(u32, u64) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         // Check if we're in a ring and clone position to avoid borrow issues
         let position = self.position.clone().ok_or_else(|| {
             AgentError::Execution("Worker is not part of a ring topology".to_string())
@@ -407,7 +422,10 @@ impl InferenceCoordinator {
 
         // Run generation loop with bounded checkpoint recovery.
         let result = loop {
-            match self.run_generation_loop(&mut job, &position).await {
+            match self
+                .run_generation_loop(&mut job, &position, &mut on_progress)
+                .await
+            {
                 Ok(()) => break Ok(()),
                 Err(error) => {
                     if !self.config.checkpointing_enabled
@@ -477,12 +495,19 @@ impl InferenceCoordinator {
     ///
     /// This generates tokens one at a time until max_tokens is reached
     /// or a stop sequence is encountered.
-    async fn run_generation_loop(
+    async fn run_generation_loop<F, Fut>(
         &mut self,
         job: &mut InferenceJob,
         position: &WorkerPosition,
-    ) -> Result<()> {
+        on_progress: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(u32, u64) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let max_tokens = job.request.config.max_tokens;
+        let progress_report_interval = job.request.config.progress_report_interval.max(1);
+        let mut last_reported_completion_tokens = 0_u32;
 
         debug!(
             job_id = %job.request.job_id,
@@ -512,6 +537,15 @@ impl InferenceCoordinator {
                 "Generated token"
             );
 
+            if job
+                .current_token_idx
+                .saturating_sub(last_reported_completion_tokens)
+                >= progress_report_interval
+            {
+                on_progress(job.current_token_idx, job.elapsed().as_millis() as u64).await?;
+                last_reported_completion_tokens = job.current_token_idx;
+            }
+
             // Check for stop sequences
             if self.should_stop(job) {
                 debug!(job_id = %job.request.job_id, "Stop sequence encountered");
@@ -523,6 +557,10 @@ impl InferenceCoordinator {
                 self.checkpoint(job).await?;
                 job.mark_checkpointed();
             }
+        }
+
+        if job.current_token_idx > last_reported_completion_tokens {
+            on_progress(job.current_token_idx, job.elapsed().as_millis() as u64).await?;
         }
 
         Ok(())

@@ -66,6 +66,10 @@ pub fn create_router(state: AppState) -> Router {
             post(inference::report_inference_result),
         )
         .route(
+            "/api/inference/jobs/:job_id/progress",
+            post(inference::report_inference_progress),
+        )
+        .route(
             "/api/inference/jobs/:job_id",
             get(inference::get_inference_job_status),
         )

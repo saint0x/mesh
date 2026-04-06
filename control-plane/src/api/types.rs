@@ -437,6 +437,14 @@ pub struct ReportInferenceAssignmentRequest {
     pub error: Option<String>,
 }
 
+/// Request to record cumulative worker progress during execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportInferenceAssignmentProgressRequest {
+    pub device_id: String,
+    pub completion_tokens: u32,
+    pub execution_time_ms: u64,
+}
+
 /// Response describing a submitted inference job
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceJobStatusResponse {

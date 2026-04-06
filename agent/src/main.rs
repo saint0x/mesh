@@ -39,7 +39,9 @@ use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
 use agent::{
-    api::types::{PeerPunchPlan, RingTopologyResponse, WorkerInfo},
+    api::types::{
+        PeerPunchPlan, ReportInferenceAssignmentProgressRequest, RingTopologyResponse, WorkerInfo,
+    },
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
     parse_data_plane_endpoint, parse_memory_string, parse_tensor_plane_advertised_addr_env,
@@ -845,7 +847,10 @@ async fn cmd_start(log_level: String) -> Result<()> {
 
     loop {
         restart_attempt += 1;
-        info!(attempt = restart_attempt, "Launching isolated runtime child");
+        info!(
+            attempt = restart_attempt,
+            "Launching isolated runtime child"
+        );
 
         let mut command = tokio::process::Command::new(&current_exe);
         command
@@ -1493,7 +1498,9 @@ async fn cmd_runtime() -> Result<()> {
                 model_id: assignment.model_id.clone(),
                 prompt_tokens: assignment.prompt_tokens.clone(),
                 config: GenerationConfig {
-                    max_tokens: assignment.available_completion_tokens.min(assignment.max_tokens),
+                    max_tokens: assignment
+                        .available_completion_tokens
+                        .min(assignment.max_tokens),
                     temperature: assignment.temperature,
                     top_p: assignment.top_p,
                     ..Default::default()
@@ -1505,7 +1512,25 @@ async fn cmd_runtime() -> Result<()> {
                     .as_secs(),
             };
 
-            match coordinator.process_inference(request).await {
+            match coordinator
+                .process_inference_with_progress(request, |completion_tokens, execution_time_ms| {
+                    let registration_client = registration_client.clone();
+                    let device_id = device_id;
+                    async move {
+                        registration_client
+                            .report_inference_progress(
+                                job_id,
+                                ReportInferenceAssignmentProgressRequest {
+                                    device_id: device_id.to_string(),
+                                    completion_tokens,
+                                    execution_time_ms,
+                                },
+                            )
+                            .await
+                    }
+                })
+                .await
+            {
                 Ok(result) => {
                     let completion = result.generated_tokens.as_ref().and_then(|tokens| {
                         match agent::model_assets::decode_tokens(&assignment.model_id, tokens) {

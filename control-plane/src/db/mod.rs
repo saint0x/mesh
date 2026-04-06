@@ -253,6 +253,15 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
                 && column_exists(conn, "inference_jobs", "available_completion_tokens")?
                 && column_exists(conn, "inference_jobs", "model_size_factor")?
         }
+        "013_add_realtime_accounting_progress.sql" => {
+            column_exists(conn, "inference_jobs", "accounted_completion_tokens")?
+                && column_exists(conn, "inference_jobs", "prompt_credits_accounted")?
+                && column_exists(
+                    conn,
+                    "inference_job_assignments",
+                    "reported_completion_tokens",
+                )?
+        }
         _ => false,
     })
 }

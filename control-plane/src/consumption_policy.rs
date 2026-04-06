@@ -24,11 +24,27 @@ pub struct ConsumptionPolicyOutput {
 }
 
 pub fn quote_consumption(input: ConsumptionQuoteInput) -> ConsumptionPolicyOutput {
-    compute_consumption(input.prompt_tokens, input.requested_completion_tokens, input.total_model_bytes)
+    compute_consumption(
+        input.prompt_tokens,
+        input.requested_completion_tokens,
+        input.total_model_bytes,
+    )
 }
 
 pub fn settle_consumption(input: ConsumptionSettlementInput) -> ConsumptionPolicyOutput {
-    compute_consumption(input.prompt_tokens, input.actual_completion_tokens, input.total_model_bytes)
+    compute_consumption(
+        input.prompt_tokens,
+        input.actual_completion_tokens,
+        input.total_model_bytes,
+    )
+}
+
+pub fn compute_consumption_components(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_model_bytes: u64,
+) -> ConsumptionPolicyOutput {
+    compute_consumption(prompt_tokens, completion_tokens, total_model_bytes)
 }
 
 fn compute_consumption(
@@ -37,7 +53,7 @@ fn compute_consumption(
     total_model_bytes: u64,
 ) -> ConsumptionPolicyOutput {
     let model_size_factor = (total_model_bytes as f64 / GIB / MODEL_SIZE_BUDGET_SCALE_GIB).max(1.0);
-    let prompt_credits = prompt_tokens.max(1) as f64 * model_size_factor;
+    let prompt_credits = prompt_tokens as f64 * model_size_factor;
     let completion_credits = completion_tokens as f64 * model_size_factor;
     ConsumptionPolicyOutput {
         model_size_factor,

@@ -146,3 +146,10 @@ pub struct ReportInferenceAssignmentRequest {
     pub execution_time_ms: u64,
     pub error: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportInferenceAssignmentProgressRequest {
+    pub device_id: String,
+    pub completion_tokens: u32,
+    pub execution_time_ms: u64,
+}

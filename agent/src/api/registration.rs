@@ -1,7 +1,8 @@
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse, InferenceAssignment,
-    RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentRequest,
+    RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentProgressRequest,
+    ReportInferenceAssignmentRequest,
 };
 use crate::connectivity::{
     build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
@@ -17,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Client for registering and maintaining connection with control plane
+#[derive(Clone)]
 pub struct RegistrationClient {
     client: Client,
     control_plane_url: String,
@@ -341,6 +343,38 @@ impl RegistrationClient {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(AgentError::Network(format!(
                 "Inference result report failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn report_inference_progress(
+        &self,
+        job_id: Uuid,
+        request: ReportInferenceAssignmentProgressRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/progress",
+            self.control_plane_url, job_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("Inference progress report failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Inference progress report failed: HTTP {}: {}",
                 status, error_text
             )));
         }

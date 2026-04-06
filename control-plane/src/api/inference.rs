@@ -3,7 +3,6 @@ use axum::{
     Json,
 };
 use rusqlite::{params, OptionalExtension};
-use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -12,13 +11,13 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, InferenceAssignment, InferenceJobAssignmentStatus,
-    InferenceJobStatusResponse, ReportInferenceAssignmentRequest, SubmitInferenceRequest,
-    SubmitInferenceResponse,
-};
-use crate::consumption_policy::{
-    quote_consumption, settle_consumption, ConsumptionQuoteInput, ConsumptionSettlementInput,
+    InferenceJobStatusResponse, ReportInferenceAssignmentProgressRequest,
+    ReportInferenceAssignmentRequest, SubmitInferenceRequest, SubmitInferenceResponse,
 };
 use crate::connectivity::InferenceSchedulingPolicy;
+use crate::consumption_policy::{
+    compute_consumption_components, quote_consumption, ConsumptionQuoteInput,
+};
 use crate::credit_policy::{
     compute_credit_policy, AssignmentCreditInput, AssignmentCreditOutput, CreditPolicyInput,
 };
@@ -61,6 +60,8 @@ struct PersistedJobContext {
     ring_worker_count: u32,
     prompt_tokens: u32,
     reserved_credits: f64,
+    total_model_bytes: u64,
+    total_columns: u32,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,7 @@ struct PersistedCompletedAssignmentCreditInput {
     device_id: String,
     execution_provider: String,
     execution_time_ms: u64,
+    reported_completion_tokens: u32,
     assigned_capacity_units: u32,
     shard_column_start: u32,
     shard_column_end: u32,
@@ -78,6 +80,8 @@ struct PersistedCompletedAssignmentCreditInput {
 struct PersistedJobSettlementState {
     settled_credits: f64,
     released_credits: f64,
+    accounted_completion_tokens: u32,
+    prompt_credits_accounted: bool,
 }
 
 #[instrument(skip(state))]
@@ -200,7 +204,7 @@ pub async fn submit_inference(
             "credits_reserved",
             Some(&persisted_job_id),
             Some(&request.device_id),
-            Some(-consumption_quote.total_credits),
+            None,
             serde_json::json!({
                 "credit_model": "consumption_v1",
                 "model_id": request.model_id,
@@ -346,6 +350,27 @@ pub async fn report_inference_result(
     let db = state.db.clone();
     let request = req.clone();
     tokio::task::spawn_blocking(move || report_assignment_result(&db, &job_id, &request))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[instrument(skip(state))]
+pub async fn report_inference_progress(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(req): Json<ReportInferenceAssignmentProgressRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if req.device_id.is_empty() || job_id.is_empty() {
+        return Err(ApiError::BadRequest(
+            "device_id and job_id must be provided".to_string(),
+        ));
+    }
+
+    let db = state.db.clone();
+    let request = req.clone();
+    tokio::task::spawn_blocking(move || report_assignment_progress(&db, &job_id, &request))
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
@@ -724,7 +749,9 @@ fn report_assignment_result(
         .execute(
             r#"
             UPDATE inference_job_assignments
-            SET status = ?, completed_at = ?, lease_expires_at = NULL, failure_reason = ?, execution_time_ms = ?
+            SET status = ?, completed_at = ?, lease_expires_at = NULL, failure_reason = ?,
+                execution_time_ms = ?,
+                reported_completion_tokens = MAX(reported_completion_tokens, ?)
             WHERE job_id = ? AND device_id = ? AND status IN ('leased', 'acknowledged')
             "#,
             params![
@@ -732,6 +759,7 @@ fn report_assignment_result(
                 &now,
                 req.error.as_deref(),
                 req.execution_time_ms as i64,
+                req.completion_tokens.unwrap_or(0) as i64,
                 job_id,
                 &req.device_id
             ],
@@ -759,148 +787,96 @@ fn report_assignment_result(
     let authoritative_execution_time_ms =
         compute_job_execution_time_ms(&tx, job_id, &now).unwrap_or(req.execution_time_ms);
 
-    let (job_status, completion, completion_tokens, execution_time_ms, settled_credits, released_credits, error, completed_at) =
-        if let Some((_, _, failure_reason)) = failed {
-            if settlement_state.released_credits <= f64::EPSILON {
-                insert_ledger_event(
-                    &tx,
-                    &job_context.network_id,
-                    "credits_released",
-                    Some(job_id),
-                    Some(&job_context.submitted_by_device_id),
-                    Some(job_context.reserved_credits),
-                    serde_json::json!({
-                        "credit_model": "consumption_v1",
-                        "model_id": job_context.model_id,
-                        "reserved_credits": job_context.reserved_credits,
-                        "release_reason": "job_failed",
-                    }),
-                )?;
-            }
-            (
-                "failed",
-                None,
-                0_i64,
-                authoritative_execution_time_ms as i64,
-                settlement_state.settled_credits,
-                if settlement_state.released_credits > f64::EPSILON {
-                    settlement_state.released_credits
-                } else {
-                    job_context.reserved_credits
-                },
-                failure_reason.clone().or_else(|| req.error.clone()),
-                Some(now.clone()),
-            )
-        } else if all_completed {
-            let actual_consumption = calculate_job_consumption_settlement(
-                &tx,
-                job_id,
-                &job_context,
-                req.completion_tokens.unwrap_or(0),
-            )?;
-            let credit_plan = calculate_job_credit_plan(
-                &tx,
-                job_id,
-                &job_context,
-                req.completion_tokens.unwrap_or(0),
-            )?;
-            let assignment_inputs = load_completed_assignment_credit_inputs(&tx, job_id)?;
-            let assignment_inputs_by_device = assignment_inputs
-                .iter()
-                .map(|assignment| (assignment.device_id.as_str(), assignment))
-                .collect::<HashMap<_, _>>();
-
-            for assignment in &credit_plan.assignments {
-                let input = assignment_inputs_by_device
-                    .get(assignment.device_id.as_str())
-                    .ok_or_else(|| {
-                        ApiError::Internal(format!(
-                            "Missing credit input for completed assignment {}",
-                            assignment.device_id
-                        ))
-                    })?;
-                insert_ledger_event(
-                    &tx,
-                    &job_context.network_id,
-                    "credits_earned",
-                    Some(job_id),
-                    Some(&assignment.device_id),
-                    Some(assignment.credits),
-                    earned_credit_metadata(&job_context, &credit_plan, assignment, input),
-                )?;
-            }
-
-            if settlement_state.released_credits <= f64::EPSILON {
-                insert_ledger_event(
-                    &tx,
-                    &job_context.network_id,
-                    "credits_released",
-                    Some(job_id),
-                    Some(&job_context.submitted_by_device_id),
-                    Some(job_context.reserved_credits),
-                    serde_json::json!({
-                        "credit_model": "consumption_v1",
-                        "model_id": job_context.model_id,
-                        "reserved_credits": job_context.reserved_credits,
-                        "release_reason": "job_settlement",
-                    }),
-                )?;
-            }
-            let total_credits_burned = credit_plan
-                .assignments
-                .iter()
-                .map(|assignment| assignment.credits)
-                .sum::<f64>();
+    let (
+        job_status,
+        completion,
+        completion_tokens,
+        execution_time_ms,
+        settled_credits,
+        released_credits,
+        error,
+        completed_at,
+    ) = if let Some((_, _, failure_reason)) = failed {
+        if settlement_state.released_credits <= f64::EPSILON {
             insert_ledger_event(
                 &tx,
                 &job_context.network_id,
-                "job_completed",
+                "credits_released",
                 Some(job_id),
                 Some(&job_context.submitted_by_device_id),
                 None,
-                serde_json::json!({
-                    "credit_model": "contribution_v1",
-                    "model_id": job_context.model_id,
-                    "ring_worker_count": job_context.ring_worker_count,
-                    "execution_time_ms": authoritative_execution_time_ms,
-                    "job_credit_budget": credit_plan.job_credit_budget,
-                    "reserved_credits": job_context.reserved_credits,
-                    "settled_credits": actual_consumption.total_credits,
-                }),
-            )?;
-            insert_ledger_event(
-                &tx,
-                &job_context.network_id,
-                "credits_burned",
-                Some(job_id),
-                Some(&job_context.submitted_by_device_id),
-                Some(-actual_consumption.total_credits),
                 serde_json::json!({
                     "credit_model": "consumption_v1",
                     "model_id": job_context.model_id,
-                    "ring_worker_count": job_context.ring_worker_count,
-                    "execution_time_ms": authoritative_execution_time_ms,
                     "reserved_credits": job_context.reserved_credits,
-                    "settled_credits": actual_consumption.total_credits,
-                    "prompt_credits": actual_consumption.prompt_credits,
-                    "completion_credits": actual_consumption.completion_credits,
-                    "model_size_factor": actual_consumption.model_size_factor,
-                    "requested_contribution_budget": total_credits_burned,
+                    "release_reason": "job_failed",
                 }),
             )?;
-            (
-                "completed",
-                req.completion.clone(),
-                req.completion_tokens.unwrap_or(0) as i64,
-                authoritative_execution_time_ms as i64,
-                actual_consumption.total_credits,
-                job_context.reserved_credits,
+        }
+        (
+            "failed",
+            None,
+            0_i64,
+            authoritative_execution_time_ms as i64,
+            settlement_state.settled_credits,
+            if settlement_state.released_credits > f64::EPSILON {
+                settlement_state.released_credits
+            } else {
+                job_context.reserved_credits
+            },
+            failure_reason.clone().or_else(|| req.error.clone()),
+            Some(now.clone()),
+        )
+    } else if all_completed {
+        reconcile_realtime_job_accounting(&tx, job_id, &job_context, &settlement_state)?;
+
+        let refreshed_settlement_state = load_job_settlement_state(&tx, job_id)?;
+        if refreshed_settlement_state.released_credits <= f64::EPSILON {
+            insert_ledger_event(
+                &tx,
+                &job_context.network_id,
+                "credits_released",
+                Some(job_id),
+                Some(&job_context.submitted_by_device_id),
                 None,
-                Some(now.clone()),
-            )
-        } else {
-            ("running", None, 0_i64, 0_i64, 0.0_f64, 0.0_f64, None, None)
-        };
+                serde_json::json!({
+                    "credit_model": "consumption_v1",
+                    "model_id": job_context.model_id,
+                    "reserved_credits": job_context.reserved_credits,
+                    "release_reason": "job_settlement",
+                }),
+            )?;
+        }
+        insert_ledger_event(
+            &tx,
+            &job_context.network_id,
+            "job_completed",
+            Some(job_id),
+            Some(&job_context.submitted_by_device_id),
+            None,
+            serde_json::json!({
+                "credit_model": "realtime_pipeline",
+                "model_id": job_context.model_id,
+                "ring_worker_count": job_context.ring_worker_count,
+                "execution_time_ms": authoritative_execution_time_ms,
+                "reserved_credits": job_context.reserved_credits,
+                "settled_credits": refreshed_settlement_state.settled_credits,
+                "accounted_completion_tokens": refreshed_settlement_state.accounted_completion_tokens,
+            }),
+        )?;
+        (
+            "completed",
+            req.completion.clone(),
+            req.completion_tokens.unwrap_or(0) as i64,
+            authoritative_execution_time_ms as i64,
+            refreshed_settlement_state.settled_credits,
+            job_context.reserved_credits,
+            None,
+            Some(now.clone()),
+        )
+    } else {
+        ("running", None, 0_i64, 0_i64, 0.0_f64, 0.0_f64, None, None)
+    };
 
     tx.execute(
         r#"
@@ -934,6 +910,49 @@ fn report_assignment_result(
     tx.commit()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
+    Ok(())
+}
+
+fn report_assignment_progress(
+    db: &crate::db::Database,
+    job_id: &str,
+    req: &ReportInferenceAssignmentProgressRequest,
+) -> ApiResult<()> {
+    let mut conn = db.get_conn()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let updated = tx
+        .execute(
+            r#"
+            UPDATE inference_job_assignments
+            SET reported_completion_tokens = MAX(reported_completion_tokens, ?),
+                execution_time_ms = MAX(execution_time_ms, ?)
+            WHERE job_id = ? AND device_id = ? AND status IN ('acknowledged', 'completed')
+            "#,
+            params![
+                req.completion_tokens as i64,
+                req.execution_time_ms as i64,
+                job_id,
+                &req.device_id
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    if updated == 0 {
+        return Err(ApiError::NotFound(format!(
+            "Assignment not found for progress report on job {} and device {}",
+            job_id, req.device_id
+        )));
+    }
+
+    let job_context = load_job_context(&tx, job_id)?;
+    let settlement_state = load_job_settlement_state(&tx, job_id)?;
+    reconcile_realtime_job_accounting(&tx, job_id, &job_context, &settlement_state)?;
+
+    tx.commit()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(())
 }
 
@@ -1054,6 +1073,14 @@ fn load_job_context(
                         Box::new(e),
                     )
                 })?;
+            let manifest =
+                model_assets::load_model_manifest(&row.get::<_, String>(1)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::other(e.to_string())),
+                    )
+                })?;
             Ok(PersistedJobContext {
                 network_id: row.get(0)?,
                 model_id: row.get(1)?,
@@ -1061,6 +1088,8 @@ fn load_job_context(
                 ring_worker_count: row.get::<_, i64>(3)? as u32,
                 prompt_tokens: prompt_tokens.len() as u32,
                 reserved_credits: row.get(5)?,
+                total_model_bytes: manifest.total_model_bytes,
+                total_columns: manifest.tensor_parallelism_dim,
             })
         },
     )
@@ -1078,6 +1107,7 @@ fn load_completed_assignment_credit_inputs(
                 a.device_id,
                 a.execution_provider,
                 a.execution_time_ms,
+                a.reported_completion_tokens,
                 a.assigned_capacity_units,
                 a.shard_column_start,
                 a.shard_column_end,
@@ -1088,7 +1118,7 @@ fn load_completed_assignment_credit_inputs(
                 ON d.device_id = a.device_id
                AND d.network_id = a.network_id
             WHERE a.job_id = ?
-              AND a.status = 'completed'
+              AND a.status IN ('acknowledged', 'completed')
             ORDER BY a.ring_position ASC, a.assignment_id ASC
             "#,
         )
@@ -1096,17 +1126,17 @@ fn load_completed_assignment_credit_inputs(
 
     let rows = stmt
         .query_map(params![job_id], |row| {
-            let capabilities_json: String = row.get(6)?;
+            let capabilities_json: String = row.get(7)?;
             let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
                 .map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        6,
+                        7,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
                 })?;
             let contributed_memory =
-                row.get::<_, Option<i64>>(7)?.unwrap_or_default().max(0) as u64;
+                row.get::<_, Option<i64>>(8)?.unwrap_or_default().max(0) as u64;
             let available_memory_bytes = if contributed_memory > 0 {
                 contributed_memory.max(1)
             } else {
@@ -1120,9 +1150,10 @@ fn load_completed_assignment_credit_inputs(
                 device_id: row.get(0)?,
                 execution_provider: row.get(1)?,
                 execution_time_ms: row.get::<_, i64>(2)? as u64,
-                assigned_capacity_units: row.get::<_, i64>(3)? as u32,
-                shard_column_start: row.get::<_, i64>(4)? as u32,
-                shard_column_end: row.get::<_, i64>(5)? as u32,
+                reported_completion_tokens: row.get::<_, i64>(3)? as u32,
+                assigned_capacity_units: row.get::<_, i64>(4)? as u32,
+                shard_column_start: row.get::<_, i64>(5)? as u32,
+                shard_column_end: row.get::<_, i64>(6)? as u32,
                 available_memory_bytes,
             })
         })
@@ -1139,6 +1170,7 @@ fn load_job_settlement_state(
     conn.query_row(
         r#"
         SELECT settled_credits, released_credits
+             , accounted_completion_tokens, prompt_credits_accounted
         FROM inference_jobs
         WHERE job_id = ?
         "#,
@@ -1147,24 +1179,129 @@ fn load_job_settlement_state(
             Ok(PersistedJobSettlementState {
                 settled_credits: row.get(0)?,
                 released_credits: row.get(1)?,
+                accounted_completion_tokens: row.get::<_, i64>(2)? as u32,
+                prompt_credits_accounted: row.get::<_, i64>(3)? != 0,
             })
         },
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
-fn calculate_job_credit_plan(
+fn reconcile_realtime_job_accounting(
     conn: &rusqlite::Transaction<'_>,
     job_id: &str,
     job_context: &PersistedJobContext,
+    settlement_state: &PersistedJobSettlementState,
+) -> ApiResult<()> {
+    let assignment_inputs = load_completed_assignment_credit_inputs(conn, job_id)?;
+    if assignment_inputs.len() < job_context.ring_worker_count as usize {
+        return Ok(());
+    }
+
+    let frontier_completion_tokens = assignment_inputs
+        .iter()
+        .map(|assignment| assignment.reported_completion_tokens)
+        .min()
+        .unwrap_or_default();
+
+    let prompt_tokens_delta = if settlement_state.prompt_credits_accounted {
+        0
+    } else {
+        job_context.prompt_tokens
+    };
+    let completion_tokens_delta =
+        frontier_completion_tokens.saturating_sub(settlement_state.accounted_completion_tokens);
+
+    if prompt_tokens_delta == 0 && completion_tokens_delta == 0 {
+        return Ok(());
+    }
+
+    let credit_plan = calculate_realtime_credit_plan(
+        job_context,
+        &assignment_inputs,
+        prompt_tokens_delta,
+        completion_tokens_delta,
+    );
+    let consumption = compute_consumption_components(
+        prompt_tokens_delta,
+        completion_tokens_delta,
+        job_context.total_model_bytes,
+    );
+
+    for (assignment, input) in credit_plan.assignments.iter().zip(assignment_inputs.iter()) {
+        insert_ledger_event(
+            conn,
+            &job_context.network_id,
+            "credits_earned",
+            Some(job_id),
+            Some(&assignment.device_id),
+            Some(assignment.credits),
+            realtime_earned_credit_metadata(
+                job_context,
+                assignment,
+                input,
+                prompt_tokens_delta,
+                completion_tokens_delta,
+                frontier_completion_tokens,
+            ),
+        )?;
+    }
+
+    insert_ledger_event(
+        conn,
+        &job_context.network_id,
+        "credits_burned",
+        Some(job_id),
+        Some(&job_context.submitted_by_device_id),
+        Some(-consumption.total_credits),
+        serde_json::json!({
+            "credit_model": "realtime_consumption",
+            "model_id": job_context.model_id,
+            "prompt_tokens_delta": prompt_tokens_delta,
+            "completion_tokens_delta": completion_tokens_delta,
+            "frontier_completion_tokens": frontier_completion_tokens,
+            "prompt_credits": consumption.prompt_credits,
+            "completion_credits": consumption.completion_credits,
+            "settled_credits_delta": consumption.total_credits,
+            "model_size_factor": consumption.model_size_factor,
+        }),
+    )?;
+
+    conn.execute(
+        r#"
+        UPDATE inference_jobs
+        SET completion_tokens = MAX(completion_tokens, ?),
+            accounted_completion_tokens = ?,
+            prompt_credits_accounted = CASE WHEN ? > 0 THEN 1 ELSE prompt_credits_accounted END,
+            settled_credits = settled_credits + ?,
+            updated_at = ?
+        WHERE job_id = ?
+        "#,
+        params![
+            frontier_completion_tokens as i64,
+            frontier_completion_tokens as i64,
+            prompt_tokens_delta as i64,
+            consumption.total_credits,
+            &now_rfc3339()?,
+            job_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    Ok(())
+}
+
+fn calculate_realtime_credit_plan(
+    job_context: &PersistedJobContext,
+    assignments: &[PersistedCompletedAssignmentCreditInput],
+    prompt_tokens: u32,
     completion_tokens: u32,
-) -> ApiResult<crate::credit_policy::CreditPolicyOutput> {
-    let manifest = model_assets::load_model_manifest(&job_context.model_id)?;
-    let assignments = load_completed_assignment_credit_inputs(conn, job_id)?
-        .into_iter()
+) -> crate::credit_policy::CreditPolicyOutput {
+    let inputs = assignments
+        .iter()
         .map(|assignment| AssignmentCreditInput {
-            device_id: assignment.device_id,
-            execution_time_ms: assignment.execution_time_ms,
+            device_id: assignment.device_id.clone(),
+            execution_time_ms: assignment.execution_time_ms.max(1),
             assigned_capacity_units: assignment.assigned_capacity_units,
             shard_column_start: assignment.shard_column_start,
             shard_column_end: assignment.shard_column_end,
@@ -1172,44 +1309,35 @@ fn calculate_job_credit_plan(
         })
         .collect::<Vec<_>>();
 
-    Ok(compute_credit_policy(CreditPolicyInput {
-        prompt_tokens: job_context.prompt_tokens,
+    compute_credit_policy(CreditPolicyInput {
+        prompt_tokens,
         completion_tokens,
-        total_model_bytes: manifest.total_model_bytes,
-        total_columns: manifest.tensor_parallelism_dim,
-        assignments,
-    }))
+        total_model_bytes: job_context.total_model_bytes,
+        total_columns: job_context.total_columns,
+        assignments: inputs,
+    })
 }
 
-fn calculate_job_consumption_settlement(
-    _conn: &rusqlite::Transaction<'_>,
-    _job_id: &str,
+fn realtime_earned_credit_metadata(
     job_context: &PersistedJobContext,
-    completion_tokens: u32,
-) -> ApiResult<crate::consumption_policy::ConsumptionPolicyOutput> {
-    let manifest = model_assets::load_model_manifest(&job_context.model_id)?;
-    Ok(settle_consumption(ConsumptionSettlementInput {
-        prompt_tokens: job_context.prompt_tokens,
-        actual_completion_tokens: completion_tokens,
-        total_model_bytes: manifest.total_model_bytes,
-    }))
-}
-
-fn earned_credit_metadata(
-    job_context: &PersistedJobContext,
-    credit_plan: &crate::credit_policy::CreditPolicyOutput,
     assignment: &AssignmentCreditOutput,
     assignment_input: &PersistedCompletedAssignmentCreditInput,
+    prompt_tokens_delta: u32,
+    completion_tokens_delta: u32,
+    frontier_completion_tokens: u32,
 ) -> serde_json::Value {
     serde_json::json!({
-        "credit_model": "contribution_v1",
+        "credit_model": "realtime_contribution",
         "model_id": job_context.model_id,
-        "job_credit_budget": credit_plan.job_credit_budget,
         "execution_provider": assignment_input.execution_provider,
         "execution_time_ms": assignment_input.execution_time_ms,
+        "reported_completion_tokens": assignment_input.reported_completion_tokens,
         "assigned_capacity_units": assignment_input.assigned_capacity_units,
         "shard_column_start": assignment_input.shard_column_start,
         "shard_column_end": assignment_input.shard_column_end,
+        "prompt_tokens_delta": prompt_tokens_delta,
+        "completion_tokens_delta": completion_tokens_delta,
+        "frontier_completion_tokens": frontier_completion_tokens,
         "compute_share": assignment.compute_share,
         "throughput_multiplier": assignment.throughput_multiplier,
         "resource_pressure_multiplier": assignment.resource_pressure_multiplier,
@@ -1249,10 +1377,21 @@ fn load_device_available_credits(
 ) -> ApiResult<f64> {
     conn.query_row(
         r#"
-        SELECT COALESCE(SUM(COALESCE(credits_amount, 0)), 0)
-        FROM ledger_events
-        WHERE network_id = ?1
-          AND device_id = ?2
+        SELECT
+            COALESCE((
+                SELECT SUM(COALESCE(credits_amount, 0))
+                FROM ledger_events
+                WHERE network_id = ?1
+                  AND device_id = ?2
+            ), 0)
+            -
+            COALESCE((
+                SELECT SUM(MAX(reserved_credits - released_credits, 0))
+                FROM inference_jobs
+                WHERE network_id = ?1
+                  AND submitted_by_device_id = ?2
+                  AND reserved_credits > released_credits
+            ), 0)
         "#,
         params![network_id, device_id],
         |row| row.get::<_, f64>(0),
@@ -1320,6 +1459,7 @@ mod tests {
     use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::device_service;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn ensure_test_models() {
@@ -1865,6 +2005,273 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == "credits_burned"));
+    }
+
+    #[tokio::test]
+    async fn test_realtime_progress_advances_frontier_only_after_all_assignments_report() {
+        let network_id = "test-network-realtime-progress";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "streaming".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        for device_id in ["worker-1", "worker-2"] {
+            let claim = claim_inference_assignment(
+                State(state.clone()),
+                Json(ClaimInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    network_id: network_id.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .assignment
+            .expect("expected assignment");
+
+            let _ = acknowledge_inference_assignment(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(AcknowledgeInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let _ = report_inference_progress(
+            State(state.clone()),
+            Path(submit.job_id.clone()),
+            Json(ReportInferenceAssignmentProgressRequest {
+                device_id: "worker-1".into(),
+                completion_tokens: 3,
+                execution_time_ms: 120,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let status_after_first_progress =
+            get_inference_job_status(State(state.clone()), Path(submit.job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(status_after_first_progress.completion_tokens, 0);
+        assert!(status_after_first_progress.settled_credits > 0.0);
+
+        let _ = report_inference_progress(
+            State(state.clone()),
+            Path(submit.job_id.clone()),
+            Json(ReportInferenceAssignmentProgressRequest {
+                device_id: "worker-2".into(),
+                completion_tokens: 3,
+                execution_time_ms: 140,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let status_after_frontier =
+            get_inference_job_status(State(state.clone()), Path(submit.job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(status_after_frontier.completion_tokens, 3);
+        assert!(status_after_frontier.settled_credits > 0.0);
+
+        let events = crate::api::ledger::list_ledger_events(
+            State(state),
+            axum::extract::Query(crate::api::ledger::ListLedgerEventsQuery {
+                network_id: Some(network_id.into()),
+                job_id: Some(Uuid::parse_str(&submit.job_id).unwrap()),
+                device_id: None,
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| event.event_type == "credits_earned")
+                .count(),
+            4
+        );
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| event.event_type == "credits_burned")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_reservation_reduces_available_balance_until_release() {
+        ensure_test_models();
+        let db = create_test_db();
+        let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
+        let state = AppState::new(db.clone(), keypair);
+        let network_id = "test-network-open-reservation";
+
+        let _ = crate::services::network_service::create_network(
+            &db,
+            network_id.to_string(),
+            network_id.to_string(),
+            "owner-1".to_string(),
+            test_connectivity(),
+            InferenceSchedulingPolicy::default(),
+        );
+
+        register_test_device(&db, "worker-1", network_id);
+        register_test_device(&db, "worker-2", network_id);
+
+        for (idx, device_id) in ["worker-1", "worker-2"].into_iter().enumerate() {
+            let _ = join_ring(
+                State(state.clone()),
+                Json(RingJoinRequest {
+                    device_id: device_id.to_string(),
+                    network_id: network_id.to_string(),
+                    model_id: "llama-70b".to_string(),
+                    contributed_memory: 8_000_000_000 + idx as u64,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let manifest = crate::model_assets::load_model_manifest("llama-70b").unwrap();
+        let prompt_tokens = crate::model_assets::tokenize_prompt("llama-70b", "reservation")
+            .unwrap()
+            .len() as u32;
+        let reserved_credits = quote_consumption(ConsumptionQuoteInput {
+            prompt_tokens,
+            requested_completion_tokens: 16,
+            total_model_bytes: manifest.total_model_bytes,
+        })
+        .total_credits;
+        let settled_credits =
+            compute_consumption_components(prompt_tokens, 4, manifest.total_model_bytes)
+                .total_credits;
+        seed_device_credits(
+            &db,
+            network_id,
+            "worker-1",
+            reserved_credits + settled_credits,
+        );
+
+        let first_submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "reservation".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let second_submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "reservation".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await;
+        assert!(matches!(second_submit, Err(ApiError::Conflict(_))));
+
+        for device_id in ["worker-1", "worker-2"] {
+            let claim = claim_inference_assignment(
+                State(state.clone()),
+                Json(ClaimInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    network_id: network_id.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .assignment
+            .expect("expected assignment");
+
+            let _ = acknowledge_inference_assignment(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(AcknowledgeInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let _ = report_inference_result(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(ReportInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    success: true,
+                    completion: Some(format!("completion-from-{}", device_id)),
+                    completion_tokens: Some(4),
+                    execution_time_ms: 300,
+                    error: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let released_status =
+            get_inference_job_status(State(state.clone()), Path(first_submit.job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(
+            released_status.released_credits,
+            first_submit.reserved_credits
+        );
+
+        let third_submit = submit_inference(
+            State(state),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "reservation".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await;
+        assert!(third_submit.is_ok());
     }
 
     #[tokio::test]

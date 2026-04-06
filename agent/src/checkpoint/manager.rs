@@ -395,6 +395,7 @@ impl CheckpointManager {
             stop_sequences: checkpoint.config.stop_sequences,
             stream: checkpoint.config.stream,
             checkpoint_interval: checkpoint.config.checkpoint_interval,
+            progress_report_interval: GenerationConfig::default().progress_report_interval,
         };
 
         let request = InferenceRequest {

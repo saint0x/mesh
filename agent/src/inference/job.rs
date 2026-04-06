@@ -25,6 +25,9 @@ pub struct GenerationConfig {
 
     /// Checkpoint interval (save state every N tokens)
     pub checkpoint_interval: u32,
+
+    /// Report progress every N generated tokens.
+    pub progress_report_interval: u32,
 }
 
 impl Default for GenerationConfig {
@@ -36,6 +39,7 @@ impl Default for GenerationConfig {
             stop_sequences: vec![],
             stream: false,
             checkpoint_interval: 50,
+            progress_report_interval: 4,
         }
     }
 }
