@@ -393,21 +393,11 @@ impl RingTopology {
 #[cfg(test)]
 mod test_utils {
     use super::*;
-    use crate::pki::DeviceKeyPair;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Create a test pool ID with a specific seed
     pub fn create_test_pool_id() -> PoolId {
         PoolId::from_bytes([1u8; 32])
-    }
-
-    /// Create a test node with deterministic seed
-    pub fn create_test_node(seed: u64) -> (DeviceKeyPair, NodeId) {
-        // For testing, we'll use a simple approach - generate and cache
-        // In real property-based tests, quickcheck will generate these
-        let device = DeviceKeyPair::generate();
-        let node_id = device.node_id();
-        (device, node_id)
     }
 
     /// Create a test ring member with specified parameters
@@ -452,16 +442,6 @@ mod test_utils {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-    }
-
-    /// Get timestamp with offset (positive = future, negative = past)
-    pub fn timestamp_offset(offset_seconds: i64) -> u64 {
-        let now = timestamp_now();
-        if offset_seconds >= 0 {
-            now + offset_seconds as u64
-        } else {
-            now - (-offset_seconds) as u64
-        }
     }
 
     /// Assert that a ring has complete shard coverage with no overlaps
@@ -1389,7 +1369,7 @@ mod tests {
     fn test_neighbors_wraparound_position_zero() {
         let pool_id = create_test_pool_id();
         let now = timestamp_now();
-        let (ring, node_ids) = create_ring_with_members(pool_id, 5, now);
+        let (ring, _node_ids) = create_ring_with_members(pool_id, 5, now);
 
         // Find the node at position 0 (first in sorted order)
         let sorted_members: Vec<_> = ring.members.values().collect();
@@ -1418,7 +1398,7 @@ mod tests {
     fn test_neighbors_wraparound_last_position() {
         let pool_id = create_test_pool_id();
         let now = timestamp_now();
-        let (ring, node_ids) = create_ring_with_members(pool_id, 7, now);
+        let (ring, _node_ids) = create_ring_with_members(pool_id, 7, now);
 
         // Find the node at last position (position 6 in 7-node ring)
         let sorted_members: Vec<_> = ring.members.values().collect();
@@ -1466,7 +1446,7 @@ mod tests {
 
         let pool_id = create_test_pool_id();
         let now = timestamp_now();
-        let (ring, node_ids) = create_ring_with_members(pool_id, n as usize, now);
+        let (ring, _node_ids) = create_ring_with_members(pool_id, n as usize, now);
 
         // Verify symmetry: If A's right neighbor is B, then B's left neighbor is A
         let sorted_members: Vec<_> = ring.members.values().collect();
