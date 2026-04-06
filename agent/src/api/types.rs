@@ -120,6 +120,9 @@ pub struct InferenceAssignment {
     pub max_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,
+    pub reserved_credits: f64,
+    pub available_completion_tokens: u32,
+    pub model_size_factor: f64,
     pub lease_expires_at: String,
 }
 

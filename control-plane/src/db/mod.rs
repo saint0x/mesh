@@ -240,6 +240,19 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
             column_exists(conn, "inference_job_assignments", "execution_time_ms")?
         }
         "010_add_ring_model_id.sql" => column_exists(conn, "devices", "shard_model_id")?,
+        "011_add_assignment_capacity_and_shards.sql" => {
+            column_exists(conn, "inference_job_assignments", "shard_column_start")?
+                && column_exists(conn, "inference_job_assignments", "shard_column_end")?
+                && column_exists(conn, "inference_job_assignments", "assigned_capacity_units")?
+                && column_exists(conn, "inference_job_assignments", "execution_provider")?
+        }
+        "012_add_credit_reservation_and_allowance.sql" => {
+            column_exists(conn, "inference_jobs", "reserved_credits")?
+                && column_exists(conn, "inference_jobs", "settled_credits")?
+                && column_exists(conn, "inference_jobs", "released_credits")?
+                && column_exists(conn, "inference_jobs", "available_completion_tokens")?
+                && column_exists(conn, "inference_jobs", "model_size_factor")?
+        }
         _ => false,
     })
 }

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod consumption_policy;
 pub mod connectivity;
 pub mod credit_policy;
 pub mod db;

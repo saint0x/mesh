@@ -80,6 +80,8 @@ pub struct LedgerEvent {
 pub enum LedgerEventType {
     JobStarted,
     JobCompleted,
+    CreditsReserved,
+    CreditsReleased,
     CreditsBurned,
     CreditsEarned,
 }
@@ -89,6 +91,8 @@ impl LedgerEventType {
         match self {
             LedgerEventType::JobStarted => "job_started",
             LedgerEventType::JobCompleted => "job_completed",
+            LedgerEventType::CreditsReserved => "credits_reserved",
+            LedgerEventType::CreditsReleased => "credits_released",
             LedgerEventType::CreditsBurned => "credits_burned",
             LedgerEventType::CreditsEarned => "credits_earned",
         }
@@ -102,6 +106,8 @@ impl std::str::FromStr for LedgerEventType {
         match s {
             "job_started" => Ok(LedgerEventType::JobStarted),
             "job_completed" => Ok(LedgerEventType::JobCompleted),
+            "credits_reserved" => Ok(LedgerEventType::CreditsReserved),
+            "credits_released" => Ok(LedgerEventType::CreditsReleased),
             "credits_burned" => Ok(LedgerEventType::CreditsBurned),
             "credits_earned" => Ok(LedgerEventType::CreditsEarned),
             _ => Err(format!("Invalid ledger event type: {}", s)),

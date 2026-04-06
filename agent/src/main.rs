@@ -53,6 +53,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 use tracing::{error, info, warn};
@@ -140,6 +141,12 @@ enum DeviceCommands {
     },
     /// Run the production agent daemon
     Start {
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(short, long, default_value = "info")]
+        log_level: String,
+    },
+    #[command(hide = true)]
+    Runtime {
         /// Log level (trace, debug, info, warn, error)
         #[arg(short, long, default_value = "info")]
         log_level: String,
@@ -298,7 +305,11 @@ async fn main() -> Result<()> {
             }
             DeviceCommands::Start { log_level } => {
                 init_production_logging(&log_level, None)?;
-                cmd_start().await?;
+                cmd_start(log_level).await?;
+            }
+            DeviceCommands::Runtime { log_level } => {
+                init_production_logging(&log_level, None)?;
+                cmd_runtime().await?;
             }
             DeviceCommands::Status => {
                 cmd_status().await?;
@@ -731,6 +742,32 @@ fn resolve_ring_contributed_memory(config: &DeviceConfig, memory: Option<&str>) 
     Ok(config.capabilities.ram_mb as u64 * 1024 * 1024)
 }
 
+fn load_supervised_memory_limit_bytes() -> Result<u64> {
+    let config_path = DeviceConfig::default_path()?;
+    let config = DeviceConfig::load(&config_path)
+        .context("Failed to load device config for runtime memory sizing")?;
+    let baseline = resolve_ring_contributed_memory(&config, None)?;
+    Ok(baseline.saturating_mul(2).max(512 * 1024 * 1024))
+}
+
+#[cfg(unix)]
+fn apply_runtime_rlimits(memory_limit_bytes: u64) -> Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: memory_limit_bytes as libc::rlim_t,
+        rlim_max: memory_limit_bytes as libc::rlim_t,
+    };
+
+    let result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
+    if result != 0 {
+        return Err(anyhow::anyhow!(
+            "setrlimit(RLIMIT_AS) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct InferenceJobStatusResponse {
     success: bool,
@@ -741,6 +778,11 @@ struct InferenceJobStatusResponse {
     completion: Option<String>,
     completion_tokens: u32,
     execution_time_ms: u64,
+    reserved_credits: f64,
+    settled_credits: f64,
+    released_credits: f64,
+    available_completion_tokens: u32,
+    model_size_factor: f64,
     error: Option<String>,
     assignments: Vec<InferenceJobAssignmentStatus>,
 }
@@ -795,7 +837,69 @@ fn control_plane_url(config: &DeviceConfig, path: &str) -> String {
 }
 
 /// Run agent daemon
-async fn cmd_start() -> Result<()> {
+async fn cmd_start(log_level: String) -> Result<()> {
+    println!("🛡️  Starting Mesh inference supervisor...\n");
+
+    let current_exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let mut restart_attempt = 0_u32;
+
+    loop {
+        restart_attempt += 1;
+        info!(attempt = restart_attempt, "Launching isolated runtime child");
+
+        let mut command = tokio::process::Command::new(&current_exe);
+        command
+            .arg("device")
+            .arg("runtime")
+            .arg("--log-level")
+            .arg(&log_level)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+
+        #[cfg(unix)]
+        {
+            let memory_limit = load_supervised_memory_limit_bytes()?;
+            unsafe {
+                command.pre_exec(move || {
+                    apply_runtime_rlimits(memory_limit)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                });
+            }
+        }
+
+        let mut child = command
+            .spawn()
+            .context("Failed to spawn isolated runtime child")?;
+
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.context("Failed to wait for isolated runtime child")?;
+                if status.success() {
+                    info!("Runtime child exited cleanly");
+                    return Ok(());
+                }
+
+                warn!(
+                    status = ?status,
+                    attempt = restart_attempt,
+                    "Runtime child exited unexpectedly; restarting"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("Failed to listen for ctrl-c")?;
+                info!("Supervisor received shutdown signal");
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn cmd_runtime() -> Result<()> {
     println!("🚀 Starting Mesh AI agent daemon...\n");
 
     // Load device configuration
@@ -1323,7 +1427,9 @@ async fn cmd_start() -> Result<()> {
                 assignment_id = %assignment.assignment_id,
                 model = %assignment.model_id,
                 prompt_len = assignment.prompt_tokens.len(),
-                max_tokens = assignment.max_tokens,
+                requested_max_tokens = assignment.max_tokens,
+                allowed_completion_tokens = assignment.available_completion_tokens,
+                reserved_credits = assignment.reserved_credits,
                 "Claimed distributed inference assignment"
             );
 
@@ -1387,7 +1493,7 @@ async fn cmd_start() -> Result<()> {
                 model_id: assignment.model_id.clone(),
                 prompt_tokens: assignment.prompt_tokens.clone(),
                 config: GenerationConfig {
-                    max_tokens: assignment.max_tokens,
+                    max_tokens: assignment.available_completion_tokens.min(assignment.max_tokens),
                     temperature: assignment.temperature,
                     top_p: assignment.top_p,
                     ..Default::default()
@@ -2173,6 +2279,11 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
     println!("  Status:          {}", status.status);
     println!("  Tokens:          {}", status.completion_tokens);
     println!("  Execution Time:  {}ms", status.execution_time_ms);
+    println!("  Reserved Credits:{:.3}", status.reserved_credits);
+    println!("  Settled Credits: {:.3}", status.settled_credits);
+    println!("  Released Credits:{:.3}", status.released_credits);
+    println!("  Token Allowance: {}", status.available_completion_tokens);
+    println!("  Model Factor:    {:.3}", status.model_size_factor);
     if let Some(error) = &status.error {
         println!("  Error:           {}", error.red());
     }

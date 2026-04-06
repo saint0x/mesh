@@ -379,6 +379,10 @@ pub struct SubmitInferenceResponse {
     pub completion_tokens: u32,
     /// Total execution time in milliseconds
     pub execution_time_ms: u64,
+    /// Credits reserved up front to authorize this job
+    pub reserved_credits: f64,
+    /// Model-normalized completion token ceiling enforced for this job
+    pub available_completion_tokens: u32,
     /// Error message if failed
     pub error: Option<String>,
 }
@@ -396,6 +400,9 @@ pub struct InferenceAssignment {
     pub max_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,
+    pub reserved_credits: f64,
+    pub available_completion_tokens: u32,
+    pub model_size_factor: f64,
     pub lease_expires_at: String,
 }
 
@@ -441,6 +448,11 @@ pub struct InferenceJobStatusResponse {
     pub completion: Option<String>,
     pub completion_tokens: u32,
     pub execution_time_ms: u64,
+    pub reserved_credits: f64,
+    pub settled_credits: f64,
+    pub released_credits: f64,
+    pub available_completion_tokens: u32,
+    pub model_size_factor: f64,
     pub error: Option<String>,
     pub assignments: Vec<InferenceJobAssignmentStatus>,
 }
