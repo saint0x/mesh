@@ -410,6 +410,35 @@ pub async fn get_inference_job_status(
     }))
 }
 
+#[instrument(skip(state))]
+pub async fn cancel_inference_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if job_id.is_empty() {
+        return Err(ApiError::BadRequest("job_id cannot be empty".to_string()));
+    }
+
+    let db = state.db.clone();
+    let result = tokio::task::spawn_blocking(move || cancel_job(&db, &job_id))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "job_id": result.job_id,
+        "status": result.status,
+        "released_credits": result.released_credits,
+    })))
+}
+
+#[derive(Debug, Clone)]
+struct CancelledJobResult {
+    job_id: String,
+    status: String,
+    released_credits: f64,
+}
+
 fn validate_submit_request(req: &SubmitInferenceRequest) -> ApiResult<()> {
     if req.device_id.is_empty() {
         return Err(ApiError::BadRequest(
@@ -433,6 +462,114 @@ fn validate_submit_request(req: &SubmitInferenceRequest) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+fn cancel_job(db: &crate::db::Database, job_id: &str) -> ApiResult<CancelledJobResult> {
+    let mut conn = db.get_conn()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let job_context = load_job_context(&tx, job_id)?;
+    let current_state = load_job_settlement_state(&tx, job_id)?;
+    let current_status: String = tx
+        .query_row(
+            "SELECT status FROM inference_jobs WHERE job_id = ?",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    if !matches!(current_status.as_str(), "dispatched" | "running") {
+        return Err(ApiError::Conflict(format!(
+            "Job {} cannot be cancelled from status {}",
+            job_id, current_status
+        )));
+    }
+
+    let now = now_rfc3339()?;
+    let released_credits = if current_state.released_credits > f64::EPSILON {
+        current_state.released_credits
+    } else {
+        job_context.reserved_credits
+    };
+
+    tx.execute(
+        r#"
+        UPDATE inference_job_assignments
+        SET status = CASE
+                WHEN status IN ('pending', 'leased', 'acknowledged') THEN 'cancelled'
+                ELSE status
+            END,
+            completed_at = COALESCE(completed_at, ?),
+            lease_expires_at = NULL,
+            failure_reason = CASE
+                WHEN status IN ('pending', 'leased', 'acknowledged') THEN 'cancelled'
+                ELSE failure_reason
+            END
+        WHERE job_id = ?
+        "#,
+        params![&now, job_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    tx.execute(
+        r#"
+        UPDATE inference_jobs
+        SET status = 'cancelled',
+            completed_at = COALESCE(completed_at, ?),
+            updated_at = ?,
+            error = COALESCE(error, 'cancelled by operator'),
+            released_credits = CASE
+                WHEN released_credits > 0 THEN released_credits
+                ELSE ?
+            END
+        WHERE job_id = ?
+        "#,
+        params![&now, &now, released_credits, job_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    if current_state.released_credits <= f64::EPSILON {
+        insert_ledger_event(
+            &tx,
+            &job_context.network_id,
+            "credits_released",
+            Some(job_id),
+            Some(&job_context.submitted_by_device_id),
+            None,
+            serde_json::json!({
+                "credit_model": "consumption_v1",
+                "model_id": job_context.model_id,
+                "reserved_credits": job_context.reserved_credits,
+                "release_reason": "job_cancelled",
+            }),
+        )?;
+    }
+
+    insert_ledger_event(
+        &tx,
+        &job_context.network_id,
+        "job_cancelled",
+        Some(job_id),
+        Some(&job_context.submitted_by_device_id),
+        None,
+        serde_json::json!({
+            "credit_model": "consumption_v1",
+            "model_id": job_context.model_id,
+            "reserved_credits_released": released_credits,
+            "cancelled_by_device_id": job_context.submitted_by_device_id,
+        }),
+    )?;
+
+    tx.commit()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    Ok(CancelledJobResult {
+        job_id: job_id.to_string(),
+        status: "cancelled".to_string(),
+        released_credits,
+    })
 }
 
 fn execution_provider_label(provider: ExecutionProviderKind) -> &'static str {

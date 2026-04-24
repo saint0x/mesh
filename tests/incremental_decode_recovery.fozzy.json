@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "incremental-decode-recovery-gate",
+  "steps": [
+    {
+      "name": "incremental decode matches full recompute",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "--lib",
+        "inference::forward_pass::tests::test_local_incremental_decode_matches_full_recompute",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "checkpoint recovery preserves sequence position",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "--lib",
+        "checkpoint::manager::tests::test_save_and_load_checkpoint_kv_cache",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

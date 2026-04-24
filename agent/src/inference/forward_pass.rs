@@ -45,7 +45,7 @@
 //! ```
 
 use crate::errors::Result;
-use crate::executor::ring_allreduce::WorkerRing;
+use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use candle_core::Tensor as CandleTensor;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -54,9 +54,8 @@ use uuid::Uuid;
 
 use super::kv_cache::KVCache;
 use super::tensor_ops::{
-    apply_rope, apply_rope_candle, causal_self_attention_candle, causal_self_attention_gpu,
-    embed_tokens, from_candle_2d, matmul, rms_norm, rms_norm_candle, sample_greedy, sample_token,
-    silu, silu_candle, to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
+    apply_rope, apply_rope_candle, embed_tokens, from_candle_2d, matmul, rms_norm, rms_norm_candle,
+    sample_greedy, sample_token, silu, silu_candle, to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
 
 /// Weights for a single transformer layer (sharded)
@@ -256,8 +255,161 @@ fn partition_columns(total_columns: usize, worker_position: u32, total_workers: 
     }
 }
 
-fn causal_self_attention(q: &Tensor2D, k: &Tensor2D, v: &Tensor2D, scale: f32) -> Result<Tensor2D> {
-    causal_self_attention_gpu(q, k, v, scale)
+fn causal_attention_with_prefix(
+    q: &Tensor2D,
+    k: &Tensor2D,
+    v: &Tensor2D,
+    scale: f32,
+    prefix_len: usize,
+) -> Result<Tensor2D> {
+    if q.cols != k.cols || k.cols != v.cols || k.rows != v.rows {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Attention shape mismatch: q {}x{}, k {}x{}, v {}x{}",
+            q.rows, q.cols, k.rows, k.cols, v.rows, v.cols
+        )));
+    }
+
+    let mut out = Tensor2D::zeros(q.rows, v.cols);
+    for q_row in 0..q.rows {
+        let q_slice = q.row(q_row);
+        let max_k = prefix_len + q_row + 1;
+        if max_k > k.rows {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Attention prefix exceeds cached sequence: prefix {} query_row {} cache_rows {}",
+                prefix_len, q_row, k.rows
+            )));
+        }
+
+        let mut scores = Vec::with_capacity(max_k);
+        let mut max_score = f32::NEG_INFINITY;
+        for k_row in 0..max_k {
+            let k_slice = k.row(k_row);
+            let score = q_slice
+                .iter()
+                .zip(k_slice.iter())
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum::<f32>()
+                * scale;
+            max_score = max_score.max(score);
+            scores.push(score);
+        }
+
+        let mut exp_sum = 0.0;
+        for score in &mut scores {
+            *score = (*score - max_score).exp();
+            exp_sum += *score;
+        }
+
+        for (k_row, prob) in scores.into_iter().enumerate() {
+            let weight = prob / exp_sum;
+            let v_slice = v.row(k_row);
+            for (col_idx, value) in v_slice.iter().enumerate() {
+                out.data[q_row * out.cols + col_idx] += weight * value;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn validate_positions(absolute_positions: &[u32], expected_start: usize) -> Result<()> {
+    if absolute_positions.is_empty() {
+        return Err(crate::errors::AgentError::Execution(
+            "Attention positions cannot be empty".to_string(),
+        ));
+    }
+
+    for (offset, position) in absolute_positions.iter().enumerate() {
+        let expected = expected_start + offset;
+        if *position as usize != expected {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Non-contiguous attention positions: expected {}, got {}",
+                expected, position
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn build_positions(start: usize, count: usize) -> Vec<u32> {
+    (start..start + count)
+        .map(|position| position as u32)
+        .collect()
+}
+
+fn causal_attention_with_prefix_candle(
+    q_t: &CandleTensor,
+    k_t: &CandleTensor,
+    v_t: &CandleTensor,
+    q_rows: usize,
+    k_rows: usize,
+    cols: usize,
+    scale: f32,
+    prefix_len: usize,
+) -> Result<CandleTensor> {
+    if prefix_len + q_rows > k_rows {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Attention prefix exceeds cache: prefix {} + query_rows {} > key_rows {}",
+            prefix_len, q_rows, k_rows
+        )));
+    }
+
+    let q_t = q_t.contiguous().map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let k_t = k_t
+        .transpose(0, 1)
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?
+        .contiguous()
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+    let v_t = v_t.contiguous().map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let scores = q_t.matmul(&k_t).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let scores = scores.affine(scale as f64, 0.0).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+
+    let mut mask = vec![f32::NEG_INFINITY; q_rows * k_rows];
+    for q_row in 0..q_rows {
+        let max_k = prefix_len + q_row + 1;
+        for k_row in 0..max_k {
+            mask[q_row * k_rows + k_row] = 0.0;
+        }
+    }
+    let mask = CandleTensor::from_vec(mask, (q_rows, k_rows), q_t.device()).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let masked = scores.broadcast_add(&mask).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let probs = candle_nn::ops::softmax(&masked, 1).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let output = probs
+        .contiguous()
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?
+        .matmul(&v_t)
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+    let dims = output.dims();
+    if dims != [q_rows, cols] {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "GPU attention output shape mismatch: expected [{}, {}], got {:?}",
+            q_rows, cols, dims
+        )));
+    }
+    Ok(output)
 }
 
 fn attention_output(
@@ -266,6 +418,7 @@ fn attention_output(
     worker_position: u32,
     total_workers: u32,
     layer_idx: usize,
+    absolute_positions: &[u32],
     q_local: Tensor2D,
     k_local: Tensor2D,
     v_local: Tensor2D,
@@ -317,17 +470,19 @@ fn attention_output(
         partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
     let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
 
-    let positions: Vec<u32> = (0..q_local.rows as u32).collect();
-    let q_rope = apply_rope(&q_local, &positions, head_dim, config.rope_base)?;
-    let k_rope = apply_rope(&k_local, &positions, head_dim, config.rope_base)?;
+    let cache_prefix_len = kv_cache.layer_seq_len(layer_idx)?;
+    validate_positions(absolute_positions, cache_prefix_len)?;
+    let q_rope = apply_rope(&q_local, absolute_positions, head_dim, config.rope_base)?;
+    let k_rope = apply_rope(&k_local, absolute_positions, head_dim, config.rope_base)?;
 
-    kv_cache.update_layer(layer_idx, k_rope.clone(), v_local.clone())?;
+    kv_cache.append_layer(layer_idx, k_rope, v_local)?;
+    let (cached_k, cached_v) = kv_cache.get_layer_kv(layer_idx)?;
 
     let local_q_heads = q_local.cols / head_dim;
-    let local_kv_heads = k_local.cols / head_dim;
+    let local_kv_heads = cached_k.cols / head_dim;
     let q_heads = split_heads(&q_rope, local_q_heads, head_dim)?;
-    let k_heads = split_heads(&k_rope, local_kv_heads, head_dim)?;
-    let v_heads = split_heads(&v_local, local_kv_heads, head_dim)?;
+    let k_heads = split_heads(cached_k, local_kv_heads, head_dim)?;
+    let v_heads = split_heads(cached_v, local_kv_heads, head_dim)?;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     let mut output_heads = Vec::with_capacity(local_q_heads);
@@ -344,11 +499,12 @@ fn attention_output(
             )));
         }
         let local_kv_idx = global_kv_head - kv_head_start;
-        output_heads.push(causal_self_attention(
+        output_heads.push(causal_attention_with_prefix(
             q_head,
             &k_heads[local_kv_idx],
             &v_heads[local_kv_idx],
             scale,
+            cache_prefix_len,
         )?);
     }
 
@@ -425,6 +581,9 @@ pub struct ForwardPass {
 
     /// Current position in sequence
     pub position: usize,
+
+    /// Aggregated ring all-reduce timings from the last forward invocation.
+    pub last_allreduce_metrics: RingAllReduceMetrics,
 }
 
 impl ForwardPass {
@@ -455,6 +614,7 @@ impl ForwardPass {
             worker_position,
             total_workers,
             position: 0,
+            last_allreduce_metrics: RingAllReduceMetrics::default(),
         })
     }
 
@@ -483,6 +643,7 @@ impl ForwardPass {
         &mut self,
         hidden: &CandleTensor,
         layer_idx: usize,
+        absolute_positions: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<CandleTensor> {
@@ -523,6 +684,7 @@ impl ForwardPass {
             self.worker_position,
             self.total_workers,
             layer_idx,
+            absolute_positions,
             q_partial,
             k_partial,
             v_partial,
@@ -618,74 +780,53 @@ impl ForwardPass {
     }
 
     /// Run full forward pass for all layers
-    pub async fn forward(
+    pub async fn prefill(
         &mut self,
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<CandleTensor> {
-        let start = Instant::now();
-        self.kv_cache.clear();
-
-        // 1. Embed tokens
-        let mut hidden = self.embed(tokens)?;
-        let hidden_dims = hidden.dims();
-        debug!(
-            "Embedded {} tokens -> {:?}",
-            tokens.len(),
-            (hidden_dims[0], hidden_dims[1])
-        );
-
-        // 2. Run through all layers
-        for layer_idx in 0..self.config.num_layers {
-            hidden = self
-                .forward_layer(&hidden, layer_idx, worker_ring, job_id)
-                .await?;
+    ) -> Result<Tensor1D> {
+        if tokens.is_empty() {
+            return Err(crate::errors::AgentError::Execution(
+                "Cannot prefill an empty prompt without an explicit BOS policy".to_string(),
+            ));
         }
 
-        // 3. Apply final norm
-        hidden = rms_norm_candle(
-            &hidden,
-            &self.device_weights.final_norm,
-            self.config.rms_norm_eps,
-        )?;
-
-        info!(
-            "Full forward pass complete: {} layers in {:?}",
-            self.config.num_layers,
-            start.elapsed()
-        );
-
-        Ok(hidden)
+        self.clear_cache();
+        let hidden = self.forward_tokens(tokens, 0, worker_ring, job_id).await?;
+        self.position = tokens.len();
+        self.compute_logits(&hidden)
     }
 
-    /// Generate next token using full forward pass
-    pub async fn generate_next_token(
+    pub async fn decode_step(
         &mut self,
-        tokens: &[u32],
+        token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-        temperature: f32,
-        top_p: f32,
-    ) -> Result<u32> {
-        // Run forward pass
-        let hidden = self.forward(tokens, worker_ring, job_id).await?;
+    ) -> Result<Tensor1D> {
+        if self.position == 0 {
+            return Err(crate::errors::AgentError::Execution(
+                "Decode step requested before prompt prefill".to_string(),
+            ));
+        }
+        if self.kv_cache.seq_len() != self.position {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Forward pass position {} diverged from KV cache length {}",
+                self.position,
+                self.kv_cache.seq_len()
+            )));
+        }
 
-        // Compute logits
-        let logits = self.compute_logits(&hidden)?;
-
-        // Sample
-        let seed = job_id.as_u128() as u64 ^ self.position as u64;
-        let next_token = self.sample(&logits, temperature, top_p, seed);
-
+        let hidden = self
+            .forward_tokens(&[token], self.position, worker_ring, job_id)
+            .await?;
         self.position += 1;
-
-        Ok(next_token)
+        self.compute_logits(&hidden)
     }
 
     /// Helper: Convert Tensor2D to ring all-reduce format and back
     async fn ring_allreduce_candle(
-        &self,
+        &mut self,
         tensor: &CandleTensor,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
@@ -699,6 +840,8 @@ impl ForwardPass {
         let reduced = worker_ring
             .ring_all_reduce_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
             .await?;
+        self.last_allreduce_metrics
+            .accumulate(worker_ring.last_run_metrics());
 
         // Convert back to 2D
         let host = Tensor2D::from_allreduce_tensor(&reduced)?;
@@ -715,6 +858,62 @@ impl ForwardPass {
     pub fn cache_memory_usage(&self) -> usize {
         self.kv_cache.memory_usage()
     }
+
+    pub fn cache_seq_len(&self) -> usize {
+        self.kv_cache.seq_len()
+    }
+
+    async fn forward_tokens(
+        &mut self,
+        tokens: &[u32],
+        absolute_position_start: usize,
+        worker_ring: &mut WorkerRing<'_>,
+        job_id: Uuid,
+    ) -> Result<CandleTensor> {
+        if tokens.is_empty() {
+            return Err(crate::errors::AgentError::Execution(
+                "Forward pass requires at least one token".to_string(),
+            ));
+        }
+        let start = Instant::now();
+        let absolute_positions = build_positions(absolute_position_start, tokens.len());
+        self.last_allreduce_metrics = RingAllReduceMetrics::default();
+
+        let mut hidden = self.embed(tokens)?;
+        let hidden_dims = hidden.dims();
+        debug!(
+            "Embedded {} tokens -> {:?} at positions {}..{}",
+            tokens.len(),
+            (hidden_dims[0], hidden_dims[1]),
+            absolute_position_start,
+            absolute_position_start + tokens.len() - 1
+        );
+
+        for layer_idx in 0..self.config.num_layers {
+            hidden = self
+                .forward_layer(&hidden, layer_idx, &absolute_positions, worker_ring, job_id)
+                .await?;
+        }
+
+        hidden = rms_norm_candle(
+            &hidden,
+            &self.device_weights.final_norm,
+            self.config.rms_norm_eps,
+        )?;
+
+        info!(
+            positions = format!(
+                "{}..{}",
+                absolute_position_start,
+                absolute_position_start + tokens.len() - 1
+            ),
+            layers = self.config.num_layers,
+            elapsed_ms = start.elapsed().as_millis(),
+            "Forward pass segment complete"
+        );
+
+        Ok(hidden)
+    }
 }
 
 fn attention_output_device(
@@ -723,6 +922,7 @@ fn attention_output_device(
     worker_position: u32,
     total_workers: u32,
     layer_idx: usize,
+    absolute_positions: &[u32],
     q_local: CandleTensor,
     k_local: CandleTensor,
     v_local: CandleTensor,
@@ -781,12 +981,13 @@ fn attention_output_device(
     let q_head_start =
         partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
     let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
-    let positions: Vec<u32> = (0..q_rows as u32).collect();
+    let cache_prefix_len = kv_cache.layer_seq_len(layer_idx)?;
+    validate_positions(absolute_positions, cache_prefix_len)?;
     let q_rope = apply_rope_candle(
         &q_local,
         q_rows,
         q_cols,
-        &positions,
+        absolute_positions,
         head_dim,
         config.rope_base,
     )?;
@@ -794,16 +995,20 @@ fn attention_output_device(
         &k_local,
         q_rows,
         k_cols,
-        &positions,
+        absolute_positions,
         head_dim,
         config.rope_base,
     )?;
 
-    kv_cache.update_layer(
+    kv_cache.append_layer(
         layer_idx,
         from_candle_2d(&k_rope)?,
         from_candle_2d(&v_local)?,
     )?;
+    let (cached_k, cached_v) = kv_cache.get_layer_kv(layer_idx)?;
+    let cached_k = to_candle_2d(cached_k)?;
+    let cached_v = to_candle_2d(cached_v)?;
+    let cached_seq_len = cached_k.dims()[0];
 
     let local_q_heads = q_cols / head_dim;
     let local_kv_heads = k_cols / head_dim;
@@ -828,18 +1033,25 @@ fn attention_output_device(
             .map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
-        let k_head = k_rope
+        let k_head = cached_k
             .narrow(1, local_kv_idx * head_dim, head_dim)
             .map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
-        let v_head = v_local
+        let v_head = cached_v
             .narrow(1, local_kv_idx * head_dim, head_dim)
             .map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
-        output_heads.push(causal_self_attention_candle(
-            &q_head, &k_head, &v_head, q_rows, head_dim, scale,
+        output_heads.push(causal_attention_with_prefix_candle(
+            &q_head,
+            &k_head,
+            &v_head,
+            q_rows,
+            cached_seq_len,
+            head_dim,
+            scale,
+            cache_prefix_len,
         )?);
     }
 
@@ -879,6 +1091,61 @@ impl LocalForwardPass {
     /// Run forward pass without distribution (for testing)
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Tensor2D> {
         self.kv_cache.clear();
+        let hidden = self.forward_tokens(tokens, 0)?;
+        self.position = tokens.len();
+        Ok(hidden)
+    }
+
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<Tensor1D> {
+        if tokens.is_empty() {
+            return Err(crate::errors::AgentError::Execution(
+                "Cannot prefill an empty prompt without an explicit BOS policy".to_string(),
+            ));
+        }
+
+        self.kv_cache.clear();
+        let hidden = self.forward_tokens(tokens, 0)?;
+        self.position = tokens.len();
+        let last_row = hidden.row(hidden.rows - 1);
+        let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols)?;
+        let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
+        Ok(Tensor1D::new(logits_2d.data))
+    }
+
+    pub fn decode_step(&mut self, token: u32) -> Result<Tensor1D> {
+        if self.position == 0 {
+            return Err(crate::errors::AgentError::Execution(
+                "Decode step requested before prompt prefill".to_string(),
+            ));
+        }
+        if self.kv_cache.seq_len() != self.position {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Local forward pass position {} diverged from KV cache length {}",
+                self.position,
+                self.kv_cache.seq_len()
+            )));
+        }
+
+        let hidden = self.forward_tokens(&[token], self.position)?;
+        self.position += 1;
+        let last_row = hidden.row(hidden.rows - 1);
+        let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols)?;
+        let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
+        Ok(Tensor1D::new(logits_2d.data))
+    }
+
+    fn forward_tokens(
+        &mut self,
+        tokens: &[u32],
+        absolute_position_start: usize,
+    ) -> Result<Tensor2D> {
+        if tokens.is_empty() {
+            return Err(crate::errors::AgentError::Execution(
+                "Forward pass requires at least one token".to_string(),
+            ));
+        }
+        let absolute_positions = build_positions(absolute_position_start, tokens.len());
+
         // Embed tokens
         let mut hidden = embed_tokens(&self.weights.embedding, tokens)?;
 
@@ -898,6 +1165,7 @@ impl LocalForwardPass {
                 0,
                 1,
                 layer_idx,
+                &absolute_positions,
                 q_local,
                 k_local,
                 v_local,
@@ -932,15 +1200,7 @@ impl LocalForwardPass {
         temperature: f32,
         top_p: f32,
     ) -> Result<u32> {
-        let hidden = self.forward(tokens)?;
-
-        // Get last hidden state
-        let last_row = hidden.row(hidden.rows - 1);
-        let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols)?;
-
-        // Project to logits
-        let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
-        let logits = Tensor1D::new(logits_2d.data);
+        let logits = self.prefill(tokens)?;
 
         // Sample
         let seed = self.position as u64;
@@ -950,7 +1210,6 @@ impl LocalForwardPass {
             sample_token(&logits, temperature, top_p, seed)
         };
 
-        self.position += 1;
         Ok(next_token)
     }
 }
@@ -1064,6 +1323,30 @@ mod tests {
 
         // Token should be in vocab range
         assert!(next_token < 100);
+    }
+
+    #[test]
+    fn test_local_incremental_decode_matches_full_recompute() {
+        let config = create_test_config();
+        let weights = create_test_weights(&config, config.hidden_dim);
+        let prompt = vec![1, 2, 3];
+
+        let mut incremental = LocalForwardPass::new(weights.clone());
+        let first_logits = incremental.prefill(&prompt).unwrap();
+        let first_token = sample_greedy(&first_logits);
+        let decode_logits = incremental.decode_step(first_token).unwrap();
+
+        let mut reference = LocalForwardPass::new(weights.clone());
+        let hidden = reference
+            .forward(&[prompt.clone(), vec![first_token]].concat())
+            .unwrap();
+        let last_row = hidden.row(hidden.rows - 1);
+        let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols).unwrap();
+        let reference_logits = Tensor1D::new(matmul(&last_hidden, &weights.lm_head).unwrap().data);
+
+        assert_eq!(decode_logits.data, reference_logits.data);
+        assert_eq!(incremental.kv_cache.seq_len(), prompt.len() + 1);
+        assert_eq!(incremental.position, prompt.len() + 1);
     }
 
     #[test]

@@ -611,18 +611,6 @@ impl InferenceCoordinator {
             .take()
             .expect("active forward pass must be initialized");
 
-        // Build full token sequence (prompt + generated so far)
-        let mut all_tokens = job.request.prompt_tokens.clone();
-        all_tokens.extend(&job.generated_tokens);
-
-        debug!(
-            job_id = %job.request.job_id,
-            total_tokens = all_tokens.len(),
-            "Running forward pass with ring all-reduce"
-        );
-
-        // Run forward pass with ring all-reduce
-        // WorkerRing created per-token (lightweight metadata structure)
         let next_token = {
             let mut worker_ring = WorkerRing::new(
                 position.position,
@@ -634,15 +622,49 @@ impl InferenceCoordinator {
                 self.tensor_plane_mut(),
             );
 
-            forward_pass
-                .generate_next_token(
-                    &all_tokens,
-                    &mut worker_ring,
-                    job.request.job_id,
-                    job.request.config.temperature,
-                    job.request.config.top_p,
-                )
-                .await?
+            let logits = if job.generated_tokens.is_empty() {
+                if job.request.prompt_tokens.is_empty() {
+                    return Err(AgentError::Execution(
+                        "Inference request must contain at least one prompt token".to_string(),
+                    ));
+                }
+                debug!(
+                    job_id = %job.request.job_id,
+                    prompt_tokens = job.request.prompt_tokens.len(),
+                    "Running prompt prefill"
+                );
+                forward_pass
+                    .prefill(
+                        &job.request.prompt_tokens,
+                        &mut worker_ring,
+                        job.request.job_id,
+                    )
+                    .await?
+            } else {
+                let decode_token = *job.generated_tokens.last().ok_or_else(|| {
+                    AgentError::Execution(
+                        "Coordinator entered decode mode without a prior generated token"
+                            .to_string(),
+                    )
+                })?;
+                debug!(
+                    job_id = %job.request.job_id,
+                    decode_token = decode_token,
+                    cache_seq_len = forward_pass.cache_seq_len(),
+                    "Running incremental decode step"
+                );
+                forward_pass
+                    .decode_step(decode_token, &mut worker_ring, job.request.job_id)
+                    .await?
+            };
+
+            let seed = job.request.job_id.as_u128() as u64 ^ forward_pass.position as u64;
+            forward_pass.sample(
+                &logits,
+                job.request.config.temperature,
+                job.request.config.top_p,
+                seed,
+            )
         };
 
         self.active_forward_pass = Some(forward_pass);
@@ -657,6 +679,10 @@ impl InferenceCoordinator {
 
         // Record statistics
         self.stats.record_allreduce(elapsed);
+        if let Some(pass) = self.active_forward_pass.as_ref() {
+            self.stats
+                .record_allreduce_breakdown(pass.last_allreduce_metrics);
+        }
         for _ in 0..weights.config.num_layers {
             self.stats.record_layer();
         }
@@ -682,7 +708,13 @@ impl InferenceCoordinator {
             );
 
             let kv_cache = self.active_forward_pass.as_ref().map(|pass| &pass.kv_cache);
-            manager.save_checkpoint(job, kv_cache).await?;
+            let sequence_position = self
+                .active_forward_pass
+                .as_ref()
+                .map(|pass| pass.position as u32);
+            manager
+                .save_checkpoint(job, kv_cache, sequence_position)
+                .await?;
             self.stats.record_checkpoint();
         }
         Ok(())
@@ -709,7 +741,23 @@ impl InferenceCoordinator {
 
                     if let Some(kv_cache) = manager.load_checkpoint_kv_cache(job_id).await? {
                         forward_pass.kv_cache = kv_cache;
-                        forward_pass.position = job.current_token_idx as usize;
+                        let sequence_position = manager
+                            .load_checkpoint_sequence_position(job_id)
+                            .await?
+                            .ok_or_else(|| {
+                                AgentError::Execution(
+                                    "Checkpoint missing sequence_position for KV recovery"
+                                        .to_string(),
+                                )
+                            })?;
+                        if forward_pass.kv_cache.seq_len() != sequence_position as usize {
+                            return Err(AgentError::Execution(format!(
+                                "Recovered checkpoint sequence_position {} does not match KV cache length {}",
+                                sequence_position,
+                                forward_pass.kv_cache.seq_len()
+                            )));
+                        }
+                        forward_pass.position = sequence_position as usize;
                     }
 
                     self.active_forward_pass = Some(forward_pass);

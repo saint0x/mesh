@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::info;
 
+use crate::executor::ring_allreduce::RingAllReduceMetrics;
 use crate::network::TensorPlaneMetricsSnapshot;
 
 /// Statistics for inference operations
@@ -62,6 +63,13 @@ pub struct InferenceStats {
     /// Total tensor-plane bytes received across ring traffic.
     pub tensor_bytes_received: AtomicU64,
 
+    pub tensor_reduce_scatter_bytes_sent: AtomicU64,
+    pub tensor_reduce_scatter_bytes_received: AtomicU64,
+    pub tensor_all_gather_bytes_sent: AtomicU64,
+    pub tensor_all_gather_bytes_received: AtomicU64,
+    pub tensor_barrier_bytes_sent: AtomicU64,
+    pub tensor_barrier_bytes_received: AtomicU64,
+
     /// Number of outbound sends that had to wait for byte-budget permits.
     pub tensor_outbound_backpressure_wait_count: AtomicU64,
 
@@ -73,6 +81,14 @@ pub struct InferenceStats {
 
     /// Total time spent waiting on the tensor-plane bandwidth governor.
     pub tensor_outbound_bandwidth_wait_ms: AtomicU64,
+
+    pub tensor_send_count: AtomicU64,
+    pub tensor_send_latency_ms: AtomicU64,
+    pub tensor_receive_count: AtomicU64,
+    pub tensor_receive_latency_ms: AtomicU64,
+    pub tensor_receive_queue_wait_ms: AtomicU64,
+    pub tensor_send_timeout_count: AtomicU64,
+    pub tensor_receive_timeout_count: AtomicU64,
 
     /// Number of inbound tensor messages rejected because the bounded queue was full.
     pub tensor_inbound_queue_full_rejections: AtomicU64,
@@ -86,8 +102,18 @@ pub struct InferenceStats {
     /// Current inbound queued tensor bytes waiting for consumption.
     pub tensor_current_inbound_queued_bytes: AtomicU64,
 
+    pub tensor_peak_inbound_queued_bytes: AtomicU64,
+
     /// Current outbound in-flight tensor bytes waiting to complete.
     pub tensor_current_outbound_inflight_bytes: AtomicU64,
+
+    pub tensor_peak_outbound_inflight_bytes: AtomicU64,
+    pub tensor_current_outbound_connections: AtomicU64,
+
+    pub total_reduce_scatter_time_ms: AtomicU64,
+    pub total_all_gather_time_ms: AtomicU64,
+    pub total_allreduce_send_wait_ms: AtomicU64,
+    pub total_allreduce_receive_wait_ms: AtomicU64,
 }
 
 impl Default for InferenceStats {
@@ -117,15 +143,35 @@ impl InferenceStats {
             total_layers_processed: AtomicU64::new(0),
             tensor_bytes_sent: AtomicU64::new(0),
             tensor_bytes_received: AtomicU64::new(0),
+            tensor_reduce_scatter_bytes_sent: AtomicU64::new(0),
+            tensor_reduce_scatter_bytes_received: AtomicU64::new(0),
+            tensor_all_gather_bytes_sent: AtomicU64::new(0),
+            tensor_all_gather_bytes_received: AtomicU64::new(0),
+            tensor_barrier_bytes_sent: AtomicU64::new(0),
+            tensor_barrier_bytes_received: AtomicU64::new(0),
             tensor_outbound_backpressure_wait_count: AtomicU64::new(0),
             tensor_outbound_backpressure_wait_ms: AtomicU64::new(0),
             tensor_outbound_bandwidth_wait_count: AtomicU64::new(0),
             tensor_outbound_bandwidth_wait_ms: AtomicU64::new(0),
+            tensor_send_count: AtomicU64::new(0),
+            tensor_send_latency_ms: AtomicU64::new(0),
+            tensor_receive_count: AtomicU64::new(0),
+            tensor_receive_latency_ms: AtomicU64::new(0),
+            tensor_receive_queue_wait_ms: AtomicU64::new(0),
+            tensor_send_timeout_count: AtomicU64::new(0),
+            tensor_receive_timeout_count: AtomicU64::new(0),
             tensor_inbound_queue_full_rejections: AtomicU64::new(0),
             tensor_inbound_byte_budget_rejections: AtomicU64::new(0),
             tensor_oversized_message_rejections: AtomicU64::new(0),
             tensor_current_inbound_queued_bytes: AtomicU64::new(0),
             tensor_current_outbound_inflight_bytes: AtomicU64::new(0),
+            tensor_peak_inbound_queued_bytes: AtomicU64::new(0),
+            tensor_peak_outbound_inflight_bytes: AtomicU64::new(0),
+            tensor_current_outbound_connections: AtomicU64::new(0),
+            total_reduce_scatter_time_ms: AtomicU64::new(0),
+            total_all_gather_time_ms: AtomicU64::new(0),
+            total_allreduce_send_wait_ms: AtomicU64::new(0),
+            total_allreduce_receive_wait_ms: AtomicU64::new(0),
         }
     }
 
@@ -162,6 +208,17 @@ impl InferenceStats {
         self.total_layers_processed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_allreduce_breakdown(&self, metrics: RingAllReduceMetrics) {
+        self.total_reduce_scatter_time_ms
+            .fetch_add(metrics.reduce_scatter_step_time_ms, Ordering::Relaxed);
+        self.total_all_gather_time_ms
+            .fetch_add(metrics.all_gather_step_time_ms, Ordering::Relaxed);
+        self.total_allreduce_send_wait_ms
+            .fetch_add(metrics.send_wait_time_ms, Ordering::Relaxed);
+        self.total_allreduce_receive_wait_ms
+            .fetch_add(metrics.receive_wait_time_ms, Ordering::Relaxed);
+    }
+
     /// Record a checkpoint creation
     pub fn record_checkpoint(&self) {
         self.checkpoints_created.fetch_add(1, Ordering::Relaxed);
@@ -196,6 +253,18 @@ impl InferenceStats {
             .store(snapshot.bytes_sent, Ordering::Relaxed);
         self.tensor_bytes_received
             .store(snapshot.bytes_received, Ordering::Relaxed);
+        self.tensor_reduce_scatter_bytes_sent
+            .store(snapshot.reduce_scatter_bytes_sent, Ordering::Relaxed);
+        self.tensor_reduce_scatter_bytes_received
+            .store(snapshot.reduce_scatter_bytes_received, Ordering::Relaxed);
+        self.tensor_all_gather_bytes_sent
+            .store(snapshot.all_gather_bytes_sent, Ordering::Relaxed);
+        self.tensor_all_gather_bytes_received
+            .store(snapshot.all_gather_bytes_received, Ordering::Relaxed);
+        self.tensor_barrier_bytes_sent
+            .store(snapshot.barrier_bytes_sent, Ordering::Relaxed);
+        self.tensor_barrier_bytes_received
+            .store(snapshot.barrier_bytes_received, Ordering::Relaxed);
         self.tensor_outbound_backpressure_wait_count
             .store(snapshot.outbound_backpressure_wait_count, Ordering::Relaxed);
         self.tensor_outbound_backpressure_wait_ms
@@ -204,6 +273,20 @@ impl InferenceStats {
             .store(snapshot.outbound_bandwidth_wait_count, Ordering::Relaxed);
         self.tensor_outbound_bandwidth_wait_ms
             .store(snapshot.outbound_bandwidth_wait_ms, Ordering::Relaxed);
+        self.tensor_send_count
+            .store(snapshot.send_count, Ordering::Relaxed);
+        self.tensor_send_latency_ms
+            .store(snapshot.send_latency_ms, Ordering::Relaxed);
+        self.tensor_receive_count
+            .store(snapshot.receive_count, Ordering::Relaxed);
+        self.tensor_receive_latency_ms
+            .store(snapshot.receive_latency_ms, Ordering::Relaxed);
+        self.tensor_receive_queue_wait_ms
+            .store(snapshot.receive_queue_wait_ms, Ordering::Relaxed);
+        self.tensor_send_timeout_count
+            .store(snapshot.send_timeout_count, Ordering::Relaxed);
+        self.tensor_receive_timeout_count
+            .store(snapshot.receive_timeout_count, Ordering::Relaxed);
         self.tensor_inbound_queue_full_rejections
             .store(snapshot.inbound_queue_full_rejections, Ordering::Relaxed);
         self.tensor_inbound_byte_budget_rejections
@@ -212,8 +295,14 @@ impl InferenceStats {
             .store(snapshot.oversized_message_rejections, Ordering::Relaxed);
         self.tensor_current_inbound_queued_bytes
             .store(snapshot.current_inbound_queued_bytes, Ordering::Relaxed);
+        self.tensor_peak_inbound_queued_bytes
+            .store(snapshot.peak_inbound_queued_bytes, Ordering::Relaxed);
         self.tensor_current_outbound_inflight_bytes
             .store(snapshot.current_outbound_inflight_bytes, Ordering::Relaxed);
+        self.tensor_peak_outbound_inflight_bytes
+            .store(snapshot.peak_outbound_inflight_bytes, Ordering::Relaxed);
+        self.tensor_current_outbound_connections
+            .store(snapshot.current_outbound_connections, Ordering::Relaxed);
     }
 
     /// Get total jobs (completed + failed)
@@ -302,6 +391,12 @@ impl InferenceStats {
             recovery_attempts = recovery_attempts,
             tensor_bytes_sent = self.tensor_bytes_sent.load(Ordering::Relaxed),
             tensor_bytes_received = self.tensor_bytes_received.load(Ordering::Relaxed),
+            tensor_reduce_scatter_bytes_sent = self
+                .tensor_reduce_scatter_bytes_sent
+                .load(Ordering::Relaxed),
+            tensor_all_gather_bytes_sent = self
+                .tensor_all_gather_bytes_sent
+                .load(Ordering::Relaxed),
             tensor_backpressure_waits = self
                 .tensor_outbound_backpressure_wait_count
                 .load(Ordering::Relaxed),
@@ -407,6 +502,11 @@ impl InferenceStats {
             self.tensor_oversized_message_rejections
                 .load(Ordering::Relaxed)
         );
+        println!(
+            "  Open Connections:    {}",
+            self.tensor_current_outbound_connections
+                .load(Ordering::Relaxed)
+        );
 
         println!("\n{}", "Fault Tolerance:".bold());
         println!(
@@ -441,38 +541,275 @@ impl InferenceStats {
 
     /// Serialize to JSON for persistence
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "jobs_completed": self.jobs_completed.load(Ordering::Relaxed),
-            "jobs_failed": self.jobs_failed.load(Ordering::Relaxed),
-            "total_tokens_generated": self.total_tokens_generated.load(Ordering::Relaxed),
-            "total_prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
-            "total_inference_time_ms": self.total_inference_time_ms.load(Ordering::Relaxed),
-            "total_allreduce_time_ms": self.total_allreduce_time_ms.load(Ordering::Relaxed),
-            "allreduce_operations": self.allreduce_operations.load(Ordering::Relaxed),
-            "total_layers_processed": self.total_layers_processed.load(Ordering::Relaxed),
-            "checkpoints_created": self.checkpoints_created.load(Ordering::Relaxed),
-            "checkpoint_recoveries": self.checkpoint_recoveries.load(Ordering::Relaxed),
-            "recovery_attempts": self.recovery_attempts.load(Ordering::Relaxed),
-            "recovery_cooldown_rejections": self.recovery_cooldown_rejections.load(Ordering::Relaxed),
-            "recovery_budget_rejections": self.recovery_budget_rejections.load(Ordering::Relaxed),
-            "recovery_checkpoint_misses": self.recovery_checkpoint_misses.load(Ordering::Relaxed),
-            "tensor_bytes_sent": self.tensor_bytes_sent.load(Ordering::Relaxed),
-            "tensor_bytes_received": self.tensor_bytes_received.load(Ordering::Relaxed),
-            "tensor_outbound_backpressure_wait_count": self.tensor_outbound_backpressure_wait_count.load(Ordering::Relaxed),
-            "tensor_outbound_backpressure_wait_ms": self.tensor_outbound_backpressure_wait_ms.load(Ordering::Relaxed),
-            "tensor_outbound_bandwidth_wait_count": self.tensor_outbound_bandwidth_wait_count.load(Ordering::Relaxed),
-            "tensor_outbound_bandwidth_wait_ms": self.tensor_outbound_bandwidth_wait_ms.load(Ordering::Relaxed),
-            "tensor_inbound_queue_full_rejections": self.tensor_inbound_queue_full_rejections.load(Ordering::Relaxed),
-            "tensor_inbound_byte_budget_rejections": self.tensor_inbound_byte_budget_rejections.load(Ordering::Relaxed),
-            "tensor_oversized_message_rejections": self.tensor_oversized_message_rejections.load(Ordering::Relaxed),
-            "tensor_current_inbound_queued_bytes": self.tensor_current_inbound_queued_bytes.load(Ordering::Relaxed),
-            "tensor_current_outbound_inflight_bytes": self.tensor_current_outbound_inflight_bytes.load(Ordering::Relaxed),
-            "success_rate": self.success_rate(),
-            "avg_tokens_per_second": self.avg_tokens_per_second(),
-            "avg_allreduce_latency_ms": self.avg_allreduce_latency_ms(),
-            "uptime": self.uptime_string(),
-            "last_updated": chrono::Local::now().to_rfc3339(),
-        })
+        let mut map = serde_json::Map::new();
+        let insert_u64 =
+            |map: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: u64| {
+                map.insert(key.to_string(), serde_json::Value::from(value));
+            };
+
+        insert_u64(
+            &mut map,
+            "jobs_completed",
+            self.jobs_completed.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "jobs_failed",
+            self.jobs_failed.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_tokens_generated",
+            self.total_tokens_generated.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_prompt_tokens",
+            self.total_prompt_tokens.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_inference_time_ms",
+            self.total_inference_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_allreduce_time_ms",
+            self.total_allreduce_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "allreduce_operations",
+            self.allreduce_operations.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_layers_processed",
+            self.total_layers_processed.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "checkpoints_created",
+            self.checkpoints_created.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "checkpoint_recoveries",
+            self.checkpoint_recoveries.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "recovery_attempts",
+            self.recovery_attempts.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "recovery_cooldown_rejections",
+            self.recovery_cooldown_rejections.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "recovery_budget_rejections",
+            self.recovery_budget_rejections.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "recovery_checkpoint_misses",
+            self.recovery_checkpoint_misses.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_bytes_sent",
+            self.tensor_bytes_sent.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_bytes_received",
+            self.tensor_bytes_received.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_reduce_scatter_bytes_sent",
+            self.tensor_reduce_scatter_bytes_sent
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_reduce_scatter_bytes_received",
+            self.tensor_reduce_scatter_bytes_received
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_all_gather_bytes_sent",
+            self.tensor_all_gather_bytes_sent.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_all_gather_bytes_received",
+            self.tensor_all_gather_bytes_received
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_barrier_bytes_sent",
+            self.tensor_barrier_bytes_sent.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_barrier_bytes_received",
+            self.tensor_barrier_bytes_received.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_outbound_backpressure_wait_count",
+            self.tensor_outbound_backpressure_wait_count
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_outbound_backpressure_wait_ms",
+            self.tensor_outbound_backpressure_wait_ms
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_outbound_bandwidth_wait_count",
+            self.tensor_outbound_bandwidth_wait_count
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_outbound_bandwidth_wait_ms",
+            self.tensor_outbound_bandwidth_wait_ms
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_send_count",
+            self.tensor_send_count.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_send_latency_ms",
+            self.tensor_send_latency_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_receive_count",
+            self.tensor_receive_count.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_receive_latency_ms",
+            self.tensor_receive_latency_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_receive_queue_wait_ms",
+            self.tensor_receive_queue_wait_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_send_timeout_count",
+            self.tensor_send_timeout_count.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_receive_timeout_count",
+            self.tensor_receive_timeout_count.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_inbound_queue_full_rejections",
+            self.tensor_inbound_queue_full_rejections
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_inbound_byte_budget_rejections",
+            self.tensor_inbound_byte_budget_rejections
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_oversized_message_rejections",
+            self.tensor_oversized_message_rejections
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_current_inbound_queued_bytes",
+            self.tensor_current_inbound_queued_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_peak_inbound_queued_bytes",
+            self.tensor_peak_inbound_queued_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_current_outbound_inflight_bytes",
+            self.tensor_current_outbound_inflight_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_peak_outbound_inflight_bytes",
+            self.tensor_peak_outbound_inflight_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_current_outbound_connections",
+            self.tensor_current_outbound_connections
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_reduce_scatter_time_ms",
+            self.total_reduce_scatter_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_all_gather_time_ms",
+            self.total_all_gather_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_allreduce_send_wait_ms",
+            self.total_allreduce_send_wait_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_allreduce_receive_wait_ms",
+            self.total_allreduce_receive_wait_ms.load(Ordering::Relaxed),
+        );
+
+        map.insert(
+            "success_rate".to_string(),
+            serde_json::Value::from(self.success_rate()),
+        );
+        map.insert(
+            "avg_tokens_per_second".to_string(),
+            serde_json::Value::from(self.avg_tokens_per_second()),
+        );
+        map.insert(
+            "avg_allreduce_latency_ms".to_string(),
+            serde_json::Value::from(self.avg_allreduce_latency_ms()),
+        );
+        map.insert(
+            "uptime".to_string(),
+            serde_json::Value::from(self.uptime_string()),
+        );
+        map.insert(
+            "last_updated".to_string(),
+            serde_json::Value::from(chrono::Local::now().to_rfc3339()),
+        );
+
+        serde_json::Value::Object(map)
     }
 
     /// Save statistics to file
@@ -583,15 +920,31 @@ mod tests {
         stats.update_tensor_plane_metrics(TensorPlaneMetricsSnapshot {
             bytes_sent: 128,
             bytes_received: 256,
+            reduce_scatter_bytes_sent: 32,
+            reduce_scatter_bytes_received: 64,
+            all_gather_bytes_sent: 48,
+            all_gather_bytes_received: 96,
+            barrier_bytes_sent: 8,
+            barrier_bytes_received: 16,
             outbound_backpressure_wait_count: 3,
             outbound_backpressure_wait_ms: 42,
             outbound_bandwidth_wait_count: 4,
             outbound_bandwidth_wait_ms: 55,
+            send_count: 6,
+            send_latency_ms: 77,
+            receive_count: 9,
+            receive_latency_ms: 88,
+            receive_queue_wait_ms: 21,
+            send_timeout_count: 1,
+            receive_timeout_count: 2,
             inbound_queue_full_rejections: 5,
             inbound_byte_budget_rejections: 7,
             oversized_message_rejections: 11,
             current_inbound_queued_bytes: 13,
+            peak_inbound_queued_bytes: 19,
             current_outbound_inflight_bytes: 17,
+            peak_outbound_inflight_bytes: 23,
+            current_outbound_connections: 2,
         });
 
         assert_eq!(stats.tensor_bytes_sent.load(Ordering::Relaxed), 128);

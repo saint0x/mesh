@@ -5,6 +5,7 @@ pub use capabilities::{DeviceCapabilities, Tier};
 
 use crate::connectivity::NetworkConnectivity;
 use crate::errors::{AgentError, Result};
+use crate::network::TensorPlaneProfile;
 use crate::provider::{resolve_requested_provider, ExecutionProviderKind};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,9 @@ pub struct GovernanceConfig {
     /// Maximum total outbound tensor bytes allowed in flight at once.
     pub tensor_plane_max_outbound_inflight_bytes: usize,
 
+    /// Deployment profile for tensor-plane defaults and tuning.
+    pub tensor_plane_profile: TensorPlaneProfile,
+
     /// Sustained outbound tensor-plane bandwidth budget for this node.
     pub tensor_plane_max_send_bandwidth_bytes_per_sec: u64,
 
@@ -117,7 +121,8 @@ impl Default for GovernanceConfig {
             tensor_plane_max_inbound_messages: 64,
             tensor_plane_max_inbound_queued_bytes: 64 * 1024 * 1024,
             tensor_plane_max_outbound_inflight_bytes: 64 * 1024 * 1024,
-            tensor_plane_max_send_bandwidth_bytes_per_sec: 10 * 1024 * 1024,
+            tensor_plane_profile: TensorPlaneProfile::Conservative,
+            tensor_plane_max_send_bandwidth_bytes_per_sec: 0,
             recovery_max_attempts_per_job: 2,
             recovery_cooldown_ms: 5_000,
             recovery_max_checkpoint_loads_per_minute: 8,
@@ -415,10 +420,14 @@ mod tests {
             64 * 1024 * 1024
         );
         assert_eq!(
+            config.governance.tensor_plane_profile,
+            TensorPlaneProfile::Conservative
+        );
+        assert_eq!(
             config
                 .governance
                 .tensor_plane_max_send_bandwidth_bytes_per_sec,
-            10 * 1024 * 1024
+            0
         );
         assert_eq!(config.governance.recovery_max_attempts_per_job, 2);
         assert_eq!(config.governance.recovery_cooldown_ms, 5_000);
@@ -477,10 +486,14 @@ default_execution_provider = "cuda"
             64 * 1024 * 1024
         );
         assert_eq!(
+            loaded.governance.tensor_plane_profile,
+            TensorPlaneProfile::Conservative
+        );
+        assert_eq!(
             loaded
                 .governance
                 .tensor_plane_max_send_bandwidth_bytes_per_sec,
-            10 * 1024 * 1024
+            0
         );
         assert_eq!(loaded.governance.recovery_max_attempts_per_job, 2);
         assert_eq!(loaded.governance.recovery_cooldown_ms, 5_000);
@@ -535,6 +548,10 @@ default_execution_provider = "cuda"
         assert_eq!(
             original.governance.tensor_plane_max_outbound_inflight_bytes,
             loaded.governance.tensor_plane_max_outbound_inflight_bytes
+        );
+        assert_eq!(
+            original.governance.tensor_plane_profile,
+            loaded.governance.tensor_plane_profile
         );
         assert_eq!(
             original

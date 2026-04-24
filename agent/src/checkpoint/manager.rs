@@ -58,6 +58,7 @@ impl CheckpointManager {
         &self,
         job: &InferenceJob,
         kv_cache: Option<&KVCache>,
+        sequence_position: Option<u32>,
     ) -> Result<CheckpointMetadata> {
         debug!(
             job_id = %job.request.job_id,
@@ -66,7 +67,7 @@ impl CheckpointManager {
         );
 
         // Create checkpoint from job state
-        let checkpoint = self.create_checkpoint(job, kv_cache)?;
+        let checkpoint = self.create_checkpoint(job, kv_cache, sequence_position)?;
 
         // Serialize to CBOR
         let data = checkpoint
@@ -111,49 +112,7 @@ impl CheckpointManager {
 
     /// Load the latest checkpoint for a job
     pub async fn load_checkpoint(&self, job_id: Uuid) -> Result<Option<InferenceJob>> {
-        // Find all checkpoints for this job
-        let job_dir = self.config.checkpoint_dir.join(job_id.to_string());
-
-        if !job_dir.exists() {
-            debug!(job_id = %job_id, "No checkpoint directory found");
-            return Ok(None);
-        }
-
-        // List checkpoint files
-        let mut checkpoints = Vec::new();
-        for entry in std::fs::read_dir(&job_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map(|e| e == "ckpt").unwrap_or(false) {
-                checkpoints.push(path);
-            }
-        }
-
-        if checkpoints.is_empty() {
-            debug!(job_id = %job_id, "No checkpoints found");
-            return Ok(None);
-        }
-
-        // Load and find the latest checkpoint
-        let mut latest: Option<Checkpoint> = None;
-        let mut latest_token_idx = 0;
-
-        for path in checkpoints {
-            match self.load_checkpoint_file(&path).await {
-                Ok(checkpoint) => {
-                    if checkpoint.metadata.token_index >= latest_token_idx {
-                        latest_token_idx = checkpoint.metadata.token_index;
-                        latest = Some(checkpoint);
-                    }
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "Failed to load checkpoint");
-                }
-            }
-        }
-
-        // Convert checkpoint to InferenceJob
-        if let Some(checkpoint) = latest {
+        if let Some(checkpoint) = self.load_latest_checkpoint(job_id).await? {
             let job = self.restore_job(checkpoint)?;
             info!(
                 job_id = %job_id,
@@ -167,35 +126,19 @@ impl CheckpointManager {
     }
 
     pub async fn load_checkpoint_kv_cache(&self, job_id: Uuid) -> Result<Option<KVCache>> {
-        let job_dir = self.config.checkpoint_dir.join(job_id.to_string());
-        if !job_dir.exists() {
-            return Ok(None);
-        }
-
-        let mut checkpoints = Vec::new();
-        for entry in std::fs::read_dir(&job_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map(|e| e == "ckpt").unwrap_or(false) {
-                checkpoints.push(path);
-            }
-        }
-
-        let mut latest: Option<Checkpoint> = None;
-        let mut latest_token_idx = 0;
-        for path in checkpoints {
-            if let Ok(checkpoint) = self.load_checkpoint_file(&path).await {
-                if checkpoint.metadata.token_index >= latest_token_idx {
-                    latest_token_idx = checkpoint.metadata.token_index;
-                    latest = Some(checkpoint);
-                }
-            }
-        }
-
-        Ok(latest
+        Ok(self
+            .load_latest_checkpoint(job_id)
+            .await?
             .and_then(|checkpoint| checkpoint.kv_cache_state)
             .map(|bytes| KVCache::from_bytes(&bytes))
             .transpose()?)
+    }
+
+    pub async fn load_checkpoint_sequence_position(&self, job_id: Uuid) -> Result<Option<u32>> {
+        Ok(self
+            .load_latest_checkpoint(job_id)
+            .await?
+            .and_then(|checkpoint| checkpoint.sequence_position))
     }
 
     /// List all checkpoints for a job
@@ -332,6 +275,7 @@ impl CheckpointManager {
         &self,
         job: &InferenceJob,
         kv_cache: Option<&KVCache>,
+        sequence_position: Option<u32>,
     ) -> Result<Checkpoint> {
         let metadata = CheckpointMetadata::new(
             job.request.job_id,
@@ -369,6 +313,7 @@ impl CheckpointManager {
             generated_tokens: job.generated_tokens.clone(),
             config,
             kv_cache_state: kv_cache.map(KVCache::to_bytes).transpose()?,
+            sequence_position,
             rng_state,
         };
 
@@ -381,6 +326,46 @@ impl CheckpointManager {
         let checkpoint = Checkpoint::from_cbor(&data)
             .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
         Ok(checkpoint)
+    }
+
+    async fn load_latest_checkpoint(&self, job_id: Uuid) -> Result<Option<Checkpoint>> {
+        let job_dir = self.config.checkpoint_dir.join(job_id.to_string());
+        if !job_dir.exists() {
+            debug!(job_id = %job_id, "No checkpoint directory found");
+            return Ok(None);
+        }
+
+        let mut checkpoints = Vec::new();
+        for entry in std::fs::read_dir(&job_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "ckpt").unwrap_or(false) {
+                checkpoints.push(path);
+            }
+        }
+
+        if checkpoints.is_empty() {
+            debug!(job_id = %job_id, "No checkpoints found");
+            return Ok(None);
+        }
+
+        let mut latest: Option<Checkpoint> = None;
+        let mut latest_token_idx = 0;
+        for path in checkpoints {
+            match self.load_checkpoint_file(&path).await {
+                Ok(checkpoint) => {
+                    if checkpoint.metadata.token_index >= latest_token_idx {
+                        latest_token_idx = checkpoint.metadata.token_index;
+                        latest = Some(checkpoint);
+                    }
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Failed to load checkpoint");
+                }
+            }
+        }
+
+        Ok(latest)
     }
 
     /// Restore an InferenceJob from checkpoint
@@ -489,7 +474,7 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save checkpoint
-        let metadata = manager.save_checkpoint(&job, None).await.unwrap();
+        let metadata = manager.save_checkpoint(&job, None, None).await.unwrap();
         assert_eq!(metadata.job_id, job_id);
         assert_eq!(metadata.token_index, 3);
 
@@ -520,16 +505,18 @@ mod tests {
             head_dim: 2,
             max_seq_len: 16,
         });
-        kv_cache
-            .update_layer(
-                0,
-                Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4).unwrap(),
-                Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 1, 4).unwrap(),
-            )
-            .unwrap();
+        for layer_idx in 0..2 {
+            kv_cache
+                .update_layer(
+                    layer_idx,
+                    Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4).unwrap(),
+                    Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 1, 4).unwrap(),
+                )
+                .unwrap();
+        }
 
         manager
-            .save_checkpoint(&job, Some(&kv_cache))
+            .save_checkpoint(&job, Some(&kv_cache), Some(1))
             .await
             .unwrap();
         let restored = manager
@@ -542,6 +529,13 @@ mod tests {
         assert_eq!(
             restored.layers[0].keys.as_ref().unwrap().data,
             vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            manager
+                .load_checkpoint_sequence_position(job.request.job_id)
+                .await
+                .unwrap(),
+            Some(1)
         );
     }
 
@@ -559,11 +553,11 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save multiple checkpoints
-        manager.save_checkpoint(&job, None).await.unwrap();
+        manager.save_checkpoint(&job, None, None).await.unwrap();
         job.add_token(103);
-        manager.save_checkpoint(&job, None).await.unwrap();
+        manager.save_checkpoint(&job, None, None).await.unwrap();
         job.add_token(104);
-        manager.save_checkpoint(&job, None).await.unwrap();
+        manager.save_checkpoint(&job, None, None).await.unwrap();
 
         // List checkpoints
         let checkpoints = manager.list_checkpoints(job_id).await.unwrap();
@@ -588,7 +582,7 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save and then delete
-        let metadata = manager.save_checkpoint(&job, None).await.unwrap();
+        let metadata = manager.save_checkpoint(&job, None, None).await.unwrap();
         manager
             .delete_checkpoint(job_id, metadata.checkpoint_id)
             .await
@@ -615,7 +609,7 @@ mod tests {
         // Save 4 checkpoints (should keep only 2)
         for i in 0..4 {
             job.add_token(200 + i);
-            manager.save_checkpoint(&job, None).await.unwrap();
+            manager.save_checkpoint(&job, None, None).await.unwrap();
         }
 
         // Should only have 2 checkpoints
@@ -643,7 +637,7 @@ mod tests {
 
         // Save a checkpoint
         let job = create_test_job();
-        manager.save_checkpoint(&job, None).await.unwrap();
+        manager.save_checkpoint(&job, None, None).await.unwrap();
 
         // Should have some usage now
         let usage = manager.storage_usage().await.unwrap();

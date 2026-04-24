@@ -71,7 +71,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/api/inference/jobs/:job_id",
-            get(inference::get_inference_job_status),
+            get(inference::get_inference_job_status).delete(inference::cancel_inference_job),
         )
         // Attach application state
         .with_state(state)

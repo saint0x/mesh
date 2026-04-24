@@ -7,11 +7,20 @@ export type DashboardSection =
   | 'jobs'
   | 'ledger'
   | 'credits'
+  | 'pools'
+  | 'doctor'
   | 'settings'
 
 export type ThemeMode = 'dark' | 'light'
 export type OverviewTab = 'overview' | 'operations' | 'runtime'
 export type TimeRange = '24h' | '7d' | '30d'
+export type MutationState = 'idle' | 'pending' | 'success' | 'error'
+
+export interface ApiErrorShape {
+  code: string
+  message: string
+  hint?: string | null
+}
 
 export interface AttachmentRecord {
   kind: string
@@ -124,6 +133,23 @@ export interface ModelRecord {
   providerCompatibility: string[]
 }
 
+export interface AssignmentCreditBreakdownRecord {
+  deviceId: string
+  credits: number
+  computeShare: number
+  throughputMultiplier: number
+  resourcePressureMultiplier: number
+  normalizedContributionShare: number
+  measuredServiceRate: number
+  referenceServiceRate: number
+  memoryPressure: number
+}
+
+export interface CreditPolicyRecord {
+  jobCreditBudget: number
+  assignments: AssignmentCreditBreakdownRecord[]
+}
+
 export interface AssignmentRecord {
   assignmentId: string
   deviceId: string
@@ -140,6 +166,12 @@ export interface AssignmentRecord {
   shardColumnEnd?: number | null
   assignedCapacityUnits: number
   executionProvider?: string | null
+  reportedCompletionTokens: number
+  creditsEarned?: number | null
+  throughputMultiplier?: number | null
+  resourcePressureMultiplier?: number | null
+  normalizedContributionShare?: number | null
+  availableMemoryBytes?: number | null
 }
 
 export interface JobRecord {
@@ -154,8 +186,17 @@ export interface JobRecord {
   startedAt?: string | null
   completedAt?: string | null
   completionTokens: number
+  promptTokens?: number | null
   executionTimeMs: number
+  reservedCredits: number
+  settledCredits: number
+  releasedCredits: number
+  availableCompletionTokens: number
+  modelSizeFactor: number
+  accountedCompletionTokens: number
+  promptCreditsAccounted: boolean
   error?: string | null
+  creditPolicy?: CreditPolicyRecord | null
   assignments: AssignmentRecord[]
 }
 
@@ -207,6 +248,79 @@ export interface TopologyRecord {
   punchPlans: PunchPlanRecord[]
 }
 
+export interface ResourceLockStatus {
+  status: string
+  totalMemoryBytes: number
+  userAllocatedBytes: number
+  lockedMemoryBytes: number
+  lockTimestampMs?: number | null
+  readyToUnlock: boolean
+  unlockInSeconds?: number | null
+}
+
+export interface PoolSummary {
+  id: string
+  name: string
+  role: string
+  createdAt: string
+  expiresAt: number
+  daysUntilExpiry?: number | null
+  peerCount: number
+  rootPubkeyHex: string
+  validCert: boolean
+}
+
+export interface PoolPeer {
+  nodeId: string
+  lanAddr: string
+  discoveryMethod: string
+  lastSeen: number
+}
+
+export interface DoctorCheck {
+  id: string
+  label: string
+  status: 'ok' | 'warn' | 'fail'
+  detail: string
+  hint?: string | null
+  durationMs: number
+}
+
+export interface DoctorReport {
+  generatedAt: string
+  overall: 'ok' | 'warn' | 'fail'
+  checks: DoctorCheck[]
+}
+
+export interface DeviceStatus {
+  configured: boolean
+  deviceId?: string | null
+  networkId?: string | null
+  name?: string | null
+  controlPlaneUrl?: string | null
+  preferredProvider?: string | null
+  hasCertificate: boolean
+  daemonRunning: boolean
+  listenAddrs: string[]
+  observedAddrs: string[]
+  directCandidateCount: number
+}
+
+export interface QuoteResponse {
+  modelId: string
+  networkId: string
+  modelSizeFactor: number
+  promptTokens: number
+  maxTokens: number
+  promptCredits: number
+  completionCreditsCap: number
+  totalCreditsCap: number
+  availableCompletionTokens: number
+  deviceAvailableCredits: number
+  feasible: boolean
+  reason?: string | null
+}
+
 export interface SettingsRecord {
   controlPlaneUrl?: string | null
   localDeviceName?: string | null
@@ -232,6 +346,10 @@ export interface DashboardState {
   jobs: JobRecord[]
   ledgerEvents: LedgerRecord[]
   topologies: TopologyRecord[]
+  runtimeStats?: Record<string, unknown> | null
+  resourceLock?: ResourceLockStatus | null
+  pools: PoolSummary[]
+  doctor?: DoctorReport | null
   settings: SettingsRecord
 }
 
@@ -253,9 +371,11 @@ export const sections: SectionDefinition[] = [
   { id: 'devices', label: 'Devices', summary: 'Provider, capability, runtime, and identity truth' },
   { id: 'topology', label: 'Topology', summary: 'Ring workers, neighbors, tensor endpoints, and punch plans' },
   { id: 'models', label: 'Models', summary: 'Artifact readiness, shard manifests, and provider compatibility' },
-  { id: 'jobs', label: 'Jobs', summary: 'Assignment-level execution detail across the mesh' },
+  { id: 'jobs', label: 'Jobs', summary: 'Reservation lifecycle and assignment-level execution detail' },
   { id: 'ledger', label: 'Ledger', summary: 'Authoritative ledger events and audit trail' },
-  { id: 'credits', label: 'Credits', summary: 'Participation accounting from mesh ledger activity' },
+  { id: 'credits', label: 'Credits', summary: 'Participation accounting and reservation flow' },
+  { id: 'pools', label: 'Pools', summary: 'LAN pools, peers, membership, and invitations' },
+  { id: 'doctor', label: 'Doctor', summary: 'Local setup and control-plane reachability checks' },
   { id: 'settings', label: 'Settings', summary: 'Local device, relay, and runtime configuration' },
 ]
 
@@ -277,6 +397,8 @@ export const navGroups: SidebarGroup[] = [
       { id: 'networks', label: 'Networks' },
       { id: 'devices', label: 'Devices' },
       { id: 'topology', label: 'Topology' },
+      { id: 'pools', label: 'Pools' },
+      { id: 'doctor', label: 'Doctor' },
     ],
   },
   {
@@ -300,11 +422,11 @@ export const pageMeta: Record<DashboardSection, { title: string; subtitle: strin
   },
   devices: {
     title: 'Devices',
-    subtitle: 'See execution providers, hardware capabilities, ring state, and certificate posture for each device.',
+    subtitle: 'See execution providers, hardware capabilities, ring state, resources, and certificate posture.',
   },
   topology: {
     title: 'Topology',
-    subtitle: 'Review ring order, neighbor assignments, tensor endpoints, and any live control-plane punch plans.',
+    subtitle: 'Review ring order, neighbor assignments, tensor endpoints, and live punch plans.',
   },
   models: {
     title: 'Models',
@@ -312,7 +434,7 @@ export const pageMeta: Record<DashboardSection, { title: string; subtitle: strin
   },
   jobs: {
     title: 'Jobs',
-    subtitle: 'Assignment-level status, shard ranges, execution providers, timing, and participant failures.',
+    subtitle: 'Submit work, watch reservation settlement, and inspect assignment-level execution detail.',
   },
   ledger: {
     title: 'Ledger',
@@ -320,7 +442,15 @@ export const pageMeta: Record<DashboardSection, { title: string; subtitle: strin
   },
   credits: {
     title: 'Credits',
-    subtitle: 'View participation accounting derived directly from the real mesh ledger.',
+    subtitle: 'View participation accounting and reserved-to-settled-to-released credit flow.',
+  },
+  pools: {
+    title: 'Pools',
+    subtitle: 'Manage local pool membership, peer discovery, and shareable pool credentials.',
+  },
+  doctor: {
+    title: 'Doctor',
+    subtitle: 'Run local health checks across device config, certificate posture, and control-plane reachability.',
   },
   settings: {
     title: 'Settings',
@@ -337,6 +467,8 @@ export const dashboardPathBySection: Record<DashboardSection, string> = {
   jobs: '/dashboard/jobs',
   ledger: '/dashboard/ledger',
   credits: '/dashboard/credits',
+  pools: '/dashboard/pools',
+  doctor: '/dashboard/doctor',
   settings: '/dashboard/settings',
 }
 

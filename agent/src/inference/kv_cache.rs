@@ -61,16 +61,23 @@ impl LayerKVCache {
     /// # Arguments
     /// * `new_keys` - New key tensor [new_tokens, kv_dim]
     /// * `new_values` - New value tensor [new_tokens, kv_dim]
-    pub fn update(&mut self, new_keys: Tensor2D, new_values: Tensor2D) -> Result<()> {
+    pub fn append(&mut self, new_keys: Tensor2D, new_values: Tensor2D) -> Result<()> {
         if new_keys.rows != new_values.rows || new_keys.cols != new_values.cols {
             return Err(AgentError::Execution(format!(
                 "KV cache update shape mismatch: keys {}x{} vs values {}x{}",
                 new_keys.rows, new_keys.cols, new_values.rows, new_values.cols
             )));
         }
+        self.validate_new_tensors(&new_keys, &new_values)?;
 
         match (&mut self.keys, &mut self.values) {
             (Some(existing_keys), Some(existing_values)) => {
+                if existing_keys.cols != new_keys.cols || existing_values.cols != new_values.cols {
+                    return Err(AgentError::Execution(format!(
+                        "KV cache append width mismatch: existing {}x{}, new {}x{}",
+                        existing_keys.rows, existing_keys.cols, new_keys.rows, new_keys.cols
+                    )));
+                }
                 // Concatenate with existing cache
                 let new_k_data = [existing_keys.data.as_slice(), new_keys.data.as_slice()].concat();
                 let new_v_data =
@@ -95,6 +102,52 @@ impl LayerKVCache {
                 self.seq_len = new_keys.rows;
                 self.keys = Some(new_keys);
                 self.values = Some(new_values);
+            }
+        }
+
+        self.validate()?;
+        Ok(())
+    }
+
+    fn validate_new_tensors(&self, keys: &Tensor2D, values: &Tensor2D) -> Result<()> {
+        if keys.rows != values.rows || keys.cols != values.cols {
+            return Err(AgentError::Execution(format!(
+                "KV cache tensor mismatch: keys {}x{} vs values {}x{}",
+                keys.rows, keys.cols, values.rows, values.cols
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match (&self.keys, &self.values) {
+            (Some(keys), Some(values)) => {
+                if keys.rows != values.rows || keys.cols != values.cols {
+                    return Err(AgentError::Execution(format!(
+                        "KV cache invariant violated for layer {}: keys {}x{} vs values {}x{}",
+                        self.layer_idx, keys.rows, keys.cols, values.rows, values.cols
+                    )));
+                }
+                if self.seq_len != keys.rows {
+                    return Err(AgentError::Execution(format!(
+                        "KV cache invariant violated for layer {}: seq_len {} vs tensor rows {}",
+                        self.layer_idx, self.seq_len, keys.rows
+                    )));
+                }
+            }
+            (None, None) => {
+                if self.seq_len != 0 {
+                    return Err(AgentError::Execution(format!(
+                        "KV cache invariant violated for layer {}: empty tensors with seq_len {}",
+                        self.layer_idx, self.seq_len
+                    )));
+                }
+            }
+            _ => {
+                return Err(AgentError::Execution(format!(
+                    "KV cache invariant violated for layer {}: keys/values presence diverged",
+                    self.layer_idx
+                )));
             }
         }
 
@@ -183,16 +236,55 @@ impl KVCache {
         keys: Tensor2D,
         values: Tensor2D,
     ) -> Result<()> {
+        self.append_layer(layer_idx, keys, values)
+    }
+
+    pub fn append_layer(
+        &mut self,
+        layer_idx: usize,
+        keys: Tensor2D,
+        values: Tensor2D,
+    ) -> Result<()> {
+        let incoming_rows = keys.rows;
         let layer = self
             .layers
             .get_mut(layer_idx)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
-        layer.update(keys, values)
+        if layer.seq_len + incoming_rows > self.config.max_seq_len {
+            return Err(AgentError::Execution(format!(
+                "KV cache exceeded max_seq_len {} on layer {}: {} + {}",
+                self.config.max_seq_len, layer_idx, layer.seq_len, incoming_rows
+            )));
+        }
+        layer.append(keys, values)
     }
 
     /// Get the current sequence length
     pub fn seq_len(&self) -> usize {
         self.layers.first().map(|l| l.seq_len).unwrap_or(0)
+    }
+
+    pub fn layer_seq_len(&self, layer_idx: usize) -> Result<usize> {
+        Ok(self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?
+            .seq_len)
+    }
+
+    pub fn get_layer_kv(&self, layer_idx: usize) -> Result<(&Tensor2D, &Tensor2D)> {
+        let layer = self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
+        layer.validate()?;
+        match (layer.get_keys(), layer.get_values()) {
+            (Some(keys), Some(values)) => Ok((keys, values)),
+            _ => Err(AgentError::Execution(format!(
+                "Layer {} has no cached KV state",
+                layer_idx
+            ))),
+        }
     }
 
     /// Check if cache has reached maximum length
@@ -221,6 +313,7 @@ impl KVCache {
 
     /// Serialize to bytes for checkpointing
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
         let mut buffer = Vec::new();
         ciborium::ser::into_writer(self, &mut buffer)
             .map_err(|e| AgentError::Config(format!("Failed to serialize KV cache: {}", e)))?;
@@ -229,8 +322,28 @@ impl KVCache {
 
     /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        ciborium::de::from_reader(data)
-            .map_err(|e| AgentError::Config(format!("Failed to deserialize KV cache: {}", e)))
+        let cache: Self = ciborium::de::from_reader(data)
+            .map_err(|e| AgentError::Config(format!("Failed to deserialize KV cache: {}", e)))?;
+        cache.validate()?;
+        Ok(cache)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut expected_seq_len = None;
+        for layer in &self.layers {
+            layer.validate()?;
+            match expected_seq_len {
+                Some(expected) if expected != layer.seq_len => {
+                    return Err(AgentError::Execution(format!(
+                        "KV cache invariant violated across layers: expected seq_len {}, layer {} has {}",
+                        expected, layer.layer_idx, layer.seq_len
+                    )));
+                }
+                None => expected_seq_len = Some(layer.seq_len),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -293,14 +406,14 @@ mod tests {
         // First update
         let keys1 = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
         let values1 = Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 2, 2).unwrap();
-        cache.update(keys1, values1).unwrap();
+        cache.append(keys1, values1).unwrap();
 
         assert_eq!(cache.seq_len, 2);
 
         // Second update
         let keys2 = Tensor2D::new(vec![9.0, 10.0], 1, 2).unwrap();
         let values2 = Tensor2D::new(vec![11.0, 12.0], 1, 2).unwrap();
-        cache.update(keys2, values2).unwrap();
+        cache.append(keys2, values2).unwrap();
 
         assert_eq!(cache.seq_len, 3);
 
@@ -381,9 +494,11 @@ mod tests {
         };
         let mut cache = KVCache::new(config);
 
-        let keys = Tensor2D::new(vec![1.0; 2 * 8], 2, 8).unwrap();
-        let values = Tensor2D::new(vec![2.0; 2 * 8], 2, 8).unwrap();
-        cache.update_layer(0, keys, values).unwrap();
+        for layer_idx in 0..2 {
+            let keys = Tensor2D::new(vec![1.0; 2 * 8], 2, 8).unwrap();
+            let values = Tensor2D::new(vec![2.0; 2 * 8], 2, 8).unwrap();
+            cache.update_layer(layer_idx, keys, values).unwrap();
+        }
 
         // Serialize and deserialize
         let bytes = cache.to_bytes().unwrap();
@@ -391,5 +506,32 @@ mod tests {
 
         assert_eq!(restored.seq_len(), cache.seq_len());
         assert_eq!(restored.layers.len(), cache.layers.len());
+    }
+
+    #[test]
+    fn test_kv_cache_enforces_max_seq_len() {
+        let mut cache = KVCache::new(KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 2,
+        });
+
+        cache
+            .append_layer(
+                0,
+                Tensor2D::new(vec![1.0; 2 * 8], 2, 8).unwrap(),
+                Tensor2D::new(vec![2.0; 2 * 8], 2, 8).unwrap(),
+            )
+            .unwrap();
+
+        let err = cache
+            .append_layer(
+                0,
+                Tensor2D::new(vec![3.0; 8], 1, 8).unwrap(),
+                Tensor2D::new(vec![4.0; 8], 1, 8).unwrap(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("max_seq_len"));
     }
 }

@@ -132,6 +132,9 @@ pub struct Checkpoint {
     /// In production, this would be serialized tensor data
     pub kv_cache_state: Option<Vec<u8>>,
 
+    /// Absolute sequence position represented by the persisted forward pass.
+    pub sequence_position: Option<u32>,
+
     /// RNG state for reproducibility
     pub rng_state: Option<Vec<u8>>,
 }
@@ -287,6 +290,7 @@ mod tests {
                 total_layers: 70,
             },
             kv_cache_state: None,
+            sequence_position: None,
             rng_state: None,
         };
 
@@ -331,6 +335,7 @@ mod tests {
                 total_layers: 70,
             },
             kv_cache_state: None,
+            sequence_position: None,
             rng_state: None,
         };
 
@@ -377,6 +382,7 @@ mod tests {
                 total_layers: 70,
             },
             kv_cache_state: None,
+            sequence_position: None,
             rng_state: None,
         };
 

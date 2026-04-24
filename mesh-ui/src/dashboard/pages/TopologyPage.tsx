@@ -1,230 +1,197 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
+import {
+  ChartTooltipFoot,
+  ChartTooltipHeader,
+  ChartTooltipRow,
+  RingTopology,
+  chartColors,
+  type RingChartNode,
+  type RingNodeStatus,
+} from '../charts'
+import { Drawer, EmptyState, Stat, StatRow, StatusBadge } from '../primitives'
 import { formatBytes } from '../lib/format'
 import type { DashboardPageProps } from '../lib/pageProps'
 import type { TopologyWorkerRecord } from '../../domain/dashboard'
 
-const RING_CX = 200
-const RING_CY = 190
-const RING_R = 140
-const NODE_R = 38
-
-function nodePosition(index: number, total: number) {
-  const angle = (2 * Math.PI * index) / total - Math.PI / 2
-  return { x: RING_CX + RING_R * Math.cos(angle), y: RING_CY + RING_R * Math.sin(angle) }
+function workerStatus(worker: TopologyWorkerRecord): RingNodeStatus {
+  const status = worker.status.toLowerCase()
+  if (status === 'online' || status === 'active' || status === 'healthy') return 'healthy'
+  if (status === 'syncing' || status === 'pending') return 'syncing'
+  if (status === 'offline' || status === 'unreachable') return 'offline'
+  return 'unknown'
 }
 
-function RingVisualization({ workers }: { workers: TopologyWorkerRecord[] }) {
-  const sorted = useMemo(
-    () => [...workers].sort((a, b) => (a.position ?? 0) - (b.position ?? 0)),
-    [workers],
-  )
-  const n = sorted.length
-  if (n === 0) return null
-
-  const positions = sorted.map((_, i) => nodePosition(i, n))
-
-  return (
-    <div className="dashboard-topology">
-      <svg viewBox="0 0 400 380" width="100%" height="100%" style={{ minHeight: 340 }}>
-        {/* Ring circle (subtle) */}
-        <circle
-          cx={RING_CX}
-          cy={RING_CY}
-          r={RING_R}
-          fill="none"
-          stroke="var(--line)"
-          strokeWidth={1}
-          strokeDasharray="6 4"
-        />
-
-        {/* Neighbor edges */}
-        {positions.map((pos, i) => {
-          const next = positions[(i + 1) % n]!
-          return (
-            <line
-              key={`edge-${i}`}
-              x1={pos.x}
-              y1={pos.y}
-              x2={next.x}
-              y2={next.y}
-              stroke="rgba(102, 240, 192, 0.3)"
-              strokeWidth={1.5}
-              strokeDasharray="4 3"
-            />
-          )
-        })}
-
-        {/* Nodes */}
-        {sorted.map((worker, i) => {
-          const pos = positions[i]!
-          const isHealthy = worker.status === 'online' || worker.status === 'active'
-          const fillColor = isHealthy
-            ? 'color-mix(in srgb, var(--accent) 14%, transparent)'
-            : 'rgba(255, 97, 97, 0.1)'
-          const strokeColor = isHealthy
-            ? 'rgba(102, 240, 192, 0.4)'
-            : 'rgba(255, 97, 97, 0.3)'
-          const shortName = worker.deviceName.length > 14
-            ? worker.deviceName.slice(0, 12) + '…'
-            : worker.deviceName
-
-          return (
-            <g key={worker.deviceId}>
-              <circle
-                cx={pos.x}
-                cy={pos.y}
-                r={NODE_R}
-                fill={fillColor}
-                stroke={strokeColor}
-                strokeWidth={1.5}
-              />
-              {isHealthy && (
-                <circle
-                  cx={pos.x}
-                  cy={pos.y}
-                  r={NODE_R}
-                  fill="none"
-                  stroke="rgba(102, 240, 192, 0.08)"
-                  strokeWidth={8}
-                />
-              )}
-              <text
-                x={pos.x}
-                y={pos.y - 6}
-                textAnchor="middle"
-                fill="var(--text-strong)"
-                fontSize={9}
-                fontWeight={600}
-                fontFamily="'Instrument Sans', sans-serif"
-              >
-                {shortName}
-              </text>
-              <text
-                x={pos.x}
-                y={pos.y + 8}
-                textAnchor="middle"
-                fill="var(--text-muted)"
-                fontSize={8}
-                fontFamily="'Instrument Sans', sans-serif"
-              >
-                pos {worker.position ?? '?'}
-              </text>
-              <text
-                x={pos.x}
-                y={pos.y + 19}
-                textAnchor="middle"
-                fill="var(--text-muted)"
-                fontSize={7}
-                fontFamily="'Instrument Sans', sans-serif"
-              >
-                {worker.contributedMemoryBytes ? formatBytes(worker.contributedMemoryBytes) : ''}
-              </text>
-            </g>
-          )
-        })}
-
-        {/* Center label */}
-        <text
-          x={RING_CX}
-          y={RING_CY - 6}
-          textAnchor="middle"
-          fill="var(--text-muted)"
-          fontSize={10}
-          fontWeight={600}
-          fontFamily="'Space Grotesk', sans-serif"
-          letterSpacing="0.08em"
-        >
-          RING
-        </text>
-        <text
-          x={RING_CX}
-          y={RING_CY + 10}
-          textAnchor="middle"
-          fill="var(--text-strong)"
-          fontSize={16}
-          fontWeight={700}
-          fontFamily="'Space Grotesk', sans-serif"
-          letterSpacing="-0.02em"
-        >
-          {n} nodes
-        </text>
-      </svg>
-    </div>
-  )
+function loadFromShardSpan(worker: TopologyWorkerRecord): number {
+  if (worker.shardColumnStart == null || worker.shardColumnEnd == null) return 0.5
+  const span = Math.max(0, worker.shardColumnEnd - worker.shardColumnStart)
+  return Math.max(0.1, Math.min(1, span / 64))
 }
 
 export function TopologyPage({ controller }: DashboardPageProps) {
   const topology = controller.selectedTopology
+  const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+
+  const workers = useMemo(
+    () => (topology ? [...topology.workers].sort((a, b) => (a.position ?? 0) - (b.position ?? 0)) : []),
+    [topology],
+  )
+
+  const ringNodes: RingChartNode[] = useMemo(
+    () =>
+      workers.map((worker, i) => ({
+        id: worker.deviceId,
+        label:
+          worker.deviceName.length > 14
+            ? `${worker.deviceName.slice(0, 12)}…`
+            : worker.deviceName,
+        position: worker.position ?? i,
+        status: workerStatus(worker),
+        load: loadFromShardSpan(worker),
+      })),
+    [workers],
+  )
+
+  const healthy = useMemo(
+    () => workers.filter((worker) => workerStatus(worker) === 'healthy').length,
+    [workers],
+  )
+
+  const totalContributed = useMemo(
+    () => workers.reduce((sum, worker) => sum + (worker.contributedMemoryBytes ?? 0), 0),
+    [workers],
+  )
+
   if (!topology) {
     return (
       <section className="panel dashboard-panel">
-        <div className="dashboard-empty">No topology data is available for the selected network yet.</div>
+        <EmptyState
+          title="No topology data yet"
+          hint="Run a ring on this network and the topology snapshot will appear here."
+        />
       </section>
     )
   }
 
+  const selectedWorker = workers.find((worker) => worker.deviceId === selectedWorkerId)
+
+  const openWorker = (node: RingChartNode) => {
+    setSelectedWorkerId(node.id)
+    setDrawerOpen(true)
+  }
+
   return (
     <div className="dashboard-stack">
-      <div className="dashboard-grid">
-        <section className="panel dashboard-panel">
-          <div className="dashboard-panel-head">
-            <div>
-              <div className="eyebrow">Ring topology</div>
-              <h3>{topology.networkId}</h3>
-            </div>
-          </div>
-          <div className="dashboard-detail-grid">
-            <article><span>Source</span><strong>{topology.source}</strong></article>
-            <article><span>Ring stable</span><strong>{topology.ringStable ? 'yes' : 'no'}</strong></article>
-            <article><span>Workers</span><strong>{topology.workers.length}</strong></article>
-            <article><span>Punch plans</span><strong>{topology.punchPlans.length}</strong></article>
-          </div>
-
-          <RingVisualization workers={topology.workers} />
-        </section>
-
-        <section className="panel dashboard-panel">
-          <div className="dashboard-panel-head">
-            <div>
-              <div className="eyebrow">Workers</div>
-              <h3>Ring member detail</h3>
-            </div>
-          </div>
-          <div className="dashboard-data-table">
-            <div className="dashboard-data-head">
-              <span>Position</span>
-              <span>Worker</span>
-              <span>Neighbors</span>
-              <span>Shard range</span>
-              <span>Tensor endpoints</span>
-            </div>
-            {topology.workers.map((worker) => (
-              <div key={worker.deviceId} className="dashboard-data-row">
-                <span className="row-primary">{worker.position ?? 'n/a'}</span>
-                <span>{worker.deviceName}</span>
-                <span>{worker.leftNeighborId ? worker.leftNeighborId.split('-')[0] : 'n/a'} / {worker.rightNeighborId ? worker.rightNeighborId.split('-')[0] : 'n/a'}</span>
-                <span>
-                  {worker.shardColumnStart !== null && worker.shardColumnStart !== undefined
-                    ? `${worker.shardColumnStart} - ${worker.shardColumnEnd ?? 'n/a'}`
-                    : 'n/a'}
-                </span>
-                <span>{worker.tensorPlaneEndpoints.join(', ') || worker.activeEndpoint || 'n/a'}</span>
-              </div>
-            ))}
-          </div>
-        </section>
-      </div>
+      <StatRow>
+        <Stat
+          label="Workers"
+          value={workers.length}
+          accent="cool"
+          caption={`${healthy} healthy · ${workers.length - healthy} other`}
+        />
+        <Stat
+          label="Ring stable"
+          value={topology.ringStable ? 'yes' : 'no'}
+          accent={topology.ringStable ? 'accent' : 'warm'}
+          caption={`Source: ${topology.source}`}
+        />
+        <Stat
+          label="Punch plans"
+          value={topology.punchPlans.length}
+          accent={topology.punchPlans.length > 0 ? 'warm' : 'neutral'}
+          caption={
+            topology.punchPlans.length > 0
+              ? 'Live direct-path coordination requested.'
+              : 'No active hole-punching attempts.'
+          }
+        />
+        <Stat
+          label="Contributed memory"
+          value={totalContributed > 0 ? formatBytes(totalContributed) : '—'}
+          accent="violet"
+          caption="Sum of memory pledged by ring members."
+        />
+      </StatRow>
 
       <section className="panel dashboard-panel">
-        <div className="dashboard-panel-head">
-          <div>
-            <div className="eyebrow">Punch plans</div>
-            <h3>Direct-path coordination</h3>
+        <div className="ms-section-head">
+          <div className="ms-section-head-copy">
+            <div className="eyebrow">Ring topology</div>
+            <h3>{topology.networkId}</h3>
+            <p>Click a worker to open its assignment, neighbors, and tensor endpoints.</p>
+          </div>
+          <div className="ms-section-head-actions">
+            <StatusBadge status={topology.ringStable ? 'stable' : 'pending'} />
           </div>
         </div>
-        {topology.punchPlans.length > 0 ? (
-          <div className="dashboard-data-table">
-            <div className="dashboard-data-head">
+        {ringNodes.length === 0 ? (
+          <EmptyState title="Empty ring" hint="No workers have joined this network's ring yet." />
+        ) : (
+          <div className="ms-chart-card">
+            <RingTopology
+              nodes={ringNodes}
+              onSelectNode={openWorker}
+              {...(selectedWorkerId ? { selectedId: selectedWorkerId } : {})}
+              centerCaption="workers"
+              showCrossChords={ringNodes.length >= 8}
+              renderTooltip={(node) => {
+                const worker = workers.find((w) => w.deviceId === node.id)
+                return (
+                  <>
+                    <ChartTooltipHeader>{node.label}</ChartTooltipHeader>
+                    <ChartTooltipRow color={chartColors.cool} label="position" value={`#${node.position}`} />
+                    <ChartTooltipRow
+                      color={
+                        node.status === 'healthy'
+                          ? chartColors.settled
+                          : node.status === 'syncing'
+                            ? chartColors.outstanding
+                            : chartColors.danger
+                      }
+                      label="status"
+                      value={node.status}
+                    />
+                    {worker?.shardColumnStart != null ? (
+                      <ChartTooltipRow
+                        color={chartColors.released}
+                        label="shards"
+                        value={`${worker.shardColumnStart}–${worker.shardColumnEnd ?? '?'}`}
+                      />
+                    ) : null}
+                    {worker?.contributedMemoryBytes ? (
+                      <ChartTooltipRow
+                        color={chartColors.outstanding}
+                        label="memory"
+                        value={formatBytes(worker.contributedMemoryBytes)}
+                      />
+                    ) : null}
+                    {worker?.activePath ? (
+                      <ChartTooltipFoot>via {worker.activePath}</ChartTooltipFoot>
+                    ) : null}
+                  </>
+                )
+              }}
+            />
+          </div>
+        )}
+      </section>
+
+      <section className="panel dashboard-panel">
+        <div className="ms-section-head">
+          <div className="ms-section-head-copy">
+            <div className="eyebrow">Punch plans</div>
+            <h3>Direct-path coordination</h3>
+            <p>Hole-punching requests issued by the control-plane to bring peers onto direct paths.</p>
+          </div>
+        </div>
+        {topology.punchPlans.length === 0 ? (
+          <EmptyState
+            title="No live punch plans"
+            hint="The mesh is connected via existing direct paths or relays."
+          />
+        ) : (
+          <div className="ms-assignments">
+            <div className="ms-assignments-head">
               <span>Source</span>
               <span>Target</span>
               <span>Reason</span>
@@ -232,19 +199,126 @@ export function TopologyPage({ controller }: DashboardPageProps) {
               <span>Rendezvous</span>
             </div>
             {topology.punchPlans.map((plan) => (
-              <div key={`${plan.sourceDeviceId}-${plan.targetDeviceId}-${plan.issuedAtMs}`} className="dashboard-data-row">
-                <span className="row-primary">{plan.sourceDeviceId.split('-')[0]}</span>
-                <span>{plan.targetDeviceId.split('-')[0]}</span>
+              <div
+                key={`${plan.sourceDeviceId}-${plan.targetDeviceId}-${plan.issuedAtMs}`}
+                className="ms-assignments-row"
+              >
+                <span className="mono" style={{ fontSize: 11 }}>
+                  {plan.sourceDeviceId.slice(0, 12)}
+                </span>
+                <span className="mono" style={{ fontSize: 11 }}>
+                  {plan.targetDeviceId.slice(0, 12)}
+                </span>
                 <span>{plan.reason}</span>
                 <span>{plan.strategy}</span>
-                <span>{plan.relayRendezvousRequired ? 'required' : 'not required'}</span>
+                <span>
+                  <StatusBadge
+                    status={plan.relayRendezvousRequired ? 'warn' : 'ok'}
+                    dot={false}
+                  >
+                    {plan.relayRendezvousRequired ? 'relay required' : 'direct'}
+                  </StatusBadge>
+                </span>
               </div>
             ))}
           </div>
-        ) : (
-          <div className="dashboard-empty">No live punch plans were returned for this topology snapshot.</div>
         )}
       </section>
+
+      <Drawer
+        open={drawerOpen && selectedWorker !== undefined}
+        onClose={() => setDrawerOpen(false)}
+        eyebrow={selectedWorker ? `Position #${selectedWorker.position ?? '?'}` : 'Worker'}
+        title={selectedWorker?.deviceName ?? null}
+      >
+        {selectedWorker ? (
+          <>
+            <section className="ms-drawer-section">
+              <h4>Identity</h4>
+              <div className="ms-drawer-lifecycle">
+                <div className="cell">
+                  <span>Device ID</span>
+                  <strong className="mono" style={{ fontSize: 12 }}>
+                    {selectedWorker.deviceId.slice(0, 14)}
+                  </strong>
+                </div>
+                <div className="cell">
+                  <span>Peer ID</span>
+                  <strong className="mono" style={{ fontSize: 12 }}>
+                    {selectedWorker.peerId ? selectedWorker.peerId.slice(0, 14) : '—'}
+                  </strong>
+                </div>
+                <div className="cell">
+                  <span>Status</span>
+                  <strong>
+                    <StatusBadge status={selectedWorker.status} />
+                  </strong>
+                </div>
+                <div className="cell">
+                  <span>Memory</span>
+                  <strong>
+                    {selectedWorker.contributedMemoryBytes
+                      ? formatBytes(selectedWorker.contributedMemoryBytes)
+                      : '—'}
+                  </strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="ms-drawer-section">
+              <h4>Shard assignment</h4>
+              <div className="ms-drawer-lifecycle">
+                <div className="cell">
+                  <span>Column start</span>
+                  <strong>{selectedWorker.shardColumnStart ?? '—'}</strong>
+                </div>
+                <div className="cell">
+                  <span>Column end</span>
+                  <strong>{selectedWorker.shardColumnEnd ?? '—'}</strong>
+                </div>
+                <div className="cell">
+                  <span>Left neighbor</span>
+                  <strong className="mono" style={{ fontSize: 12 }}>
+                    {selectedWorker.leftNeighborId ? selectedWorker.leftNeighborId.slice(0, 12) : '—'}
+                  </strong>
+                </div>
+                <div className="cell">
+                  <span>Right neighbor</span>
+                  <strong className="mono" style={{ fontSize: 12 }}>
+                    {selectedWorker.rightNeighborId ? selectedWorker.rightNeighborId.slice(0, 12) : '—'}
+                  </strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="ms-drawer-section">
+              <h4>Tensor plane endpoints</h4>
+              {selectedWorker.tensorPlaneEndpoints.length === 0 ? (
+                <EmptyState title="No tensor endpoints registered" />
+              ) : (
+                <div className="ms-assignments">
+                  {selectedWorker.tensorPlaneEndpoints.map((endpoint) => (
+                    <div key={endpoint} className="ms-assignments-row" style={{ gridTemplateColumns: '1fr' }}>
+                      <span className="mono" style={{ fontSize: 11 }}>
+                        {endpoint}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {selectedWorker.activeEndpoint ? (
+                <div style={{ marginTop: 8, fontSize: 11, color: chartColors.text }}>
+                  Active path:{' '}
+                  <strong style={{ color: chartColors.textStrong }}>
+                    {selectedWorker.activePath ?? 'unknown'}
+                  </strong>{' '}
+                  → <span className="mono">{selectedWorker.activeEndpoint}</span>
+                </div>
+              ) : null}
+            </section>
+          </>
+        ) : null}
+      </Drawer>
     </div>
   )
 }

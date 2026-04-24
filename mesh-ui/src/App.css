@@ -261,6 +261,150 @@
   height: 260px;
 }
 
+.monospace {
+  font-family: 'SFMono-Regular', ui-monospace, monospace;
+}
+
+.dashboard-textarea,
+.dashboard-form-grid input,
+.dashboard-form-grid select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-strong);
+  padding: 12px 14px;
+}
+
+.dashboard-textarea {
+  min-height: 132px;
+  resize: vertical;
+}
+
+.dashboard-form-grid,
+.job-submit-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.dashboard-form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dashboard-form-grid.two-up {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dashboard-form-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+.dashboard-form-grid span {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.dashboard-inline-actions,
+.dashboard-inline-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dashboard-inline-meta {
+  color: var(--text-muted);
+}
+
+.dashboard-inline-meta strong {
+  color: var(--text-strong);
+}
+
+.dense .dashboard-data-row,
+.dashboard-data-table.dense .dashboard-data-row {
+  min-height: 38px;
+}
+
+.dashboard-data-row.active {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.dashboard-code-inline {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.job-lifecycle-card {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+}
+
+.job-lifecycle-values {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.job-lifecycle-values article,
+.dashboard-detail-grid article {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.job-lifecycle-values span,
+.dashboard-detail-grid span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.job-lifecycle-values strong,
+.dashboard-detail-grid strong {
+  color: var(--text-strong);
+}
+
+.token-meter {
+  display: grid;
+  gap: 8px;
+}
+
+.token-meter-bar {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.token-meter-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-warm));
+}
+
+@media (max-width: 960px) {
+  .dashboard-form-grid,
+  .dashboard-form-grid.two-up,
+  .job-lifecycle-values {
+    grid-template-columns: 1fr;
+  }
+}
+
 .ring-three {
   width: 370px;
   height: 370px;
@@ -2175,4 +2319,1105 @@
   .dashboard-summary-bar {
     grid-template-columns: 1fr;
   }
+}
+
+/* ========================================================================
+   Chart library (SVG charts + recharts-class tooltips)
+   ======================================================================== */
+
+.chart-host {
+  position: relative;
+}
+
+.chart-host svg {
+  display: block;
+  overflow: visible;
+}
+
+.chart-host text {
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-empty {
+  padding: 24px;
+  border-radius: 12px;
+  border: 1px dashed var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.chart-tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  min-width: 172px;
+  padding: 10px 12px 11px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel-elevated) 96%, transparent);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 18px 46px rgba(0, 0, 0, 0.52),
+    0 0 0 1px rgba(255, 255, 255, 0.02);
+  color: var(--text-strong);
+  font-size: 11.5px;
+  z-index: 12;
+  opacity: 0;
+  backdrop-filter: blur(6px);
+  font-variant-numeric: tabular-nums;
+  transition:
+    opacity 140ms ease,
+    transform 80ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform, opacity;
+}
+
+.chart-tooltip-header {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-strong);
+  margin-bottom: 8px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+  letter-spacing: 0.01em;
+}
+
+.chart-tooltip-row {
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  column-gap: 9px;
+  align-items: center;
+  padding: 2.5px 0;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.chart-tooltip-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 2.5px;
+  display: inline-block;
+}
+
+.chart-tooltip-label {
+  color: var(--text-soft);
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.chart-tooltip-value {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.chart-tooltip-foot {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+/* ProgressBar */
+
+.chart-progress {
+  display: grid;
+  gap: 6px;
+}
+
+.chart-progress-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-soft);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-progress-track {
+  position: relative;
+  width: 100%;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.chart-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  transition: width 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.chart-progress-fill.indeterminate {
+  animation: ms-progress-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes ms-progress-sweep {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+.chart-progress-caption {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-sparkline {
+  line-height: 0;
+}
+
+/* ========================================================================
+   Primitive: StatusBadge
+   ======================================================================== */
+
+.ms-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 7px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
+.ms-badge-md {
+  padding: 5px 10px;
+  font-size: 11.5px;
+}
+
+.ms-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent);
+}
+
+.ms-badge-label {
+  line-height: 1;
+}
+
+.ms-badge-ok,
+.ms-badge-completed {
+  color: #66f0c0;
+  background: rgba(102, 240, 192, 0.1);
+  border-color: rgba(102, 240, 192, 0.26);
+}
+
+.ms-badge-running,
+.ms-badge-acknowledged {
+  color: #9af5d7;
+  background: rgba(102, 240, 192, 0.08);
+  border-color: rgba(102, 240, 192, 0.24);
+}
+
+.ms-badge-running .ms-badge-dot {
+  animation: ms-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes ms-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(102, 240, 192, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(102, 240, 192, 0);
+  }
+}
+
+.ms-badge-warn,
+.ms-badge-pending,
+.ms-badge-dispatched {
+  color: #ffbd59;
+  background: rgba(255, 189, 89, 0.1);
+  border-color: rgba(255, 189, 89, 0.28);
+}
+
+.ms-badge-info {
+  color: #6aa9ff;
+  background: rgba(106, 169, 255, 0.1);
+  border-color: rgba(106, 169, 255, 0.26);
+}
+
+.ms-badge-fail,
+.ms-badge-failed {
+  color: #ff8d86;
+  background: rgba(255, 107, 107, 0.11);
+  border-color: rgba(255, 107, 107, 0.32);
+}
+
+.ms-badge-cancelled {
+  color: #b58cff;
+  background: rgba(181, 140, 255, 0.1);
+  border-color: rgba(181, 140, 255, 0.28);
+}
+
+.ms-badge-neutral {
+  color: var(--text-soft);
+}
+
+/* ========================================================================
+   Primitive: Stat + StatRow
+   ======================================================================== */
+
+.ms-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ms-stat {
+  position: relative;
+  padding: 14px 16px 15px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-elevated) 92%, transparent);
+  overflow: hidden;
+  transition: border-color 160ms ease;
+}
+
+.ms-stat::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
+}
+
+.ms-stat-center {
+  text-align: center;
+}
+
+.ms-stat-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.ms-stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.ms-stat-value.mono {
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.ms-stat-delta {
+  margin-top: 6px;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ms-stat-delta-up {
+  color: #66f0c0;
+}
+
+.ms-stat-delta-down {
+  color: #ff8d86;
+}
+
+.ms-stat-caption {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--text-soft);
+  line-height: 1.4;
+}
+
+.ms-stat-accent {
+  border-color: rgba(102, 240, 192, 0.22);
+  background: linear-gradient(180deg, rgba(102, 240, 192, 0.06), rgba(102, 240, 192, 0));
+}
+
+.ms-stat-warm {
+  border-color: rgba(255, 189, 89, 0.22);
+  background: linear-gradient(180deg, rgba(255, 189, 89, 0.05), rgba(255, 189, 89, 0));
+}
+
+.ms-stat-cool {
+  border-color: rgba(106, 169, 255, 0.22);
+  background: linear-gradient(180deg, rgba(106, 169, 255, 0.05), rgba(106, 169, 255, 0));
+}
+
+.ms-stat-violet {
+  border-color: rgba(181, 140, 255, 0.22);
+  background: linear-gradient(180deg, rgba(181, 140, 255, 0.05), rgba(181, 140, 255, 0));
+}
+
+.ms-stat-danger {
+  border-color: rgba(255, 107, 107, 0.22);
+  background: linear-gradient(180deg, rgba(255, 107, 107, 0.05), rgba(255, 107, 107, 0));
+}
+
+@media (max-width: 960px) {
+  .ms-stat-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .ms-stat-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ========================================================================
+   Primitive: Drawer
+   ======================================================================== */
+
+.ms-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+}
+
+.ms-drawer.open {
+  pointer-events: auto;
+}
+
+.ms-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(4, 8, 17, 0.54);
+  backdrop-filter: blur(4px);
+  opacity: 0;
+  transition: opacity 220ms ease;
+}
+
+.ms-drawer.open .ms-drawer-backdrop {
+  opacity: 1;
+}
+
+.ms-drawer-panel {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  max-width: 92vw;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background: color-mix(in srgb, var(--panel-elevated) 98%, transparent);
+  border-left: 1px solid var(--line);
+  box-shadow: -36px 0 80px rgba(0, 0, 0, 0.5);
+  transform: translateX(100%);
+  transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.ms-drawer.open .ms-drawer-panel {
+  transform: translateX(0);
+}
+
+.ms-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ms-drawer-head h3 {
+  margin: 4px 0 0;
+  font-size: 16px;
+  color: var(--text-strong);
+  letter-spacing: -0.01em;
+}
+
+.ms-drawer-actions {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ms-drawer-close {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-strong);
+  font-size: 18px;
+  line-height: 0;
+  cursor: pointer;
+}
+
+.ms-drawer-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ms-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 22px 24px;
+  display: grid;
+  gap: 18px;
+}
+
+/* ========================================================================
+   Primitive: Modal
+   ======================================================================== */
+
+.ms-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.ms-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(4, 8, 17, 0.62);
+  backdrop-filter: blur(5px);
+}
+
+.ms-modal-panel {
+  position: relative;
+  max-width: 100%;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-elevated) 98%, transparent);
+  box-shadow: 0 40px 120px rgba(0, 0, 0, 0.5);
+  display: grid;
+}
+
+.ms-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ms-modal-head h3 {
+  margin: 4px 0 0;
+  font-size: 16px;
+  color: var(--text-strong);
+}
+
+.ms-modal-body {
+  padding: 18px 22px 22px;
+  display: grid;
+  gap: 14px;
+}
+
+.ms-modal-foot {
+  padding: 14px 22px 18px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+/* ========================================================================
+   Primitive: MutationButton
+   ======================================================================== */
+
+.ms-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  font-weight: 600;
+  font-size: 12.5px;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.ms-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ms-button-sm {
+  padding: 7px 12px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+
+.ms-button-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #061019;
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  box-shadow: 0 14px 30px color-mix(in srgb, var(--accent-strong) 22%, transparent);
+}
+
+.ms-button-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.ms-button-ghost {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-strong);
+  border-color: var(--line);
+}
+
+.ms-button-ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ms-button-danger {
+  background: rgba(255, 107, 107, 0.1);
+  color: #ff9d93;
+  border-color: rgba(255, 107, 107, 0.34);
+}
+
+.ms-button-danger:hover:not(:disabled) {
+  background: rgba(255, 107, 107, 0.16);
+}
+
+.ms-button-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.6px solid currentColor;
+  border-right-color: transparent;
+  animation: ms-spin 720ms linear infinite;
+}
+
+@keyframes ms-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ms-button-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  font-size: 10px;
+  line-height: 1;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.ms-button-success {
+  animation: ms-flash 420ms ease;
+}
+
+@keyframes ms-flash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(102, 240, 192, 0.5);
+  }
+  100% {
+    box-shadow: 0 0 0 6px rgba(102, 240, 192, 0);
+  }
+}
+
+.ms-button-error {
+  border-color: rgba(255, 107, 107, 0.5);
+}
+
+/* ========================================================================
+   Primitive: SectionHeader + EmptyState
+   ======================================================================== */
+
+.ms-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.ms-section-head-copy h3 {
+  margin: 4px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-strong);
+}
+
+.ms-section-head-copy p {
+  margin: 4px 0 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  max-width: 64ch;
+}
+
+.ms-section-head-actions {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.ms-empty {
+  padding: 22px;
+  border-radius: 12px;
+  border: 1px dashed var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  text-align: center;
+  color: var(--text-soft);
+}
+
+.ms-empty strong {
+  display: block;
+  color: var(--text-strong);
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.ms-empty p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ms-empty-action {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* ========================================================================
+   Page: Jobs / Credits / Topology redesign helpers
+   ======================================================================== */
+
+.ms-jobs-layout {
+  display: grid;
+  gap: 14px;
+}
+
+.ms-job-submit {
+  display: grid;
+  gap: 14px;
+}
+
+.ms-job-submit-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+  gap: 16px;
+}
+
+.ms-job-submit textarea {
+  width: 100%;
+  min-height: 140px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-strong);
+  resize: vertical;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ms-job-submit textarea:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.ms-job-submit .ms-field-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ms-field {
+  display: grid;
+  gap: 5px;
+}
+
+.ms-field span {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.ms-field input,
+.ms-field select {
+  width: 100%;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-strong);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-field input:focus,
+.ms-field select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.ms-job-quote {
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  display: grid;
+  gap: 10px;
+}
+
+.ms-job-quote-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.ms-job-quote-head small {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.ms-job-quote-head strong {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-job-quote-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px 18px;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.ms-job-quote-grid span {
+  display: flex;
+  justify-content: space-between;
+}
+
+.ms-job-quote-grid strong {
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.ms-job-quote.infeasible {
+  border-color: rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.05);
+}
+
+.ms-jobs-table {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.ms-jobs-table-head,
+.ms-jobs-table-row {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1.1fr) minmax(90px, 0.7fr) minmax(0, 1.1fr)
+    minmax(80px, 0.6fr) minmax(80px, 0.6fr) minmax(80px, 0.6fr)
+    minmax(140px, 1fr);
+  gap: 10px;
+  padding: 10px 14px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.ms-jobs-table-head {
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--line);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.ms-jobs-table-row {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: var(--text-soft);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-jobs-table-row:last-child {
+  border-bottom: 0;
+}
+
+.ms-jobs-table-row:hover {
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--text-strong);
+}
+
+.ms-jobs-table-row.active {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text-strong);
+}
+
+.ms-jobs-table-row .mono {
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--text-strong);
+}
+
+.ms-jobs-table-row .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-jobs-table-row .progress-cell {
+  display: grid;
+  gap: 2px;
+}
+
+.ms-jobs-table-row .progress-cell small {
+  color: var(--text-muted);
+  font-size: 10px;
+  text-align: right;
+}
+
+.ms-jobs-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ms-credit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.ms-credit-full {
+  grid-column: 1 / -1;
+}
+
+.ms-credit-metadata {
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  max-width: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ms-drawer-section {
+  display: grid;
+  gap: 10px;
+}
+
+.ms-drawer-section h4 {
+  margin: 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.ms-drawer-lifecycle {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.ms-drawer-lifecycle .cell {
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line);
+}
+
+.ms-drawer-lifecycle .cell span {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.ms-drawer-lifecycle .cell strong {
+  color: var(--text-strong);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.ms-assignments {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.ms-assignments-head,
+.ms-assignments-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(80px, 0.7fr) minmax(70px, 0.6fr) minmax(80px, 0.6fr) minmax(80px, 0.7fr);
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 11.5px;
+  align-items: center;
+}
+
+.ms-assignments-head {
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  font-weight: 700;
+  border-bottom: 1px solid var(--line);
+}
+
+.ms-assignments-row {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: var(--text-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-assignments-row:last-child {
+  border-bottom: 0;
+}
+
+.ms-assignments-row .num {
+  text-align: right;
+}
+
+.ms-chart-card {
+  padding: 14px 14px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.ms-chart-card h4 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+@media (max-width: 1100px) {
+  .ms-job-submit-grid,
+  .ms-credit-grid {
+    grid-template-columns: 1fr;
+  }
+  .ms-jobs-kpis {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .ms-drawer-lifecycle {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .ms-jobs-table-head,
+  .ms-jobs-table-row {
+    grid-template-columns: minmax(0, 1.4fr) 90px 80px 80px 80px 120px;
+  }
+  .ms-jobs-table-head > :nth-child(3),
+  .ms-jobs-table-row > :nth-child(3) {
+    display: none;
+  }
+}
+
+/* ========================================================================
+   Universal polish — typography + accessibility
+   Applied last so it overrides earlier base rules without disrupting layout.
+   ======================================================================== */
+
+body,
+.dashboard-shell {
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.dashboard-shell .ms-stat-value,
+.dashboard-shell .num,
+.dashboard-shell .mono,
+.dashboard-shell .chart-tooltip,
+.dashboard-shell table,
+.dashboard-shell .ms-jobs-table-row,
+.dashboard-shell .ms-assignments-row {
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-shell h1,
+.dashboard-shell h2,
+.dashboard-shell h3,
+.dashboard-shell h4 {
+  letter-spacing: -0.012em;
+}
+
+.dashboard-shell button:focus-visible,
+.dashboard-shell input:focus-visible,
+.dashboard-shell select:focus-visible,
+.dashboard-shell textarea:focus-visible,
+.dashboard-shell a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+.dashboard-shell ::selection {
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
+  color: var(--text-strong);
+}
+
+.dashboard-shell .panel.dashboard-panel {
+  padding: 18px 20px 20px;
+}
+
+.dashboard-shell .ms-jobs-table button.ms-jobs-table-row {
+  border: 0;
 }

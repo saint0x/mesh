@@ -39,7 +39,7 @@ pub use network::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
     parse_tensor_plane_bind_addr_env, AllReducePhase, ConnectionInfo, ConnectionType, MeshEvent,
     MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections, TensorMessage, TensorPlane,
-    TensorPlaneConfig, TensorPlaneMetricsSnapshot,
+    TensorPlaneConfig, TensorPlaneMetricsSnapshot, TensorPlaneProfile,
 };
 pub use observability::{init_production_logging, init_simple_logging};
 pub use provider::{

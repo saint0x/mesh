@@ -122,6 +122,10 @@ enum Commands {
         /// Local API port to serve on
         #[arg(long, default_value = "43111")]
         api_port: u16,
+
+        /// Serve only the local UI API and skip building/serving the static frontend.
+        #[arg(long)]
+        api_only: bool,
     },
 }
 
@@ -408,9 +412,13 @@ async fn main() -> Result<()> {
         Commands::Doctor => {
             cmd_doctor().await?;
         }
-        Commands::Ui { port, api_port } => {
+        Commands::Ui {
+            port,
+            api_port,
+            api_only,
+        } => {
             init_simple_logging("warn")?;
-            cmd_ui(port, api_port).await?;
+            cmd_ui(port, api_port, api_only).await?;
         }
     }
 
@@ -418,7 +426,11 @@ async fn main() -> Result<()> {
 }
 
 /// Initialize device and register with control plane
-async fn cmd_init(network_id: String, name: String, control_plane_url: String) -> Result<()> {
+pub(crate) async fn cmd_init(
+    network_id: String,
+    name: String,
+    control_plane_url: String,
+) -> Result<()> {
     println!("🔧 Initializing Mesh AI agent...\n");
 
     // Generate device configuration
@@ -752,7 +764,7 @@ fn load_supervised_memory_limit_bytes() -> Result<u64> {
     Ok(baseline.saturating_mul(2).max(512 * 1024 * 1024))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn apply_runtime_rlimits(memory_limit_bytes: u64) -> Result<()> {
     let limit = libc::rlimit {
         rlim_cur: memory_limit_bytes as libc::rlim_t,
@@ -767,6 +779,11 @@ fn apply_runtime_rlimits(memory_limit_bytes: u64) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_runtime_rlimits(_memory_limit_bytes: u64) -> Result<()> {
     Ok(())
 }
 
@@ -839,7 +856,7 @@ fn control_plane_url(config: &DeviceConfig, path: &str) -> String {
 }
 
 /// Run agent daemon
-async fn cmd_start(log_level: String) -> Result<()> {
+pub(crate) async fn cmd_start(log_level: String) -> Result<()> {
     println!("🛡️  Starting Mesh inference supervisor...\n");
 
     let current_exe = std::env::current_exe().context("Failed to resolve current executable")?;
@@ -1317,6 +1334,7 @@ async fn cmd_runtime() -> Result<()> {
         }
 
         let tensor_plane = match TensorPlane::bind(TensorPlaneConfig {
+            profile: inference_config_task.governance.tensor_plane_profile,
             bind_addr: parse_tensor_plane_bind_addr_env()
                 .unwrap_or_else(|| TensorPlaneConfig::default().bind_addr),
             advertised_addr: parse_tensor_plane_advertised_addr_env(),
@@ -1747,7 +1765,7 @@ async fn cmd_status() -> Result<()> {
 }
 
 /// Lock resources for pool contribution
-async fn cmd_lock_resources(memory: String) -> Result<()> {
+pub(crate) async fn cmd_lock_resources(memory: String) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Locking Resources".bold().cyan());
@@ -1819,7 +1837,7 @@ async fn cmd_lock_resources(memory: String) -> Result<()> {
 }
 
 /// Request resource unlock (requires 24h cooldown)
-async fn cmd_unlock_resources() -> Result<()> {
+pub(crate) async fn cmd_unlock_resources() -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Unlocking Resources".bold().cyan());
@@ -2228,6 +2246,27 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(wait_ms) = stats.get("tensor_outbound_bandwidth_wait_ms") {
         println!("  Bandwidth Wait:    {}ms", wait_ms);
+    }
+    if let Some(reduce_scatter_ms) = stats.get("total_reduce_scatter_time_ms") {
+        println!("  Reduce-Scatter:    {}ms", reduce_scatter_ms);
+    }
+    if let Some(all_gather_ms) = stats.get("total_all_gather_time_ms") {
+        println!("  All-Gather:        {}ms", all_gather_ms);
+    }
+    if let Some(send_wait_ms) = stats.get("total_allreduce_send_wait_ms") {
+        println!("  Send Wait:         {}ms", send_wait_ms);
+    }
+    if let Some(receive_wait_ms) = stats.get("total_allreduce_receive_wait_ms") {
+        println!("  Receive Wait:      {}ms", receive_wait_ms);
+    }
+    if let Some(rs_bytes) = stats.get("tensor_reduce_scatter_bytes_sent") {
+        println!("  RS Bytes Sent:     {}", rs_bytes);
+    }
+    if let Some(ag_bytes) = stats.get("tensor_all_gather_bytes_sent") {
+        println!("  AG Bytes Sent:     {}", ag_bytes);
+    }
+    if let Some(open_connections) = stats.get("tensor_current_outbound_connections") {
+        println!("  Open Connections:  {}", open_connections);
     }
     if let Some(queue_drops) = stats.get("tensor_inbound_queue_full_rejections") {
         println!("  Queue Drops:       {}", queue_drops);
@@ -2655,7 +2694,7 @@ async fn cmd_pool_status() -> Result<()> {
 }
 
 /// Join ring topology for distributed inference
-async fn cmd_join_ring(model_id: String, memory: Option<String>) -> Result<()> {
+pub(crate) async fn cmd_join_ring(model_id: String, memory: Option<String>) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Joining Ring Topology".bold().cyan());
@@ -2932,7 +2971,7 @@ mod tests {
 }
 
 /// Leave ring topology
-async fn cmd_leave_ring() -> Result<()> {
+pub(crate) async fn cmd_leave_ring() -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Leaving Ring Topology".bold().cyan());
@@ -3062,7 +3101,7 @@ async fn cmd_inference(
 }
 
 /// Create a new pool (become admin)
-async fn cmd_pool_create(name: String) -> Result<()> {
+pub(crate) async fn cmd_pool_create(name: String) -> Result<()> {
     use colored::Colorize;
 
     println!("\n{}", "Creating New Pool".bold().cyan());
@@ -3245,7 +3284,7 @@ async fn request_certificate_with_retry(
 }
 
 /// Join an existing pool
-async fn cmd_pool_join(
+pub(crate) async fn cmd_pool_join(
     pool_id_hex: String,
     pool_root_pubkey_hex: String,
     name: Option<String>,

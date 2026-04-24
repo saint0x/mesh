@@ -158,7 +158,10 @@ mesh pool list
 mesh pool peers --pool-id <POOL_ID>
 mesh ledger summary
 mesh ledger events
+mesh ui
 ```
+
+For local UI development, `mesh-ui`'s existing `dev` command now boots the real local Mesh UI API first and then starts Vite, so the dashboard talks to live Mesh state instead of a frontend-only server.
 
 ## Model Assets
 

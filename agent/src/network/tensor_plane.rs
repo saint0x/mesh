@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::errors::{AgentError, Result};
 
-use super::tensor_message::TensorMessage;
+use super::tensor_message::{AllReducePhase, TensorMessage};
 
 pub const DATA_PLANE_ENDPOINT_PREFIX: &str = "dataplane://";
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -20,8 +20,31 @@ pub const DEFAULT_MAX_INBOUND_MESSAGES: usize = 64;
 pub const DEFAULT_MAX_INBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TensorPlaneProfile {
+    Lan,
+    Conservative,
+}
+
+impl Default for TensorPlaneProfile {
+    fn default() -> Self {
+        Self::Conservative
+    }
+}
+
+impl TensorPlaneProfile {
+    fn default_bandwidth_bytes_per_sec(self, max_message_bytes: usize) -> u64 {
+        match self {
+            Self::Lan => (256 * 1024 * 1024) as u64,
+            Self::Conservative => max_message_bytes as u64,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TensorPlaneConfig {
+    pub profile: TensorPlaneProfile,
     pub bind_addr: SocketAddr,
     pub advertised_addr: Option<SocketAddr>,
     pub connect_timeout: Duration,
@@ -36,6 +59,7 @@ pub struct TensorPlaneConfig {
 impl Default for TensorPlaneConfig {
     fn default() -> Self {
         Self {
+            profile: TensorPlaneProfile::default(),
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             advertised_addr: None,
             connect_timeout: Duration::from_secs(2),
@@ -53,6 +77,7 @@ impl Default for TensorPlaneConfig {
 pub struct InboundTensorMessage {
     pub tensor: TensorMessage,
     pub remote_addr: SocketAddr,
+    queued_at: Instant,
     _queued_bytes_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -60,28 +85,60 @@ pub struct InboundTensorMessage {
 pub struct TensorPlaneMetricsSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub reduce_scatter_bytes_sent: u64,
+    pub reduce_scatter_bytes_received: u64,
+    pub all_gather_bytes_sent: u64,
+    pub all_gather_bytes_received: u64,
+    pub barrier_bytes_sent: u64,
+    pub barrier_bytes_received: u64,
     pub outbound_backpressure_wait_count: u64,
     pub outbound_backpressure_wait_ms: u64,
     pub outbound_bandwidth_wait_count: u64,
     pub outbound_bandwidth_wait_ms: u64,
+    pub send_count: u64,
+    pub send_latency_ms: u64,
+    pub receive_count: u64,
+    pub receive_latency_ms: u64,
+    pub receive_queue_wait_ms: u64,
+    pub send_timeout_count: u64,
+    pub receive_timeout_count: u64,
     pub inbound_queue_full_rejections: u64,
     pub inbound_byte_budget_rejections: u64,
     pub oversized_message_rejections: u64,
     pub current_inbound_queued_bytes: u64,
+    pub peak_inbound_queued_bytes: u64,
     pub current_outbound_inflight_bytes: u64,
+    pub peak_outbound_inflight_bytes: u64,
+    pub current_outbound_connections: u64,
 }
 
 #[derive(Debug)]
 struct TensorPlaneMetrics {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
+    reduce_scatter_bytes_sent: AtomicU64,
+    reduce_scatter_bytes_received: AtomicU64,
+    all_gather_bytes_sent: AtomicU64,
+    all_gather_bytes_received: AtomicU64,
+    barrier_bytes_sent: AtomicU64,
+    barrier_bytes_received: AtomicU64,
     outbound_backpressure_wait_count: AtomicU64,
     outbound_backpressure_wait_ms: AtomicU64,
     outbound_bandwidth_wait_count: AtomicU64,
     outbound_bandwidth_wait_ms: AtomicU64,
+    send_count: AtomicU64,
+    send_latency_ms: AtomicU64,
+    receive_count: AtomicU64,
+    receive_latency_ms: AtomicU64,
+    receive_queue_wait_ms: AtomicU64,
+    send_timeout_count: AtomicU64,
+    receive_timeout_count: AtomicU64,
     inbound_queue_full_rejections: AtomicU64,
     inbound_byte_budget_rejections: AtomicU64,
     oversized_message_rejections: AtomicU64,
+    peak_inbound_queued_bytes: AtomicU64,
+    peak_outbound_inflight_bytes: AtomicU64,
+    current_outbound_connections: AtomicU64,
 }
 
 impl TensorPlaneMetrics {
@@ -89,15 +146,37 @@ impl TensorPlaneMetrics {
         Self {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            reduce_scatter_bytes_sent: AtomicU64::new(0),
+            reduce_scatter_bytes_received: AtomicU64::new(0),
+            all_gather_bytes_sent: AtomicU64::new(0),
+            all_gather_bytes_received: AtomicU64::new(0),
+            barrier_bytes_sent: AtomicU64::new(0),
+            barrier_bytes_received: AtomicU64::new(0),
             outbound_backpressure_wait_count: AtomicU64::new(0),
             outbound_backpressure_wait_ms: AtomicU64::new(0),
             outbound_bandwidth_wait_count: AtomicU64::new(0),
             outbound_bandwidth_wait_ms: AtomicU64::new(0),
+            send_count: AtomicU64::new(0),
+            send_latency_ms: AtomicU64::new(0),
+            receive_count: AtomicU64::new(0),
+            receive_latency_ms: AtomicU64::new(0),
+            receive_queue_wait_ms: AtomicU64::new(0),
+            send_timeout_count: AtomicU64::new(0),
+            receive_timeout_count: AtomicU64::new(0),
             inbound_queue_full_rejections: AtomicU64::new(0),
             inbound_byte_budget_rejections: AtomicU64::new(0),
             oversized_message_rejections: AtomicU64::new(0),
+            peak_inbound_queued_bytes: AtomicU64::new(0),
+            peak_outbound_inflight_bytes: AtomicU64::new(0),
+            current_outbound_connections: AtomicU64::new(0),
         }
     }
+}
+
+#[derive(Debug)]
+struct InboundState {
+    inbound_rx: mpsc::Receiver<InboundTensorMessage>,
+    pending_inbound: VecDeque<InboundTensorMessage>,
 }
 
 #[derive(Debug)]
@@ -112,6 +191,7 @@ struct TensorPlaneState {
     inbound_queue_bytes: Arc<Semaphore>,
     outbound_inflight_bytes: Arc<Semaphore>,
     outbound_bandwidth_limiter: Mutex<BandwidthLimiter>,
+    outbound_connections: Mutex<HashMap<SocketAddr, Arc<Mutex<TcpStream>>>>,
     metrics: TensorPlaneMetrics,
 }
 
@@ -158,8 +238,7 @@ impl BandwidthLimiter {
 
 pub struct TensorPlane {
     state: Arc<TensorPlaneState>,
-    inbound_rx: mpsc::Receiver<InboundTensorMessage>,
-    pending_inbound: VecDeque<InboundTensorMessage>,
+    inbound: Arc<Mutex<InboundState>>,
     _accept_task: tokio::task::JoinHandle<()>,
 }
 
@@ -202,6 +281,7 @@ impl TensorPlane {
                 config.max_send_bandwidth_bytes_per_sec,
                 config.max_message_bytes,
             )),
+            outbound_connections: Mutex::new(HashMap::new()),
             metrics,
         });
         let accept_state = Arc::clone(&metrics_state);
@@ -212,83 +292,106 @@ impl TensorPlane {
                         let tx = inbound_tx.clone();
                         let state = Arc::clone(&accept_state);
                         tokio::spawn(async move {
-                            match tokio::time::timeout(
-                                io_timeout,
-                                read_tensor_message(&mut stream, max_message_bytes),
-                            )
-                            .await
-                            {
-                                Ok(Ok(tensor)) => {
-                                    let queued_bytes = tensor.size_bytes().max(1);
-                                    let queued_bytes_u32: u32 = match queued_bytes.try_into() {
-                                        Ok(value) => value,
-                                        Err(_) => {
+                            loop {
+                                match tokio::time::timeout(
+                                    io_timeout,
+                                    read_tensor_message(&mut stream, max_message_bytes),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(tensor)) => {
+                                        let queued_bytes = tensor.size_bytes().max(1);
+                                        let queued_bytes_u32: u32 = match queued_bytes.try_into() {
+                                            Ok(value) => value,
+                                            Err(_) => {
+                                                state
+                                                    .metrics
+                                                    .oversized_message_rejections
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                warn!(
+                                                    queued_bytes,
+                                                    remote_addr = %remote_addr,
+                                                    "Tensor message size exceeded supported queue accounting"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        state
+                                            .metrics
+                                            .bytes_received
+                                            .fetch_add(queued_bytes as u64, Ordering::Relaxed);
+                                        record_phase_bytes(
+                                            &state.metrics,
+                                            tensor.phase,
+                                            queued_bytes as u64,
+                                            false,
+                                        );
+
+                                        let queued_bytes_permit = match state
+                                            .inbound_queue_bytes
+                                            .clone()
+                                            .try_acquire_many_owned(queued_bytes_u32)
+                                        {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                state
+                                                    .metrics
+                                                    .inbound_byte_budget_rejections
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                warn!(
+                                                    queued_bytes,
+                                                    remote_addr = %remote_addr,
+                                                    "Tensor plane inbound byte budget exhausted"
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                        if tx
+                                            .try_send(InboundTensorMessage {
+                                                tensor,
+                                                remote_addr,
+                                                queued_at: Instant::now(),
+                                                _queued_bytes_permit: Some(queued_bytes_permit),
+                                            })
+                                            .is_err()
+                                        {
+                                            state
+                                                .metrics
+                                                .inbound_queue_full_rejections
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                remote_addr = %remote_addr,
+                                                "Tensor plane inbound queue full"
+                                            );
+                                        } else {
+                                            update_peak(
+                                                &state.metrics.peak_inbound_queued_bytes,
+                                                (state.inbound_queue_byte_capacity
+                                                    - state.inbound_queue_bytes.available_permits()
+                                                        as usize)
+                                                    as u64,
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(error)) => {
+                                        if error.kind() == std::io::ErrorKind::InvalidData {
                                             state
                                                 .metrics
                                                 .oversized_message_rejections
                                                 .fetch_add(1, Ordering::Relaxed);
-                                            warn!(
-                                                queued_bytes,
-                                                remote_addr = %remote_addr,
-                                                "Tensor message size exceeded supported queue accounting"
-                                            );
-                                            return;
+                                            warn!(error = %error, remote_addr = %remote_addr, "Tensor plane receive failed");
                                         }
-                                    };
-                                    state
-                                        .metrics
-                                        .bytes_received
-                                        .fetch_add(queued_bytes as u64, Ordering::Relaxed);
-
-                                    let queued_bytes_permit = match state
-                                        .inbound_queue_bytes
-                                        .clone()
-                                        .try_acquire_many_owned(queued_bytes_u32)
-                                    {
-                                        Ok(permit) => permit,
-                                        Err(_) => {
-                                            state
-                                                .metrics
-                                                .inbound_byte_budget_rejections
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            warn!(
-                                                queued_bytes,
-                                                remote_addr = %remote_addr,
-                                                "Tensor plane inbound byte budget exhausted"
-                                            );
-                                            return;
-                                        }
-                                    };
-
-                                    if tx
-                                        .try_send(InboundTensorMessage {
-                                            tensor,
-                                            remote_addr,
-                                            _queued_bytes_permit: Some(queued_bytes_permit),
-                                        })
-                                        .is_err()
-                                    {
+                                        return;
+                                    }
+                                    Err(_) => {
                                         state
                                             .metrics
-                                            .inbound_queue_full_rejections
+                                            .receive_timeout_count
                                             .fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            remote_addr = %remote_addr,
-                                            "Tensor plane inbound queue full"
-                                        );
+                                        warn!(remote_addr = %remote_addr, "Tensor plane receive timed out");
+                                        return;
                                     }
-                                }
-                                Ok(Err(error)) => {
-                                    if error.kind() == std::io::ErrorKind::InvalidData {
-                                        state
-                                            .metrics
-                                            .oversized_message_rejections
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    warn!(error = %error, remote_addr = %remote_addr, "Tensor plane receive failed");
-                                }
-                                Err(_) => {
-                                    warn!(remote_addr = %remote_addr, "Tensor plane receive timed out");
                                 }
                             }
                         });
@@ -302,8 +405,10 @@ impl TensorPlane {
 
         Ok(Self {
             state: metrics_state,
-            inbound_rx,
-            pending_inbound: VecDeque::new(),
+            inbound: Arc::new(Mutex::new(InboundState {
+                inbound_rx,
+                pending_inbound: VecDeque::new(),
+            })),
             _accept_task: accept_task,
         })
     }
@@ -327,6 +432,36 @@ impl TensorPlane {
         TensorPlaneMetricsSnapshot {
             bytes_sent: self.state.metrics.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.state.metrics.bytes_received.load(Ordering::Relaxed),
+            reduce_scatter_bytes_sent: self
+                .state
+                .metrics
+                .reduce_scatter_bytes_sent
+                .load(Ordering::Relaxed),
+            reduce_scatter_bytes_received: self
+                .state
+                .metrics
+                .reduce_scatter_bytes_received
+                .load(Ordering::Relaxed),
+            all_gather_bytes_sent: self
+                .state
+                .metrics
+                .all_gather_bytes_sent
+                .load(Ordering::Relaxed),
+            all_gather_bytes_received: self
+                .state
+                .metrics
+                .all_gather_bytes_received
+                .load(Ordering::Relaxed),
+            barrier_bytes_sent: self
+                .state
+                .metrics
+                .barrier_bytes_sent
+                .load(Ordering::Relaxed),
+            barrier_bytes_received: self
+                .state
+                .metrics
+                .barrier_bytes_received
+                .load(Ordering::Relaxed),
             outbound_backpressure_wait_count: self
                 .state
                 .metrics
@@ -347,6 +482,29 @@ impl TensorPlane {
                 .metrics
                 .outbound_bandwidth_wait_ms
                 .load(Ordering::Relaxed),
+            send_count: self.state.metrics.send_count.load(Ordering::Relaxed),
+            send_latency_ms: self.state.metrics.send_latency_ms.load(Ordering::Relaxed),
+            receive_count: self.state.metrics.receive_count.load(Ordering::Relaxed),
+            receive_latency_ms: self
+                .state
+                .metrics
+                .receive_latency_ms
+                .load(Ordering::Relaxed),
+            receive_queue_wait_ms: self
+                .state
+                .metrics
+                .receive_queue_wait_ms
+                .load(Ordering::Relaxed),
+            send_timeout_count: self
+                .state
+                .metrics
+                .send_timeout_count
+                .load(Ordering::Relaxed),
+            receive_timeout_count: self
+                .state
+                .metrics
+                .receive_timeout_count
+                .load(Ordering::Relaxed),
             inbound_queue_full_rejections: self
                 .state
                 .metrics
@@ -365,13 +523,29 @@ impl TensorPlane {
             current_inbound_queued_bytes: (self.state.inbound_queue_byte_capacity
                 - self.state.inbound_queue_bytes.available_permits() as usize)
                 as u64,
+            peak_inbound_queued_bytes: self
+                .state
+                .metrics
+                .peak_inbound_queued_bytes
+                .load(Ordering::Relaxed),
             current_outbound_inflight_bytes: (self.state.outbound_inflight_byte_capacity
                 - self.state.outbound_inflight_bytes.available_permits() as usize)
                 as u64,
+            peak_outbound_inflight_bytes: self
+                .state
+                .metrics
+                .peak_outbound_inflight_bytes
+                .load(Ordering::Relaxed),
+            current_outbound_connections: self
+                .state
+                .metrics
+                .current_outbound_connections
+                .load(Ordering::Relaxed),
         }
     }
 
     pub async fn send(&self, target: SocketAddr, message: &TensorMessage) -> Result<()> {
+        let send_started = Instant::now();
         let message_bytes = message.size_bytes().max(1);
         if message_bytes > self.state.max_message_bytes {
             self.state
@@ -418,6 +592,12 @@ impl TensorPlane {
                 permit
             }
         };
+        update_peak(
+            &self.state.metrics.peak_outbound_inflight_bytes,
+            (self.state.outbound_inflight_byte_capacity
+                - self.state.outbound_inflight_bytes.available_permits() as usize)
+                as u64,
+        );
         let bandwidth_wait = {
             let mut limiter = self.state.outbound_bandwidth_limiter.lock().await;
             limiter.reserve_wait(message_bytes)
@@ -433,57 +613,163 @@ impl TensorPlane {
                 .fetch_add(bandwidth_wait.as_millis() as u64, Ordering::Relaxed);
             tokio::time::sleep(bandwidth_wait).await;
         }
-        let mut stream =
-            tokio::time::timeout(self.state.connect_timeout, TcpStream::connect(target))
-                .await
-                .map_err(|_| {
-                    AgentError::Network(format!("Timed out connecting to tensor peer {}", target))
-                })?
-                .map_err(|e| {
-                    AgentError::Network(format!(
-                        "Failed to connect to tensor peer {}: {}",
-                        target, e
-                    ))
-                })?;
-
-        tokio::time::timeout(
-            self.state.io_timeout,
-            write_tensor_message(&mut stream, message, self.state.max_message_bytes),
-        )
-        .await
-        .map_err(|_| AgentError::Network(format!("Timed out sending tensor to {}", target)))?
-        .map_err(|e| AgentError::Network(format!("Failed to send tensor to {}: {}", target, e)))?;
+        let stream = self.get_or_connect(target).await?;
+        let send_result = {
+            let mut stream_guard = stream.lock().await;
+            tokio::time::timeout(
+                self.state.io_timeout,
+                write_tensor_message(&mut *stream_guard, message, self.state.max_message_bytes),
+            )
+            .await
+        };
+        let send_result = match send_result {
+            Ok(result) => result,
+            Err(_) => {
+                self.state
+                    .metrics
+                    .send_timeout_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.evict_connection(target).await;
+                drop(outbound_permit);
+                return Err(AgentError::Network(format!(
+                    "Timed out sending tensor to {}",
+                    target
+                )));
+            }
+        };
+        if let Err(error) = send_result {
+            self.evict_connection(target).await;
+            drop(outbound_permit);
+            return Err(AgentError::Network(format!(
+                "Failed to send tensor to {}: {}",
+                target, error
+            )));
+        }
         self.state
             .metrics
             .bytes_sent
             .fetch_add(message_bytes as u64, Ordering::Relaxed);
+        record_phase_bytes(
+            &self.state.metrics,
+            message.phase,
+            message_bytes as u64,
+            true,
+        );
+        self.state
+            .metrics
+            .send_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .metrics
+            .send_latency_ms
+            .fetch_add(send_started.elapsed().as_millis() as u64, Ordering::Relaxed);
         drop(outbound_permit);
 
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> Option<InboundTensorMessage> {
-        if let Some(message) = self.pending_inbound.pop_front() {
-            return Some(message);
+    async fn get_or_connect(&self, target: SocketAddr) -> Result<Arc<Mutex<TcpStream>>> {
+        {
+            let connections = self.state.outbound_connections.lock().await;
+            if let Some(existing) = connections.get(&target) {
+                return Ok(Arc::clone(existing));
+            }
         }
-        self.inbound_rx.recv().await
+
+        let stream = tokio::time::timeout(self.state.connect_timeout, TcpStream::connect(target))
+            .await
+            .map_err(|_| {
+                self.state
+                    .metrics
+                    .send_timeout_count
+                    .fetch_add(1, Ordering::Relaxed);
+                AgentError::Network(format!("Timed out connecting to tensor peer {}", target))
+            })?
+            .map_err(|e| {
+                AgentError::Network(format!(
+                    "Failed to connect to tensor peer {}: {}",
+                    target, e
+                ))
+            })?;
+        stream.set_nodelay(true).map_err(|e| {
+            AgentError::Network(format!("Failed to set TCP_NODELAY on {}: {}", target, e))
+        })?;
+        let stream = Arc::new(Mutex::new(stream));
+
+        let mut connections = self.state.outbound_connections.lock().await;
+        let was_present = connections.contains_key(&target);
+        let entry = connections
+            .entry(target)
+            .or_insert_with(|| Arc::clone(&stream));
+        if !was_present {
+            self.state
+                .metrics
+                .current_outbound_connections
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Arc::clone(entry))
     }
 
-    pub async fn recv_matching<F>(&mut self, mut predicate: F) -> Option<InboundTensorMessage>
+    async fn evict_connection(&self, target: SocketAddr) {
+        let mut connections = self.state.outbound_connections.lock().await;
+        if connections.remove(&target).is_some() {
+            self.state
+                .metrics
+                .current_outbound_connections
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub async fn recv(&self) -> Option<InboundTensorMessage> {
+        let mut inbound = self.inbound.lock().await;
+        if let Some(message) = inbound.pending_inbound.pop_front() {
+            self.record_receive_metrics(&message);
+            return Some(message);
+        }
+        let message = inbound.inbound_rx.recv().await?;
+        self.record_receive_metrics(&message);
+        Some(message)
+    }
+
+    pub async fn recv_matching<F>(&self, mut predicate: F) -> Option<InboundTensorMessage>
     where
         F: FnMut(&InboundTensorMessage) -> bool,
     {
-        if let Some(index) = self.pending_inbound.iter().position(&mut predicate) {
-            return self.pending_inbound.remove(index);
+        let mut inbound = self.inbound.lock().await;
+        if let Some(index) = inbound.pending_inbound.iter().position(&mut predicate) {
+            let message = inbound.pending_inbound.remove(index)?;
+            self.record_receive_metrics(&message);
+            return Some(message);
         }
 
         loop {
-            let inbound = self.inbound_rx.recv().await?;
-            if predicate(&inbound) {
-                return Some(inbound);
+            let message = inbound.inbound_rx.recv().await?;
+            if predicate(&message) {
+                self.record_receive_metrics(&message);
+                return Some(message);
             }
-            self.pending_inbound.push_back(inbound);
+            inbound.pending_inbound.push_back(message);
         }
+    }
+
+    fn record_receive_metrics(&self, inbound: &InboundTensorMessage) {
+        self.state
+            .metrics
+            .receive_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.state.metrics.receive_latency_ms.fetch_add(
+            inbound.queued_at.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        self.state.metrics.receive_queue_wait_ms.fetch_add(
+            inbound.queued_at.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        update_peak(
+            &self.state.metrics.peak_inbound_queued_bytes,
+            (self.state.inbound_queue_byte_capacity
+                - self.state.inbound_queue_bytes.available_permits() as usize) as u64,
+        );
     }
 }
 
@@ -533,14 +819,50 @@ pub fn parse_tensor_plane_advertised_addr_env() -> Option<SocketAddr> {
 }
 
 fn sanitized_config(config: TensorPlaneConfig) -> Result<TensorPlaneConfig> {
+    let max_message_bytes = config.max_message_bytes.max(1);
+    let max_send_bandwidth_bytes_per_sec = if config.max_send_bandwidth_bytes_per_sec == 0 {
+        config
+            .profile
+            .default_bandwidth_bytes_per_sec(max_message_bytes)
+    } else {
+        config.max_send_bandwidth_bytes_per_sec
+    };
+
     Ok(TensorPlaneConfig {
-        max_message_bytes: config.max_message_bytes.max(1),
+        max_message_bytes,
         max_inbound_messages: config.max_inbound_messages.max(1),
         max_inbound_queued_bytes: config.max_inbound_queued_bytes.max(1),
         max_outbound_inflight_bytes: config.max_outbound_inflight_bytes.max(1),
-        max_send_bandwidth_bytes_per_sec: config.max_send_bandwidth_bytes_per_sec.max(1),
+        max_send_bandwidth_bytes_per_sec,
         ..config
     })
+}
+
+fn update_peak(metric: &AtomicU64, value: u64) {
+    let mut current = metric.load(Ordering::Relaxed);
+    while value > current {
+        match metric.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn record_phase_bytes(
+    metrics: &TensorPlaneMetrics,
+    phase: AllReducePhase,
+    bytes: u64,
+    outbound: bool,
+) {
+    let target = match (phase, outbound) {
+        (AllReducePhase::ReduceScatter, true) => &metrics.reduce_scatter_bytes_sent,
+        (AllReducePhase::ReduceScatter, false) => &metrics.reduce_scatter_bytes_received,
+        (AllReducePhase::AllGather, true) => &metrics.all_gather_bytes_sent,
+        (AllReducePhase::AllGather, false) => &metrics.all_gather_bytes_received,
+        (AllReducePhase::Barrier, true) => &metrics.barrier_bytes_sent,
+        (AllReducePhase::Barrier, false) => &metrics.barrier_bytes_received,
+    };
+    target.fetch_add(bytes, Ordering::Relaxed);
 }
 
 async fn read_tensor_message<T>(
@@ -672,7 +994,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tensor_plane_rejects_inbound_when_queue_is_full() {
-        let mut plane = TensorPlane::bind(TensorPlaneConfig {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
             max_inbound_messages: 1,
             max_inbound_queued_bytes: 1024 * 1024,
             ..TensorPlaneConfig::default()
@@ -702,7 +1024,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tensor_plane_rejects_inbound_when_byte_budget_is_exhausted() {
-        let mut plane = TensorPlane::bind(TensorPlaneConfig {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
             max_inbound_messages: 4,
             max_inbound_queued_bytes: 100,
             ..TensorPlaneConfig::default()
@@ -726,7 +1048,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recv_matching_buffers_nonmatching_messages() {
-        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
             .await
             .unwrap();
         let addr = plane.local_addr();
@@ -753,6 +1075,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(buffered.tensor.step, 1);
+    }
+
+    #[tokio::test]
+    async fn test_tensor_plane_reuses_outbound_connection_for_multiple_messages() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let addr = plane.local_addr();
+
+        let mut first = test_message(4);
+        first.step = 1;
+        let mut second = test_message(4);
+        second.step = 2;
+
+        plane.send(addr, &first).await.unwrap();
+        plane.send(addr, &second).await.unwrap();
+
+        let first_received = timeout(
+            Duration::from_secs(1),
+            plane.recv_matching(|inbound| inbound.tensor.step == 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second_received = timeout(
+            Duration::from_secs(1),
+            plane.recv_matching(|inbound| inbound.tensor.step == 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first_received.tensor.step, 1);
+        assert_eq!(second_received.tensor.step, 2);
+        assert_eq!(plane.metrics_snapshot().current_outbound_connections, 1);
     }
 
     #[test]

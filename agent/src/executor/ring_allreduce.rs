@@ -20,6 +20,23 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingAllReduceMetrics {
+    pub reduce_scatter_step_time_ms: u64,
+    pub all_gather_step_time_ms: u64,
+    pub send_wait_time_ms: u64,
+    pub receive_wait_time_ms: u64,
+}
+
+impl RingAllReduceMetrics {
+    pub fn accumulate(&mut self, other: RingAllReduceMetrics) {
+        self.reduce_scatter_step_time_ms += other.reduce_scatter_step_time_ms;
+        self.all_gather_step_time_ms += other.all_gather_step_time_ms;
+        self.send_wait_time_ms += other.send_wait_time_ms;
+        self.receive_wait_time_ms += other.receive_wait_time_ms;
+    }
+}
+
 /// Tensor data structure for ring all-reduce operations
 ///
 /// Represents a multi-dimensional array of f32 values commonly used
@@ -148,6 +165,8 @@ pub struct WorkerRing<'a> {
     pub right_tensor_addr: SocketAddr,
     /// Dedicated tensor plane for network communication (borrowed).
     pub tensor_plane: &'a mut TensorPlane,
+    /// Timings captured during the most recent all-reduce call.
+    last_run_metrics: RingAllReduceMetrics,
 }
 
 impl<'a> WorkerRing<'a> {
@@ -176,6 +195,7 @@ impl<'a> WorkerRing<'a> {
             left_tensor_addr,
             right_tensor_addr,
             tensor_plane,
+            last_run_metrics: RingAllReduceMetrics::default(),
         }
     }
 
@@ -202,6 +222,7 @@ impl<'a> WorkerRing<'a> {
         let n = self.total_workers as usize;
         let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
+        let mut run_metrics = RingAllReduceMetrics::default();
 
         // Split tensor into n chunks
         let mut chunks = partial_result.chunk(n);
@@ -241,9 +262,12 @@ impl<'a> WorkerRing<'a> {
                 chunks[send_idx].shape.clone(),
             );
 
-            // Send to right, receive from left (simulated with sequential ops)
-            // In a real implementation, this would be done concurrently
-            let recv_msg = self.send_to_right_recv_from_left(send_msg).await?;
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) =
+                self.send_to_right_recv_from_left(send_msg).await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
 
             // Convert received message to Tensor
             let received_chunk = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
@@ -281,7 +305,12 @@ impl<'a> WorkerRing<'a> {
                 chunks[send_idx].shape.clone(),
             );
 
-            let recv_msg = self.send_to_right_recv_from_left(send_msg).await?;
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) =
+                self.send_to_right_recv_from_left(send_msg).await?;
+            run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
 
             // In all-gather, we just copy (replace) the received chunk
             chunks[recv_idx] = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
@@ -292,6 +321,7 @@ impl<'a> WorkerRing<'a> {
         // Concatenate chunks to get full tensor
         let full_tensor = Tensor::concat(chunks);
 
+        self.last_run_metrics = run_metrics;
         Ok(Tensor::new(full_tensor.data, original_shape))
     }
 
@@ -331,7 +361,7 @@ impl<'a> WorkerRing<'a> {
         );
 
         // Send barrier notification to right
-        let received = self.send_to_right_recv_from_left(barrier_msg).await?;
+        let (received, _, _) = self.send_to_right_recv_from_left(barrier_msg).await?;
 
         // Verify received from left neighbor
         let expected_pos = (self.my_position + self.total_workers - 1) % self.total_workers;
@@ -353,22 +383,14 @@ impl<'a> WorkerRing<'a> {
     async fn send_to_right_recv_from_left(
         &mut self,
         message: TensorMessage,
-    ) -> Result<TensorMessage> {
-        // Send to right neighbor over the dedicated tensor data plane.
-        self.tensor_plane
-            .send(self.right_tensor_addr, &message)
-            .await?;
-
-        debug!(
-            "Sent tensor to right neighbor {}, waiting for tensor from left neighbor {}",
-            self.right_neighbor, self.left_neighbor
-        );
-
+    ) -> Result<(TensorMessage, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
-        let inbound = self
-            .tensor_plane
-            .recv_matching(|inbound| {
+        let send_started = std::time::Instant::now();
+        let recv_started = std::time::Instant::now();
+        let (send_result, inbound) = tokio::join!(
+            self.tensor_plane.send(self.right_tensor_addr, &message),
+            self.tensor_plane.recv_matching(|inbound| {
                 let tensor = &inbound.tensor;
                 tensor.sender_position == expected_sender_position
                     && tensor.job_id == message.job_id
@@ -376,20 +398,35 @@ impl<'a> WorkerRing<'a> {
                     && tensor.phase == message.phase
                     && tensor.step == message.step
             })
-            .await
-            .ok_or_else(|| {
-                AgentError::Network(format!(
-                    "Tensor plane closed while waiting for {:?} step {} from worker {}",
-                    message.phase, message.step, expected_sender_position
-                ))
-            })?;
+        );
+        send_result?;
+
+        debug!(
+            "Sent tensor to right neighbor {}, waiting for tensor from left neighbor {}",
+            self.right_neighbor, self.left_neighbor
+        );
+
+        let inbound = inbound.ok_or_else(|| {
+            AgentError::Network(format!(
+                "Tensor plane closed while waiting for {:?} step {} from worker {}",
+                message.phase, message.step, expected_sender_position
+            ))
+        })?;
 
         let tensor = inbound.tensor;
         debug!(
             "Received tensor from left neighbor {}, phase={:?}, step={}, remote_addr={}",
             self.left_neighbor, tensor.phase, tensor.step, inbound.remote_addr
         );
-        Ok(tensor)
+        Ok((
+            tensor,
+            send_started.elapsed().as_millis() as u64,
+            recv_started.elapsed().as_millis() as u64,
+        ))
+    }
+
+    pub fn last_run_metrics(&self) -> RingAllReduceMetrics {
+        self.last_run_metrics
     }
 }
 

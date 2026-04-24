@@ -12,6 +12,8 @@ const ModelsPage = lazy(async () => import('./dashboard/pages/ModelsPage').then(
 const JobsPage = lazy(async () => import('./dashboard/pages/JobsPage').then((module) => ({ default: module.JobsPage })))
 const LedgerPage = lazy(async () => import('./dashboard/pages/LedgerPage').then((module) => ({ default: module.LedgerPage })))
 const CreditsPage = lazy(async () => import('./dashboard/pages/CreditsPage').then((module) => ({ default: module.CreditsPage })))
+const PoolsPage = lazy(async () => import('./dashboard/pages/PoolsPage').then((module) => ({ default: module.PoolsPage })))
+const DoctorPage = lazy(async () => import('./dashboard/pages/DoctorPage').then((module) => ({ default: module.DoctorPage })))
 const SettingsPage = lazy(async () => import('./dashboard/pages/SettingsPage').then((module) => ({ default: module.SettingsPage })))
 
 export function Dashboard(props: DashboardShellProps) {
@@ -75,6 +77,10 @@ function renderPage(
       return <LedgerPage {...pageProps} />
     case 'credits':
       return <CreditsPage {...pageProps} />
+    case 'pools':
+      return <PoolsPage {...pageProps} />
+    case 'doctor':
+      return <DoctorPage {...pageProps} />
     case 'settings':
       return <SettingsPage {...pageProps} />
   }
