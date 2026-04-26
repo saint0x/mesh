@@ -1669,6 +1669,14 @@ async fn cmd_runtime() -> Result<()> {
                 requested_max_tokens = assignment.active_segment.max_tokens,
                 allowed_completion_tokens = assignment.available_completion_tokens,
                 reserved_credits = assignment.reserved_credits,
+                decode_target_sessions = decode_lease
+                    .as_ref()
+                    .and_then(|lease| lease.lease_target_session_count)
+                    .or(assignment.session.lease_target_session_count),
+                decode_target_batch_size = decode_lease
+                    .as_ref()
+                    .and_then(|lease| lease.lease_target_batch_size)
+                    .or(assignment.session.lease_target_batch_size),
                 "Claimed distributed inference assignment"
             );
 
@@ -1747,6 +1755,16 @@ async fn cmd_runtime() -> Result<()> {
                 phase: match assignment.active_segment.phase {
                     ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
                     ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
+                },
+                decode_batch_targets: agent::inference::DecodeBatchTargets {
+                    target_session_count: decode_lease
+                        .as_ref()
+                        .and_then(|lease| lease.lease_target_session_count)
+                        .or(assignment.session.lease_target_session_count),
+                    target_batch_size: decode_lease
+                        .as_ref()
+                        .and_then(|lease| lease.lease_target_batch_size)
+                        .or(assignment.session.lease_target_batch_size),
                 },
                 executor_id: device_id.to_string(),
                 created_at: std::time::SystemTime::now()

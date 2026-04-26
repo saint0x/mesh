@@ -35,7 +35,7 @@ use super::engine::{
 };
 use super::forward_pass::ModelWeights;
 use super::job::{
-    InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
+    DecodeBatchTargets, InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
     SegmentExecutionResult,
 };
 use super::stats::InferenceStats;
@@ -393,8 +393,12 @@ impl InferenceCoordinator {
         Ok(())
     }
 
-    fn build_next_decode_batch(&mut self) -> DecodeBatchPlan {
-        let policy = self.decode_batch_policy();
+    fn build_next_decode_batch(
+        &mut self,
+        primary_session_id: Uuid,
+        targets: DecodeBatchTargets,
+    ) -> DecodeBatchPlan {
+        let policy = self.decode_batch_policy_for_targets(targets);
         let mut total_kv_tokens = 0_usize;
         let mut slots = Vec::new();
         let mut deferred = Vec::new();
@@ -406,8 +410,14 @@ impl InferenceCoordinator {
         queue.sort_by_key(|task| {
             self.sessions
                 .get(&task.session_id)
-                .map(|session| (session.decode_steps_served, task.fairness_epoch))
-                .unwrap_or((u64::MAX, task.fairness_epoch))
+                .map(|session| {
+                    (
+                        task.session_id != primary_session_id,
+                        session.decode_steps_served,
+                        task.fairness_epoch,
+                    )
+                })
+                .unwrap_or((true, u64::MAX, task.fairness_epoch))
         });
 
         for task in queue {
@@ -463,6 +473,23 @@ impl InferenceCoordinator {
             .values()
             .filter(|session| session.job.has_decode_context() && !session.job.is_complete())
             .count()
+    }
+
+    fn decode_batch_policy_for_targets(&self, targets: DecodeBatchTargets) -> DecodeBatchPolicy {
+        let base = self.decode_batch_policy();
+        let mut max_batch_size = base.max_batch_size;
+
+        if let Some(target_batch_size) = targets.target_batch_size {
+            max_batch_size = max_batch_size.min(target_batch_size.max(1) as usize);
+        }
+        if let Some(target_session_count) = targets.target_session_count {
+            max_batch_size = max_batch_size.min(target_session_count.max(1) as usize);
+        }
+
+        DecodeBatchPolicy {
+            max_batch_size: max_batch_size.max(1),
+            max_total_kv_tokens: base.max_total_kv_tokens,
+        }
     }
 
     pub async fn export_session_checkpoint_bytes(&mut self, session_id: Uuid) -> Result<Vec<u8>> {
@@ -1207,7 +1234,8 @@ impl InferenceCoordinator {
                 }
             }
 
-            let batch = self.build_next_decode_batch();
+            let batch =
+                self.build_next_decode_batch(request.session_id, request.decode_batch_targets);
             if batch.is_empty() {
                 return Err(AgentError::Execution(
                     "decode runtime had no admitted work despite active queued sessions"
@@ -1677,7 +1705,7 @@ mod tests {
         coordinator.enqueue_decode_task(session_a).unwrap();
         coordinator.enqueue_decode_task(session_b).unwrap();
 
-        let batch = coordinator.build_next_decode_batch();
+        let batch = coordinator.build_next_decode_batch(session_b, DecodeBatchTargets::default());
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.total_kv_tokens, 20);
         assert!(batch.deferred.is_empty());
@@ -1703,7 +1731,7 @@ mod tests {
         coordinator.enqueue_decode_task(session_b).unwrap();
         coordinator.enqueue_decode_task(session_c).unwrap();
 
-        let batch = coordinator.build_next_decode_batch();
+        let batch = coordinator.build_next_decode_batch(session_b, DecodeBatchTargets::default());
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.total_kv_tokens, 9);
         assert_eq!(batch.deferred.len(), 1);
@@ -1739,11 +1767,80 @@ mod tests {
         coordinator.enqueue_decode_task(session_a).unwrap();
         coordinator.enqueue_decode_task(session_b).unwrap();
 
-        let batch = coordinator.build_next_decode_batch();
+        let batch = coordinator.build_next_decode_batch(session_b, DecodeBatchTargets::default());
         assert_eq!(batch.slots.len(), 1);
         assert_eq!(batch.slots[0].session_id, session_b);
         assert_eq!(batch.deferred.len(), 1);
         assert_eq!(batch.deferred[0].session_id, session_a);
         assert_eq!(batch.deferred_for_capacity, 1);
+    }
+
+    #[test]
+    fn test_build_next_decode_batch_honors_scheduler_batch_targets() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let session_c = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 4, 22);
+        insert_decode_session(&mut coordinator, session_c, 4, 33);
+
+        coordinator.enqueue_decode_task(session_a).unwrap();
+        coordinator.enqueue_decode_task(session_b).unwrap();
+        coordinator.enqueue_decode_task(session_c).unwrap();
+
+        let batch = coordinator.build_next_decode_batch(
+            session_a,
+            DecodeBatchTargets {
+                target_session_count: Some(2),
+                target_batch_size: Some(2),
+            },
+        );
+        assert_eq!(batch.slots.len(), 2);
+        assert_eq!(batch.slots[0].session_id, session_a);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred_for_capacity, 1);
+    }
+
+    #[test]
+    fn test_build_next_decode_batch_can_force_single_session_decode() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 4, 22);
+        coordinator
+            .sessions
+            .get_mut(&session_b)
+            .expect("session b")
+            .decode_steps_served = 0;
+        coordinator
+            .sessions
+            .get_mut(&session_a)
+            .expect("session a")
+            .decode_steps_served = 10;
+
+        coordinator.enqueue_decode_task(session_a).unwrap();
+        coordinator.enqueue_decode_task(session_b).unwrap();
+
+        let batch = coordinator.build_next_decode_batch(
+            session_a,
+            DecodeBatchTargets {
+                target_session_count: Some(1),
+                target_batch_size: Some(1),
+            },
+        );
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, session_a);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred[0].session_id, session_b);
     }
 }

@@ -64,8 +64,8 @@ pub use engine::{
 };
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
 pub use job::{
-    GenerationConfig, InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
-    SegmentExecutionResult,
+    DecodeBatchTargets, GenerationConfig, InferenceJob, InferenceProgressUpdate, InferenceRequest,
+    InferenceResult, SegmentExecutionResult,
 };
 pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};
 pub use stats::InferenceStats;

@@ -7,6 +7,12 @@ use uuid::Uuid;
 
 use super::engine::ExecutionPhase;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct DecodeBatchTargets {
+    pub target_session_count: Option<u32>,
+    pub target_batch_size: Option<u32>,
+}
+
 /// Configuration for text generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationConfig {
@@ -70,6 +76,10 @@ pub struct InferenceRequest {
     /// Execution phase requested by the control plane.
     pub phase: ExecutionPhase,
 
+    /// Optional scheduler-owned decode batch targets for this serving lease.
+    #[serde(default)]
+    pub decode_batch_targets: DecodeBatchTargets,
+
     /// Executor ID (for credit tracking)
     pub executor_id: String,
 
@@ -93,6 +103,7 @@ impl InferenceRequest {
             config: GenerationConfig::default(),
             session_id: Uuid::new_v4(),
             phase: ExecutionPhase::Prefill,
+            decode_batch_targets: DecodeBatchTargets::default(),
             executor_id,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
