@@ -572,8 +572,8 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
             .min(31);
         let fresh_score = match mode {
             SchedulerPolicyMode::FitFirst => ((31u32.saturating_sub(fresh_target)) << 10)
-                .saturating_add(fresh_ready << 5)
-                .saturating_add(31u32.saturating_sub(fresh_blocked)),
+                .saturating_add((31u32.saturating_sub(fresh_blocked)) << 5)
+                .saturating_add(fresh_ready),
             SchedulerPolicyMode::ThroughputFirst => (fresh_target << 10)
                 .saturating_add(fresh_ready << 5)
                 .saturating_add(31u32.saturating_sub(fresh_blocked)),
@@ -2589,6 +2589,87 @@ mod tests {
             &HashMap::new(),
         );
         assert!(throughput_larger < throughput_smaller);
+    }
+
+    #[test]
+    fn fit_first_prefers_less_transfer_exposed_equal_size_fresh_decode_cohort_while_latency_prefers_readier_one() {
+        let mut less_blocked = base_candidate(SchedulerPhase::Decode);
+        less_blocked.assignment_id = "less-blocked".into();
+        less_blocked.group_status = "decode_ready".into();
+        less_blocked.decode_queue_status = Some("ready".into());
+        less_blocked.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        less_blocked.decode_lease_target_session_count = Some(3);
+        less_blocked.decode_cohort_ready_sessions = 1;
+        less_blocked.decode_cohort_blocked_sessions = 0;
+        less_blocked.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut readier_more_blocked = less_blocked.clone();
+        readier_more_blocked.assignment_id = "readier-more-blocked".into();
+        readier_more_blocked.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        readier_more_blocked.decode_cohort_ready_sessions = 3;
+        readier_more_blocked.decode_cohort_blocked_sessions = 2;
+
+        let less_blocked = RunnableCandidate {
+            ready_at: less_blocked.decode_ready_at.clone().unwrap(),
+            candidate: less_blocked,
+        };
+        let readier_more_blocked = RunnableCandidate {
+            ready_at: readier_more_blocked.decode_ready_at.clone().unwrap(),
+            candidate: readier_more_blocked,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let fit_less_blocked = rank_candidate(
+            &less_blocked,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fit_readier = rank_candidate(
+            &readier_more_blocked,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(fit_less_blocked < fit_readier);
+
+        let latency_less_blocked = rank_candidate(
+            &less_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_readier = rank_candidate(
+            &readier_more_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_readier < latency_less_blocked);
     }
 
     #[test]
