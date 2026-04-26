@@ -1794,6 +1794,20 @@ async fn cmd_runtime() -> Result<()> {
                         .and_then(|lease| lease.lease_target_batch_size)
                         .or(assignment.session.lease_target_batch_size),
                 },
+                runtime_mode: match assignment.execution_plan.runtime_mode {
+                    agent::api::types::InferenceRuntimeMode::FitFirst => {
+                        agent::inference::InferenceRuntimeMode::FitFirst
+                    }
+                    agent::api::types::InferenceRuntimeMode::ThroughputFirst => {
+                        agent::inference::InferenceRuntimeMode::ThroughputFirst
+                    }
+                    agent::api::types::InferenceRuntimeMode::LatencyFirst => {
+                        agent::inference::InferenceRuntimeMode::LatencyFirst
+                    }
+                    agent::api::types::InferenceRuntimeMode::ResilientEdge => {
+                        agent::inference::InferenceRuntimeMode::ResilientEdge
+                    }
+                },
                 executor_id: device_id.to_string(),
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1813,6 +1827,13 @@ async fn cmd_runtime() -> Result<()> {
                     })
                     .unwrap_or(false);
                 if !decode_ready {
+                    if coordinator.has_session(request.session_id) {
+                        coordinator.pause_local_session(
+                            request.session_id,
+                            agent::inference::SessionPauseReason::LocalKvNotReady,
+                            "decode lease missing local resume-ready KV replica".to_string(),
+                        );
+                    }
                     error!(
                         job_id = %job_id,
                         segment_id = %active_segment_id,
@@ -1886,6 +1907,13 @@ async fn cmd_runtime() -> Result<()> {
                                 }
                             }
                             Ok(None) => {
+                                if coordinator.has_session(request.session_id) {
+                                    coordinator.pause_local_session(
+                                        request.session_id,
+                                        agent::inference::SessionPauseReason::LocalKvNotReady,
+                                        "remote checkpoint not yet available".to_string(),
+                                    );
+                                }
                                 warn!(
                                     job_id = %job_id,
                                     session_id = %request.session_id,
@@ -1893,6 +1921,13 @@ async fn cmd_runtime() -> Result<()> {
                                 );
                             }
                             Err(e) => {
+                                if coordinator.has_session(request.session_id) {
+                                    coordinator.pause_local_session(
+                                        request.session_id,
+                                        agent::inference::SessionPauseReason::Failover,
+                                        format!("remote checkpoint download failed: {}", e),
+                                    );
+                                }
                                 error!(
                                     job_id = %job_id,
                                     session_id = %request.session_id,

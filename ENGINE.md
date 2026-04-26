@@ -93,13 +93,13 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Introduce backend/runtime boundary in the agent
 - ✅ Preserve explicit session identity in runtime state
 - ✅ Preserve checkpoint-backed recovery for lost in-memory state
-- In progress: Add long-lived decode worker loop that consumes scheduler-owned decode work
-- In progress: Add runtime batching interface at the execution backend boundary
-- Planned: Add explicit runtime memory budgeting for active sessions and KV
-- Planned: Add session eviction hooks driven by control-plane policy
-- In progress: Add runtime pause/resume semantics for regroup and failover
-- In progress: Add explicit transport prioritization between decode traffic and bulk transfer
-- Planned: Add provider-specialized fast paths behind the backend abstraction
+- ✅ Add long-lived decode worker loop that consumes scheduler-owned decode work
+- ✅ Add runtime batching interface at the execution backend boundary
+- ✅ Add explicit runtime memory budgeting for active sessions and KV
+- ✅ Add session eviction hooks driven by control-plane policy
+- ✅ Add runtime pause/resume semantics for regroup and failover
+- ✅ Add explicit transport prioritization between decode traffic and bulk transfer
+- ✅ Add provider-specialized fast paths behind the backend abstraction
 
 ## 5. Failover, Regroup, And Recovery
 

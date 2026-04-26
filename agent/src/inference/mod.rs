@@ -58,8 +58,10 @@ pub use backend::{
 };
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{
-    BackendInstanceSpec, DecodeBatchPlan, DecodeBatchPolicy, DecodeBatchSlot, DecodeTask,
-    EngineSessionState, ExecutionPhase, KvTransferPolicy, SessionAssignment,
+    BackendInstanceSpec, BackendOptimizationProfile, DecodeBatchPlan, DecodeBatchPolicy,
+    DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase, InferenceRuntimeMode,
+    KvTransferPolicy, RuntimeMemoryBudget, SessionAssignment, SessionEvictionReason,
+    SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
     TransportCapabilityTier,
 };
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};

@@ -470,6 +470,7 @@ impl CheckpointManager {
             session_id: checkpoint.request.session_id,
             phase: checkpoint.request.phase,
             decode_batch_targets: crate::inference::DecodeBatchTargets::default(),
+            runtime_mode: crate::inference::InferenceRuntimeMode::default(),
             executor_id: checkpoint.request.executor_id,
             created_at: checkpoint.metadata.created_at,
         };

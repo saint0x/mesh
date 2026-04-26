@@ -5,6 +5,21 @@ use crate::provider::ExecutionProviderKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum InferenceRuntimeMode {
+    FitFirst,
+    ThroughputFirst,
+    LatencyFirst,
+    ResilientEdge,
+}
+
+impl Default for InferenceRuntimeMode {
+    fn default() -> Self {
+        Self::ThroughputFirst
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionPhase {
     Prefill,
     Decode,
@@ -42,10 +57,66 @@ pub struct BackendInstanceSpec {
     pub transport_tier: TransportCapabilityTier,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPauseReason {
+    Regroup,
+    Failover,
+    LocalKvNotReady,
+    RuntimeMemoryPressure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPauseState {
+    pub reason: SessionPauseReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEvictionReason {
+    RuntimeMemoryPressure,
+    IdleSession,
+    CompletedSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEvictionState {
+    pub reason: SessionEvictionReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRuntimeStatus {
+    Active,
+    Paused,
+    Evicted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendOptimizationProfile {
+    CpuSerial,
+    MetalVectorized,
+    CudaFused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuntimeMemoryBudget {
+    pub max_active_sessions: usize,
+    pub max_total_kv_cache_bytes: usize,
+    pub max_total_runtime_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSessionState {
     pub assignment: SessionAssignment,
     pub backend: BackendInstanceSpec,
+    pub runtime_mode: InferenceRuntimeMode,
+    pub runtime_status: SessionRuntimeStatus,
+    pub paused: Option<SessionPauseState>,
+    pub evicted: Option<SessionEvictionState>,
+    pub memory_budget: RuntimeMemoryBudget,
     pub max_tokens: u32,
     pub prompt_tokens: usize,
 }
@@ -57,9 +128,11 @@ impl EngineSessionState {
         kv_owner_device_id: String,
         shard_owner_device_ids: Vec<String>,
         participant_device_ids: Vec<String>,
+        runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
         shard_column_range: (u32, u32),
         transport_tier: TransportCapabilityTier,
+        memory_budget: RuntimeMemoryBudget,
         max_tokens: u32,
         prompt_tokens: usize,
     ) -> Self {
@@ -76,6 +149,11 @@ impl EngineSessionState {
                 shard_column_range,
                 transport_tier,
             },
+            runtime_mode,
+            runtime_status: SessionRuntimeStatus::Active,
+            paused: None,
+            evicted: None,
+            memory_budget,
             max_tokens,
             prompt_tokens,
         }

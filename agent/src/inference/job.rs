@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::engine::ExecutionPhase;
+use super::engine::{ExecutionPhase, InferenceRuntimeMode};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct DecodeBatchTargets {
@@ -80,6 +80,10 @@ pub struct InferenceRequest {
     #[serde(default)]
     pub decode_batch_targets: DecodeBatchTargets,
 
+    /// Runtime mode chosen by the control-plane scheduler.
+    #[serde(default)]
+    pub runtime_mode: InferenceRuntimeMode,
+
     /// Executor ID (for credit tracking)
     pub executor_id: String,
 
@@ -104,6 +108,7 @@ impl InferenceRequest {
             session_id: Uuid::new_v4(),
             phase: ExecutionPhase::Prefill,
             decode_batch_targets: DecodeBatchTargets::default(),
+            runtime_mode: InferenceRuntimeMode::default(),
             executor_id,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

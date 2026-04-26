@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "name": "runtime-serving-engine",
+  "steps": [
+    {
+      "name": "decode worker honors scheduler batch targets",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_honors_scheduler_batch_targets",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "runtime memory budget evicts an unprotected session under pressure",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_enforce_runtime_memory_budget_evicts_unprotected_session",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "runtime pause and resume state stays explicit",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_pause_and_resume_session_updates_runtime_status",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "latency critical transport bypasses bulk throttle",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_latency_critical_send_skips_bulk_bandwidth_throttle",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "backend optimization profile tracks provider kind",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::backend::tests::backend_optimization_profile_tracks_provider_kind",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

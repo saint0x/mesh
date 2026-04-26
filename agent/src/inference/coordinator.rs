@@ -31,7 +31,9 @@ use super::backend::{
 };
 use super::engine::{
     DecodeBatchPlan, DecodeBatchPolicy, DecodeBatchSlot, DecodeTask, EngineSessionState,
-    ExecutionPhase, TransportCapabilityTier,
+    ExecutionPhase, InferenceRuntimeMode, RuntimeMemoryBudget, SessionEvictionReason,
+    SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
+    TransportCapabilityTier,
 };
 use super::forward_pass::ModelWeights;
 use super::job::{
@@ -75,6 +77,18 @@ pub struct InferenceConfig {
 
     /// Maximum aggregate KV-token footprint admitted into a single microbatch.
     pub max_decode_batch_kv_tokens: usize,
+
+    /// Maximum number of active resident sessions before runtime eviction engages.
+    pub max_active_sessions: usize,
+
+    /// Maximum aggregate KV cache bytes allowed across active sessions.
+    pub max_total_kv_cache_bytes: usize,
+
+    /// Maximum aggregate runtime memory footprint allowed across active sessions.
+    pub max_total_runtime_bytes: usize,
+
+    /// How long an idle session may stay resident before eviction is allowed.
+    pub idle_session_evict_after: Duration,
 }
 
 impl Default for InferenceConfig {
@@ -94,6 +108,10 @@ impl Default for InferenceConfig {
             recovery_max_checkpoint_loads_per_minute: 8,
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 16_384,
+            max_active_sessions: 8,
+            max_total_kv_cache_bytes: 512 * 1024 * 1024,
+            max_total_runtime_bytes: 2 * 1024 * 1024 * 1024,
+            idle_session_evict_after: Duration::from_secs(60),
         }
     }
 }
@@ -237,6 +255,7 @@ struct ActiveSession {
     job: InferenceJob,
     queued_for_decode: bool,
     decode_steps_served: u64,
+    last_active_at: Instant,
 }
 
 struct DecodeStepOutcome {
@@ -256,6 +275,19 @@ struct DecodeBatchTelemetry {
     active_decode_sessions: u32,
     batch_kv_tokens: u32,
     deferred_decode_sessions: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionMemoryFootprint {
+    runtime_bytes: usize,
+    kv_cache_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeMemorySnapshot {
+    active_sessions: usize,
+    total_runtime_bytes: usize,
+    total_kv_cache_bytes: usize,
 }
 
 impl InferenceCoordinator {
@@ -297,12 +329,57 @@ impl InferenceCoordinator {
             request.executor_id.clone(),
             vec![request.executor_id.clone()],
             vec![request.executor_id.clone()],
+            request.runtime_mode,
             provider,
             position.shard_column_range,
             TransportCapabilityTier::DirectTcp,
+            self.runtime_memory_budget(),
             request.config.max_tokens,
             request.prompt_tokens.len(),
         )
+    }
+
+    fn runtime_memory_budget(&self) -> RuntimeMemoryBudget {
+        RuntimeMemoryBudget {
+            max_active_sessions: self.config.max_active_sessions.max(1),
+            max_total_kv_cache_bytes: self.config.max_total_kv_cache_bytes.max(1),
+            max_total_runtime_bytes: self.config.max_total_runtime_bytes.max(1),
+        }
+    }
+
+    fn session_memory_footprint(session: &ActiveSession) -> SessionMemoryFootprint {
+        let prompt_bytes = session.job.request.prompt_tokens.len() * std::mem::size_of::<u32>();
+        let generated_bytes = session.job.generated_tokens.len() * std::mem::size_of::<u32>();
+        let kv_cache_bytes = session.backend.cache_memory_usage();
+        SessionMemoryFootprint {
+            runtime_bytes: prompt_bytes
+                .saturating_add(generated_bytes)
+                .saturating_add(kv_cache_bytes),
+            kv_cache_bytes,
+        }
+    }
+
+    fn runtime_memory_snapshot(&self) -> RuntimeMemorySnapshot {
+        let mut active_sessions = 0_usize;
+        let mut total_runtime_bytes = 0_usize;
+        let mut total_kv_cache_bytes = 0_usize;
+        for session in self.sessions.values() {
+            if matches!(
+                session.engine_state.runtime_status,
+                SessionRuntimeStatus::Evicted
+            ) {
+                continue;
+            }
+            active_sessions = active_sessions.saturating_add(1);
+            let footprint = Self::session_memory_footprint(session);
+            total_runtime_bytes = total_runtime_bytes.saturating_add(footprint.runtime_bytes);
+            total_kv_cache_bytes = total_kv_cache_bytes.saturating_add(footprint.kv_cache_bytes);
+        }
+        RuntimeMemorySnapshot {
+            active_sessions,
+            total_runtime_bytes,
+            total_kv_cache_bytes,
+        }
     }
 
     async fn ensure_session_backend<'a>(
@@ -332,8 +409,11 @@ impl InferenceCoordinator {
                     job: InferenceJob::new(request.clone(), self.config.total_layers),
                     queued_for_decode: false,
                     decode_steps_served: 0,
+                    last_active_at: Instant::now(),
                 },
             );
+            self.enforce_runtime_memory_budget(Some(request.session_id))
+                .await?;
         }
 
         self.sessions.get_mut(&request.session_id).ok_or_else(|| {
@@ -357,6 +437,15 @@ impl InferenceCoordinator {
 
     pub fn has_session(&self, session_id: Uuid) -> bool {
         self.sessions.contains_key(&session_id)
+    }
+
+    pub fn pause_local_session(
+        &mut self,
+        session_id: Uuid,
+        reason: SessionPauseReason,
+        detail: String,
+    ) {
+        self.pause_session(session_id, reason, detail);
     }
 
     fn decode_batch_policy(&self) -> DecodeBatchPolicy {
@@ -400,6 +489,146 @@ impl InferenceCoordinator {
             fairness_epoch: self.next_decode_fairness_epoch,
         });
         Ok(())
+    }
+
+    fn pause_session(&mut self, session_id: Uuid, reason: SessionPauseReason, detail: String) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.queued_for_decode = false;
+            session.engine_state.runtime_status = SessionRuntimeStatus::Paused;
+            session.engine_state.paused = Some(SessionPauseState { reason, detail });
+        }
+        self.decode_queue
+            .retain(|task| task.session_id != session_id);
+    }
+
+    fn resume_session(&mut self, session_id: Uuid) -> Result<()> {
+        let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
+            AgentError::Execution(format!("Session {} is not present for resume", session_id))
+        })?;
+        session.engine_state.runtime_status = SessionRuntimeStatus::Active;
+        session.engine_state.paused = None;
+        session.engine_state.evicted = None;
+        session.last_active_at = Instant::now();
+        Ok(())
+    }
+
+    async fn evict_session(
+        &mut self,
+        session_id: Uuid,
+        reason: SessionEvictionReason,
+        detail: String,
+    ) -> Result<()> {
+        if let Some(session) = self.sessions.get(&session_id) {
+            if self.config.checkpointing_enabled
+                && !session.job.is_complete()
+                && self.checkpoint_manager.is_some()
+            {
+                let snapshot = session.job.clone();
+                self.checkpoint(&snapshot).await?;
+            }
+        }
+
+        if let Some(mut session) = self.sessions.remove(&session_id) {
+            session.queued_for_decode = false;
+            session.engine_state.runtime_status = SessionRuntimeStatus::Evicted;
+            session.engine_state.evicted = Some(SessionEvictionState { reason, detail });
+        }
+        self.decode_queue
+            .retain(|task| task.session_id != session_id);
+        Ok(())
+    }
+
+    async fn enforce_runtime_memory_budget(
+        &mut self,
+        protected_session_id: Option<Uuid>,
+    ) -> Result<()> {
+        loop {
+            let snapshot = self.runtime_memory_snapshot();
+            let over_active_sessions = snapshot.active_sessions > self.config.max_active_sessions;
+            let over_kv_budget =
+                snapshot.total_kv_cache_bytes > self.config.max_total_kv_cache_bytes;
+            let over_runtime_budget =
+                snapshot.total_runtime_bytes > self.config.max_total_runtime_bytes;
+            if !over_active_sessions && !over_kv_budget && !over_runtime_budget {
+                return Ok(());
+            }
+
+            let eviction_candidate = self.select_eviction_candidate(protected_session_id);
+            let Some(session_id) = eviction_candidate else {
+                return Err(AgentError::Execution(
+                    "runtime memory budget exceeded but no evictable session was available"
+                        .to_string(),
+                ));
+            };
+
+            let detail = format!(
+                "active_sessions={} runtime_bytes={} kv_bytes={}",
+                snapshot.active_sessions,
+                snapshot.total_runtime_bytes,
+                snapshot.total_kv_cache_bytes
+            );
+            self.evict_session(
+                session_id,
+                SessionEvictionReason::RuntimeMemoryPressure,
+                detail,
+            )
+            .await?;
+        }
+    }
+
+    fn select_eviction_candidate(&self, protected_session_id: Option<Uuid>) -> Option<Uuid> {
+        let mut candidates = self
+            .sessions
+            .iter()
+            .filter(|(session_id, _)| Some(**session_id) != protected_session_id)
+            .map(|(session_id, session)| {
+                let footprint = Self::session_memory_footprint(session);
+                let idle_for = session.last_active_at.elapsed();
+                let priority = match session.engine_state.runtime_status {
+                    SessionRuntimeStatus::Paused => 0_u8,
+                    SessionRuntimeStatus::Active if session.job.is_complete() => 1_u8,
+                    SessionRuntimeStatus::Active => 2_u8,
+                    SessionRuntimeStatus::Evicted => 3_u8,
+                };
+                let mode_bias = match session.job.request.runtime_mode {
+                    InferenceRuntimeMode::FitFirst => footprint.runtime_bytes,
+                    InferenceRuntimeMode::ThroughputFirst => usize::MAX.saturating_sub(
+                        (session.decode_steps_served as usize).saturating_mul(1024),
+                    ),
+                    InferenceRuntimeMode::LatencyFirst => footprint.kv_cache_bytes,
+                    InferenceRuntimeMode::ResilientEdge => {
+                        footprint.kv_cache_bytes / 2
+                            + if matches!(
+                                session.engine_state.runtime_status,
+                                SessionRuntimeStatus::Paused
+                            ) {
+                                0
+                            } else {
+                                footprint.runtime_bytes
+                            }
+                    }
+                };
+                (
+                    *session_id,
+                    priority,
+                    idle_for < self.config.idle_session_evict_after,
+                    mode_bias,
+                    footprint.runtime_bytes,
+                    footprint.kv_cache_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        candidates.sort_by_key(|candidate| {
+            (
+                candidate.1,
+                candidate.2,
+                std::cmp::Reverse(candidate.3),
+                std::cmp::Reverse(candidate.4),
+                std::cmp::Reverse(candidate.5),
+            )
+        });
+        candidates.first().map(|candidate| candidate.0)
     }
 
     fn build_next_decode_batch(
@@ -1169,49 +1398,16 @@ impl InferenceCoordinator {
         Ok(outcomes)
     }
 
-    async fn run_decode_segment<F, Fut>(
+    async fn run_scheduler_owned_decode_worker<F, Fut>(
         &mut self,
         request: &InferenceRequest,
         position: &WorkerPosition,
         on_progress: &mut F,
-    ) -> Result<SegmentExecutionResult>
+    ) -> Result<(InferenceResult, Option<DecodeBatchTelemetry>, u32)>
     where
         F: FnMut(InferenceProgressUpdate) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        if !self.sessions.contains_key(&request.session_id) {
-            let recovered = self
-                .recover_session_from_checkpoint(request, position)
-                .await?;
-            if recovered {
-                info!(
-                    job_id = %request.job_id,
-                    session_id = %request.session_id,
-                    "Recovered decode segment session state from checkpoint"
-                );
-            }
-        }
-
-        let job_snapshot = {
-            let session = self.sessions.get(&request.session_id).ok_or_else(|| {
-                AgentError::Execution(format!(
-                    "Decode segment for session {} cannot start before prefill state exists",
-                    request.session_id
-                ))
-            })?;
-            if session.job.generated_tokens.is_empty() {
-                return Err(AgentError::Execution(format!(
-                    "Decode segment for session {} cannot start without a sampled prefill token",
-                    request.session_id
-                )));
-            }
-            session.job.clone()
-        };
-        {
-            let mut active = self.active_job.write().await;
-            *active = Some(job_snapshot);
-        }
-
         let segment_start = Instant::now();
         let progress_report_interval = request.config.progress_report_interval.max(1);
         let mut last_reported_completion_tokens = self
@@ -1220,29 +1416,37 @@ impl InferenceCoordinator {
             .map(|session| session.job.current_token_idx)
             .unwrap_or(0);
         let mut last_batch_telemetry = None::<DecodeBatchTelemetry>;
+
+        self.resume_session(request.session_id)?;
         self.enqueue_decode_task(request.session_id)?;
 
         loop {
-            let should_stop = {
-                let session = self.sessions.get(&request.session_id).ok_or_else(|| {
-                    AgentError::Execution("decode session vanished during execution".to_string())
-                })?;
-                session.job.is_complete()
+            let Some(session) = self.sessions.get(&request.session_id) else {
+                return Err(AgentError::Execution(
+                    "decode session vanished during execution".to_string(),
+                ));
             };
-            if should_stop {
+            if session.job.is_complete() {
                 break;
             }
-
-            {
-                let session = self.sessions.get(&request.session_id).ok_or_else(|| {
-                    AgentError::Execution(
-                        "decode session vanished before batch scheduling".to_string(),
-                    )
-                })?;
-                if session.job.elapsed() > self.config.job_timeout {
-                    return Err(AgentError::Execution("Inference job timed out".to_string()));
-                }
+            if matches!(
+                session.engine_state.runtime_status,
+                SessionRuntimeStatus::Paused
+            ) {
+                let detail = session
+                    .engine_state
+                    .paused
+                    .as_ref()
+                    .map(|state| state.detail.clone())
+                    .unwrap_or_else(|| "decode session paused".to_string());
+                return Err(AgentError::Execution(detail));
             }
+            if session.job.elapsed() > self.config.job_timeout {
+                return Err(AgentError::Execution("Inference job timed out".to_string()));
+            }
+
+            self.enforce_runtime_memory_budget(Some(request.session_id))
+                .await?;
 
             let batch =
                 self.build_next_decode_batch(request.session_id, request.decode_batch_targets);
@@ -1282,6 +1486,10 @@ impl InferenceCoordinator {
                     if let Some(session) = self.sessions.get_mut(&outcome.session_id) {
                         session.job.mark_checkpointed();
                     }
+                }
+
+                if let Some(session) = self.sessions.get_mut(&outcome.session_id) {
+                    session.last_active_at = Instant::now();
                 }
 
                 if outcome.session_id != request.session_id {
@@ -1342,6 +1550,55 @@ impl InferenceCoordinator {
             })
             .await?;
         }
+
+        Ok((result, last_batch_telemetry, execution_time_ms as u32))
+    }
+
+    async fn run_decode_segment<F, Fut>(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+        on_progress: &mut F,
+    ) -> Result<SegmentExecutionResult>
+    where
+        F: FnMut(InferenceProgressUpdate) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        if !self.sessions.contains_key(&request.session_id) {
+            let recovered = self
+                .recover_session_from_checkpoint(request, position)
+                .await?;
+            if recovered {
+                info!(
+                    job_id = %request.job_id,
+                    session_id = %request.session_id,
+                    "Recovered decode segment session state from checkpoint"
+                );
+            }
+        }
+
+        let job_snapshot = {
+            let session = self.sessions.get(&request.session_id).ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "Decode segment for session {} cannot start before prefill state exists",
+                    request.session_id
+                ))
+            })?;
+            if session.job.generated_tokens.is_empty() {
+                return Err(AgentError::Execution(format!(
+                    "Decode segment for session {} cannot start without a sampled prefill token",
+                    request.session_id
+                )));
+            }
+            session.job.clone()
+        };
+        {
+            let mut active = self.active_job.write().await;
+            *active = Some(job_snapshot);
+        }
+        let (result, _last_batch_telemetry, _execution_time_ms) = self
+            .run_scheduler_owned_decode_worker(request, position, on_progress)
+            .await?;
 
         {
             let mut active = self.active_job.write().await;
@@ -1436,7 +1693,24 @@ impl InferenceCoordinator {
                             peer_id = %peer_id,
                             "Ring neighbor disconnected! Ring topology broken."
                         );
-                        // In production, this would trigger recovery
+                        let impacted_sessions = self
+                            .sessions
+                            .iter()
+                            .filter_map(|(session_id, session)| {
+                                if session.job.has_decode_context() && !session.job.is_complete() {
+                                    Some(*session_id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        for session_id in impacted_sessions {
+                            self.pause_session(
+                                session_id,
+                                SessionPauseReason::Failover,
+                                format!("ring neighbor {} disconnected", peer_id),
+                            );
+                        }
                     }
                 }
             }
@@ -1462,6 +1736,7 @@ mod tests {
 
     struct TestBackend {
         cache_seq_len: usize,
+        cache_memory_usage: usize,
         sequence_position: usize,
     }
 
@@ -1469,6 +1744,10 @@ mod tests {
     impl ExecutionBackend for TestBackend {
         fn provider_kind(&self) -> ExecutionProviderKind {
             ExecutionProviderKind::Cpu
+        }
+
+        fn optimization_profile(&self) -> crate::inference::BackendOptimizationProfile {
+            crate::inference::BackendOptimizationProfile::CpuSerial
         }
 
         async fn prefill(
@@ -1498,7 +1777,7 @@ mod tests {
         }
 
         fn cache_memory_usage(&self) -> usize {
-            0
+            self.cache_memory_usage
         }
 
         fn sequence_position(&self) -> usize {
@@ -1558,19 +1837,23 @@ mod tests {
                     "worker-1".to_string(),
                     vec!["worker-1".to_string()],
                     vec!["worker-1".to_string()],
+                    InferenceRuntimeMode::ThroughputFirst,
                     ExecutionProviderKind::Cpu,
                     (0, 1024),
                     TransportCapabilityTier::DirectPreferred,
+                    coordinator.runtime_memory_budget(),
                     request.config.max_tokens,
                     request.prompt_tokens.len(),
                 ),
                 backend: Box::new(TestBackend {
                     cache_seq_len: kv_tokens,
+                    cache_memory_usage: kv_tokens * 1024,
                     sequence_position: kv_tokens,
                 }),
                 job,
                 queued_for_decode: false,
                 decode_steps_served: 0,
+                last_active_at: Instant::now(),
             },
         );
     }
@@ -1861,5 +2144,87 @@ mod tests {
         assert_eq!(batch.slots[0].session_id, session_a);
         assert_eq!(batch.deferred.len(), 1);
         assert_eq!(batch.deferred[0].session_id, session_b);
+    }
+
+    #[test]
+    fn test_enforce_runtime_memory_budget_evicts_unprotected_session() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_active_sessions: 1,
+            max_total_kv_cache_bytes: 8 * 1024,
+            max_total_runtime_bytes: 16 * 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 6, 11);
+        insert_decode_session(&mut coordinator, session_b, 6, 22);
+        coordinator
+            .sessions
+            .get_mut(&session_a)
+            .expect("session a")
+            .last_active_at = Instant::now() - Duration::from_secs(120);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                coordinator
+                    .enforce_runtime_memory_budget(Some(session_b))
+                    .await
+                    .expect("memory budget enforcement should succeed");
+            });
+
+        assert!(!coordinator.sessions.contains_key(&session_a));
+        assert!(coordinator.sessions.contains_key(&session_b));
+    }
+
+    #[test]
+    fn test_pause_and_resume_session_updates_runtime_status() {
+        let mut coordinator = test_coordinator(InferenceConfig::default());
+        let session_id = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_id, 4, 11);
+        coordinator.enqueue_decode_task(session_id).unwrap();
+
+        coordinator.pause_session(
+            session_id,
+            SessionPauseReason::Failover,
+            "neighbor lost".to_string(),
+        );
+        let paused = coordinator
+            .sessions
+            .get(&session_id)
+            .expect("paused session");
+        assert!(matches!(
+            paused.engine_state.runtime_status,
+            SessionRuntimeStatus::Paused
+        ));
+        assert!(paused.engine_state.paused.is_some());
+        assert!(coordinator.decode_queue.is_empty());
+
+        coordinator
+            .resume_session(session_id)
+            .expect("resume session");
+        let resumed = coordinator
+            .sessions
+            .get(&session_id)
+            .expect("resumed session");
+        assert!(matches!(
+            resumed.engine_state.runtime_status,
+            SessionRuntimeStatus::Active
+        ));
+        assert!(resumed.engine_state.paused.is_none());
+    }
+
+    #[test]
+    fn test_runtime_memory_snapshot_counts_runtime_and_kv_bytes() {
+        let mut coordinator = test_coordinator(InferenceConfig::default());
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 8, 22);
+
+        let snapshot = coordinator.runtime_memory_snapshot();
+        assert_eq!(snapshot.active_sessions, 2);
+        assert_eq!(snapshot.total_kv_cache_bytes, (4 + 8) * 1024);
+        assert!(snapshot.total_runtime_bytes >= snapshot.total_kv_cache_bytes);
     }
 }

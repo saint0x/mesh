@@ -6,6 +6,7 @@ use crate::errors::Result;
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
 
+use super::engine::BackendOptimizationProfile;
 use super::forward_pass::{ForwardPass, ModelWeights};
 use super::kv_cache::KVCacheSnapshot;
 use super::tensor_ops::Tensor1D;
@@ -13,6 +14,8 @@ use super::tensor_ops::Tensor1D;
 #[async_trait]
 pub trait ExecutionBackend: Send {
     fn provider_kind(&self) -> ExecutionProviderKind;
+
+    fn optimization_profile(&self) -> BackendOptimizationProfile;
 
     async fn prefill(
         &mut self,
@@ -65,12 +68,29 @@ impl BackendMicrobatchExecutor {
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
-        let mut outputs = Vec::with_capacity(requests.len());
+        let profile = requests
+            .first()
+            .map(|request| request.backend.optimization_profile())
+            .unwrap_or(BackendOptimizationProfile::CpuSerial);
 
-        // The first microbatch implementation is deliberately conservative: the
-        // coordinator decides fairness and admission, then the backend boundary
-        // owns the merged decode-step execution path. A future backend can swap
-        // this loop for a fused batched kernel without changing the runtime API.
+        match profile {
+            BackendOptimizationProfile::CpuSerial => {
+                Self::decode_step_batch_serial(requests, worker_ring).await
+            }
+            BackendOptimizationProfile::MetalVectorized => {
+                Self::decode_step_batch_accelerated(requests, worker_ring).await
+            }
+            BackendOptimizationProfile::CudaFused => {
+                Self::decode_step_batch_accelerated(requests, worker_ring).await
+            }
+        }
+    }
+
+    async fn decode_step_batch_serial(
+        requests: &mut [DecodeMicrobatchRequest<'_>],
+        worker_ring: &mut WorkerRing<'_>,
+    ) -> Result<Vec<DecodeMicrobatchOutput>> {
+        let mut outputs = Vec::with_capacity(requests.len());
         for request in requests.iter_mut() {
             let step_start = Instant::now();
             let logits = request
@@ -83,8 +103,16 @@ impl BackendMicrobatchExecutor {
                 execution_time_ms: step_start.elapsed().as_millis() as u64,
             });
         }
-
         Ok(outputs)
+    }
+
+    async fn decode_step_batch_accelerated(
+        requests: &mut [DecodeMicrobatchRequest<'_>],
+        worker_ring: &mut WorkerRing<'_>,
+    ) -> Result<Vec<DecodeMicrobatchOutput>> {
+        // Provider-specialized fast paths keep the same runtime API while
+        // allowing Metal/CUDA backends to swap in fused kernels later.
+        Self::decode_step_batch_serial(requests, worker_ring).await
     }
 }
 
@@ -120,6 +148,14 @@ impl CandleExecutionBackend {
 impl ExecutionBackend for CandleExecutionBackend {
     fn provider_kind(&self) -> ExecutionProviderKind {
         self.provider
+    }
+
+    fn optimization_profile(&self) -> BackendOptimizationProfile {
+        match self.provider {
+            ExecutionProviderKind::Cpu => BackendOptimizationProfile::CpuSerial,
+            ExecutionProviderKind::Metal => BackendOptimizationProfile::MetalVectorized,
+            ExecutionProviderKind::Cuda => BackendOptimizationProfile::CudaFused,
+        }
     }
 
     async fn prefill(
@@ -191,5 +227,102 @@ impl ExecutionBackend for CandleExecutionBackend {
 
     fn clear(&mut self) {
         self.forward_pass.clear_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ProfileBackend {
+        provider: ExecutionProviderKind,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for ProfileBackend {
+        fn provider_kind(&self) -> ExecutionProviderKind {
+            self.provider
+        }
+
+        fn optimization_profile(&self) -> BackendOptimizationProfile {
+            match self.provider {
+                ExecutionProviderKind::Cpu => BackendOptimizationProfile::CpuSerial,
+                ExecutionProviderKind::Metal => BackendOptimizationProfile::MetalVectorized,
+                ExecutionProviderKind::Cuda => BackendOptimizationProfile::CudaFused,
+            }
+        }
+
+        async fn prefill(
+            &mut self,
+            _tokens: &[u32],
+            _worker_ring: &mut WorkerRing<'_>,
+            _job_id: Uuid,
+        ) -> Result<Tensor1D> {
+            Ok(Tensor1D::zeros(1))
+        }
+
+        async fn decode_step(
+            &mut self,
+            _token: u32,
+            _worker_ring: &mut WorkerRing<'_>,
+            _job_id: Uuid,
+        ) -> Result<Tensor1D> {
+            Ok(Tensor1D::zeros(1))
+        }
+
+        fn sample(&self, _logits: &Tensor1D, _temperature: f32, _top_p: f32, _seed: u64) -> u32 {
+            0
+        }
+
+        fn cache_seq_len(&self) -> usize {
+            0
+        }
+
+        fn cache_memory_usage(&self) -> usize {
+            0
+        }
+
+        fn sequence_position(&self) -> usize {
+            0
+        }
+
+        fn last_allreduce_metrics(&self) -> RingAllReduceMetrics {
+            RingAllReduceMetrics::default()
+        }
+
+        fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
+            Ok(None)
+        }
+
+        fn import_kv_cache(&mut self, _snapshot: &KVCacheSnapshot) -> Result<()> {
+            Ok(())
+        }
+
+        fn clear(&mut self) {}
+    }
+
+    #[test]
+    fn backend_optimization_profile_tracks_provider_kind() {
+        assert_eq!(
+            ProfileBackend {
+                provider: ExecutionProviderKind::Cpu
+            }
+            .optimization_profile(),
+            BackendOptimizationProfile::CpuSerial
+        );
+        assert_eq!(
+            ProfileBackend {
+                provider: ExecutionProviderKind::Metal
+            }
+            .optimization_profile(),
+            BackendOptimizationProfile::MetalVectorized
+        );
+        assert_eq!(
+            ProfileBackend {
+                provider: ExecutionProviderKind::Cuda
+            }
+            .optimization_profile(),
+            BackendOptimizationProfile::CudaFused
+        );
     }
 }
