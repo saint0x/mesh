@@ -27,6 +27,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Prefer owned decode cohorts with more immediate ready runway when remaining capacity and density tie
 - ✅ Prefer owned decode cohorts with less blocked transfer debt when remaining capacity and density tie
 - ✅ Prefer older owned decode cohorts before lease-count noise when cohort-specific latency signals tie
+- ✅ In `throughput_first`, prefer draining already leased owned decode work before opening fresh ready decode groups
 - Planned: Add admission control across multiple concurrent jobs and models
 - Planned: Add topology-aware pool partitioning for prefill-heavy vs decode-heavy work
 - In progress: Add scheduler scoring that reasons about queue age, latency target, throughput target, and resiliency target
