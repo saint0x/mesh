@@ -371,6 +371,7 @@ fn rank_candidate(
         submitter_leased_assignments,
         job_leased_assignments,
     );
+    let session_order_time = decode_session_order_time(candidate);
 
     (
         fairness_rank.0,
@@ -383,7 +384,7 @@ fn rank_candidate(
         policy_rank.3,
         policy_rank.4,
         policy_rank.5,
-        candidate.candidate.assigned_at.clone(),
+        session_order_time,
         candidate.candidate.assignment_id.clone(),
     )
 }
@@ -461,6 +462,13 @@ fn decode_group_order_time(candidate: &RunnableCandidate) -> String {
             .unwrap_or_else(|| candidate.ready_at.clone());
     }
     candidate.ready_at.clone()
+}
+
+fn decode_session_order_time(candidate: &RunnableCandidate) -> String {
+    if matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
+        return candidate.ready_at.clone();
+    }
+    candidate.candidate.assigned_at.clone()
 }
 
 fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
@@ -1691,6 +1699,60 @@ mod tests {
         );
         let right = rank_candidate(
             &newer_cohort,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_oldest_ready_session_within_same_fresh_decode_cohort() {
+        let mut older_session = base_candidate(SchedulerPhase::Decode);
+        older_session.assignment_id = "older-session".into();
+        older_session.group_status = "decode_ready".into();
+        older_session.decode_queue_status = Some("ready".into());
+        older_session.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        older_session.decode_lease_target_session_count = Some(4);
+        older_session.decode_cohort_ready_sessions = 2;
+        older_session.decode_cohort_blocked_sessions = 1;
+        older_session.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut newer_session = older_session.clone();
+        newer_session.assignment_id = "newer-session".into();
+        newer_session.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        newer_session.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let older_session = RunnableCandidate {
+            ready_at: older_session.decode_ready_at.clone().unwrap(),
+            candidate: older_session,
+        };
+        let newer_session = RunnableCandidate {
+            ready_at: newer_session.decode_ready_at.clone().unwrap(),
+            candidate: newer_session,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &older_session,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &newer_session,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
