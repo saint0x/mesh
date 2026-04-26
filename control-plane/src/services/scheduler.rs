@@ -526,7 +526,10 @@ fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
         let remaining_capacity = target.saturating_sub(cohort_fill);
         let remaining_rank = 1_023u32.saturating_sub(remaining_capacity.min(1_023));
         let fill_density_rank = 1_023u32.saturating_sub(cohort_fill.min(1_023));
-        return (remaining_rank << 10).saturating_add(fill_density_rank);
+        let blocked_rank = candidate.candidate.decode_cohort_blocked_sessions.min(31);
+        return (remaining_rank << 10)
+            .saturating_add(fill_density_rank << 5)
+            .saturating_add(blocked_rank);
     } else {
         2_000_000
     }
@@ -1881,6 +1884,63 @@ mod tests {
         );
         let right = rank_candidate(
             &thinner,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_owned_decode_cohort_with_less_blocked_transfer_debt_when_fill_ties() {
+        let mut less_blocked = base_candidate(SchedulerPhase::Decode);
+        less_blocked.assignment_id = "less-blocked".into();
+        less_blocked.group_status = "decode_leased".into();
+        less_blocked.decode_queue_status = Some("leased".into());
+        less_blocked.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        less_blocked.group_lease_owner_device_id = Some("worker-1".into());
+        less_blocked.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        less_blocked.decode_lease_target_session_count = Some(5);
+        less_blocked.decode_cohort_leased_sessions = 2;
+        less_blocked.decode_cohort_active_sessions = 1;
+        less_blocked.decode_cohort_blocked_sessions = 1;
+        less_blocked.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut more_blocked = less_blocked.clone();
+        more_blocked.assignment_id = "more-blocked".into();
+        more_blocked.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        more_blocked.decode_cohort_blocked_sessions = 4;
+
+        let less_blocked = RunnableCandidate {
+            ready_at: less_blocked.decode_ready_at.clone().unwrap(),
+            candidate: less_blocked,
+        };
+        let more_blocked = RunnableCandidate {
+            ready_at: more_blocked.decode_ready_at.clone().unwrap(),
+            candidate: more_blocked,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &less_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &more_blocked,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
