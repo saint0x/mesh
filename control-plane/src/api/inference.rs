@@ -3104,6 +3104,13 @@ fn acknowledge_assignment(
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         if matches!(phase, crate::api::types::ExecutionPhase::Decode) {
+            let network_id: String = conn
+                .query_row(
+                    "SELECT network_id FROM inference_jobs WHERE job_id = ?",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             conn.execute(
                 r#"
                 UPDATE inference_decode_queue
@@ -3112,21 +3119,82 @@ fn acknowledge_assignment(
                     lease_expires_at = NULL,
                     last_error = NULL,
                     updated_at = ?
-                WHERE session_id = (
-                    SELECT session_id FROM inference_sessions WHERE job_id = ?
-                )
+                WHERE network_id = ?
+                  AND COALESCE(batch_group_key, group_id) = ?
+                  AND lease_owner_device_id = ?
+                  AND status IN ('leased', 'active')
                 "#,
-                params![device_id, &now, job_id],
+                params![
+                    device_id,
+                    &now,
+                    &network_id,
+                    &decode_batch_group_key(&execution_plan, &active_segment_id)?,
+                    device_id
+                ],
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             let batch_group_key = decode_batch_group_key(&execution_plan, &active_segment_id)?;
-            let network_id: String = conn
-                .query_row(
-                    "SELECT network_id FROM inference_jobs WHERE job_id = ?",
-                    params![job_id],
-                    |row| row.get(0),
+            conn.execute(
+                r#"
+                UPDATE inference_sessions
+                SET status = 'decode_active',
+                    active_segment_id = ?,
+                    updated_at = ?
+                WHERE session_id IN (
+                    SELECT session_id
+                    FROM inference_decode_queue
+                    WHERE network_id = ?
+                      AND COALESCE(batch_group_key, group_id) = ?
+                      AND lease_owner_device_id = ?
+                      AND status = 'active'
                 )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                "#,
+                params![&active_segment_id, &now, &network_id, &batch_group_key, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            conn.execute(
+                r#"
+                UPDATE inference_session_replicas
+                SET status = 'decode_active',
+                    active_segment_id = ?,
+                    updated_at = ?,
+                    last_error = NULL
+                WHERE session_id IN (
+                    SELECT session_id
+                    FROM inference_decode_queue
+                    WHERE network_id = ?
+                      AND COALESCE(batch_group_key, group_id) = ?
+                      AND lease_owner_device_id = ?
+                      AND status = 'active'
+                )
+                  AND device_id = ?
+                "#,
+                params![
+                    &active_segment_id,
+                    &now,
+                    &network_id,
+                    &batch_group_key,
+                    device_id,
+                    device_id
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            conn.execute(
+                r#"
+                UPDATE inference_serving_groups
+                SET status = 'decode_active',
+                    lease_owner_device_id = ?,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    last_error = NULL
+                WHERE network_id = ?
+                  AND group_id = ?
+                  AND phase = 'decode'
+                  AND lease_owner_device_id = ?
+                "#,
+                params![device_id, &now, &network_id, &group_id, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             refresh_decode_batch_targets(&conn, &network_id, &batch_group_key, &group_id)?;
         }
     }
@@ -7741,6 +7809,229 @@ mod tests {
                     .session
                     .as_ref()
                     .and_then(|session| session.pooled_ready_sessions),
+                Some(2)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_leased_sessions),
+                Some(0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_decode_promotes_owned_pooled_cohort_to_active() {
+        let network_id = "test-network-pooled-decode-acknowledge";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+        let mut job_ids = Vec::new();
+        let mut pooled_group_key = None::<String>;
+        let mut pooled_group_id = None::<String>;
+
+        for prompt in ["first", "second"] {
+            let submit = submit_inference(
+                State(state.clone()),
+                Json(SubmitInferenceRequest {
+                    device_id: "worker-1".into(),
+                    network_id: network_id.into(),
+                    model_id: "llama-70b".into(),
+                    prompt: prompt.into(),
+                    max_tokens: 8,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            job_ids.push(submit.job_id.clone());
+            let plan = submit
+                .execution_plan
+                .clone()
+                .expect("expected execution plan");
+            let decode_segment = plan
+                .segments
+                .iter()
+                .find(|segment| matches!(segment.phase, ExecutionPhase::Decode))
+                .expect("expected decode segment")
+                .clone();
+            let computed_batch_group_key =
+                decode_batch_group_key(&plan, &decode_segment.segment_id).expect("batch key");
+            let conn = state.db.get_conn().unwrap();
+            let (session_id, batch_group_key): (String, Option<String>) = conn
+                .query_row(
+                    r#"
+                    SELECT session_id, batch_group_key
+                    FROM inference_decode_queue
+                    WHERE job_id = ?
+                    "#,
+                    params![submit.job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_jobs
+                SET status = 'running',
+                    active_segment_id = ?,
+                    updated_at = datetime('now')
+                WHERE job_id = ?
+                "#,
+                params![&decode_segment.segment_id, &submit.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_sessions
+                SET status = 'decode_ready',
+                    active_segment_id = ?,
+                    kv_sequence_position = 1,
+                    updated_at = datetime('now')
+                WHERE job_id = ?
+                "#,
+                params![&decode_segment.segment_id, &submit.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_decode_queue
+                SET segment_id = ?,
+                    group_id = ?,
+                    batch_group_key = ?,
+                    status = 'ready',
+                    ready_at = datetime('now'),
+                    lease_owner_device_id = NULL,
+                    lease_expires_at = NULL,
+                    lease_target_session_count = NULL,
+                    lease_target_batch_size = NULL,
+                    updated_at = datetime('now')
+                WHERE session_id = ?
+                "#,
+                params![
+                    &decode_segment.segment_id,
+                    &decode_segment.execution_group_id,
+                    &computed_batch_group_key,
+                    &session_id
+                ],
+            )
+            .unwrap();
+            for device_id in &decode_segment.participant_device_ids {
+                conn.execute(
+                    r#"
+                    UPDATE inference_job_assignments
+                    SET status = 'pending',
+                        active_segment_id = ?,
+                        lease_expires_at = NULL
+                    WHERE job_id = ?
+                      AND device_id = ?
+                    "#,
+                    params![&decode_segment.segment_id, &submit.job_id, device_id],
+                )
+                .unwrap();
+                conn.execute(
+                    r#"
+                    UPDATE inference_serving_groups
+                    SET status = 'decode_ready',
+                        lease_owner_device_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = datetime('now'),
+                        last_error = NULL
+                    WHERE job_id = ?
+                      AND device_id = ?
+                      AND phase = 'decode'
+                    "#,
+                    params![&submit.job_id, device_id],
+                )
+                .unwrap();
+                conn.execute(
+                    r#"
+                    UPDATE inference_session_replicas
+                    SET status = 'decode_ready',
+                        active_segment_id = ?,
+                        kv_sequence_position = 1,
+                        updated_at = datetime('now')
+                    WHERE session_id = ?
+                      AND device_id = ?
+                    "#,
+                    params![&decode_segment.segment_id, &session_id, device_id],
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let batch_group_key =
+                batch_group_key.expect("decode queue row should have a pooled batch group key");
+            if let Some(existing_key) = pooled_group_key.as_ref() {
+                assert_eq!(existing_key, &batch_group_key);
+            } else {
+                pooled_group_key = Some(batch_group_key.clone());
+            }
+            if pooled_group_id.is_none() {
+                pooled_group_id = Some(decode_segment.execution_group_id.clone());
+            }
+        }
+
+        let conn = state.db.get_conn().unwrap();
+        refresh_decode_batch_targets(
+            &conn,
+            network_id,
+            pooled_group_key.as_deref().unwrap(),
+            pooled_group_id.as_deref().unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let decode_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Decode,
+                include_queue_state: true,
+                include_serving_session: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected pooled decode assignment");
+
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(decode_claim.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
+        assert_eq!(scheduler.decode_queue.len(), 2);
+        assert!(scheduler.decode_queue.iter().all(|session| {
+            session.status == "active"
+                && session.lease_owner_device_id.as_deref() == Some("worker-1")
+        }));
+
+        for job_id in &job_ids {
+            let status = get_inference_job_status(State(state.clone()), Path(job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .map(|session| session.status.as_str()),
+                Some("decode_active")
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_active_sessions),
                 Some(2)
             );
             assert_eq!(
