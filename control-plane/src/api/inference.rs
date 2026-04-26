@@ -1286,6 +1286,29 @@ fn renew_decode_lease_state(
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    tx.execute(
+        r#"
+        UPDATE inference_serving_groups
+        SET lease_owner_device_id = ?,
+            lease_expires_at = CASE
+                WHEN phase = 'decode' THEN ?
+                ELSE lease_expires_at
+            END,
+            updated_at = ?,
+            last_error = NULL
+        WHERE session_id = ?
+          AND group_id = ?
+          AND phase = 'decode'
+        "#,
+        params![
+            &req.device_id,
+            &lease_expires,
+            &now,
+            &req.session_id,
+            &group_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     refresh_decode_batch_targets(
         &tx,
@@ -1391,30 +1414,26 @@ fn release_decode_lease_state(
     tx.execute(
         r#"
         UPDATE inference_serving_groups
-        SET status = 'decode_ready',
+        SET status = CASE
+                WHEN device_id = ? THEN 'decode_ready'
+                ELSE status
+            END,
             lease_owner_device_id = NULL,
             lease_expires_at = NULL,
             updated_at = ?,
             last_error = ?
         WHERE session_id = ?
-          AND group_id = (
-                SELECT group_id
-                FROM inference_decode_queue
-                WHERE session_id = ?
-                  AND segment_id = ?
-            )
-          AND device_id = ?
+          AND group_id = ?
           AND phase = 'decode'
         "#,
         params![
+            &req.device_id,
             &now,
             req.error
                 .clone()
                 .unwrap_or_else(|| format!("decode lease released: {}", req.reason)),
             &req.session_id,
-            &req.session_id,
-            &req.segment_id,
-            &req.device_id
+            &group_id
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -2641,18 +2660,31 @@ fn claim_assignment(
         tx.execute(
             r#"
             UPDATE inference_serving_groups
-            SET status = ?, updated_at = ?, last_error = NULL
-            WHERE job_id = ? AND group_id = ? AND device_id = ?
+            SET status = CASE
+                    WHEN device_id = ? THEN ?
+                    ELSE status
+                END,
+                lease_owner_device_id = ?,
+                lease_expires_at = ?,
+                updated_at = ?,
+                last_error = NULL
+            WHERE job_id = ? AND group_id = ? AND phase = ?
             "#,
             params![
+                &assignment.device_id,
                 match active.phase {
                     crate::api::types::ExecutionPhase::Prefill => "prefill_leased",
                     crate::api::types::ExecutionPhase::Decode => "decode_leased",
                 },
+                &assignment.device_id,
+                &lease_expires,
                 &now_str,
                 &assignment.job_id,
                 &active.execution_group_id,
-                &assignment.device_id
+                match active.phase {
+                    crate::api::types::ExecutionPhase::Prefill => "prefill",
+                    crate::api::types::ExecutionPhase::Decode => "decode",
+                }
             ],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -2811,18 +2843,37 @@ fn acknowledge_assignment(
         conn.execute(
             r#"
             UPDATE inference_serving_groups
-            SET status = ?, updated_at = ?, last_error = NULL
-            WHERE job_id = ? AND group_id = ? AND device_id = ?
+            SET status = CASE
+                    WHEN device_id = ? THEN ?
+                    ELSE status
+                END,
+                lease_owner_device_id = CASE
+                    WHEN ? = 'decode' THEN ?
+                    ELSE lease_owner_device_id
+                END,
+                lease_expires_at = NULL,
+                updated_at = ?,
+                last_error = NULL
+            WHERE job_id = ? AND group_id = ? AND phase = ?
             "#,
             params![
+                device_id,
                 match phase {
                     crate::api::types::ExecutionPhase::Prefill => "prefill_active",
                     crate::api::types::ExecutionPhase::Decode => "decode_active",
                 },
+                match phase {
+                    crate::api::types::ExecutionPhase::Prefill => "prefill",
+                    crate::api::types::ExecutionPhase::Decode => "decode",
+                },
+                device_id,
                 &now,
                 job_id,
                 &group_id,
-                device_id
+                match phase {
+                    crate::api::types::ExecutionPhase::Prefill => "prefill",
+                    crate::api::types::ExecutionPhase::Decode => "decode",
+                }
             ],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -3145,6 +3196,8 @@ fn report_assignment_result(
                 r#"
                 UPDATE inference_serving_groups
                 SET status = ?,
+                    lease_owner_device_id = NULL,
+                    lease_expires_at = NULL,
                     updated_at = ?,
                     last_error = ?
                 WHERE job_id = ? AND group_id = ? AND device_id = ?
@@ -3194,6 +3247,8 @@ fn report_assignment_result(
             r#"
             UPDATE inference_serving_groups
             SET status = 'completed',
+                lease_owner_device_id = NULL,
+                lease_expires_at = NULL,
                 updated_at = ?,
                 last_error = NULL
             WHERE job_id = ?
