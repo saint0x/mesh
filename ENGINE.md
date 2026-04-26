@@ -70,10 +70,10 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add microbatch formation across multiple active sessions
 - ✅ Add fairness policy for per-session decode participation inside a batch
 - ✅ Add KV-budget-aware admission for decode steps
-- In progress: Add runtime support for merged decode stepping on a serving group
-- In progress: Add completion/progress accounting for batched decode steps
-- In progress: Add tests for latency-vs-throughput scheduling under mixed workloads
-- Planned: Add Fozzy scenarios for multi-session decode batching
+- ✅ Add runtime support for merged decode stepping on a serving group
+- ✅ Add completion/progress accounting for batched decode steps
+- ✅ Add tests for latency-vs-throughput scheduling under mixed workloads
+- ✅ Add Fozzy scenarios for multi-session decode batching
 
 ## 3. Session, KV, And Residency Management
 

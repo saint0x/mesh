@@ -249,6 +249,15 @@ struct DecodeStepOutcome {
     time_to_first_token_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DecodeBatchTelemetry {
+    kv_cache_seq_len: u32,
+    batch_size: u32,
+    active_decode_sessions: u32,
+    batch_kv_tokens: u32,
+    deferred_decode_sessions: u32,
+}
+
 impl InferenceCoordinator {
     /// Create a new inference coordinator
     pub fn new(swarm: MeshSwarm, tensor_plane: TensorPlane, config: InferenceConfig) -> Self {
@@ -1210,6 +1219,7 @@ impl InferenceCoordinator {
             .get(&request.session_id)
             .map(|session| session.job.current_token_idx)
             .unwrap_or(0);
+        let mut last_batch_telemetry = None::<DecodeBatchTelemetry>;
         self.enqueue_decode_task(request.session_id)?;
 
         loop {
@@ -1278,6 +1288,14 @@ impl InferenceCoordinator {
                     continue;
                 }
 
+                last_batch_telemetry = Some(DecodeBatchTelemetry {
+                    kv_cache_seq_len: outcome.kv_cache_seq_len,
+                    batch_size,
+                    active_decode_sessions,
+                    batch_kv_tokens,
+                    deferred_decode_sessions,
+                });
+
                 if outcome
                     .completion_tokens
                     .saturating_sub(last_reported_completion_tokens)
@@ -1310,16 +1328,17 @@ impl InferenceCoordinator {
         }
 
         if result.completion_tokens > last_reported_completion_tokens {
+            let telemetry = last_batch_telemetry;
             on_progress(InferenceProgressUpdate {
                 phase: ExecutionPhase::Decode,
                 completion_tokens: result.completion_tokens,
                 execution_time_ms,
                 time_to_first_token_ms: None,
-                kv_cache_seq_len: None,
-                batch_size: None,
-                active_decode_sessions: None,
-                batch_kv_tokens: None,
-                deferred_decode_sessions: None,
+                kv_cache_seq_len: telemetry.map(|value| value.kv_cache_seq_len),
+                batch_size: telemetry.map(|value| value.batch_size),
+                active_decode_sessions: telemetry.map(|value| value.active_decode_sessions),
+                batch_kv_tokens: telemetry.map(|value| value.batch_kv_tokens),
+                deferred_decode_sessions: telemetry.map(|value| value.deferred_decode_sessions),
             })
             .await?;
         }

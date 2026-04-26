@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "name": "multi-session-decode-batching",
+  "steps": [
+    {
+      "name": "agent coordinator admits multiple decode sessions into one microbatch",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_admits_multiple_sessions",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "control-plane pools decode batch targets across shared participants",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_decode_batch_targets_pool_across_shared_decode_participants",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "control-plane promotes and refreshes owned pooled decode cohorts",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_completed_session_refreshes_remaining_pooled_decode_targets",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

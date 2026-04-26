@@ -3202,6 +3202,96 @@ mod tests {
     }
 
     #[test]
+    fn mixed_workload_latency_prefers_fresh_ready_runway_while_throughput_prefers_owned_leased_decode() {
+        let mut owned_satisfied = base_candidate(SchedulerPhase::Decode);
+        owned_satisfied.assignment_id = "owned-satisfied".into();
+        owned_satisfied.group_status = "decode_leased".into();
+        owned_satisfied.decode_queue_status = Some("leased".into());
+        owned_satisfied.decode_ready_at = Some("2026-01-01T00:00:04Z".into());
+        owned_satisfied.group_lease_owner_device_id = Some("worker-1".into());
+        owned_satisfied.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        owned_satisfied.decode_lease_target_session_count = Some(2);
+        owned_satisfied.decode_cohort_leased_sessions = 1;
+        owned_satisfied.decode_cohort_active_sessions = 1;
+        owned_satisfied.decode_cohort_ready_sessions = 0;
+        owned_satisfied.decode_cohort_blocked_sessions = 0;
+
+        let mut fresh_ready = base_candidate(SchedulerPhase::Decode);
+        fresh_ready.assignment_id = "fresh-ready".into();
+        fresh_ready.group_status = "decode_ready".into();
+        fresh_ready.decode_queue_status = Some("ready".into());
+        fresh_ready.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        fresh_ready.group_lease_owner_device_id = None;
+        fresh_ready.group_lease_expires_at = None;
+        fresh_ready.decode_lease_target_session_count = Some(4);
+        fresh_ready.decode_cohort_ready_sessions = 3;
+        fresh_ready.decode_cohort_blocked_sessions = 0;
+        fresh_ready.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let owned_satisfied = RunnableCandidate {
+            ready_at: owned_satisfied.decode_ready_at.clone().unwrap(),
+            candidate: owned_satisfied,
+        };
+        let fresh_ready = RunnableCandidate {
+            ready_at: fresh_ready.decode_ready_at.clone().unwrap(),
+            candidate: fresh_ready,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let latency_fresh = rank_candidate(
+            &fresh_ready,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_owned = rank_candidate(
+            &owned_satisfied,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_fresh < latency_owned);
+
+        let throughput_owned = rank_candidate(
+            &owned_satisfied,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_fresh = rank_candidate(
+            &fresh_ready,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_owned < throughput_fresh);
+    }
+
+    #[test]
     fn throughput_prefers_less_transfer_debt_in_equally_dense_owned_decode_cohorts_while_latency_prefers_broader_one() {
         let mut broader_more_blocked = base_candidate(SchedulerPhase::Decode);
         broader_more_blocked.assignment_id = "broader-more-blocked".into();
