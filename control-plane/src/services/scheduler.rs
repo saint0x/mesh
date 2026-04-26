@@ -607,14 +607,30 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
         };
         let ready_rank = 31u32.saturating_sub(candidate.candidate.decode_cohort_ready_sessions.min(31));
         let blocked_rank = candidate.candidate.decode_cohort_blocked_sessions.min(31);
-        let (primary_rank, secondary_rank) = match mode {
-            SchedulerPolicyMode::ThroughputFirst => (fill_density_rank, remaining_rank),
-            _ => (remaining_rank, fill_density_rank),
+        let (primary_rank, secondary_rank, tertiary_rank, quaternary_rank) = match mode {
+            SchedulerPolicyMode::ThroughputFirst => (
+                fill_density_rank,
+                remaining_rank,
+                ready_rank,
+                blocked_rank,
+            ),
+            SchedulerPolicyMode::ResilientEdge => (
+                blocked_rank,
+                remaining_rank,
+                fill_density_rank,
+                ready_rank,
+            ),
+            _ => (
+                remaining_rank,
+                fill_density_rank,
+                ready_rank,
+                blocked_rank,
+            ),
         };
         return (primary_rank << 15)
             .saturating_add(secondary_rank << 10)
-            .saturating_add(ready_rank << 5)
-            .saturating_add(blocked_rank);
+            .saturating_add(tertiary_rank << 5)
+            .saturating_add(quaternary_rank);
     } else {
         2_000_000
     }
@@ -2822,6 +2838,90 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_broader < latency_denser);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_less_transfer_exposed_owned_decode_cohort_while_latency_prefers_broader_one() {
+        let mut broader_more_blocked = base_candidate(SchedulerPhase::Decode);
+        broader_more_blocked.assignment_id = "broader-more-blocked".into();
+        broader_more_blocked.group_status = "decode_leased".into();
+        broader_more_blocked.decode_queue_status = Some("leased".into());
+        broader_more_blocked.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        broader_more_blocked.group_lease_owner_device_id = Some("worker-1".into());
+        broader_more_blocked.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        broader_more_blocked.decode_lease_target_session_count = Some(6);
+        broader_more_blocked.decode_cohort_leased_sessions = 1;
+        broader_more_blocked.decode_cohort_active_sessions = 1;
+        broader_more_blocked.decode_cohort_blocked_sessions = 3;
+        broader_more_blocked.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut narrower_less_blocked = broader_more_blocked.clone();
+        narrower_less_blocked.assignment_id = "narrower-less-blocked".into();
+        narrower_less_blocked.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        narrower_less_blocked.decode_lease_target_session_count = Some(4);
+        narrower_less_blocked.decode_cohort_blocked_sessions = 1;
+
+        let broader_more_blocked = RunnableCandidate {
+            ready_at: broader_more_blocked.decode_ready_at.clone().unwrap(),
+            candidate: broader_more_blocked,
+        };
+        let narrower_less_blocked = RunnableCandidate {
+            ready_at: narrower_less_blocked.decode_ready_at.clone().unwrap(),
+            candidate: narrower_less_blocked,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_narrower = rank_candidate(
+            &narrower_less_blocked,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_broader = rank_candidate(
+            &broader_more_blocked,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_narrower < resilient_broader);
+
+        let latency_broader = rank_candidate(
+            &broader_more_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_narrower = rank_candidate(
+            &narrower_less_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_broader < latency_narrower);
     }
 
     #[test]
