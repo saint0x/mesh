@@ -19,5 +19,5 @@ pub use tensor_plane::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
     parse_tensor_plane_bind_addr_env, InboundTensorMessage, TensorPlane,
     TensorPlaneCapabilitiesSnapshot, TensorPlaneConfig, TensorPlaneMetricsSnapshot,
-    TensorPlaneProfile, DATA_PLANE_ENDPOINT_PREFIX,
+    TensorPlaneProfile, TransportFallbackPolicy, DATA_PLANE_ENDPOINT_PREFIX,
 };

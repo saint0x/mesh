@@ -1223,8 +1223,11 @@ impl InferenceCoordinator {
                 position.right_neighbor,
                 position.left_neighbor_tensor_addr,
                 position.right_neighbor_tensor_addr,
+                session.job.request.runtime_mode,
+                session.backend.provider_kind(),
                 self.tensor_plane_mut(),
             );
+            worker_ring.prepare_serving_group_channels().await?;
             session.engine_state.assignment.phase = ExecutionPhase::Prefill;
             let logits = session
                 .backend
@@ -1333,8 +1336,17 @@ impl InferenceCoordinator {
             position.right_neighbor,
             position.left_neighbor_tensor_addr,
             position.right_neighbor_tensor_addr,
+            batch_sessions
+                .first()
+                .map(|(_, session, _)| session.job.request.runtime_mode)
+                .unwrap_or_default(),
+            batch_sessions
+                .first()
+                .map(|(_, session, _)| session.backend.provider_kind())
+                .unwrap_or(crate::provider::ExecutionProviderKind::Cpu),
             self.tensor_plane_mut(),
         );
+        worker_ring.prepare_serving_group_channels().await?;
         let mut requests = batch_sessions
             .iter_mut()
             .map(

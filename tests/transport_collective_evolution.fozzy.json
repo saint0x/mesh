@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "name": "transport-collective-evolution",
+  "steps": [
+    {
+      "name": "serving peer channel warmup opens multiple persistent streams for throughput mode",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_prepare_serving_peer_channels_opens_multiple_streams_for_throughput",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "latency critical transport still bypasses bulk throttle under mixed traffic",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_latency_critical_send_skips_bulk_bandwidth_throttle",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "transport policy helpers preserve runtime mode intent",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_transport_policy_helpers_preserve_runtime_mode_intent",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "collective optimization profile tracks provider and runtime mode",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "executor::ring_allreduce::tests::test_collective_optimization_profile_tracks_provider_and_runtime_mode",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

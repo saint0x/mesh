@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::errors::{AgentError, Result};
+use crate::inference::InferenceRuntimeMode;
+use crate::provider::ExecutionProviderKind;
 
 use super::tensor_message::{AllReducePhase, TensorMessage, TensorTrafficClass};
 
@@ -21,6 +23,16 @@ pub const DEFAULT_MAX_INBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_BULK_BANDWIDTH_SHARE_NUMERATOR: u64 = 3;
 const DEFAULT_BULK_BANDWIDTH_SHARE_DENOMINATOR: u64 = 4;
+const DEFAULT_MAX_CONCURRENT_OUTBOUND_STREAMS_PER_PEER: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportFallbackPolicy {
+    PreserveFit,
+    PreserveThroughput,
+    PreserveLatency,
+    PreserveResiliency,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +68,7 @@ pub struct TensorPlaneConfig {
     pub max_inbound_queued_bytes: usize,
     pub max_outbound_inflight_bytes: usize,
     pub max_send_bandwidth_bytes_per_sec: u64,
+    pub max_concurrent_outbound_streams_per_peer: usize,
 }
 
 impl Default for TensorPlaneConfig {
@@ -71,6 +84,8 @@ impl Default for TensorPlaneConfig {
             max_inbound_queued_bytes: DEFAULT_MAX_INBOUND_QUEUED_BYTES,
             max_outbound_inflight_bytes: DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES,
             max_send_bandwidth_bytes_per_sec: DEFAULT_MAX_MESSAGE_BYTES as u64,
+            max_concurrent_outbound_streams_per_peer:
+                DEFAULT_MAX_CONCURRENT_OUTBOUND_STREAMS_PER_PEER,
         }
     }
 }
@@ -127,8 +142,14 @@ pub struct TensorPlaneCapabilitiesSnapshot {
     pub bulk_outbound_inflight_byte_capacity: usize,
     pub max_send_bandwidth_bytes_per_sec: u64,
     pub bulk_send_bandwidth_bytes_per_sec: u64,
+    pub max_concurrent_outbound_streams_per_peer: usize,
+    pub peer_bulk_outbound_byte_capacity: usize,
     pub concurrent_receive_waiters: bool,
     pub prioritized_traffic_classes: bool,
+    pub persistent_serving_peer_channels: bool,
+    pub per_peer_bulk_fairness: bool,
+    pub runtime_mode_aware_fallbacks: bool,
+    pub provider_specialized_collectives: bool,
 }
 
 #[derive(Debug)]
@@ -216,14 +237,24 @@ struct TensorPlaneState {
     outbound_inflight_byte_capacity: usize,
     reserved_priority_outbound_inflight_bytes: usize,
     bulk_outbound_inflight_byte_capacity: usize,
+    peer_bulk_outbound_byte_capacity: usize,
     max_send_bandwidth_bytes_per_sec: u64,
     bulk_send_bandwidth_bytes_per_sec: u64,
+    max_concurrent_outbound_streams_per_peer: usize,
     inbound_queue_bytes: Arc<Semaphore>,
     outbound_inflight_bytes: Arc<Semaphore>,
     bulk_outbound_inflight_bytes: Arc<Semaphore>,
+    bulk_outbound_peer_budgets: Mutex<HashMap<SocketAddr, Arc<Semaphore>>>,
     bulk_outbound_bandwidth_limiter: Mutex<BandwidthLimiter>,
-    outbound_connections: Mutex<HashMap<SocketAddr, Arc<Mutex<TcpStream>>>>,
+    outbound_connections: Mutex<HashMap<SocketAddr, OutboundPeerChannels>>,
     metrics: TensorPlaneMetrics,
+}
+
+#[derive(Debug)]
+struct OutboundPeerChannels {
+    streams: Vec<Arc<Mutex<TcpStream>>>,
+    next_stream_index: usize,
+    pinned_for_serving: bool,
 }
 
 #[derive(Debug)]
@@ -265,6 +296,13 @@ impl BandwidthLimiter {
         self.last_refill = now + wait;
         wait
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransportSendPolicy {
+    traffic_class: TensorTrafficClass,
+    desired_stream_count: usize,
+    fallback_policy: TransportFallbackPolicy,
 }
 
 pub struct TensorPlane {
@@ -312,6 +350,11 @@ impl TensorPlane {
                     AgentError::Config("tensor bulk byte budget exceeds u32".to_string())
                 })?,
         ));
+        let peer_bulk_outbound_byte_capacity = compute_peer_bulk_outbound_byte_capacity(
+            bulk_outbound_inflight_byte_capacity,
+            config.max_concurrent_outbound_streams_per_peer,
+            config.max_message_bytes,
+        );
         let bulk_send_bandwidth_bytes_per_sec = compute_bulk_bandwidth_bytes_per_sec(
             config.max_send_bandwidth_bytes_per_sec,
             config.max_message_bytes,
@@ -336,11 +379,15 @@ impl TensorPlane {
             outbound_inflight_byte_capacity: config.max_outbound_inflight_bytes,
             reserved_priority_outbound_inflight_bytes,
             bulk_outbound_inflight_byte_capacity,
+            peer_bulk_outbound_byte_capacity,
             max_send_bandwidth_bytes_per_sec: config.max_send_bandwidth_bytes_per_sec,
             bulk_send_bandwidth_bytes_per_sec,
+            max_concurrent_outbound_streams_per_peer: config
+                .max_concurrent_outbound_streams_per_peer,
             inbound_queue_bytes,
             outbound_inflight_bytes,
             bulk_outbound_inflight_bytes,
+            bulk_outbound_peer_budgets: Mutex::new(HashMap::new()),
             bulk_outbound_bandwidth_limiter: Mutex::new(BandwidthLimiter::new(
                 bulk_send_bandwidth_bytes_per_sec,
                 config.max_message_bytes,
@@ -519,8 +566,16 @@ impl TensorPlane {
             bulk_outbound_inflight_byte_capacity: self.state.bulk_outbound_inflight_byte_capacity,
             max_send_bandwidth_bytes_per_sec: self.state.max_send_bandwidth_bytes_per_sec,
             bulk_send_bandwidth_bytes_per_sec: self.state.bulk_send_bandwidth_bytes_per_sec,
+            max_concurrent_outbound_streams_per_peer: self
+                .state
+                .max_concurrent_outbound_streams_per_peer,
+            peer_bulk_outbound_byte_capacity: self.state.peer_bulk_outbound_byte_capacity,
             concurrent_receive_waiters: true,
             prioritized_traffic_classes: true,
+            persistent_serving_peer_channels: true,
+            per_peer_bulk_fairness: true,
+            runtime_mode_aware_fallbacks: true,
+            provider_specialized_collectives: true,
         }
     }
 
@@ -652,8 +707,13 @@ impl TensorPlane {
     }
 
     pub async fn send(&self, target: SocketAddr, message: &TensorMessage) -> Result<()> {
-        self.send_with_traffic_class(target, message, message.traffic_class())
-            .await
+        self.send_with_transport_context(
+            target,
+            message,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+        )
+        .await
     }
 
     pub async fn send_with_traffic_class(
@@ -661,6 +721,66 @@ impl TensorPlane {
         target: SocketAddr,
         message: &TensorMessage,
         traffic_class: TensorTrafficClass,
+    ) -> Result<()> {
+        self.send_with_transport_policy(
+            target,
+            message,
+            TransportSendPolicy {
+                traffic_class,
+                desired_stream_count: 1,
+                fallback_policy: TransportFallbackPolicy::PreserveThroughput,
+            },
+        )
+        .await
+    }
+
+    pub async fn prepare_serving_peer_channels(
+        &self,
+        peers: &[SocketAddr],
+        runtime_mode: InferenceRuntimeMode,
+        provider: ExecutionProviderKind,
+    ) -> Result<()> {
+        let desired_stream_count = preferred_serving_stream_count(
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
+        for &peer in peers {
+            self.ensure_connection_pool(peer, desired_stream_count, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_with_transport_context(
+        &self,
+        target: SocketAddr,
+        message: &TensorMessage,
+        runtime_mode: InferenceRuntimeMode,
+        provider: ExecutionProviderKind,
+    ) -> Result<()> {
+        self.send_with_transport_policy(
+            target,
+            message,
+            TransportSendPolicy {
+                traffic_class: message.traffic_class(),
+                desired_stream_count: preferred_stream_count(
+                    message.traffic_class(),
+                    runtime_mode,
+                    provider,
+                    self.state.max_concurrent_outbound_streams_per_peer,
+                ),
+                fallback_policy: fallback_policy_for_runtime_mode(runtime_mode),
+            },
+        )
+        .await
+    }
+
+    async fn send_with_transport_policy(
+        &self,
+        target: SocketAddr,
+        message: &TensorMessage,
+        policy: TransportSendPolicy,
     ) -> Result<()> {
         let send_started = Instant::now();
         let message_bytes = message.size_bytes().max(1);
@@ -715,7 +835,7 @@ impl TensorPlane {
                 permit
             }
         };
-        let bulk_outbound_permit = if traffic_class.is_bulk() {
+        let bulk_outbound_permit = if policy.traffic_class.is_bulk() {
             let wait_started = Instant::now();
             Some(
                 match self
@@ -753,13 +873,48 @@ impl TensorPlane {
         } else {
             None
         };
+        let bulk_peer_permit = if policy.traffic_class.is_bulk() {
+            let peer_budget = self.bulk_peer_budget(target).await?;
+            let wait_started = Instant::now();
+            Some(
+                match peer_budget
+                    .clone()
+                    .try_acquire_many_owned(message_bytes_u32)
+                {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        self.state
+                            .metrics
+                            .outbound_backpressure_wait_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        let permit = peer_budget
+                            .clone()
+                            .acquire_many_owned(message_bytes_u32)
+                            .await
+                            .map_err(|_| {
+                                AgentError::Network(
+                                    "Tensor plane peer bulk fairness budget unexpectedly closed"
+                                        .to_string(),
+                                )
+                            })?;
+                        self.state.metrics.outbound_backpressure_wait_ms.fetch_add(
+                            wait_started.elapsed().as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
+                        permit
+                    }
+                },
+            )
+        } else {
+            None
+        };
         update_peak(
             &self.state.metrics.peak_outbound_inflight_bytes,
             (self.state.outbound_inflight_byte_capacity
                 - self.state.outbound_inflight_bytes.available_permits() as usize)
                 as u64,
         );
-        let bandwidth_wait = if traffic_class.is_bulk() {
+        let bandwidth_wait = if policy.traffic_class.is_bulk() {
             let mut limiter = self.state.bulk_outbound_bandwidth_limiter.lock().await;
             limiter.reserve_wait(message_bytes)
         } else {
@@ -776,37 +931,12 @@ impl TensorPlane {
                 .fetch_add(bandwidth_wait.as_millis() as u64, Ordering::Relaxed);
             tokio::time::sleep(bandwidth_wait).await;
         }
-        let stream = self.get_or_connect(target).await?;
-        let send_result = {
-            let mut stream_guard = stream.lock().await;
-            tokio::time::timeout(
-                self.state.io_timeout,
-                write_tensor_message(&mut *stream_guard, message, self.state.max_message_bytes),
-            )
-            .await
-        };
-        let send_result = match send_result {
-            Ok(result) => result,
-            Err(_) => {
-                self.state
-                    .metrics
-                    .send_timeout_count
-                    .fetch_add(1, Ordering::Relaxed);
-                self.evict_connection(target).await;
-                drop(outbound_permit);
-                return Err(AgentError::Network(format!(
-                    "Timed out sending tensor to {}",
-                    target
-                )));
-            }
-        };
+        let send_result = self.send_on_policy_stream(target, message, policy).await;
         if let Err(error) = send_result {
-            self.evict_connection(target).await;
             drop(outbound_permit);
-            return Err(AgentError::Network(format!(
-                "Failed to send tensor to {}: {}",
-                target, error
-            )));
+            drop(bulk_outbound_permit);
+            drop(bulk_peer_permit);
+            return Err(error);
         }
         self.state
             .metrics
@@ -826,21 +956,126 @@ impl TensorPlane {
             .metrics
             .send_latency_ms
             .fetch_add(send_started.elapsed().as_millis() as u64, Ordering::Relaxed);
-        record_traffic_class_send(&self.state.metrics, traffic_class);
+        record_traffic_class_send(&self.state.metrics, policy.traffic_class);
         drop(outbound_permit);
         drop(bulk_outbound_permit);
+        drop(bulk_peer_permit);
 
         Ok(())
     }
 
-    async fn get_or_connect(&self, target: SocketAddr) -> Result<Arc<Mutex<TcpStream>>> {
-        {
-            let connections = self.state.outbound_connections.lock().await;
-            if let Some(existing) = connections.get(&target) {
-                return Ok(Arc::clone(existing));
+    async fn send_on_policy_stream(
+        &self,
+        target: SocketAddr,
+        message: &TensorMessage,
+        policy: TransportSendPolicy,
+    ) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let stream_target = if attempt == 0 {
+                policy.desired_stream_count
+            } else {
+                fallback_stream_count_for_policy(policy)
+            };
+            let mark_persistent = attempt == 0 && stream_target > 1;
+            let stream = self
+                .ensure_connection_pool(target, stream_target.max(1), mark_persistent)
+                .await?;
+            let send_result = {
+                let mut stream_guard = stream.lock().await;
+                tokio::time::timeout(
+                    self.state.io_timeout,
+                    write_tensor_message(&mut *stream_guard, message, self.state.max_message_bytes),
+                )
+                .await
+            };
+            match send_result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    self.evict_connection(target).await;
+                    last_error = Some(AgentError::Network(format!(
+                        "Failed to send tensor to {}: {}",
+                        target, error
+                    )));
+                }
+                Err(_) => {
+                    self.state
+                        .metrics
+                        .send_timeout_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.evict_connection(target).await;
+                    last_error = Some(AgentError::Network(format!(
+                        "Timed out sending tensor to {}",
+                        target
+                    )));
+                }
             }
         }
+        Err(last_error
+            .unwrap_or_else(|| AgentError::Network(format!("Failed to send tensor to {}", target))))
+    }
 
+    async fn ensure_connection_pool(
+        &self,
+        target: SocketAddr,
+        desired_stream_count: usize,
+        mark_persistent: bool,
+    ) -> Result<Arc<Mutex<TcpStream>>> {
+        let desired_stream_count = desired_stream_count
+            .max(1)
+            .min(self.state.max_concurrent_outbound_streams_per_peer);
+
+        loop {
+            {
+                let mut connections = self.state.outbound_connections.lock().await;
+                if let Some(pool) = connections.get_mut(&target) {
+                    if mark_persistent {
+                        pool.pinned_for_serving = true;
+                    }
+                    if pool.streams.len() >= desired_stream_count {
+                        let idx = pool.next_stream_index % pool.streams.len();
+                        pool.next_stream_index = (pool.next_stream_index + 1) % pool.streams.len();
+                        return Ok(Arc::clone(&pool.streams[idx]));
+                    }
+                }
+            }
+
+            let stream = self.connect_stream(target).await?;
+            let mut connections = self.state.outbound_connections.lock().await;
+            let pool = connections
+                .entry(target)
+                .or_insert_with(|| OutboundPeerChannels {
+                    streams: Vec::new(),
+                    next_stream_index: 0,
+                    pinned_for_serving: false,
+                });
+            if mark_persistent {
+                pool.pinned_for_serving = true;
+            }
+            if pool.streams.len() < desired_stream_count {
+                pool.streams.push(Arc::clone(&stream));
+                self.state
+                    .metrics
+                    .current_outbound_connections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn bulk_peer_budget(&self, target: SocketAddr) -> Result<Arc<Semaphore>> {
+        let mut budgets = self.state.bulk_outbound_peer_budgets.lock().await;
+        let budget = budgets.entry(target).or_insert_with(|| {
+            Arc::new(Semaphore::new(
+                self.state
+                    .peer_bulk_outbound_byte_capacity
+                    .try_into()
+                    .unwrap_or(usize::MAX),
+            ))
+        });
+        Ok(Arc::clone(budget))
+    }
+
+    async fn connect_stream(&self, target: SocketAddr) -> Result<Arc<Mutex<TcpStream>>> {
         let stream = tokio::time::timeout(self.state.connect_timeout, TcpStream::connect(target))
             .await
             .map_err(|_| {
@@ -859,30 +1094,20 @@ impl TensorPlane {
         stream.set_nodelay(true).map_err(|e| {
             AgentError::Network(format!("Failed to set TCP_NODELAY on {}: {}", target, e))
         })?;
-        let stream = Arc::new(Mutex::new(stream));
-
-        let mut connections = self.state.outbound_connections.lock().await;
-        let was_present = connections.contains_key(&target);
-        let entry = connections
-            .entry(target)
-            .or_insert_with(|| Arc::clone(&stream));
-        if !was_present {
-            self.state
-                .metrics
-                .current_outbound_connections
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(Arc::clone(entry))
+        Ok(Arc::new(Mutex::new(stream)))
     }
 
     async fn evict_connection(&self, target: SocketAddr) {
         let mut connections = self.state.outbound_connections.lock().await;
-        if connections.remove(&target).is_some() {
+        if let Some(pool) = connections.remove(&target) {
             self.state
                 .metrics
                 .current_outbound_connections
-                .fetch_sub(1, Ordering::Relaxed);
+                .fetch_sub(pool.streams.len() as u64, Ordering::Relaxed);
         }
+        drop(connections);
+        let mut budgets = self.state.bulk_outbound_peer_budgets.lock().await;
+        budgets.remove(&target);
     }
 
     pub async fn recv(&self) -> Option<InboundTensorMessage> {
@@ -1006,6 +1231,9 @@ fn sanitized_config(config: TensorPlaneConfig) -> Result<TensorPlaneConfig> {
         max_inbound_queued_bytes: config.max_inbound_queued_bytes.max(1),
         max_outbound_inflight_bytes,
         max_send_bandwidth_bytes_per_sec,
+        max_concurrent_outbound_streams_per_peer: config
+            .max_concurrent_outbound_streams_per_peer
+            .max(1),
         ..config
     })
 }
@@ -1048,6 +1276,84 @@ fn compute_bulk_bandwidth_bytes_per_sec(
         .max(max_message_bytes as u64)
         .min(max_send_bandwidth_bytes_per_sec)
         .max(1)
+}
+
+fn compute_peer_bulk_outbound_byte_capacity(
+    bulk_outbound_inflight_byte_capacity: usize,
+    max_concurrent_outbound_streams_per_peer: usize,
+    max_message_bytes: usize,
+) -> usize {
+    let peer_count = max_concurrent_outbound_streams_per_peer.max(1);
+    (bulk_outbound_inflight_byte_capacity / peer_count)
+        .max(max_message_bytes)
+        .min(bulk_outbound_inflight_byte_capacity.max(1))
+}
+
+fn preferred_stream_count(
+    traffic_class: TensorTrafficClass,
+    runtime_mode: InferenceRuntimeMode,
+    provider: ExecutionProviderKind,
+    max_concurrent_outbound_streams_per_peer: usize,
+) -> usize {
+    let max_streams = max_concurrent_outbound_streams_per_peer.max(1);
+    let provider_bias = match provider {
+        ExecutionProviderKind::Cpu => 1,
+        ExecutionProviderKind::Metal => 2,
+        ExecutionProviderKind::Cuda => max_streams,
+    };
+    let mode_bias = match runtime_mode {
+        InferenceRuntimeMode::FitFirst => 1,
+        InferenceRuntimeMode::ThroughputFirst => max_streams,
+        InferenceRuntimeMode::LatencyFirst => 2.min(max_streams),
+        InferenceRuntimeMode::ResilientEdge => 1,
+    };
+    let traffic_bias = match traffic_class {
+        TensorTrafficClass::LatencyCritical => max_streams,
+        TensorTrafficClass::Interactive => 2.min(max_streams),
+        TensorTrafficClass::Bulk => 1.max(max_streams / 2),
+    };
+    provider_bias
+        .min(mode_bias)
+        .max(traffic_bias.min(mode_bias))
+        .max(1)
+}
+
+fn preferred_serving_stream_count(
+    runtime_mode: InferenceRuntimeMode,
+    provider: ExecutionProviderKind,
+    max_concurrent_outbound_streams_per_peer: usize,
+) -> usize {
+    preferred_stream_count(
+        TensorTrafficClass::Interactive,
+        runtime_mode,
+        provider,
+        max_concurrent_outbound_streams_per_peer,
+    )
+    .max(match runtime_mode {
+        InferenceRuntimeMode::ThroughputFirst => max_concurrent_outbound_streams_per_peer.max(1),
+        InferenceRuntimeMode::LatencyFirst => {
+            2.min(max_concurrent_outbound_streams_per_peer.max(1))
+        }
+        InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => 1,
+    })
+}
+
+fn fallback_policy_for_runtime_mode(mode: InferenceRuntimeMode) -> TransportFallbackPolicy {
+    match mode {
+        InferenceRuntimeMode::FitFirst => TransportFallbackPolicy::PreserveFit,
+        InferenceRuntimeMode::ThroughputFirst => TransportFallbackPolicy::PreserveThroughput,
+        InferenceRuntimeMode::LatencyFirst => TransportFallbackPolicy::PreserveLatency,
+        InferenceRuntimeMode::ResilientEdge => TransportFallbackPolicy::PreserveResiliency,
+    }
+}
+
+fn fallback_stream_count_for_policy(policy: TransportSendPolicy) -> usize {
+    match policy.fallback_policy {
+        TransportFallbackPolicy::PreserveFit => 1,
+        TransportFallbackPolicy::PreserveThroughput => policy.desired_stream_count.max(1),
+        TransportFallbackPolicy::PreserveLatency => policy.desired_stream_count.max(2),
+        TransportFallbackPolicy::PreserveResiliency => 1,
+    }
 }
 
 fn record_phase_bytes(
@@ -1379,6 +1685,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prepare_serving_peer_channels_opens_multiple_streams_for_throughput() {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
+            max_concurrent_outbound_streams_per_peer: 3,
+            ..TensorPlaneConfig::default()
+        })
+        .await
+        .unwrap();
+        let addr = plane.local_addr();
+
+        plane
+            .prepare_serving_peer_channels(
+                &[addr],
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+
+        wait_for_metric(&plane, |snapshot| {
+            snapshot.current_outbound_connections >= 3
+        })
+        .await;
+        let capabilities = plane.capabilities_snapshot();
+        assert_eq!(capabilities.max_concurrent_outbound_streams_per_peer, 3);
+        assert!(capabilities.persistent_serving_peer_channels);
+        assert!(capabilities.runtime_mode_aware_fallbacks);
+    }
+
+    #[tokio::test]
     async fn test_latency_critical_send_skips_bulk_bandwidth_throttle() {
         let plane = Arc::new(
             TensorPlane::bind(TensorPlaneConfig {
@@ -1432,6 +1767,9 @@ mod tests {
 
         let bulk_rate = compute_bulk_bandwidth_bytes_per_sec(4096, 512);
         assert_eq!(bulk_rate, 3072);
+
+        let peer_bulk = compute_peer_bulk_outbound_byte_capacity(3072, 3, 512);
+        assert_eq!(peer_bulk, 1024);
     }
 
     #[test]
@@ -1439,5 +1777,35 @@ mod tests {
         let mut limiter = BandwidthLimiter::new(100, 100);
         assert_eq!(limiter.reserve_wait(100), Duration::ZERO);
         assert!(limiter.reserve_wait(100) >= Duration::from_millis(900));
+    }
+
+    #[test]
+    fn test_transport_policy_helpers_preserve_runtime_mode_intent() {
+        assert_eq!(
+            fallback_policy_for_runtime_mode(InferenceRuntimeMode::FitFirst),
+            TransportFallbackPolicy::PreserveFit
+        );
+        assert_eq!(
+            fallback_policy_for_runtime_mode(InferenceRuntimeMode::ResilientEdge),
+            TransportFallbackPolicy::PreserveResiliency
+        );
+        assert_eq!(
+            preferred_stream_count(
+                TensorTrafficClass::Interactive,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+                4,
+            ),
+            4
+        );
+        assert_eq!(
+            preferred_stream_count(
+                TensorTrafficClass::Interactive,
+                InferenceRuntimeMode::FitFirst,
+                ExecutionProviderKind::Cpu,
+                4,
+            ),
+            1
+        );
     }
 }

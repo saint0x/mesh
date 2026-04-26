@@ -12,7 +12,9 @@
 //! bandwidth-optimal gradient aggregation in distributed training.
 
 use crate::errors::{AgentError, Result};
+use crate::inference::InferenceRuntimeMode;
 use crate::network::{AllReducePhase, TensorMessage, TensorPlane};
+use crate::provider::ExecutionProviderKind;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -165,8 +167,44 @@ pub struct WorkerRing<'a> {
     pub right_tensor_addr: SocketAddr,
     /// Dedicated tensor plane for network communication (borrowed).
     pub tensor_plane: &'a mut TensorPlane,
+    /// Runtime mode for transport fallback and scheduling intent.
+    runtime_mode: InferenceRuntimeMode,
+    /// Provider kind used by the local execution backend.
+    provider: ExecutionProviderKind,
+    /// Provider/runtime specialized collective transport plan.
+    collective_profile: CollectiveOptimizationProfile,
     /// Timings captured during the most recent all-reduce call.
     last_run_metrics: RingAllReduceMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectiveOptimizationProfile {
+    GenericStable,
+    CpuLowFanout,
+    MetalBalanced,
+    CudaHighThroughput,
+}
+
+impl CollectiveOptimizationProfile {
+    fn for_provider_and_mode(
+        provider: ExecutionProviderKind,
+        runtime_mode: InferenceRuntimeMode,
+    ) -> Self {
+        match (provider, runtime_mode) {
+            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => {
+                Self::CudaHighThroughput
+            }
+            (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst)
+            | (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
+                Self::MetalBalanced
+            }
+            (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => {
+                Self::CpuLowFanout
+            }
+            _ => Self::GenericStable,
+        }
+    }
 }
 
 impl<'a> WorkerRing<'a> {
@@ -185,8 +223,12 @@ impl<'a> WorkerRing<'a> {
         right_neighbor: PeerId,
         left_tensor_addr: SocketAddr,
         right_tensor_addr: SocketAddr,
+        runtime_mode: InferenceRuntimeMode,
+        provider: ExecutionProviderKind,
         tensor_plane: &'a mut TensorPlane,
     ) -> Self {
+        let collective_profile =
+            CollectiveOptimizationProfile::for_provider_and_mode(provider, runtime_mode);
         Self {
             my_position,
             total_workers,
@@ -195,8 +237,21 @@ impl<'a> WorkerRing<'a> {
             left_tensor_addr,
             right_tensor_addr,
             tensor_plane,
+            runtime_mode,
+            provider,
+            collective_profile,
             last_run_metrics: RingAllReduceMetrics::default(),
         }
+    }
+
+    pub async fn prepare_serving_group_channels(&self) -> Result<()> {
+        self.tensor_plane
+            .prepare_serving_peer_channels(
+                &[self.left_tensor_addr, self.right_tensor_addr],
+                self.runtime_mode,
+                self.provider,
+            )
+            .await
     }
 
     /// Perform ring all-reduce on a tensor
@@ -386,14 +441,14 @@ impl<'a> WorkerRing<'a> {
     ) -> Result<(TensorMessage, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
-        let traffic_class = message.traffic_class();
         let send_started = std::time::Instant::now();
         let recv_started = std::time::Instant::now();
         let (send_result, inbound) = tokio::join!(
-            self.tensor_plane.send_with_traffic_class(
+            self.tensor_plane.send_with_transport_context(
                 self.right_tensor_addr,
                 &message,
-                traffic_class,
+                self.runtime_mode,
+                self.provider,
             ),
             self.tensor_plane.recv_matching(|inbound| {
                 let tensor = &inbound.tensor;
@@ -408,7 +463,9 @@ impl<'a> WorkerRing<'a> {
 
         debug!(
             "Sent {:?} tensor to right neighbor {}, waiting for tensor from left neighbor {}",
-            traffic_class, self.right_neighbor, self.left_neighbor
+            message.traffic_class(),
+            self.right_neighbor,
+            self.left_neighbor
         );
 
         let inbound = inbound.ok_or_else(|| {
@@ -433,12 +490,17 @@ impl<'a> WorkerRing<'a> {
     pub fn last_run_metrics(&self) -> RingAllReduceMetrics {
         self.last_run_metrics
     }
+
+    pub fn collective_optimization_profile(&self) -> CollectiveOptimizationProfile {
+        self.collective_profile
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
+    use crate::provider::ExecutionProviderKind;
 
     // ============== Tensor Tests ==============
 
@@ -579,6 +641,31 @@ mod tests {
         );
 
         assert!(msg.is_barrier());
+    }
+
+    #[test]
+    fn test_collective_optimization_profile_tracks_provider_and_runtime_mode() {
+        assert_eq!(
+            CollectiveOptimizationProfile::for_provider_and_mode(
+                ExecutionProviderKind::Cuda,
+                InferenceRuntimeMode::ThroughputFirst,
+            ),
+            CollectiveOptimizationProfile::CudaHighThroughput
+        );
+        assert_eq!(
+            CollectiveOptimizationProfile::for_provider_and_mode(
+                ExecutionProviderKind::Metal,
+                InferenceRuntimeMode::LatencyFirst,
+            ),
+            CollectiveOptimizationProfile::MetalBalanced
+        );
+        assert_eq!(
+            CollectiveOptimizationProfile::for_provider_and_mode(
+                ExecutionProviderKind::Cpu,
+                InferenceRuntimeMode::ResilientEdge,
+            ),
+            CollectiveOptimizationProfile::CpuLowFanout
+        );
     }
 
     // Note: Tensor message serialization is tested at the data-plane boundary.

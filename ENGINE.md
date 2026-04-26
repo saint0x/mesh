@@ -125,13 +125,13 @@ explicit-segment serving stack into the full production `zip` engine.
 
 ## 7. Transport And Collective Evolution
 
-- In progress: Add transport capability model richer than current tier tagging
-- Planned: Add multiple concurrent inference streams per serving group
-- In progress: Add decode-priority traffic classes
-- In progress: Add bulk-transfer throttling and fairness
-- Planned: Add persistent channel/session reuse for serving groups
-- Planned: Add provider-specific collective optimization hooks
-- Planned: Add transport fallback policies that preserve runtime-mode intent
+- ✅ Add transport capability model richer than current tier tagging
+- ✅ Add multiple concurrent inference streams per serving group
+- ✅ Add decode-priority traffic classes
+- ✅ Add bulk-transfer throttling and fairness
+- ✅ Add persistent channel/session reuse for serving groups
+- ✅ Add provider-specific collective optimization hooks
+- ✅ Add transport fallback policies that preserve runtime-mode intent
 
 ## 8. APIs, Persistence, And Data Model
 
@@ -174,4 +174,4 @@ explicit-segment serving stack into the full production `zip` engine.
 - In progress: Expand KV management from checkpoint handoff to live residency management
 - ✅ Add regroup/failover
 - ✅ Constrain planning with richer manifests
-- Planned: Deepen backend/provider optimization after engine control flow is stable
+- ✅ Deepen backend/provider optimization after engine control flow is stable
