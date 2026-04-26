@@ -11,8 +11,9 @@ pub mod topology_notifier;
 pub use certificate::ControlPlaneKeypair;
 pub use device_service::{register_device, update_heartbeat};
 pub use failover::{
-    DecodeQueueRecord, FailoverConfig, FailoverDecision, FailoverEngine, InferenceSessionRecord,
-    RecoveryState, RegroupStrategy, ResumeMode, ServingGroupRecord, SessionReplicaRecord,
+    reconcile_failover_state, DecodeQueueRecord, FailoverConfig, FailoverDecision, FailoverEngine,
+    InferenceSessionRecord, RecoveryState, RegroupStrategy, ResumeMode, ServingGroupRecord,
+    SessionReplicaRecord,
 };
 pub use network_service::{
     create_network, list_networks, load_network_connectivity, load_network_settings,

@@ -1,5 +1,6 @@
 use crate::connectivity::DeviceConnectivityState;
 use crate::db::Database;
+use crate::services::failover::reconcile_failover_state;
 use rusqlite::params;
 use time::OffsetDateTime;
 use tokio::time::{interval, Duration};
@@ -15,7 +16,17 @@ pub async fn presence_monitor(db: Database) {
         tick.tick().await;
 
         let db_clone = db.clone();
-        match tokio::task::spawn_blocking(move || mark_offline_devices(&db_clone)).await {
+        match tokio::task::spawn_blocking(move || {
+            let stale_devices = mark_offline_devices(&db_clone)?;
+            reconcile_failover_state(&db_clone, &stale_devices).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::other(e.to_string()))
+                },
+            )?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stale_devices.len())
+        })
+        .await
+        {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => error!(error = %e, "Failed to mark offline devices"),
             Err(e) => error!(error = %e, "Task join error"),
@@ -24,7 +35,9 @@ pub async fn presence_monitor(db: Database) {
 }
 
 /// Mark devices as offline if last_seen > 20 seconds ago
-fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+fn mark_offline_devices(
+    db: &Database,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let threshold = OffsetDateTime::now_utc() - time::Duration::seconds(20);
     let threshold_str = threshold
         .format(&time::format_description::well_known::Rfc3339)
@@ -69,12 +82,16 @@ fn mark_offline_devices(db: &Database) -> Result<usize, Box<dyn std::error::Erro
     }
 
     let affected = stale_devices.len();
+    let affected_ids = stale_devices
+        .iter()
+        .map(|(device_id, _)| device_id.clone())
+        .collect::<Vec<_>>();
 
     if affected > 0 {
         debug!(count = affected, "Marked devices offline");
     }
 
-    Ok(affected)
+    Ok(affected_ids)
 }
 
 #[cfg(test)]
@@ -183,7 +200,7 @@ mod tests {
 
         // Mark offline devices
         let affected = mark_offline_devices(&db).unwrap();
-        assert_eq!(affected, 1);
+        assert_eq!(affected, vec![device_id.to_string()]);
 
         // Device should now be offline
         let status: String = conn
@@ -238,7 +255,7 @@ mod tests {
 
         // Mark offline devices
         let affected = mark_offline_devices(&db).unwrap();
-        assert_eq!(affected, 0); // Should not mark this device offline
+        assert!(affected.is_empty()); // Should not mark this device offline
 
         // Device should still be online
         let status: String = conn

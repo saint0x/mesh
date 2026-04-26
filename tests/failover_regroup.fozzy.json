@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "name": "failover-regroup",
+  "steps": [
+    {
+      "name": "decode failover can shrink surviving participants and resume ready state",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_shrinks_decode_session_and_makes_it_resume_ready",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "decode failover can pause regroup until checkpoint transfer completes",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_pauses_decode_until_checkpoint_transfer_for_replacement",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "prefill participant loss fails the job and cleans dead session state",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_fails_prefill_job_and_cleans_dead_session_state",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "terminal sessions and orphaned leases are cleaned during reconciliation",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_cleans_terminal_sessions_and_orphaned_leases",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

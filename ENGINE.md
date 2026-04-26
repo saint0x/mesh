@@ -103,15 +103,15 @@ explicit-segment serving stack into the full production `zip` engine.
 
 ## 5. Failover, Regroup, And Recovery
 
-- In progress: Detect participant loss while a session is active
-- In progress: Pause affected sessions without corrupting segment/session state
-- In progress: Select replacement participants when topology and manifests allow
-- Planned: Resume decode on a regrouped serving group
-- In progress: Support shrink-only continuation when full replacement is impossible
-- Planned: Add dead-session cleanup and orphaned-lease cleanup
-- In progress: Add scheduler policy for failover cost vs restart cost
+- ✅ Detect participant loss while a session is active
+- ✅ Pause affected sessions without corrupting segment/session state
+- ✅ Select replacement participants when topology and manifests allow
+- ✅ Resume decode on a regrouped serving group
+- ✅ Support shrink-only continuation when full replacement is impossible
+- ✅ Add dead-session cleanup and orphaned-lease cleanup
+- ✅ Add scheduler policy for failover cost vs restart cost
 - ✅ Add control-plane and agent tests for node loss during prefill and during decode
-- Planned: Add Fozzy exploration scenarios for regroup/failover behavior
+- ✅ Add Fozzy exploration scenarios for regroup/failover behavior
 
 ## 6. Model Layout And Planning Constraints
 
@@ -161,7 +161,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add deterministic Fozzy doctor/test/trace/replay/ci coverage for current dispatch path
 - In progress: Add deterministic Fozzy coverage for pooled scheduler behavior
 - Planned: Add deterministic Fozzy coverage for continuous batching
-- Planned: Add deterministic Fozzy coverage for failover and regroup
+- ✅ Add deterministic Fozzy coverage for failover and regroup
 - ✅ Add host-backed scenarios that exercise runtime-mode-specific behavior
 - Planned: Add longer soak scenarios for queue pressure and KV pressure
 
@@ -172,6 +172,6 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add explicit decode queue state and serving-group ownership records
 - In progress: Add continuous batching in the agent/runtime and scheduler
 - In progress: Expand KV management from checkpoint handoff to live residency management
-- In progress: Add regroup/failover
+- ✅ Add regroup/failover
 - In progress: Constrain planning with richer manifests
 - Planned: Deepen backend/provider optimization after engine control flow is stable

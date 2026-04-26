@@ -6,6 +6,7 @@ use crate::connectivity::{
 use crate::db::Database;
 use crate::device::{DeviceCapabilities, Tier};
 use crate::model_assets;
+use crate::services::failover::reconcile_failover_state;
 use crate::services::network_service;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -668,6 +669,7 @@ impl RingTopologyManager {
                     failed_worker_id
                 )));
             }
+            reconcile_failover_state(&self.db, std::slice::from_ref(&failed_worker_id))?;
             return Ok(());
         }
 
@@ -725,6 +727,10 @@ impl RingTopologyManager {
             remaining_workers = remaining_workers,
             "Shard redistribution triggered (logging only for Phase 1)"
         );
+
+        drop(ring_seq);
+        drop(workers_map);
+        reconcile_failover_state(&self.db, std::slice::from_ref(&failed_worker_id))?;
 
         Ok(())
     }
