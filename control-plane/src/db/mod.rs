@@ -10,7 +10,8 @@ pub mod models;
 use crate::api::types::{
     DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
     JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencySummary, KvTransferPolicy,
-    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerJobSummary,
+    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics,
+    SchedulerJobSummary,
     ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
 };
 
@@ -378,12 +379,15 @@ impl Database {
     ) -> Result<NetworkSchedulerStatusResponse> {
         let conn = self.get_conn()?;
         require_network_exists(&conn, network_id)?;
+        let decode_queue = load_decode_queue_entries(&conn, network_id, None)?;
+        let metrics = load_scheduler_batch_metrics(&conn, network_id, None, &decode_queue)?;
 
         Ok(NetworkSchedulerStatusResponse {
             success: true,
             network_id: network_id.to_string(),
             jobs: load_scheduler_job_summaries(&conn, network_id, None)?,
-            decode_queue: load_decode_queue_entries(&conn, network_id, None)?,
+            metrics,
+            decode_queue,
             serving_groups: load_serving_group_snapshots(&conn, network_id, None)?,
             kv_residency: load_kv_residency_summaries(&conn, network_id, None)?,
             regroup_events: load_regroup_events(&conn, network_id, None)?,
@@ -413,6 +417,9 @@ impl Database {
             )
             .optional()?
             .ok_or_else(|| DbError::NotFound(format!("Inference job not found: {}", job_id)))?;
+        let decode_queue = load_decode_queue_entries(&conn, &network_id, Some(job_id))?;
+        let metrics =
+            load_scheduler_batch_metrics(&conn, &network_id, Some(job_id), &decode_queue)?;
 
         Ok(JobSchedulerStatusResponse {
             success: true,
@@ -423,7 +430,8 @@ impl Database {
             active_segment_id,
             completion_tokens,
             updated_at,
-            decode_queue: load_decode_queue_entries(&conn, &network_id, Some(job_id))?,
+            metrics,
+            decode_queue,
             serving_groups: load_serving_group_snapshots(&conn, &network_id, Some(job_id))?,
             kv_residency: load_kv_residency_summaries(&conn, &network_id, Some(job_id))?,
             regroup_events: load_regroup_events(&conn, &network_id, Some(job_id))?,
@@ -713,6 +721,114 @@ fn load_serving_group_snapshots(
     }
 
     Ok(groups.into_values().collect())
+}
+
+fn load_scheduler_batch_metrics(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+    decode_queue: &[DecodeQueueEntryStatus],
+) -> Result<SchedulerBatchMetrics> {
+    let mut runnable_sessions = 0_u32;
+    let mut blocked_sessions = 0_u32;
+    let mut leased_sessions = 0_u32;
+    let mut active_sessions = 0_u32;
+    let mut blocked_on_prefill_sessions = 0_u32;
+    let mut blocked_on_transfer_sessions = 0_u32;
+
+    for entry in decode_queue {
+        match entry.status.as_str() {
+            "ready" => runnable_sessions += 1,
+            "blocked_on_prefill" => {
+                blocked_sessions += 1;
+                blocked_on_prefill_sessions += 1;
+            }
+            "blocked_on_transfer" => {
+                blocked_sessions += 1;
+                blocked_on_transfer_sessions += 1;
+            }
+            "leased" => leased_sessions += 1,
+            "active" => active_sessions += 1,
+            _ => {}
+        }
+    }
+
+    let telemetry = if let Some(job_id) = job_id {
+        conn.query_row(
+            r#"
+            SELECT
+                SUM(CASE
+                        WHEN latest_batch_size IS NOT NULL
+                          OR latest_active_decode_sessions IS NOT NULL
+                          OR latest_batch_kv_tokens IS NOT NULL
+                          OR latest_deferred_decode_sessions IS NOT NULL
+                        THEN 1
+                        ELSE 0
+                    END),
+                MAX(latest_batch_size),
+                MAX(latest_active_decode_sessions),
+                MAX(latest_batch_kv_tokens),
+                COALESCE(SUM(latest_deferred_decode_sessions), 0)
+            FROM inference_sessions
+            WHERE network_id = ?1 AND job_id = ?2
+            "#,
+            [network_id, job_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                    row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
+                    row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                    row.get::<_, i64>(4)? as u32,
+                ))
+            },
+        )?
+    } else {
+        conn.query_row(
+            r#"
+            SELECT
+                SUM(CASE
+                        WHEN latest_batch_size IS NOT NULL
+                          OR latest_active_decode_sessions IS NOT NULL
+                          OR latest_batch_kv_tokens IS NOT NULL
+                          OR latest_deferred_decode_sessions IS NOT NULL
+                        THEN 1
+                        ELSE 0
+                    END),
+                MAX(latest_batch_size),
+                MAX(latest_active_decode_sessions),
+                MAX(latest_batch_kv_tokens),
+                COALESCE(SUM(latest_deferred_decode_sessions), 0)
+            FROM inference_sessions
+            WHERE network_id = ?1
+            "#,
+            [network_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                    row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
+                    row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                    row.get::<_, i64>(4)? as u32,
+                ))
+            },
+        )?
+    };
+
+    Ok(SchedulerBatchMetrics {
+        decode_queue_depth: decode_queue.len() as u32,
+        runnable_sessions,
+        blocked_sessions,
+        leased_sessions,
+        active_sessions,
+        blocked_on_prefill_sessions,
+        blocked_on_transfer_sessions,
+        sessions_with_batch_telemetry: telemetry.0,
+        peak_batch_size: telemetry.1,
+        peak_active_decode_sessions: telemetry.2,
+        peak_batch_kv_tokens: telemetry.3,
+        deferred_decode_sessions: telemetry.4,
+    })
 }
 
 fn load_kv_residency_summaries(
@@ -1052,11 +1168,13 @@ mod tests {
             INSERT INTO inference_sessions (
                 session_id, job_id, network_id, model_id, status, active_segment_id,
                 kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
-                kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at
+                latest_batch_size, latest_active_decode_sessions, latest_batch_kv_tokens,
+                latest_deferred_decode_sessions, kv_checkpoint_device_id,
+                kv_checkpoint_created_at, updated_at
             ) VALUES (
                 'session-1', 'job-1', 'net-1', 'model-1', 'decode_pending_transfer',
                 'segment-decode', 'worker-a', 'export_on_handoff', 3,
-                'worker-a', '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z'
+                2, 3, 11, 1, 'worker-a', '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z'
             )
             "#,
             [],
@@ -1372,6 +1490,13 @@ mod tests {
 
         assert_eq!(status.jobs.len(), 1);
         assert_eq!(status.decode_queue.len(), 1);
+        assert_eq!(status.metrics.decode_queue_depth, 1);
+        assert_eq!(status.metrics.blocked_sessions, 1);
+        assert_eq!(status.metrics.blocked_on_prefill_sessions, 1);
+        assert_eq!(status.metrics.peak_batch_size, Some(2));
+        assert_eq!(status.metrics.peak_active_decode_sessions, Some(3));
+        assert_eq!(status.metrics.peak_batch_kv_tokens, Some(11));
+        assert_eq!(status.metrics.deferred_decode_sessions, 1);
         assert_eq!(
             status.decode_queue[0].blocked_reason.as_deref(),
             Some("prefill_incomplete")
@@ -1422,6 +1547,9 @@ mod tests {
             .expect("Failed to load job scheduler status");
 
         assert_eq!(status.decode_queue[0].status, "leased");
+        assert_eq!(status.metrics.decode_queue_depth, 1);
+        assert_eq!(status.metrics.leased_sessions, 1);
+        assert_eq!(status.metrics.blocked_sessions, 0);
         assert_eq!(
             status.decode_queue[0].lease_owner_device_id.as_deref(),
             Some("worker-a")

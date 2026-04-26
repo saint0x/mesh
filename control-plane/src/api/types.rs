@@ -893,12 +893,33 @@ pub struct SchedulerJobSummary {
     pub updated_at: String,
 }
 
+/// Aggregate scheduler and batching pressure counters for operator-facing status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerBatchMetrics {
+    pub decode_queue_depth: u32,
+    pub runnable_sessions: u32,
+    pub blocked_sessions: u32,
+    pub leased_sessions: u32,
+    pub active_sessions: u32,
+    pub blocked_on_prefill_sessions: u32,
+    pub blocked_on_transfer_sessions: u32,
+    pub sessions_with_batch_telemetry: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_active_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_batch_kv_tokens: Option<u32>,
+    pub deferred_decode_sessions: u32,
+}
+
 /// Network-wide scheduler/operator status view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSchedulerStatusResponse {
     pub success: bool,
     pub network_id: String,
     pub jobs: Vec<SchedulerJobSummary>,
+    pub metrics: SchedulerBatchMetrics,
     pub decode_queue: Vec<DecodeQueueEntryStatus>,
     pub serving_groups: Vec<ServingGroupStatus>,
     pub kv_residency: Vec<KvResidencySummary>,
@@ -917,6 +938,7 @@ pub struct JobSchedulerStatusResponse {
     pub active_segment_id: Option<String>,
     pub completion_tokens: u32,
     pub updated_at: String,
+    pub metrics: SchedulerBatchMetrics,
     pub decode_queue: Vec<DecodeQueueEntryStatus>,
     pub serving_groups: Vec<ServingGroupStatus>,
     pub kv_residency: Vec<KvResidencySummary>,

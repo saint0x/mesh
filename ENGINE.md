@@ -106,7 +106,7 @@ explicit-segment serving stack into the full production `zip` engine.
 
 ## 9. Observability And Operations
 
-- ⏳ Add metrics for scheduler backlog, runnable sessions, blocked sessions, and batch size
+- ✅ Add metrics for scheduler backlog, runnable sessions, blocked sessions, and batch size
 - ☐ Add metrics for KV residency, transfer volume, and checkpoint fallback rate
 - ☐ Add metrics for regroup frequency and recovery latency
 - ⏳ Add structured event log for scheduler decisions
