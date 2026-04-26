@@ -24,6 +24,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Lease sibling ready decode sessions in the same pooled cohort up to the scheduler target when a worker claims decode work
 - ✅ Prefer draining already leased decode sessions inside an owned cohort before taking merely ready sibling sessions
 - ✅ Prefer denser already owned decode cohorts before thinner owned cohorts when their remaining capacity ties
+- ✅ Prefer owned decode cohorts with more immediate ready runway when remaining capacity and density tie
 - ✅ Prefer owned decode cohorts with less blocked transfer debt when remaining capacity and density tie
 - Planned: Add admission control across multiple concurrent jobs and models
 - Planned: Add topology-aware pool partitioning for prefill-heavy vs decode-heavy work
