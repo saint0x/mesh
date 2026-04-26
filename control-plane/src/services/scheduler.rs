@@ -574,6 +574,9 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
             SchedulerPolicyMode::ThroughputFirst => (fresh_target << 10)
                 .saturating_add(fresh_ready << 5)
                 .saturating_add(31u32.saturating_sub(fresh_blocked)),
+            SchedulerPolicyMode::ResilientEdge => ((31u32.saturating_sub(fresh_blocked)) << 10)
+                .saturating_add(fresh_target << 5)
+                .saturating_add(fresh_ready),
             _ => (fresh_ready << 10)
                 .saturating_add((31u32.saturating_sub(fresh_blocked)) << 5)
                 .saturating_add(fresh_target),
@@ -2396,6 +2399,87 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_ready < latency_larger);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_lower_transfer_fresh_decode_cohort_before_readier_one() {
+        let mut less_blocked = base_candidate(SchedulerPhase::Decode);
+        less_blocked.assignment_id = "less-blocked".into();
+        less_blocked.group_status = "decode_ready".into();
+        less_blocked.decode_queue_status = Some("ready".into());
+        less_blocked.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        less_blocked.decode_lease_target_session_count = Some(3);
+        less_blocked.decode_cohort_ready_sessions = 1;
+        less_blocked.decode_cohort_blocked_sessions = 0;
+        less_blocked.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut more_ready = less_blocked.clone();
+        more_ready.assignment_id = "more-ready".into();
+        more_ready.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        more_ready.decode_cohort_ready_sessions = 3;
+        more_ready.decode_cohort_blocked_sessions = 2;
+
+        let less_blocked = RunnableCandidate {
+            ready_at: less_blocked.decode_ready_at.clone().unwrap(),
+            candidate: less_blocked,
+        };
+        let more_ready = RunnableCandidate {
+            ready_at: more_ready.decode_ready_at.clone().unwrap(),
+            candidate: more_ready,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_less_blocked = rank_candidate(
+            &less_blocked,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_more_ready = rank_candidate(
+            &more_ready,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_less_blocked < resilient_more_ready);
+
+        let latency_less_blocked = rank_candidate(
+            &less_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_more_ready = rank_candidate(
+            &more_ready,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_more_ready < latency_less_blocked);
     }
 
     #[test]
