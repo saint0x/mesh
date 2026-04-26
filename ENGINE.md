@@ -29,6 +29,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Prefer older owned decode cohorts before lease-count noise when cohort-specific latency signals tie
 - ✅ In `throughput_first`, prefer draining already leased owned decode work before opening fresh ready decode groups
 - ✅ In `throughput_first`, prefer larger fresh decode cohort opportunities before lower-latency smaller fresh cohorts
+- ✅ In `fit_first`, prefer smaller fresh decode cohort opportunities before larger fresh cohorts
 - ✅ In `resilient_edge`, prefer fresh stable decode-ready work before continuing leased owned decode cohorts
 - ✅ In `resilient_edge`, prefer lower-transfer fresh decode cohorts before readier but more transfer-exposed cohorts
 - Planned: Add admission control across multiple concurrent jobs and models

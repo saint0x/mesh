@@ -571,6 +571,9 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
             .unwrap_or(1)
             .min(31);
         let fresh_score = match mode {
+            SchedulerPolicyMode::FitFirst => ((31u32.saturating_sub(fresh_target)) << 10)
+                .saturating_add(fresh_ready << 5)
+                .saturating_add(31u32.saturating_sub(fresh_blocked)),
             SchedulerPolicyMode::ThroughputFirst => (fresh_target << 10)
                 .saturating_add(fresh_ready << 5)
                 .saturating_add(31u32.saturating_sub(fresh_blocked)),
@@ -2480,6 +2483,86 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_more_ready < latency_less_blocked);
+    }
+
+    #[test]
+    fn fit_first_prefers_smaller_fresh_decode_cohort_while_throughput_prefers_larger_one() {
+        let mut larger_target = base_candidate(SchedulerPhase::Decode);
+        larger_target.assignment_id = "larger-target".into();
+        larger_target.group_status = "decode_ready".into();
+        larger_target.decode_queue_status = Some("ready".into());
+        larger_target.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        larger_target.decode_lease_target_session_count = Some(5);
+        larger_target.decode_cohort_ready_sessions = 2;
+        larger_target.decode_cohort_blocked_sessions = 0;
+        larger_target.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut smaller_target = larger_target.clone();
+        smaller_target.assignment_id = "smaller-target".into();
+        smaller_target.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        smaller_target.decode_lease_target_session_count = Some(2);
+
+        let larger_target = RunnableCandidate {
+            ready_at: larger_target.decode_ready_at.clone().unwrap(),
+            candidate: larger_target,
+        };
+        let smaller_target = RunnableCandidate {
+            ready_at: smaller_target.decode_ready_at.clone().unwrap(),
+            candidate: smaller_target,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let fit_larger = rank_candidate(
+            &larger_target,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fit_smaller = rank_candidate(
+            &smaller_target,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(fit_smaller < fit_larger);
+
+        let throughput_larger = rank_candidate(
+            &larger_target,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_smaller = rank_candidate(
+            &smaller_target,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_larger < throughput_smaller);
     }
 
     #[test]
