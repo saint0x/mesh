@@ -486,6 +486,18 @@ fn owned_decode_latency_cohort_age_order(
     candidate: &RunnableCandidate,
     mode: SchedulerPolicyMode,
 ) -> String {
+    if matches!(mode, SchedulerPolicyMode::ThroughputFirst)
+        && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
+        && candidate
+            .candidate
+            .group_lease_owner_device_id
+            .as_deref()
+            .is_none()
+        && candidate.candidate.decode_cohort_oldest_ready_at.is_some()
+    {
+        return decode_group_order_time(candidate);
+    }
+
     if matches!(
         mode,
         SchedulerPolicyMode::LatencyFirst | SchedulerPolicyMode::ThroughputFirst
@@ -3284,6 +3296,60 @@ mod tests {
 
         let mut newer = older.clone();
         newer.assignment_id = "newer".into();
+        newer.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        newer.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:03Z".into());
+
+        let older = RunnableCandidate {
+            ready_at: older.decode_ready_at.clone().unwrap(),
+            candidate: older,
+        };
+        let newer = RunnableCandidate {
+            ready_at: newer.decode_ready_at.clone().unwrap(),
+            candidate: newer,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let throughput_older = rank_candidate(
+            &older,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            9,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_newer = rank_candidate(
+            &newer,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            3,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_older < throughput_newer);
+    }
+
+    #[test]
+    fn throughput_prefers_older_fresh_decode_cohort_before_lease_count_noise_when_scores_tie() {
+        let mut older = base_candidate(SchedulerPhase::Decode);
+        older.assignment_id = "older-fresh".into();
+        older.group_status = "decode_ready".into();
+        older.decode_queue_status = Some("ready".into());
+        older.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        older.decode_lease_target_session_count = Some(4);
+        older.decode_cohort_ready_sessions = 2;
+        older.decode_cohort_blocked_sessions = 1;
+        older.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut newer = older.clone();
+        newer.assignment_id = "newer-fresh".into();
         newer.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
         newer.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:03Z".into());
 
