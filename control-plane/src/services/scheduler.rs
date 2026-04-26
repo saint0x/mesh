@@ -607,8 +607,12 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
         };
         let ready_rank = 31u32.saturating_sub(candidate.candidate.decode_cohort_ready_sessions.min(31));
         let blocked_rank = candidate.candidate.decode_cohort_blocked_sessions.min(31);
-        return (remaining_rank << 15)
-            .saturating_add(fill_density_rank << 10)
+        let (primary_rank, secondary_rank) = match mode {
+            SchedulerPolicyMode::ThroughputFirst => (fill_density_rank, remaining_rank),
+            _ => (remaining_rank, fill_density_rank),
+        };
+        return (primary_rank << 15)
+            .saturating_add(secondary_rank << 10)
             .saturating_add(ready_rank << 5)
             .saturating_add(blocked_rank);
     } else {
@@ -2734,6 +2738,90 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_denser < latency_thinner);
+    }
+
+    #[test]
+    fn throughput_prefers_denser_owned_decode_cohort_while_latency_prefers_broader_one() {
+        let mut broader = base_candidate(SchedulerPhase::Decode);
+        broader.assignment_id = "broader".into();
+        broader.group_status = "decode_leased".into();
+        broader.decode_queue_status = Some("leased".into());
+        broader.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        broader.group_lease_owner_device_id = Some("worker-1".into());
+        broader.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        broader.decode_lease_target_session_count = Some(6);
+        broader.decode_cohort_leased_sessions = 1;
+        broader.decode_cohort_active_sessions = 1;
+        broader.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut denser = broader.clone();
+        denser.assignment_id = "denser".into();
+        denser.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        denser.decode_lease_target_session_count = Some(5);
+        denser.decode_cohort_leased_sessions = 2;
+        denser.decode_cohort_active_sessions = 1;
+
+        let broader = RunnableCandidate {
+            ready_at: broader.decode_ready_at.clone().unwrap(),
+            candidate: broader,
+        };
+        let denser = RunnableCandidate {
+            ready_at: denser.decode_ready_at.clone().unwrap(),
+            candidate: denser,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let throughput_denser = rank_candidate(
+            &denser,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_broader = rank_candidate(
+            &broader,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_denser < throughput_broader);
+
+        let latency_broader = rank_candidate(
+            &broader,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_denser = rank_candidate(
+            &denser,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_broader < latency_denser);
     }
 
     #[test]
