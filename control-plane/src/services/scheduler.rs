@@ -442,7 +442,7 @@ fn mode_rank(
             cohort_order_time,
         ),
         SchedulerPolicyMode::ResilientEdge => (
-            decode_bias,
+            resilient_edge_priority_class(candidate),
             decode_group_fill_rank,
             u8::from(!matches!(
                 candidate.candidate.group_status.as_str(),
@@ -470,6 +470,15 @@ fn throughput_decode_priority_class(candidate: &RunnableCandidate) -> u8 {
         0
     } else {
         1
+    }
+}
+
+fn resilient_edge_priority_class(candidate: &RunnableCandidate) -> u8 {
+    match candidate.candidate.group_status.as_str() {
+        "prefill_member" | "decode_ready" => 0,
+        "prefill_leased" | "decode_member" => 1,
+        "decode_leased" => 2,
+        _ => 3,
     }
 }
 
@@ -2212,6 +2221,95 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_fresh < latency_owned);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_fresh_ready_decode_before_leased_owned_decode() {
+        let mut owned_leased = base_candidate(SchedulerPhase::Decode);
+        owned_leased.assignment_id = "owned-leased".into();
+        owned_leased.group_status = "decode_leased".into();
+        owned_leased.decode_queue_status = Some("leased".into());
+        owned_leased.decode_ready_at = Some("2026-01-01T00:00:05Z".into());
+        owned_leased.group_lease_owner_device_id = Some("worker-1".into());
+        owned_leased.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        owned_leased.decode_lease_target_session_count = Some(3);
+        owned_leased.decode_cohort_leased_sessions = 2;
+        owned_leased.decode_cohort_active_sessions = 1;
+        owned_leased.decode_cohort_ready_sessions = 0;
+        owned_leased.decode_cohort_blocked_sessions = 0;
+        owned_leased.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut fresh_ready = base_candidate(SchedulerPhase::Decode);
+        fresh_ready.assignment_id = "fresh-ready".into();
+        fresh_ready.group_status = "decode_ready".into();
+        fresh_ready.decode_queue_status = Some("ready".into());
+        fresh_ready.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        fresh_ready.decode_lease_target_session_count = Some(4);
+        fresh_ready.decode_cohort_ready_sessions = 2;
+        fresh_ready.decode_cohort_blocked_sessions = 0;
+        fresh_ready.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let owned_leased = RunnableCandidate {
+            ready_at: owned_leased.decode_ready_at.clone().unwrap(),
+            candidate: owned_leased,
+        };
+        let fresh_ready = RunnableCandidate {
+            ready_at: fresh_ready.decode_ready_at.clone().unwrap(),
+            candidate: fresh_ready,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_owned = rank_candidate(
+            &owned_leased,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_fresh = rank_candidate(
+            &fresh_ready,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_fresh < resilient_owned);
+
+        let throughput_owned = rank_candidate(
+            &owned_leased,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_fresh = rank_candidate(
+            &fresh_ready,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_owned < throughput_fresh);
     }
 
     #[test]
