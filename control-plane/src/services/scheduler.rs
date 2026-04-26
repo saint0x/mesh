@@ -449,11 +449,7 @@ fn mode_rank(
 
 fn decode_group_order_time(candidate: &RunnableCandidate) -> String {
     if matches!(candidate.candidate.phase, SchedulerPhase::Decode)
-        && candidate
-            .candidate
-            .group_lease_owner_device_id
-            .as_deref()
-            .is_none()
+        && candidate.candidate.decode_cohort_oldest_ready_at.is_some()
     {
         return candidate
             .candidate
@@ -466,9 +462,25 @@ fn decode_group_order_time(candidate: &RunnableCandidate) -> String {
 
 fn decode_session_order_time(candidate: &RunnableCandidate) -> String {
     if matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
-        return candidate.ready_at.clone();
+        return format!(
+            "{}:{}",
+            decode_session_lease_rank(candidate),
+            candidate.ready_at
+        );
     }
     candidate.candidate.assigned_at.clone()
+}
+
+fn decode_session_lease_rank(candidate: &RunnableCandidate) -> &'static str {
+    if !matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
+        return "z";
+    }
+    match candidate.candidate.decode_queue_status.as_deref() {
+        Some("leased") => "a",
+        Some("ready") => "b",
+        Some("active") => "c",
+        _ => "z",
+    }
 }
 
 fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
@@ -1753,6 +1765,62 @@ mod tests {
         );
         let right = rank_candidate(
             &newer_session,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_draining_leased_decode_session_before_ready_sibling_in_owned_cohort() {
+        let mut leased = base_candidate(SchedulerPhase::Decode);
+        leased.assignment_id = "leased".into();
+        leased.group_status = "decode_leased".into();
+        leased.decode_queue_status = Some("leased".into());
+        leased.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        leased.group_lease_owner_device_id = Some("worker-1".into());
+        leased.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        leased.decode_lease_target_session_count = Some(3);
+        leased.decode_cohort_leased_sessions = 2;
+        leased.decode_cohort_active_sessions = 0;
+        leased.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut ready = leased.clone();
+        ready.assignment_id = "ready".into();
+        ready.decode_queue_status = Some("ready".into());
+        ready.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let leased = RunnableCandidate {
+            ready_at: leased.decode_ready_at.clone().unwrap(),
+            candidate: leased,
+        };
+        let ready = RunnableCandidate {
+            ready_at: ready.decode_ready_at.clone().unwrap(),
+            candidate: ready,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &leased,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &ready,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
