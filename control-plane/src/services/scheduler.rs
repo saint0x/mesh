@@ -453,7 +453,11 @@ fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
         .as_deref()
         .is_some();
     if !is_owned {
-        return 1_000_000;
+        let fresh_target = candidate
+            .candidate
+            .decode_lease_target_session_count
+            .unwrap_or(1);
+        return 1_000_000u32.saturating_sub(fresh_target.min(1_000));
     }
 
     let cohort_fill = candidate
@@ -1409,6 +1413,57 @@ mod tests {
         );
         let right = rank_candidate(
             &less_remaining,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_fresh_decode_group_with_larger_pooled_target() {
+        let mut larger = base_candidate(SchedulerPhase::Decode);
+        larger.assignment_id = "larger".into();
+        larger.group_status = "decode_ready".into();
+        larger.decode_queue_status = Some("ready".into());
+        larger.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        larger.decode_lease_target_session_count = Some(4);
+
+        let mut smaller = larger.clone();
+        smaller.assignment_id = "smaller".into();
+        smaller.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        smaller.decode_lease_target_session_count = Some(2);
+
+        let larger = RunnableCandidate {
+            ready_at: larger.decode_ready_at.clone().unwrap(),
+            candidate: larger,
+        };
+        let smaller = RunnableCandidate {
+            ready_at: smaller.decode_ready_at.clone().unwrap(),
+            candidate: smaller,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &larger,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &smaller,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
