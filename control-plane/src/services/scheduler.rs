@@ -72,6 +72,7 @@ struct SchedulerCandidate {
     decode_lease_target_session_count: Option<u32>,
     decode_cohort_ready_sessions: u32,
     decode_cohort_blocked_sessions: u32,
+    decode_cohort_oldest_ready_at: Option<String>,
     decode_cohort_leased_sessions: u32,
     decode_cohort_active_sessions: u32,
 }
@@ -405,6 +406,7 @@ fn mode_rank(
     let decode_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Decode);
     let prefill_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Prefill);
     let decode_group_fill_rank = decode_group_fill_rank(candidate);
+    let cohort_order_time = decode_group_order_time(candidate);
     match mode {
         SchedulerPolicyMode::FitFirst => (
             prefill_bias,
@@ -420,7 +422,7 @@ fn mode_rank(
             0,
             job_leased_assignments,
             submitter_leased_assignments,
-            candidate.ready_at.clone(),
+            cohort_order_time.clone(),
         ),
         SchedulerPolicyMode::LatencyFirst => (
             decode_bias,
@@ -428,7 +430,7 @@ fn mode_rank(
             0,
             submitter_leased_assignments,
             job_leased_assignments,
-            candidate.ready_at.clone(),
+            cohort_order_time,
         ),
         SchedulerPolicyMode::ResilientEdge => (
             decode_bias,
@@ -439,9 +441,26 @@ fn mode_rank(
             )),
             submitter_leased_assignments.saturating_add(job_leased_assignments),
             0,
-            candidate.ready_at.clone(),
+            decode_group_order_time(candidate),
         ),
     }
+}
+
+fn decode_group_order_time(candidate: &RunnableCandidate) -> String {
+    if matches!(candidate.candidate.phase, SchedulerPhase::Decode)
+        && candidate
+            .candidate
+            .group_lease_owner_device_id
+            .as_deref()
+            .is_none()
+    {
+        return candidate
+            .candidate
+            .decode_cohort_oldest_ready_at
+            .clone()
+            .unwrap_or_else(|| candidate.ready_at.clone());
+    }
+    candidate.ready_at.clone()
 }
 
 fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
@@ -533,6 +552,14 @@ fn load_scheduler_candidates(
                       AND COALESCE(peer.batch_group_key, peer.group_id) =
                           COALESCE(dq.batch_group_key, dq.group_id)
                 ), 0),
+                (
+                    SELECT MIN(peer.ready_at)
+                    FROM inference_decode_queue peer
+                    WHERE peer.network_id = a.network_id
+                      AND COALESCE(peer.batch_group_key, peer.group_id) =
+                          COALESCE(dq.batch_group_key, dq.group_id)
+                      AND peer.status = 'ready'
+                ),
                 COALESCE((
                     SELECT SUM(CASE WHEN peer.status = 'leased' THEN 1 ELSE 0 END)
                     FROM inference_decode_queue peer
@@ -603,8 +630,9 @@ fn load_scheduler_candidates(
             decode_lease_target_session_count: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
             decode_cohort_ready_sessions: row.get::<_, i64>(20)? as u32,
             decode_cohort_blocked_sessions: row.get::<_, i64>(21)? as u32,
-            decode_cohort_leased_sessions: row.get::<_, i64>(22)? as u32,
-            decode_cohort_active_sessions: row.get::<_, i64>(23)? as u32,
+            decode_cohort_oldest_ready_at: row.get(22)?,
+            decode_cohort_leased_sessions: row.get::<_, i64>(23)? as u32,
+            decode_cohort_active_sessions: row.get::<_, i64>(24)? as u32,
         })
     });
     let candidates = rows
@@ -1077,6 +1105,7 @@ mod tests {
             decode_lease_target_session_count: None,
             decode_cohort_ready_sessions: 0,
             decode_cohort_blocked_sessions: 0,
+            decode_cohort_oldest_ready_at: None,
             decode_cohort_leased_sessions: 0,
             decode_cohort_active_sessions: 0,
         }
@@ -1469,6 +1498,7 @@ mod tests {
         larger.decode_lease_target_session_count = Some(4);
         larger.decode_cohort_ready_sessions = 1;
         larger.decode_cohort_blocked_sessions = 0;
+        larger.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:02Z".into());
 
         let mut smaller = larger.clone();
         smaller.assignment_id = "smaller".into();
@@ -1522,6 +1552,7 @@ mod tests {
         more_ready.decode_lease_target_session_count = Some(4);
         more_ready.decode_cohort_ready_sessions = 3;
         more_ready.decode_cohort_blocked_sessions = 0;
+        more_ready.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:02Z".into());
 
         let mut less_ready = more_ready.clone();
         less_ready.assignment_id = "less-ready".into();
@@ -1575,6 +1606,7 @@ mod tests {
         less_blocked.decode_lease_target_session_count = Some(4);
         less_blocked.decode_cohort_ready_sessions = 2;
         less_blocked.decode_cohort_blocked_sessions = 1;
+        less_blocked.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:02Z".into());
 
         let mut more_blocked = less_blocked.clone();
         more_blocked.assignment_id = "more-blocked".into();
@@ -1605,6 +1637,60 @@ mod tests {
         );
         let right = rank_candidate(
             &more_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_fresh_decode_cohort_with_older_cohort_ready_time_when_scores_tie() {
+        let mut older_cohort = base_candidate(SchedulerPhase::Decode);
+        older_cohort.assignment_id = "older-cohort".into();
+        older_cohort.group_status = "decode_ready".into();
+        older_cohort.decode_queue_status = Some("ready".into());
+        older_cohort.decode_ready_at = Some("2026-01-01T00:00:05Z".into());
+        older_cohort.decode_lease_target_session_count = Some(4);
+        older_cohort.decode_cohort_ready_sessions = 2;
+        older_cohort.decode_cohort_blocked_sessions = 1;
+        older_cohort.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut newer_cohort = older_cohort.clone();
+        newer_cohort.assignment_id = "newer-cohort".into();
+        newer_cohort.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        newer_cohort.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:03Z".into());
+
+        let older_cohort = RunnableCandidate {
+            ready_at: older_cohort.decode_ready_at.clone().unwrap(),
+            candidate: older_cohort,
+        };
+        let newer_cohort = RunnableCandidate {
+            ready_at: newer_cohort.decode_ready_at.clone().unwrap(),
+            candidate: newer_cohort,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &older_cohort,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &newer_cohort,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
