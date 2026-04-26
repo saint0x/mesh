@@ -8,11 +8,11 @@ use thiserror::Error;
 pub mod models;
 
 use crate::api::types::{
-    DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
-    JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencySummary, KvTransferPolicy,
-    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics, SchedulerEventStatus,
-    SchedulerJobSummary,
-    ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
+    ComputeNearKvHint, DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
+    JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencyKind, KvResidencySliceStatus,
+    KvResidencySummary, KvTransferPolicy, KvTransferStatus, NetworkSchedulerStatusResponse,
+    PromptCacheEntryStatus, RegroupEventStatus, SchedulerBatchMetrics, SchedulerEventStatus,
+    SchedulerJobSummary, ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
     ServingGroupWorkloadStatus,
 };
 
@@ -338,11 +338,23 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
             column_exists(conn, "inference_decode_queue", "batch_group_key")?
         }
         "030_add_target_fields_to_decode_batch_events.sql" => {
-            column_exists(conn, "inference_decode_batch_events", "target_session_count")?
-                && column_exists(conn, "inference_decode_batch_events", "target_batch_size")?
+            column_exists(
+                conn,
+                "inference_decode_batch_events",
+                "target_session_count",
+            )? && column_exists(conn, "inference_decode_batch_events", "target_batch_size")?
         }
         "031_create_inference_scheduler_events.sql" => {
             table_exists(conn, "inference_scheduler_events")?
+        }
+        "032_create_inference_session_kv_residency.sql" => {
+            table_exists(conn, "inference_session_kv_residency")?
+        }
+        "033_create_inference_session_kv_transfers.sql" => {
+            table_exists(conn, "inference_session_kv_transfers")?
+        }
+        "034_create_inference_prompt_cache_entries.sql" => {
+            table_exists(conn, "inference_prompt_cache_entries")?
         }
         _ => false,
     })
@@ -415,6 +427,71 @@ struct KvSessionRow {
     latest_checkpoint: Option<InferenceSessionCheckpointStatus>,
 }
 
+#[derive(Clone)]
+struct KvResidencySliceRow {
+    residency_id: i64,
+    phase: ExecutionPhase,
+    group_id: String,
+    replica_device_id: String,
+    shard_column_start: u32,
+    shard_column_end: u32,
+    owner_device_id: String,
+    residency_kind: KvResidencyKind,
+    status: String,
+    sequence_first_position: Option<u32>,
+    sequence_next_position: Option<u32>,
+    cached_tokens: Option<u32>,
+    payload_size_bytes: Option<u64>,
+    remote_access_uri: Option<String>,
+    checkpoint_id: Option<String>,
+    prompt_cache_key: Option<String>,
+    prompt_prefix_tokens: Option<u32>,
+    eviction_eligible: bool,
+    pinned_for_decode: bool,
+    last_accessed_at: Option<String>,
+    updated_at: String,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct KvTransferRow {
+    transfer_id: String,
+    session_id: String,
+    segment_id: String,
+    group_id: String,
+    batch_group_key: Option<String>,
+    source_device_id: String,
+    target_device_id: String,
+    transfer_kind: String,
+    status: String,
+    checkpoint_id: Option<String>,
+    remote_access_uri: Option<String>,
+    kv_sequence_position: Option<u32>,
+    bytes_total: Option<u64>,
+    bytes_transferred: Option<u64>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    updated_at: String,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct PromptCacheEntryRow {
+    entry_id: i64,
+    session_id: String,
+    cache_key: String,
+    prefix_token_count: u32,
+    overlap_token_count: u32,
+    owner_device_id: String,
+    status: String,
+    checkpoint_id: Option<String>,
+    kv_sequence_position: Option<u32>,
+    remote_access_uri: Option<String>,
+    last_accessed_at: Option<String>,
+    updated_at: String,
+    last_error: Option<String>,
+}
+
 impl Database {
     pub fn load_network_scheduler_status(
         &self,
@@ -422,6 +499,7 @@ impl Database {
     ) -> Result<NetworkSchedulerStatusResponse> {
         let conn = self.get_conn()?;
         require_network_exists(&conn, network_id)?;
+        reconcile_kv_tracking_state(&conn)?;
         let decode_queue = load_decode_queue_entries(&conn, network_id, None)?;
         let metrics = load_scheduler_batch_metrics(&conn, network_id, None, &decode_queue)?;
 
@@ -440,6 +518,7 @@ impl Database {
 
     pub fn load_job_scheduler_status(&self, job_id: &str) -> Result<JobSchedulerStatusResponse> {
         let conn = self.get_conn()?;
+        reconcile_kv_tracking_state(&conn)?;
         let (network_id, model_id, status, active_segment_id, completion_tokens, updated_at) =
             conn.query_row(
                 r#"
@@ -500,6 +579,48 @@ fn require_network_exists(conn: &rusqlite::Connection, network_id: &str) -> Resu
             network_id
         )))
     }
+}
+
+fn reconcile_kv_tracking_state(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE inference_session_kv_transfers
+        SET status = 'stale',
+            last_error = COALESCE(last_error, 'transfer record exceeded freshness window'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status IN ('queued', 'in_progress')
+          AND datetime(updated_at) < datetime('now', '-10 minutes')
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        UPDATE inference_session_kv_residency
+        SET status = 'stale',
+            eviction_eligible = 1,
+            pinned_for_decode = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id IN (
+            SELECT job_id
+            FROM inference_jobs
+            WHERE status IN ('completed', 'failed', 'cancelled')
+              AND datetime(updated_at) < datetime('now', '-30 minutes')
+        )
+          AND status != 'stale'
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        UPDATE inference_prompt_cache_entries
+        SET status = 'stale',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'planned'
+          AND datetime(updated_at) < datetime('now', '-30 minutes')
+        "#,
+        [],
+    )?;
+    Ok(())
 }
 
 fn load_scheduler_job_summaries(
@@ -1155,6 +1276,10 @@ fn load_kv_residency_summaries(
 
     let mut output = Vec::with_capacity(sessions.len());
     for session in sessions {
+        let residency_slices = load_kv_residency_slices(conn, &session.session_id)?;
+        let transfers = load_kv_transfer_rows(conn, &session.session_id)?;
+        let prompt_cache_entries = load_prompt_cache_entries(conn, &session.session_id)?;
+        let compute_hint = Some(compute_near_kv_hint(&residency_slices, &transfers));
         output.push(KvResidencySummary {
             session_id: session.session_id.clone(),
             job_id: session.job_id.clone(),
@@ -1169,6 +1294,10 @@ fn load_kv_residency_summaries(
             kv_checkpoint_created_at: session.kv_checkpoint_created_at.clone(),
             latest_checkpoint: session.latest_checkpoint.clone(),
             replicas: load_kv_replica_rows(conn, &session.session_id)?,
+            residency_slices,
+            transfers,
+            prompt_cache_entries,
+            compute_hint,
             updated_at: session.updated_at.clone(),
         });
     }
@@ -1199,6 +1328,231 @@ fn load_kv_replica_rows(
         })
     })?;
     collect_rows(rows)
+}
+
+fn load_kv_residency_slices(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<KvResidencySliceStatus>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT residency_id, phase, group_id, replica_device_id, shard_column_start, shard_column_end,
+               owner_device_id, residency_kind, status, sequence_first_position,
+               sequence_next_position, cached_tokens, payload_size_bytes, remote_access_uri,
+               checkpoint_id, prompt_cache_key, prompt_prefix_tokens, eviction_eligible,
+               pinned_for_decode, last_accessed_at, updated_at, last_error
+        FROM inference_session_kv_residency
+        WHERE session_id = ?
+        ORDER BY updated_at DESC, residency_id DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok(KvResidencySliceRow {
+            residency_id: row.get(0)?,
+            phase: parse_execution_phase(row.get::<_, String>(1)?.as_str()).map_err(to_sql_err)?,
+            group_id: row.get(2)?,
+            replica_device_id: row.get(3)?,
+            shard_column_start: row.get::<_, i64>(4)? as u32,
+            shard_column_end: row.get::<_, i64>(5)? as u32,
+            owner_device_id: row.get(6)?,
+            residency_kind: parse_kv_residency_kind(row.get::<_, String>(7)?.as_str())
+                .map_err(to_sql_err)?,
+            status: row.get(8)?,
+            sequence_first_position: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+            sequence_next_position: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+            cached_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+            payload_size_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+            remote_access_uri: row.get(13)?,
+            checkpoint_id: row.get(14)?,
+            prompt_cache_key: row.get(15)?,
+            prompt_prefix_tokens: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            eviction_eligible: row.get::<_, i64>(17)? != 0,
+            pinned_for_decode: row.get::<_, i64>(18)? != 0,
+            last_accessed_at: row.get(19)?,
+            updated_at: row.get(20)?,
+            last_error: row.get(21)?,
+        })
+    })?;
+    Ok(collect_rows(rows)?
+        .into_iter()
+        .map(|row| KvResidencySliceStatus {
+            residency_id: row.residency_id,
+            phase: row.phase,
+            group_id: row.group_id,
+            replica_device_id: row.replica_device_id,
+            shard_column_start: row.shard_column_start,
+            shard_column_end: row.shard_column_end,
+            owner_device_id: row.owner_device_id,
+            residency_kind: row.residency_kind,
+            status: row.status,
+            sequence_first_position: row.sequence_first_position,
+            sequence_next_position: row.sequence_next_position,
+            cached_tokens: row.cached_tokens,
+            payload_size_bytes: row.payload_size_bytes,
+            remote_access_uri: row.remote_access_uri,
+            checkpoint_id: row.checkpoint_id,
+            prompt_cache_key: row.prompt_cache_key,
+            prompt_prefix_tokens: row.prompt_prefix_tokens,
+            eviction_eligible: row.eviction_eligible,
+            pinned_for_decode: row.pinned_for_decode,
+            last_accessed_at: row.last_accessed_at,
+            updated_at: row.updated_at,
+            last_error: row.last_error,
+        })
+        .collect())
+}
+
+fn load_kv_transfer_rows(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<KvTransferStatus>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT transfer_id, session_id, segment_id, group_id, batch_group_key, source_device_id,
+               target_device_id, transfer_kind, status, checkpoint_id, remote_access_uri,
+               kv_sequence_position, bytes_total, bytes_transferred, started_at,
+               completed_at, updated_at, last_error
+        FROM inference_session_kv_transfers
+        WHERE session_id = ?
+        ORDER BY updated_at DESC, transfer_id DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok(KvTransferRow {
+            transfer_id: row.get(0)?,
+            session_id: row.get(1)?,
+            segment_id: row.get(2)?,
+            group_id: row.get(3)?,
+            batch_group_key: row.get(4)?,
+            source_device_id: row.get(5)?,
+            target_device_id: row.get(6)?,
+            transfer_kind: row.get(7)?,
+            status: row.get(8)?,
+            checkpoint_id: row.get(9)?,
+            remote_access_uri: row.get(10)?,
+            kv_sequence_position: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+            bytes_total: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+            bytes_transferred: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+            started_at: row.get(14)?,
+            completed_at: row.get(15)?,
+            updated_at: row.get(16)?,
+            last_error: row.get(17)?,
+        })
+    })?;
+    Ok(collect_rows(rows)?
+        .into_iter()
+        .map(|row| KvTransferStatus {
+            transfer_id: row.transfer_id,
+            session_id: row.session_id,
+            segment_id: row.segment_id,
+            group_id: row.group_id,
+            batch_group_key: row.batch_group_key,
+            source_device_id: row.source_device_id,
+            target_device_id: row.target_device_id,
+            transfer_kind: row.transfer_kind,
+            status: row.status,
+            checkpoint_id: row.checkpoint_id,
+            remote_access_uri: row.remote_access_uri,
+            kv_sequence_position: row.kv_sequence_position,
+            bytes_total: row.bytes_total,
+            bytes_transferred: row.bytes_transferred,
+            started_at: row.started_at,
+            completed_at: row.completed_at,
+            updated_at: row.updated_at,
+            last_error: row.last_error,
+        })
+        .collect())
+}
+
+fn load_prompt_cache_entries(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<PromptCacheEntryStatus>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT entry_id, session_id, cache_key, prefix_token_count, overlap_token_count,
+               owner_device_id, status, checkpoint_id, kv_sequence_position,
+               remote_access_uri, last_accessed_at, updated_at, last_error
+        FROM inference_prompt_cache_entries
+        WHERE session_id = ?
+        ORDER BY updated_at DESC, entry_id DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok(PromptCacheEntryRow {
+            entry_id: row.get(0)?,
+            session_id: row.get(1)?,
+            cache_key: row.get(2)?,
+            prefix_token_count: row.get::<_, i64>(3)? as u32,
+            overlap_token_count: row.get::<_, i64>(4)? as u32,
+            owner_device_id: row.get(5)?,
+            status: row.get(6)?,
+            checkpoint_id: row.get(7)?,
+            kv_sequence_position: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+            remote_access_uri: row.get(9)?,
+            last_accessed_at: row.get(10)?,
+            updated_at: row.get(11)?,
+            last_error: row.get(12)?,
+        })
+    })?;
+    Ok(collect_rows(rows)?
+        .into_iter()
+        .map(|row| PromptCacheEntryStatus {
+            entry_id: row.entry_id,
+            session_id: row.session_id,
+            cache_key: row.cache_key,
+            prefix_token_count: row.prefix_token_count,
+            overlap_token_count: row.overlap_token_count,
+            owner_device_id: row.owner_device_id,
+            status: row.status,
+            checkpoint_id: row.checkpoint_id,
+            kv_sequence_position: row.kv_sequence_position,
+            remote_access_uri: row.remote_access_uri,
+            last_accessed_at: row.last_accessed_at,
+            updated_at: row.updated_at,
+            last_error: row.last_error,
+        })
+        .collect())
+}
+
+fn compute_near_kv_hint(
+    residency_slices: &[KvResidencySliceStatus],
+    transfers: &[KvTransferStatus],
+) -> ComputeNearKvHint {
+    let mut preferred_device_ids = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ready_local_replicas = 0_u32;
+    let mut ready_remote_references = 0_u32;
+    let mut eviction_candidate_count = 0_u32;
+    for slice in residency_slices {
+        if slice.eviction_eligible {
+            eviction_candidate_count += 1;
+        }
+        if slice.status == "ready" {
+            if seen.insert(slice.replica_device_id.clone()) {
+                preferred_device_ids.push(slice.replica_device_id.clone());
+            }
+            match slice.residency_kind {
+                KvResidencyKind::CheckpointStore | KvResidencyKind::TransferBundle => {
+                    ready_local_replicas += 1;
+                }
+                KvResidencyKind::RemoteReference => {
+                    ready_remote_references += 1;
+                }
+            }
+        }
+    }
+    let active_transfer_count = transfers
+        .iter()
+        .filter(|transfer| transfer.status == "queued" || transfer.status == "in_progress")
+        .count() as u32;
+    ComputeNearKvHint {
+        preferred_device_ids,
+        ready_local_replicas,
+        ready_remote_references,
+        active_transfer_count,
+        eviction_candidate_count,
+    }
 }
 
 fn load_latest_checkpoint_for_session(
@@ -1336,6 +1690,20 @@ fn parse_kv_transfer_policy(value: &str) -> Result<KvTransferPolicy> {
     })
 }
 
+fn parse_kv_residency_kind(value: &str) -> Result<KvResidencyKind> {
+    let normalized = if value.starts_with('"') {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value)
+    };
+    serde_json::from_str(&normalized).map_err(|e| {
+        DbError::Data(format!(
+            "Invalid KV residency kind in persisted state ({}): {}",
+            value, e
+        ))
+    })
+}
+
 fn to_sql_err(err: DbError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         0,
@@ -1461,6 +1829,82 @@ mod tests {
             [],
         )
         .expect("Failed to insert session checkpoint");
+
+        for (phase, group_id, device_id, start, end, kind, status) in [
+            (
+                "prefill",
+                "group-prefill",
+                "worker-a",
+                0_i64,
+                64_i64,
+                "checkpoint_store",
+                "ready",
+            ),
+            (
+                "decode",
+                "group-decode",
+                "worker-b",
+                64_i64,
+                128_i64,
+                "remote_reference",
+                "ready",
+            ),
+        ] {
+            conn.execute(
+                r#"
+                INSERT INTO inference_session_kv_residency (
+                    session_id, job_id, network_id, model_id, phase, group_id, replica_device_id,
+                    shard_column_start, shard_column_end, owner_device_id, residency_kind, status,
+                    sequence_first_position, sequence_next_position, cached_tokens, payload_size_bytes,
+                    remote_access_uri, checkpoint_id, prompt_cache_key, prompt_prefix_tokens,
+                    eviction_eligible, pinned_for_decode, last_accessed_at, created_at, updated_at, last_error
+                ) VALUES (
+                    'session-1', 'job-1', 'net-1', 'model-1', ?1, ?2, ?3,
+                    ?4, ?5, 'worker-a', ?6, ?7,
+                    0, 3, 3, 3,
+                    '/api/inference/jobs/job-1/session-checkpoints/session-1', 'ckpt-1', 'prefix-1', 3,
+                    0, 1, '2026-04-25T12:00:06Z', '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z', NULL
+                )
+                "#,
+                rusqlite::params![phase, group_id, device_id, start, end, kind, status],
+            )
+            .expect("Failed to insert KV residency slice");
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_session_kv_transfers (
+                transfer_id, session_id, job_id, network_id, model_id, segment_id, group_id,
+                batch_group_key, source_device_id, target_device_id, transfer_kind, status,
+                checkpoint_id, remote_access_uri, kv_sequence_position, bytes_total,
+                bytes_transferred, started_at, completed_at, updated_at, last_error
+            ) VALUES (
+                'transfer-1', 'session-1', 'job-1', 'net-1', 'model-1', 'segment-decode',
+                'group-decode', 'batch-group-1', 'worker-a', 'worker-b', 'checkpoint_handoff',
+                'completed', 'ckpt-1', '/api/inference/jobs/job-1/session-checkpoints/session-1',
+                3, 3, 3, '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z', '2026-04-25T12:00:06Z', NULL
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert KV transfer");
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_prompt_cache_entries (
+                session_id, job_id, network_id, model_id, cache_key, prefix_token_count,
+                overlap_token_count, prompt_tokens_json, owner_device_id, checkpoint_id,
+                kv_sequence_position, status, remote_access_uri, last_accessed_at, created_at, updated_at, last_error
+            ) VALUES (
+                'session-1', 'job-1', 'net-1', 'model-1', 'prefix-1', 3,
+                2, '[1,2,3]', 'worker-a', 'ckpt-1', 3, 'ready',
+                '/api/inference/jobs/job-1/session-checkpoints/session-1',
+                '2026-04-25T12:00:06Z', '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z', NULL
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert prompt cache entry");
 
         for (device_id, ring_position, start, end, assign_status, lease_expires_at) in [
             (
@@ -1784,6 +2228,16 @@ mod tests {
         );
         assert_eq!(status.kv_residency.len(), 1);
         assert_eq!(status.kv_residency[0].replicas.len(), 2);
+        assert_eq!(status.kv_residency[0].residency_slices.len(), 2);
+        assert_eq!(status.kv_residency[0].transfers.len(), 1);
+        assert_eq!(status.kv_residency[0].prompt_cache_entries.len(), 1);
+        assert_eq!(
+            status.kv_residency[0]
+                .compute_hint
+                .as_ref()
+                .map(|hint| hint.preferred_device_ids.clone()),
+            Some(vec!["worker-b".to_string(), "worker-a".to_string()])
+        );
         assert_eq!(
             status.kv_residency[0]
                 .latest_checkpoint
@@ -1851,5 +2305,55 @@ mod tests {
             .regroup_events
             .iter()
             .any(|event| event.event_kind == "queue_lease_changed"));
+    }
+
+    #[test]
+    fn test_kv_tracking_cleanup_marks_stale_transfers_and_terminal_residency() {
+        let db = create_test_db();
+        seed_scheduler_visibility_fixture(&db);
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute(
+            "UPDATE inference_jobs SET status = 'completed', updated_at = '2026-04-25 11:00:00'",
+            [],
+        )
+        .expect("Failed to age completed job");
+        conn.execute(
+            r#"
+            UPDATE inference_session_kv_transfers
+            SET status = 'queued',
+                completed_at = NULL,
+                updated_at = '2026-04-25 11:00:00'
+            "#,
+            [],
+        )
+        .expect("Failed to age KV transfer");
+        conn.execute(
+            r#"
+            UPDATE inference_prompt_cache_entries
+            SET status = 'planned',
+                updated_at = '2026-04-25 11:00:00'
+            "#,
+            [],
+        )
+        .expect("Failed to age prompt cache entry");
+        drop(conn);
+
+        let status = db
+            .load_job_scheduler_status("job-1")
+            .expect("Failed to load job scheduler status");
+        let residency = &status.kv_residency[0];
+        assert!(residency
+            .residency_slices
+            .iter()
+            .all(|slice| slice.status == "stale" && slice.eviction_eligible));
+        assert!(residency
+            .transfers
+            .iter()
+            .all(|transfer| transfer.status == "stale"));
+        assert!(residency
+            .prompt_cache_entries
+            .iter()
+            .all(|entry| entry.status == "stale"));
     }
 }

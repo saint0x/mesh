@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "name": "session-kv-residency",
+  "steps": [
+    {
+      "name": "checkpoint upload materializes kv residency and prompt cache state",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_uploaded_session_checkpoint_is_exposed_on_status_lease_and_download",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "scheduler status exposes kv residency slices transfers and compute hints",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_network_scheduler_status_exposes_queue_groups_and_kv_residency",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "stale kv tracking records are cleaned up on status load",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_kv_tracking_cleanup_marks_stale_transfers_and_terminal_residency",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

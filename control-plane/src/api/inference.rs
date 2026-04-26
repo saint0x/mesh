@@ -484,6 +484,15 @@ pub async fn submit_inference(
             &execution_plan,
             &now,
         )?;
+        initialize_session_kv_tracking(
+            &tx,
+            &persisted_job_id,
+            &request.network_id,
+            &request.model_id,
+            &execution_plan,
+            &prompt_tokens,
+            &now,
+        )?;
         if let Some(decode_segment) = execution_plan
             .segments
             .iter()
@@ -1346,12 +1355,7 @@ fn renew_decode_lease_state(
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    refresh_decode_batch_targets(
-        &tx,
-        &req.network_id,
-        &pooled_group_key,
-        &group_id,
-    )?;
+    refresh_decode_batch_targets(&tx, &req.network_id, &pooled_group_key, &group_id)?;
     record_scheduler_event(
         &tx,
         SchedulerEventRecord {
@@ -1523,12 +1527,7 @@ fn release_decode_lease_state(
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    refresh_decode_batch_targets(
-        &tx,
-        &req.network_id,
-        &pooled_group_key,
-        &group_id,
-    )?;
+    refresh_decode_batch_targets(&tx, &req.network_id, &pooled_group_key, &group_id)?;
     record_scheduler_event(
         &tx,
         SchedulerEventRecord {
@@ -1647,6 +1646,393 @@ fn parse_kv_transfer_policy(value: &str) -> ApiResult<crate::api::types::KvTrans
     };
     serde_json::from_str(&normalized)
         .map_err(|e| ApiError::Internal(format!("Failed to parse kv transfer policy: {}", e)))
+}
+
+fn serialize_kv_residency_kind(kind: crate::api::types::KvResidencyKind) -> ApiResult<String> {
+    serde_json::to_string(&kind)
+        .map(|value| value.trim_matches('"').to_string())
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize kv residency kind: {}", e)))
+}
+
+fn build_remote_checkpoint_uri(job_id: &str, session_id: &str) -> String {
+    format!(
+        "/api/inference/jobs/{}/session-checkpoints/{}",
+        job_id, session_id
+    )
+}
+
+fn prompt_cache_key(prompt_tokens: &[u32]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for token in prompt_tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn prompt_overlap_tokens(existing_tokens_json: &str, prompt_tokens: &[u32]) -> u32 {
+    let Ok(existing_tokens) = serde_json::from_str::<Vec<u32>>(existing_tokens_json) else {
+        return 0;
+    };
+    existing_tokens
+        .iter()
+        .zip(prompt_tokens.iter())
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count() as u32
+}
+
+fn initialize_session_kv_tracking(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    network_id: &str,
+    model_id: &str,
+    execution_plan: &InferenceExecutionPlan,
+    prompt_tokens: &[u32],
+    now: &str,
+) -> ApiResult<()> {
+    let prompt_tokens_json = serde_json::to_string(prompt_tokens)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize prompt tokens: {}", e)))?;
+    let cache_key = prompt_cache_key(prompt_tokens);
+    let overlap_token_count = {
+        let mut stmt = tx
+            .prepare(
+                r#"
+                SELECT prompt_tokens_json
+                FROM inference_prompt_cache_entries
+                WHERE network_id = ? AND model_id = ? AND status = 'ready'
+                "#,
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        let rows = stmt
+            .query_map(params![network_id, model_id], |row| row.get::<_, String>(0))
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        let mut max_overlap = 0_u32;
+        for row in rows {
+            let existing =
+                row.map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            max_overlap = max_overlap.max(prompt_overlap_tokens(&existing, prompt_tokens));
+        }
+        max_overlap
+    };
+
+    let initial_segment = execution_plan
+        .segments
+        .iter()
+        .find(|segment| segment.segment_id == execution_plan.initial_segment_id)
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "Initial segment {} missing from execution plan {}",
+                execution_plan.initial_segment_id, execution_plan.plan_id
+            ))
+        })?;
+    tx.execute(
+        r#"
+        INSERT INTO inference_prompt_cache_entries (
+            session_id, job_id, network_id, model_id, cache_key, prefix_token_count,
+            overlap_token_count, prompt_tokens_json, owner_device_id, checkpoint_id,
+            kv_sequence_position, status, remote_access_uri, last_accessed_at, created_at, updated_at, last_error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'planned', NULL, ?, ?, ?, NULL)
+        "#,
+        params![
+            &initial_segment.session_id,
+            job_id,
+            network_id,
+            model_id,
+            &cache_key,
+            prompt_tokens.len() as i64,
+            overlap_token_count as i64,
+            &prompt_tokens_json,
+            &initial_segment.kv_owner_device_id,
+            now,
+            now,
+            now
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    for segment in &execution_plan.segments {
+        let group = execution_plan
+            .execution_groups
+            .iter()
+            .find(|group| group.group_id == segment.execution_group_id)
+            .ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "Execution group {} missing from execution plan {}",
+                    segment.execution_group_id, execution_plan.plan_id
+                ))
+            })?;
+        let participants = segment
+            .participant_device_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        for member in &group.members {
+            let residency_kind = if member.device_id == segment.kv_owner_device_id {
+                crate::api::types::KvResidencyKind::CheckpointStore
+            } else {
+                crate::api::types::KvResidencyKind::RemoteReference
+            };
+            tx.execute(
+                r#"
+                INSERT INTO inference_session_kv_residency (
+                    session_id, job_id, network_id, model_id, phase, group_id, replica_device_id,
+                    shard_column_start, shard_column_end, owner_device_id, residency_kind, status,
+                    sequence_first_position, sequence_next_position, cached_tokens, payload_size_bytes,
+                    remote_access_uri, checkpoint_id, prompt_cache_key, prompt_prefix_tokens,
+                    eviction_eligible, pinned_for_decode, last_accessed_at, created_at, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, 0, ?, ?, ?, ?, NULL)
+                "#,
+                params![
+                    &segment.session_id,
+                    job_id,
+                    network_id,
+                    model_id,
+                    serialize_execution_phase(segment.phase),
+                    &group.group_id,
+                    &member.device_id,
+                    member.shard.column_start as i64,
+                    member.shard.column_end as i64,
+                    &segment.kv_owner_device_id,
+                    serialize_kv_residency_kind(residency_kind)?,
+                    &cache_key,
+                    prompt_tokens.len() as i64,
+                    if matches!(segment.phase, crate::api::types::ExecutionPhase::Decode)
+                        && participants.contains(&member.device_id)
+                    {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    now,
+                    now,
+                    now
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        }
+    }
+    Ok(())
+}
+
+fn plan_session_kv_transfers_for_decode_segment(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    network_id: &str,
+    model_id: &str,
+    session_id: &str,
+    segment_id: &str,
+    group_id: &str,
+    batch_group_key: &str,
+    source_device_id: &str,
+    target_device_ids: &HashSet<String>,
+    now: &str,
+) -> ApiResult<()> {
+    for target_device_id in target_device_ids {
+        if target_device_id == source_device_id {
+            continue;
+        }
+        let transfer_id = Uuid::new_v4().to_string();
+        tx.execute(
+            r#"
+            INSERT INTO inference_session_kv_transfers (
+                transfer_id, session_id, job_id, network_id, model_id, segment_id, group_id,
+                batch_group_key, source_device_id, target_device_id, transfer_kind, status,
+                checkpoint_id, remote_access_uri, kv_sequence_position, bytes_total, bytes_transferred,
+                started_at, completed_at, updated_at, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'checkpoint_handoff', 'queued',
+                      NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, NULL)
+            ON CONFLICT(session_id, segment_id, target_device_id) DO UPDATE SET
+                group_id = excluded.group_id,
+                batch_group_key = excluded.batch_group_key,
+                source_device_id = excluded.source_device_id,
+                updated_at = excluded.updated_at,
+                last_error = NULL
+            "#,
+            params![
+                &transfer_id,
+                session_id,
+                job_id,
+                network_id,
+                model_id,
+                segment_id,
+                group_id,
+                batch_group_key,
+                source_device_id,
+                target_device_id,
+                now,
+                now
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    }
+    Ok(())
+}
+
+fn materialize_session_kv_tracking(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    session_id: &str,
+    source_device_id: &str,
+    checkpoint_id: &str,
+    kv_sequence_position: u32,
+    payload_size_bytes: u64,
+    now: &str,
+) -> ApiResult<()> {
+    let remote_access_uri = build_remote_checkpoint_uri(job_id, session_id);
+    tx.execute(
+        r#"
+        UPDATE inference_session_kv_residency
+        SET owner_device_id = ?,
+            residency_kind = CASE
+                WHEN replica_device_id = ? THEN 'checkpoint_store'
+                ELSE 'remote_reference'
+            END,
+            status = 'ready',
+            sequence_first_position = 0,
+            sequence_next_position = ?,
+            cached_tokens = ?,
+            payload_size_bytes = ?,
+            remote_access_uri = ?,
+            checkpoint_id = ?,
+            eviction_eligible = 0,
+            last_accessed_at = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE job_id = ? AND session_id = ?
+        "#,
+        params![
+            source_device_id,
+            source_device_id,
+            i64::from(kv_sequence_position),
+            i64::from(kv_sequence_position),
+            payload_size_bytes as i64,
+            &remote_access_uri,
+            checkpoint_id,
+            now,
+            now,
+            job_id,
+            session_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    tx.execute(
+        r#"
+        UPDATE inference_session_kv_transfers
+        SET status = 'completed',
+            checkpoint_id = ?,
+            remote_access_uri = ?,
+            kv_sequence_position = ?,
+            bytes_total = COALESCE(bytes_total, ?),
+            bytes_transferred = COALESCE(bytes_transferred, ?),
+            completed_at = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE job_id = ? AND session_id = ?
+        "#,
+        params![
+            checkpoint_id,
+            &remote_access_uri,
+            i64::from(kv_sequence_position),
+            payload_size_bytes as i64,
+            payload_size_bytes as i64,
+            now,
+            now,
+            job_id,
+            session_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    tx.execute(
+        r#"
+        UPDATE inference_prompt_cache_entries
+        SET owner_device_id = ?,
+            checkpoint_id = ?,
+            kv_sequence_position = ?,
+            status = 'ready',
+            remote_access_uri = ?,
+            last_accessed_at = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE job_id = ? AND session_id = ?
+        "#,
+        params![
+            source_device_id,
+            checkpoint_id,
+            i64::from(kv_sequence_position),
+            &remote_access_uri,
+            now,
+            now,
+            job_id,
+            session_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
+}
+
+fn mark_session_kv_tracking_terminal(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    job_status: &str,
+    error: Option<&str>,
+    now: &str,
+) -> ApiResult<()> {
+    tx.execute(
+        r#"
+        UPDATE inference_session_kv_residency
+        SET status = CASE
+                WHEN ? IN ('completed', 'failed') THEN 'stale'
+                ELSE status
+            END,
+            eviction_eligible = CASE
+                WHEN ? IN ('completed', 'failed') THEN 1
+                ELSE eviction_eligible
+            END,
+            pinned_for_decode = CASE
+                WHEN ? IN ('completed', 'failed') THEN 0
+                ELSE pinned_for_decode
+            END,
+            updated_at = ?,
+            last_error = COALESCE(last_error, ?)
+        WHERE job_id = ?
+        "#,
+        params![job_status, job_status, job_status, now, error, job_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    tx.execute(
+        r#"
+        UPDATE inference_session_kv_transfers
+        SET status = CASE
+                WHEN status = 'completed' THEN status
+                WHEN ? IN ('completed', 'failed') THEN 'stale'
+                ELSE status
+            END,
+            updated_at = ?,
+            last_error = COALESCE(last_error, ?)
+        WHERE job_id = ?
+        "#,
+        params![job_status, now, error, job_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    tx.execute(
+        r#"
+        UPDATE inference_prompt_cache_entries
+        SET status = CASE
+                WHEN status = 'ready' THEN status
+                WHEN ? IN ('completed', 'failed') THEN 'stale'
+                ELSE status
+            END,
+            updated_at = ?,
+            last_error = CASE
+                WHEN ? = 'failed' THEN COALESCE(last_error, ?)
+                ELSE last_error
+            END
+        WHERE job_id = ?
+        "#,
+        params![job_status, now, job_status, error, job_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
 }
 
 fn serialize_execution_phase(phase: crate::api::types::ExecutionPhase) -> &'static str {
@@ -1927,8 +2313,8 @@ fn lease_decode_cohort_ready_sessions(
         batch_group_key.to_string()
     };
 
-    let already_owned = conn
-        .query_row(
+    let already_owned =
+        conn.query_row(
             r#"
             SELECT COUNT(*)
             FROM inference_decode_queue
@@ -1940,8 +2326,7 @@ fn lease_decode_cohort_ready_sessions(
             params![network_id, &pooled_group_key, lease_owner_device_id],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
-        as u32;
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))? as u32;
     let remaining = lease_target_session_count.saturating_sub(already_owned);
     if remaining == 0 {
         return Ok(Vec::new());
@@ -2046,7 +2431,13 @@ fn lease_decode_cohort_ready_sessions(
               AND device_id = ?
               AND phase = 'decode'
             "#,
-            params![lease_owner_device_id, lease_expires_at, now, &job_id, lease_owner_device_id],
+            params![
+                lease_owner_device_id,
+                lease_expires_at,
+                now,
+                &job_id,
+                lease_owner_device_id
+            ],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         leased.push((session_id, job_id));
@@ -2187,10 +2578,7 @@ fn record_scheduler_event(
     Ok(())
 }
 
-fn decode_batch_group_key(
-    plan: &InferenceExecutionPlan,
-    segment_id: &str,
-) -> ApiResult<String> {
+fn decode_batch_group_key(plan: &InferenceExecutionPlan, segment_id: &str) -> ApiResult<String> {
     let segment = active_segment(plan, segment_id)?;
     let group = plan
         .execution_groups
@@ -2208,11 +2596,7 @@ fn decode_batch_group_key(
         .map(|member| member.device_id.clone())
         .collect::<Vec<_>>();
     members.sort();
-    Ok(format!(
-        "decode:{}:{}",
-        group.model_id,
-        members.join(",")
-    ))
+    Ok(format!("decode:{}:{}", group.model_id, members.join(",")))
 }
 
 fn load_latest_session_checkpoint_status(
@@ -3149,7 +3533,13 @@ fn acknowledge_assignment(
                       AND status = 'active'
                 )
                 "#,
-                params![&active_segment_id, &now, &network_id, &batch_group_key, device_id],
+                params![
+                    &active_segment_id,
+                    &now,
+                    &network_id,
+                    &batch_group_key,
+                    device_id
+                ],
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             conn.execute(
@@ -3582,6 +3972,7 @@ fn report_assignment_result(
             params![&now, job_id],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        mark_session_kv_tracking_terminal(&tx, job_id, job_status, None, &now)?;
     } else if job_status == "failed" {
         tx.execute(
             r#"
@@ -3596,6 +3987,13 @@ fn report_assignment_result(
             params![error.as_deref().or(req.error.as_deref()), &now, job_id],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        mark_session_kv_tracking_terminal(
+            &tx,
+            job_id,
+            job_status,
+            error.as_deref().or(req.error.as_deref()),
+            &now,
+        )?;
     }
 
     if let Some((network_id, group_id, batch_group_key)) = decode_group_refs {
@@ -3897,6 +4295,21 @@ fn report_assignment_progress(
                 )
                 .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
                 let batch_group_key = decode_batch_group_key(&execution_plan, &next_segment_id)?;
+                if decode_queue_status == "blocked_on_transfer" {
+                    plan_session_kv_transfers_for_decode_segment(
+                        &tx,
+                        job_id,
+                        &job_context.network_id,
+                        &job_context.model_id,
+                        &next_segment.session_id,
+                        &next_segment_id,
+                        &next_group.group_id,
+                        &batch_group_key,
+                        &req.device_id,
+                        &next_participants,
+                        &now,
+                    )?;
+                }
                 upsert_decode_queue(
                     &tx,
                     &next_segment.session_id,
@@ -4148,15 +4561,12 @@ fn report_assignment_progress(
 
     let job_context = load_job_context(&tx, job_id)?;
     if !prefill_complete {
-        let execution_plan = job_context
-            .execution_plan
-            .as_ref()
-            .ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "Missing execution plan while refreshing decode targets for job {}",
-                    job_id
-                ))
-            })?;
+        let execution_plan = job_context.execution_plan.as_ref().ok_or_else(|| {
+            ApiError::Internal(format!(
+                "Missing execution plan while refreshing decode targets for job {}",
+                job_id
+            ))
+        })?;
         let batch_group_key = decode_batch_group_key(execution_plan, &req.segment_id)?;
         let active = active_segment(execution_plan, &req.segment_id)?;
         refresh_decode_batch_targets(
@@ -4591,6 +5001,16 @@ fn store_session_checkpoint(
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    materialize_session_kv_tracking(
+        &tx,
+        job_id,
+        &req.session_id,
+        &req.device_id,
+        &checkpoint_id,
+        req.kv_sequence_position,
+        checkpoint_bytes.len() as u64,
+        &now,
+    )?;
 
     tx.execute(
         r#"
@@ -6383,6 +6803,40 @@ mod tests {
         assert_eq!(checkpoint.kv_sequence_position, 1);
         assert_eq!(checkpoint.sha256.len(), 64);
 
+        let scheduler = state
+            .db
+            .load_job_scheduler_status(&submit.job_id)
+            .expect("expected job scheduler status");
+        let residency = scheduler
+            .kv_residency
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .expect("expected kv residency");
+        let expected_remote_uri = format!(
+            "/api/inference/jobs/{}/session-checkpoints/{}",
+            submit.job_id, session_id
+        );
+        assert!(
+            residency
+                .residency_slices
+                .iter()
+                .any(|slice| slice.checkpoint_id.as_deref()
+                    == Some(checkpoint.checkpoint_id.as_str()))
+        );
+        assert!(residency
+            .transfers
+            .iter()
+            .all(|transfer| transfer.status == "completed"));
+        assert!(residency.prompt_cache_entries.iter().any(|entry| {
+            entry.status == "ready"
+                && entry.remote_access_uri.as_deref() == Some(expected_remote_uri.as_str())
+        }));
+        assert!(residency
+            .compute_hint
+            .as_ref()
+            .map(|hint| hint.preferred_device_ids.contains(&"worker-2".to_string()))
+            .unwrap_or(false));
+
         let download = download_inference_session_checkpoint(
             State(state.clone()),
             Path((submit.job_id.clone(), session_id.clone())),
@@ -7543,7 +7997,10 @@ mod tests {
             .iter()
             .map(|session| session.status.clone())
             .collect::<Vec<_>>();
-        assert_eq!(queue_statuses, vec!["leased".to_string(), "leased".to_string()]);
+        assert_eq!(
+            queue_statuses,
+            vec!["leased".to_string(), "leased".to_string()]
+        );
         assert!(scheduler.decode_queue.iter().all(|session| {
             session.lease_owner_device_id.as_deref() == Some("worker-1")
                 && session.lease_target_session_count == Some(2)
@@ -7617,7 +8074,8 @@ mod tests {
                 .iter_mut()
                 .find(|group| group.group_id == decode_group_id)
             {
-                group.members
+                group
+                    .members
                     .retain(|member| member.device_id == "worker-1");
             }
             let decode_segment = decode_plan
@@ -7627,7 +8085,8 @@ mod tests {
                 .expect("expected decode segment")
                 .clone();
             let computed_batch_group_key =
-                decode_batch_group_key(&decode_plan, &decode_segment.segment_id).expect("batch key");
+                decode_batch_group_key(&decode_plan, &decode_segment.segment_id)
+                    .expect("batch key");
             let conn = state.db.get_conn().unwrap();
             conn.execute(
                 "UPDATE inference_jobs SET execution_plan_json = ? WHERE job_id = ?",
@@ -8536,7 +8995,12 @@ mod tests {
                     WHERE session_id = ?
                       AND device_id = ?
                     "#,
-                    params![session_status, &decode_segment.segment_id, &session_id, device_id],
+                    params![
+                        session_status,
+                        &decode_segment.segment_id,
+                        &session_id,
+                        device_id
+                    ],
                 )
                 .unwrap();
             }

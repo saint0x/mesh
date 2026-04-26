@@ -79,14 +79,14 @@ explicit-segment serving stack into the full production `zip` engine.
 
 - ✅ Introduce authoritative serving-session and per-replica control-plane state
 - ✅ Support checkpoint-mediated KV handoff through the control plane
-- In progress: Add explicit KV residency model beyond single checkpoint ownership
-- Planned: Track residency by shard range and replica, not only by session
-- In progress: Add live KV transfer metadata and transfer lifecycle
-- Planned: Add remote KV access path without requiring full checkpoint download
-- Planned: Add eviction policy for KV under memory pressure
-- Planned: Add prefix reuse and overlap-aware prompt cache tracking
-- Planned: Add compute-near-KV scheduling hints
-- Planned: Add durability and cleanup policy for stale checkpoints and stale residency records
+- ✅ Add explicit KV residency model beyond single checkpoint ownership
+- ✅ Track residency by shard range and replica, not only by session
+- ✅ Add live KV transfer metadata and transfer lifecycle
+- ✅ Add remote KV access path without requiring full checkpoint download
+- ✅ Add eviction policy for KV under memory pressure
+- ✅ Add prefix reuse and overlap-aware prompt cache tracking
+- ✅ Add compute-near-KV scheduling hints
+- ✅ Add durability and cleanup policy for stale checkpoints and stale residency records
 
 ## 4. Agent Runtime / Serving Engine
 

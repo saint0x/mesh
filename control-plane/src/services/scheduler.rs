@@ -337,7 +337,20 @@ fn rank_candidate(
     active_capacity_by_model: &HashMap<String, u32>,
     leased_assignments_by_submitter: &HashMap<String, u32>,
     leased_assignments_by_job: &HashMap<String, u32>,
-) -> (u8, u8, u8, u8, u8, u32, u8, String, u32, u32, String, String) {
+) -> (
+    u8,
+    u8,
+    u8,
+    u8,
+    u8,
+    u32,
+    u8,
+    String,
+    u32,
+    u32,
+    String,
+    String,
+) {
     let submitter_active_jobs = active_jobs_by_submitter
         .get(&candidate.candidate.submitted_by_device_id)
         .copied()
@@ -465,7 +478,10 @@ fn throughput_decode_priority_class(candidate: &RunnableCandidate) -> u8 {
         .group_lease_owner_device_id
         .as_deref()
         .is_some();
-    let is_leased = matches!(candidate.candidate.decode_queue_status.as_deref(), Some("leased"));
+    let is_leased = matches!(
+        candidate.candidate.decode_queue_status.as_deref(),
+        Some("leased")
+    );
     if is_owned && is_leased {
         0
     } else {
@@ -491,8 +507,7 @@ fn owned_decode_latency_cohort_age_order(
         SchedulerPolicyMode::ThroughputFirst
             | SchedulerPolicyMode::FitFirst
             | SchedulerPolicyMode::ResilientEdge
-    )
-        && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
+    ) && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
         && candidate
             .candidate
             .group_lease_owner_device_id
@@ -509,8 +524,7 @@ fn owned_decode_latency_cohort_age_order(
             | SchedulerPolicyMode::ThroughputFirst
             | SchedulerPolicyMode::FitFirst
             | SchedulerPolicyMode::ResilientEdge
-    )
-        && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
+    ) && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
         && candidate
             .candidate
             .group_lease_owner_device_id
@@ -584,10 +598,7 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
             .decode_cohort_ready_sessions
             .max(1)
             .min(31);
-        let fresh_blocked = candidate
-            .candidate
-            .decode_cohort_blocked_sessions
-            .min(31);
+        let fresh_blocked = candidate.candidate.decode_cohort_blocked_sessions.min(31);
         let fresh_target = candidate
             .candidate
             .decode_lease_target_session_count
@@ -629,33 +640,20 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
             SchedulerPolicyMode::FitFirst => cohort_fill.min(31),
             _ => 31u32.saturating_sub(cohort_fill.min(31)),
         };
-        let ready_rank = 31u32.saturating_sub(candidate.candidate.decode_cohort_ready_sessions.min(31));
+        let ready_rank =
+            31u32.saturating_sub(candidate.candidate.decode_cohort_ready_sessions.min(31));
         let blocked_rank = candidate.candidate.decode_cohort_blocked_sessions.min(31);
         let (primary_rank, secondary_rank, tertiary_rank, quaternary_rank) = match mode {
-            SchedulerPolicyMode::ThroughputFirst => (
-                fill_density_rank,
-                ready_rank,
-                blocked_rank,
-                remaining_rank,
-            ),
-            SchedulerPolicyMode::FitFirst => (
-                remaining_rank,
-                fill_density_rank,
-                blocked_rank,
-                ready_rank,
-            ),
-            SchedulerPolicyMode::ResilientEdge => (
-                blocked_rank,
-                remaining_rank,
-                fill_density_rank,
-                ready_rank,
-            ),
-            _ => (
-                remaining_rank,
-                fill_density_rank,
-                ready_rank,
-                blocked_rank,
-            ),
+            SchedulerPolicyMode::ThroughputFirst => {
+                (fill_density_rank, ready_rank, blocked_rank, remaining_rank)
+            }
+            SchedulerPolicyMode::FitFirst => {
+                (remaining_rank, fill_density_rank, blocked_rank, ready_rank)
+            }
+            SchedulerPolicyMode::ResilientEdge => {
+                (blocked_rank, remaining_rank, fill_density_rank, ready_rank)
+            }
+            _ => (remaining_rank, fill_density_rank, ready_rank, blocked_rank),
         };
         return (primary_rank << 15)
             .saturating_add(secondary_rank << 10)
@@ -2542,7 +2540,8 @@ mod tests {
     }
 
     #[test]
-    fn resilient_edge_prefers_smaller_fresh_decode_cohort_when_transfer_exposure_ties_while_latency_prefers_readier_one() {
+    fn resilient_edge_prefers_smaller_fresh_decode_cohort_when_transfer_exposure_ties_while_latency_prefers_readier_one(
+    ) {
         let mut smaller = base_candidate(SchedulerPhase::Decode);
         smaller.assignment_id = "smaller".into();
         smaller.group_status = "decode_ready".into();
@@ -2703,7 +2702,8 @@ mod tests {
     }
 
     #[test]
-    fn fit_first_prefers_less_transfer_exposed_equal_size_fresh_decode_cohort_while_latency_prefers_readier_one() {
+    fn fit_first_prefers_less_transfer_exposed_equal_size_fresh_decode_cohort_while_latency_prefers_readier_one(
+    ) {
         let mut less_blocked = base_candidate(SchedulerPhase::Decode);
         less_blocked.assignment_id = "less-blocked".into();
         less_blocked.group_status = "decode_ready".into();
@@ -2784,7 +2784,8 @@ mod tests {
     }
 
     #[test]
-    fn fit_first_prefers_owned_decode_cohort_with_less_remaining_capacity_while_latency_prefers_more() {
+    fn fit_first_prefers_owned_decode_cohort_with_less_remaining_capacity_while_latency_prefers_more(
+    ) {
         let mut more_remaining = base_candidate(SchedulerPhase::Decode);
         more_remaining.assignment_id = "more-remaining".into();
         more_remaining.group_status = "decode_leased".into();
@@ -2865,7 +2866,8 @@ mod tests {
     }
 
     #[test]
-    fn fit_first_prefers_thinner_owned_decode_cohort_while_latency_prefers_denser_one_when_remaining_capacity_ties() {
+    fn fit_first_prefers_thinner_owned_decode_cohort_while_latency_prefers_denser_one_when_remaining_capacity_ties(
+    ) {
         let mut denser = base_candidate(SchedulerPhase::Decode);
         denser.assignment_id = "denser".into();
         denser.group_status = "decode_leased".into();
@@ -2949,7 +2951,8 @@ mod tests {
     }
 
     #[test]
-    fn fit_first_prefers_less_transfer_exposed_owned_decode_cohort_when_fill_ties_while_latency_prefers_readier_one() {
+    fn fit_first_prefers_less_transfer_exposed_owned_decode_cohort_when_fill_ties_while_latency_prefers_readier_one(
+    ) {
         let mut less_blocked = base_candidate(SchedulerPhase::Decode);
         less_blocked.assignment_id = "less-blocked".into();
         less_blocked.group_status = "decode_leased".into();
@@ -3118,7 +3121,8 @@ mod tests {
     }
 
     #[test]
-    fn throughput_prefers_ready_runway_in_equally_dense_owned_decode_cohorts_while_latency_prefers_broader_one() {
+    fn throughput_prefers_ready_runway_in_equally_dense_owned_decode_cohorts_while_latency_prefers_broader_one(
+    ) {
         let mut broader_colder = base_candidate(SchedulerPhase::Decode);
         broader_colder.assignment_id = "broader-colder".into();
         broader_colder.group_status = "decode_leased".into();
@@ -3202,7 +3206,8 @@ mod tests {
     }
 
     #[test]
-    fn mixed_workload_latency_prefers_fresh_ready_runway_while_throughput_prefers_owned_leased_decode() {
+    fn mixed_workload_latency_prefers_fresh_ready_runway_while_throughput_prefers_owned_leased_decode(
+    ) {
         let mut owned_satisfied = base_candidate(SchedulerPhase::Decode);
         owned_satisfied.assignment_id = "owned-satisfied".into();
         owned_satisfied.group_status = "decode_leased".into();
@@ -3292,7 +3297,8 @@ mod tests {
     }
 
     #[test]
-    fn throughput_prefers_less_transfer_debt_in_equally_dense_owned_decode_cohorts_while_latency_prefers_broader_one() {
+    fn throughput_prefers_less_transfer_debt_in_equally_dense_owned_decode_cohorts_while_latency_prefers_broader_one(
+    ) {
         let mut broader_more_blocked = base_candidate(SchedulerPhase::Decode);
         broader_more_blocked.assignment_id = "broader-more-blocked".into();
         broader_more_blocked.group_status = "decode_leased".into();
@@ -3713,7 +3719,8 @@ mod tests {
     }
 
     #[test]
-    fn resilient_edge_prefers_less_transfer_exposed_owned_decode_cohort_while_latency_prefers_broader_one() {
+    fn resilient_edge_prefers_less_transfer_exposed_owned_decode_cohort_while_latency_prefers_broader_one(
+    ) {
         let mut broader_more_blocked = base_candidate(SchedulerPhase::Decode);
         broader_more_blocked.assignment_id = "broader-more-blocked".into();
         broader_more_blocked.group_status = "decode_leased".into();
@@ -3797,7 +3804,8 @@ mod tests {
     }
 
     #[test]
-    fn resilient_edge_prefers_smaller_owned_decode_cohort_when_transfer_exposure_ties_while_latency_prefers_broader_one() {
+    fn resilient_edge_prefers_smaller_owned_decode_cohort_when_transfer_exposure_ties_while_latency_prefers_broader_one(
+    ) {
         let mut broader = base_candidate(SchedulerPhase::Decode);
         broader.assignment_id = "broader".into();
         broader.group_status = "decode_leased".into();

@@ -1123,6 +1123,113 @@ pub struct KvReplicaResidencyStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvResidencyKind {
+    CheckpointStore,
+    TransferBundle,
+    RemoteReference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvResidencySliceStatus {
+    pub residency_id: i64,
+    pub phase: ExecutionPhase,
+    pub group_id: String,
+    pub replica_device_id: String,
+    pub shard_column_start: u32,
+    pub shard_column_end: u32,
+    pub owner_device_id: String,
+    pub residency_kind: KvResidencyKind,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_first_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_next_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_access_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_prefix_tokens: Option<u32>,
+    pub eviction_eligible: bool,
+    pub pinned_for_decode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvTransferStatus {
+    pub transfer_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_group_key: Option<String>,
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub transfer_kind: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_access_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptCacheEntryStatus {
+    pub entry_id: i64,
+    pub session_id: String,
+    pub cache_key: String,
+    pub prefix_token_count: u32,
+    pub overlap_token_count: u32,
+    pub owner_device_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_access_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeNearKvHint {
+    #[serde(default)]
+    pub preferred_device_ids: Vec<String>,
+    pub ready_local_replicas: u32,
+    pub ready_remote_references: u32,
+    pub active_transfer_count: u32,
+    pub eviction_candidate_count: u32,
+}
+
 /// Session-level KV ownership and checkpoint state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvResidencySummary {
@@ -1145,6 +1252,14 @@ pub struct KvResidencySummary {
     pub latest_checkpoint: Option<InferenceSessionCheckpointStatus>,
     #[serde(default)]
     pub replicas: Vec<KvReplicaResidencyStatus>,
+    #[serde(default)]
+    pub residency_slices: Vec<KvResidencySliceStatus>,
+    #[serde(default)]
+    pub transfers: Vec<KvTransferStatus>,
+    #[serde(default)]
+    pub prompt_cache_entries: Vec<PromptCacheEntryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_hint: Option<ComputeNearKvHint>,
     pub updated_at: String,
 }
 
