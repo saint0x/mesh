@@ -28,11 +28,11 @@ explicit-segment serving stack into the full production `zip` engine.
 
 - ✅ Add explicit decode work queue records in the control plane
 - ✅ Add decode-step ownership and lease semantics
-- ☐ Add microbatch formation across multiple active sessions
-- ☐ Add fairness policy for per-session decode participation inside a batch
-- ☐ Add KV-budget-aware admission for decode steps
-- ☐ Add runtime support for merged decode stepping on a serving group
-- ☐ Add completion/progress accounting for batched decode steps
+- ✅ Add microbatch formation across multiple active sessions
+- ⏳ Add fairness policy for per-session decode participation inside a batch
+- ✅ Add KV-budget-aware admission for decode steps
+- ⏳ Add runtime support for merged decode stepping on a serving group
+- ⏳ Add completion/progress accounting for batched decode steps
 - ☐ Add tests for latency-vs-throughput scheduling under mixed workloads
 - ☐ Add Fozzy scenarios for multi-session decode batching
 
@@ -55,7 +55,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Preserve explicit session identity in runtime state
 - ✅ Preserve checkpoint-backed recovery for lost in-memory state
 - ⏳ Add long-lived decode worker loop that consumes scheduler-owned decode work
-- ☐ Add runtime batching interface at the execution backend boundary
+- ⏳ Add runtime batching interface at the execution backend boundary
 - ☐ Add explicit runtime memory budgeting for active sessions and KV
 - ☐ Add session eviction hooks driven by control-plane policy
 - ⏳ Add runtime pause/resume semantics for regroup and failover
@@ -102,11 +102,11 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add failover/regroup event history tables
 - ⏳ Add migration coverage and backward-incompatible cleanup for superseded fields
 - ✅ Add API surfaces for scheduler/debug/status inspection
-- ☐ Add API surfaces for grouped decode telemetry
+- ✅ Add API surfaces for grouped decode telemetry
 
 ## 9. Observability And Operations
 
-- ☐ Add metrics for scheduler backlog, runnable sessions, blocked sessions, and batch size
+- ⏳ Add metrics for scheduler backlog, runnable sessions, blocked sessions, and batch size
 - ☐ Add metrics for KV residency, transfer volume, and checkpoint fallback rate
 - ☐ Add metrics for regroup frequency and recovery latency
 - ⏳ Add structured event log for scheduler decisions
@@ -130,7 +130,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Land authoritative planning, explicit segments, session authority, and checkpoint handoff
 - ✅ Build real scheduler ownership over active decode planning and claim-time routing
 - ✅ Add explicit decode queue state and serving-group ownership records
-- ☐ Add continuous batching in the agent/runtime and scheduler
+- ⏳ Add continuous batching in the agent/runtime and scheduler
 - ⏳ Expand KV management from checkpoint handoff to live residency management
 - ⏳ Add regroup/failover
 - ⏳ Constrain planning with richer manifests

@@ -781,6 +781,10 @@ fn log_scheduler_queue_state(
         serving_latest_batch_size = serving_session.and_then(|session| session.latest_batch_size),
         serving_latest_active_decode_sessions =
             serving_session.and_then(|session| session.latest_active_decode_sessions),
+        serving_latest_batch_kv_tokens =
+            serving_session.and_then(|session| session.latest_batch_kv_tokens),
+        serving_latest_deferred_decode_sessions =
+            serving_session.and_then(|session| session.latest_deferred_decode_sessions),
         decode_lease_id = decode_lease.map(|lease| lease.lease_id.as_str()),
         decode_lease_status = decode_lease.and_then(|lease| lease.status.as_deref()),
         decode_lease_expires_at = decode_lease.and_then(|lease| lease.lease_expires_at.as_deref()),
@@ -1939,6 +1943,8 @@ async fn cmd_runtime() -> Result<()> {
                                     kv_cache_seq_len: progress.kv_cache_seq_len,
                                     batch_size: progress.batch_size,
                                     active_decode_sessions: progress.active_decode_sessions,
+                                    batch_kv_tokens: progress.batch_kv_tokens,
+                                    deferred_decode_sessions: progress.deferred_decode_sessions,
                                     scheduler_queue: scheduler_queue.clone(),
                                     serving_session: serving_session.clone(),
                                 },
@@ -2850,14 +2856,16 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
     if let Some(session) = &status.session {
         println!("\n{}", "Session:".bold());
         println!(
-            "  id={} status={} kv_owner={} kv_policy={:?} kv_seq={:?} batch={:?} active_decode_sessions={:?}",
+            "  id={} status={} kv_owner={} kv_policy={:?} kv_seq={:?} batch={:?} active_decode_sessions={:?} batch_kv={:?} deferred={:?}",
             session.session_id,
             session.status,
             session.kv_owner_device_id,
             session.kv_transfer_policy,
             session.kv_sequence_position,
             session.latest_batch_size,
-            session.latest_active_decode_sessions
+            session.latest_active_decode_sessions,
+            session.latest_batch_kv_tokens,
+            session.latest_deferred_decode_sessions
         );
         if let Some(segment_id) = &session.active_segment_id {
             println!("  active_segment={}", segment_id);

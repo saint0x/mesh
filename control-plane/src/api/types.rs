@@ -562,6 +562,10 @@ pub struct ReportInferenceAssignmentProgressRequest {
     pub batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_kv_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_decode_sessions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +582,10 @@ pub struct InferenceSessionStatus {
     pub latest_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_active_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_batch_kv_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_deferred_decode_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -605,6 +613,10 @@ pub struct InferenceSessionLease {
     pub latest_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_active_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_batch_kv_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_deferred_decode_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

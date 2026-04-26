@@ -62,6 +62,8 @@ struct PersistedLeaseRecord {
     kv_sequence_position: Option<u32>,
     latest_batch_size: Option<u32>,
     latest_active_decode_sessions: Option<u32>,
+    latest_batch_kv_tokens: Option<u32>,
+    latest_deferred_decode_sessions: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
     kv_checkpoint_created_at: Option<String>,
     session_updated_at: String,
@@ -138,6 +140,8 @@ struct PersistedSessionStatus {
     kv_sequence_position: Option<u32>,
     latest_batch_size: Option<u32>,
     latest_active_decode_sessions: Option<u32>,
+    latest_batch_kv_tokens: Option<u32>,
+    latest_deferred_decode_sessions: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
     kv_checkpoint_created_at: Option<String>,
     updated_at: String,
@@ -349,8 +353,9 @@ pub async fn submit_inference(
                 session_id, job_id, network_id, model_id, status, active_segment_id,
                 kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
                 latest_batch_size, latest_active_decode_sessions,
+                latest_batch_kv_tokens, latest_deferred_decode_sessions,
                 kv_checkpoint_device_id, kv_checkpoint_created_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'prefill_pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'prefill_pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
             "#,
             params![
                 &initial_segment.session_id,
@@ -585,6 +590,8 @@ fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExec
             kv_sequence_position: assignment.kv_sequence_position,
             latest_batch_size: assignment.latest_batch_size,
             latest_active_decode_sessions: assignment.latest_active_decode_sessions,
+            latest_batch_kv_tokens: assignment.latest_batch_kv_tokens,
+            latest_deferred_decode_sessions: assignment.latest_deferred_decode_sessions,
             kv_checkpoint_device_id: assignment.kv_checkpoint_device_id,
             kv_checkpoint_created_at: assignment.kv_checkpoint_created_at,
             updated_at: assignment.session_updated_at,
@@ -1054,6 +1061,8 @@ pub async fn get_inference_job_status(
                 kv_sequence_position: session.kv_sequence_position,
                 latest_batch_size: session.latest_batch_size,
                 latest_active_decode_sessions: session.latest_active_decode_sessions,
+                latest_batch_kv_tokens: session.latest_batch_kv_tokens,
+                latest_deferred_decode_sessions: session.latest_deferred_decode_sessions,
                 kv_checkpoint_device_id: session.kv_checkpoint_device_id,
                 kv_checkpoint_created_at: session.kv_checkpoint_created_at,
                 updated_at: session.updated_at,
@@ -1360,7 +1369,8 @@ fn claim_assignment(
                 j.execution_plan_json, j.active_segment_id,
                 s.session_id, s.status, s.active_segment_id, s.kv_owner_device_id,
                 s.kv_transfer_policy, s.kv_sequence_position, s.latest_batch_size,
-                s.latest_active_decode_sessions, s.kv_checkpoint_device_id,
+                s.latest_active_decode_sessions, s.latest_batch_kv_tokens,
+                s.latest_deferred_decode_sessions, s.kv_checkpoint_device_id,
                 s.kv_checkpoint_created_at, s.updated_at,
                 r.status, r.active_segment_id, r.kv_sequence_position,
                 r.checkpoint_created_at, r.updated_at, r.last_error
@@ -1393,15 +1403,17 @@ fn claim_assignment(
                     kv_sequence_position: row.get::<_, Option<i64>>(20)?.map(|v| v as u32),
                     latest_batch_size: row.get::<_, Option<i64>>(21)?.map(|v| v as u32),
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(22)?.map(|v| v as u32),
-                    kv_checkpoint_device_id: row.get(23)?,
-                    kv_checkpoint_created_at: row.get(24)?,
-                    session_updated_at: row.get(25)?,
-                    replica_status: row.get(26)?,
-                    replica_active_segment_id: row.get(27)?,
-                    replica_kv_sequence_position: row.get::<_, Option<i64>>(28)?.map(|v| v as u32),
-                    replica_checkpoint_created_at: row.get(29)?,
-                    replica_updated_at: row.get(30)?,
-                    replica_last_error: row.get(31)?,
+                    latest_batch_kv_tokens: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
+                    latest_deferred_decode_sessions: row.get::<_, Option<i64>>(24)?.map(|v| v as u32),
+                    kv_checkpoint_device_id: row.get(25)?,
+                    kv_checkpoint_created_at: row.get(26)?,
+                    session_updated_at: row.get(27)?,
+                    replica_status: row.get(28)?,
+                    replica_active_segment_id: row.get(29)?,
+                    replica_kv_sequence_position: row.get::<_, Option<i64>>(30)?.map(|v| v as u32),
+                    replica_checkpoint_created_at: row.get(31)?,
+                    replica_updated_at: row.get(32)?,
+                    replica_last_error: row.get(33)?,
                 })
             },
         )
@@ -2122,6 +2134,8 @@ fn report_assignment_progress(
                 kv_sequence_position = COALESCE(?, kv_sequence_position),
                 latest_batch_size = COALESCE(?, latest_batch_size),
                 latest_active_decode_sessions = COALESCE(?, latest_active_decode_sessions),
+                latest_batch_kv_tokens = COALESCE(?, latest_batch_kv_tokens),
+                latest_deferred_decode_sessions = COALESCE(?, latest_deferred_decode_sessions),
                 kv_checkpoint_device_id = ?,
                 kv_checkpoint_created_at = ?,
                 updated_at = ?,
@@ -2135,6 +2149,8 @@ fn report_assignment_progress(
                 req.kv_cache_seq_len.map(i64::from),
                 req.batch_size.map(i64::from),
                 req.active_decode_sessions.map(i64::from),
+                req.batch_kv_tokens.map(i64::from),
+                req.deferred_decode_sessions.map(i64::from),
                 &req.device_id,
                 &now,
                 &now,
@@ -2407,6 +2423,8 @@ fn report_assignment_progress(
                 kv_sequence_position = COALESCE(?, kv_sequence_position),
                 latest_batch_size = COALESCE(?, latest_batch_size),
                 latest_active_decode_sessions = COALESCE(?, latest_active_decode_sessions),
+                latest_batch_kv_tokens = COALESCE(?, latest_batch_kv_tokens),
+                latest_deferred_decode_sessions = COALESCE(?, latest_deferred_decode_sessions),
                 updated_at = ?,
                 last_error = NULL
             WHERE job_id = ?
@@ -2415,6 +2433,8 @@ fn report_assignment_progress(
                 req.kv_cache_seq_len.map(i64::from),
                 req.batch_size.map(i64::from),
                 req.active_decode_sessions.map(i64::from),
+                req.batch_kv_tokens.map(i64::from),
+                req.deferred_decode_sessions.map(i64::from),
                 &now,
                 job_id
             ],
@@ -2568,6 +2588,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
             r#"
             SELECT session_id, status, active_segment_id, kv_owner_device_id, kv_transfer_policy,
                    kv_sequence_position, latest_batch_size, latest_active_decode_sessions,
+                   latest_batch_kv_tokens, latest_deferred_decode_sessions,
                    kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at, last_error
             FROM inference_sessions
             WHERE job_id = ?
@@ -2583,10 +2604,12 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     kv_sequence_position: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
                     latest_batch_size: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-                    kv_checkpoint_device_id: row.get(8)?,
-                    kv_checkpoint_created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    last_error: row.get(11)?,
+                    latest_batch_kv_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+                    latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                    kv_checkpoint_device_id: row.get(10)?,
+                    kv_checkpoint_created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    last_error: row.get(13)?,
                     checkpoint: None,
                     replicas: Vec::new(),
                 })
@@ -3580,6 +3603,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await
@@ -4034,6 +4059,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await
@@ -4081,6 +4108,8 @@ mod tests {
                 kv_cache_seq_len: Some(2),
                 batch_size: Some(2),
                 active_decode_sessions: Some(2),
+                batch_kv_tokens: Some(2),
+                deferred_decode_sessions: Some(1),
             }),
         )
         .await
@@ -4108,6 +4137,8 @@ mod tests {
                 kv_cache_seq_len: Some(2),
                 batch_size: Some(2),
                 active_decode_sessions: Some(2),
+                batch_kv_tokens: Some(2),
+                deferred_decode_sessions: Some(1),
             }),
         )
         .await
@@ -4133,6 +4164,20 @@ mod tests {
                 .as_ref()
                 .and_then(|session| session.latest_active_decode_sessions),
             Some(2)
+        );
+        assert_eq!(
+            status_after_frontier
+                .session
+                .as_ref()
+                .and_then(|session| session.latest_batch_kv_tokens),
+            Some(2)
+        );
+        assert_eq!(
+            status_after_frontier
+                .session
+                .as_ref()
+                .and_then(|session| session.latest_deferred_decode_sessions),
+            Some(1)
         );
 
         let events = crate::api::ledger::list_ledger_events(
@@ -4234,6 +4279,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await
@@ -4391,6 +4438,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await
@@ -4546,6 +4595,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await
@@ -4734,6 +4785,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await
@@ -4953,6 +5006,8 @@ mod tests {
                     kv_cache_seq_len: Some(1),
                     batch_size: None,
                     active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
                 }),
             )
             .await

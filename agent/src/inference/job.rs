@@ -117,6 +117,8 @@ pub struct InferenceProgressUpdate {
     pub kv_cache_seq_len: Option<u32>,
     pub batch_size: Option<u32>,
     pub active_decode_sessions: Option<u32>,
+    pub batch_kv_tokens: Option<u32>,
+    pub deferred_decode_sessions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

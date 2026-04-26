@@ -992,6 +992,8 @@ impl InferenceCoordinator {
             kv_cache_seq_len: Some(kv_cache_seq_len),
             batch_size: None,
             active_decode_sessions: None,
+            batch_kv_tokens: None,
+            deferred_decode_sessions: None,
         })
         .await?;
 
@@ -1209,6 +1211,9 @@ impl InferenceCoordinator {
                 batch.deferred_for_kv_budget,
             );
             let batch_size = u32::try_from(batch.slots.len()).unwrap_or(u32::MAX);
+            let batch_kv_tokens = u32::try_from(batch.total_kv_tokens).unwrap_or(u32::MAX);
+            let deferred_decode_sessions =
+                u32::try_from(batch.deferred.len()).unwrap_or(u32::MAX);
 
             let outcomes = self.execute_decode_microbatch(batch, position).await?;
             let active_decode_sessions =
@@ -1248,6 +1253,8 @@ impl InferenceCoordinator {
                         kv_cache_seq_len: Some(outcome.kv_cache_seq_len),
                         batch_size: Some(batch_size),
                         active_decode_sessions: Some(active_decode_sessions),
+                        batch_kv_tokens: Some(batch_kv_tokens),
+                        deferred_decode_sessions: Some(deferred_decode_sessions),
                     })
                     .await?;
                     last_reported_completion_tokens = outcome.completion_tokens;
@@ -1273,6 +1280,8 @@ impl InferenceCoordinator {
                 kv_cache_seq_len: None,
                 batch_size: None,
                 active_decode_sessions: None,
+                batch_kv_tokens: None,
+                deferred_decode_sessions: None,
             })
             .await?;
         }
