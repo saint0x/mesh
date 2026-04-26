@@ -578,7 +578,7 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
                 .saturating_add(fresh_ready << 5)
                 .saturating_add(31u32.saturating_sub(fresh_blocked)),
             SchedulerPolicyMode::ResilientEdge => ((31u32.saturating_sub(fresh_blocked)) << 10)
-                .saturating_add(fresh_target << 5)
+                .saturating_add((31u32.saturating_sub(fresh_target)) << 5)
                 .saturating_add(fresh_ready),
             _ => (fresh_ready << 10)
                 .saturating_add((31u32.saturating_sub(fresh_blocked)) << 5)
@@ -2516,6 +2516,87 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_more_ready < latency_less_blocked);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_smaller_fresh_decode_cohort_when_transfer_exposure_ties_while_latency_prefers_readier_one() {
+        let mut smaller = base_candidate(SchedulerPhase::Decode);
+        smaller.assignment_id = "smaller".into();
+        smaller.group_status = "decode_ready".into();
+        smaller.decode_queue_status = Some("ready".into());
+        smaller.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        smaller.decode_lease_target_session_count = Some(2);
+        smaller.decode_cohort_ready_sessions = 1;
+        smaller.decode_cohort_blocked_sessions = 1;
+        smaller.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut larger_readier = smaller.clone();
+        larger_readier.assignment_id = "larger-readier".into();
+        larger_readier.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        larger_readier.decode_lease_target_session_count = Some(4);
+        larger_readier.decode_cohort_ready_sessions = 3;
+
+        let smaller = RunnableCandidate {
+            ready_at: smaller.decode_ready_at.clone().unwrap(),
+            candidate: smaller,
+        };
+        let larger_readier = RunnableCandidate {
+            ready_at: larger_readier.decode_ready_at.clone().unwrap(),
+            candidate: larger_readier,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_smaller = rank_candidate(
+            &smaller,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_larger = rank_candidate(
+            &larger_readier,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_smaller < resilient_larger);
+
+        let latency_smaller = rank_candidate(
+            &smaller,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_larger = rank_candidate(
+            &larger_readier,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_larger < latency_smaller);
     }
 
     #[test]

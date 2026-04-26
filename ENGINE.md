@@ -38,6 +38,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ In `fit_first`, prefer thinner owned decode cohorts before denser owned cohorts when remaining capacity ties
 - ✅ In `resilient_edge`, prefer fresh stable decode-ready work before continuing leased owned decode cohorts
 - ✅ In `resilient_edge`, prefer lower-transfer fresh decode cohorts before readier but more transfer-exposed cohorts
+- ✅ In `resilient_edge`, prefer smaller fresh decode cohorts before broader fresh cohorts when transfer exposure ties
 - ✅ In `resilient_edge`, prefer less transfer-exposed owned decode cohorts before broader but more transfer-exposed owned cohorts
 - ✅ In `resilient_edge`, prefer smaller owned decode cohorts before broader owned cohorts when transfer exposure ties
 - Planned: Add admission control across multiple concurrent jobs and models
