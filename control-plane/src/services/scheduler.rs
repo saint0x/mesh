@@ -331,7 +331,7 @@ fn rank_candidate(
     active_capacity_by_model: &HashMap<String, u32>,
     leased_assignments_by_submitter: &HashMap<String, u32>,
     leased_assignments_by_job: &HashMap<String, u32>,
-) -> (u8, u8, u8, u8, u8, u32, u32, String, String, String) {
+) -> (u8, u8, u8, u8, u8, u8, u32, u32, String, String, String) {
     let submitter_active_jobs = active_jobs_by_submitter
         .get(&candidate.candidate.submitted_by_device_id)
         .copied()
@@ -375,6 +375,7 @@ fn rank_candidate(
         policy_rank.1,
         policy_rank.2,
         policy_rank.3,
+        policy_rank.4,
         candidate.candidate.assigned_at.clone(),
         candidate.candidate.assignment_id.clone(),
     )
@@ -394,30 +395,42 @@ fn mode_rank(
     candidate: &RunnableCandidate,
     submitter_leased_assignments: u32,
     job_leased_assignments: u32,
-) -> (u8, u32, u32, String) {
+) -> (u8, u8, u32, u32, String) {
     let decode_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Decode);
     let prefill_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Prefill);
+    let owned_decode_group_bias = u8::from(
+        !matches!(candidate.candidate.phase, SchedulerPhase::Decode)
+            || candidate
+                .candidate
+                .group_lease_owner_device_id
+                .as_deref()
+                .is_none(),
+    );
     match mode {
         SchedulerPolicyMode::FitFirst => (
             prefill_bias,
+            owned_decode_group_bias,
             submitter_leased_assignments,
             job_leased_assignments,
             candidate.candidate.created_at.clone(),
         ),
         SchedulerPolicyMode::ThroughputFirst => (
             decode_bias,
+            owned_decode_group_bias,
             job_leased_assignments,
             submitter_leased_assignments,
             candidate.ready_at.clone(),
         ),
         SchedulerPolicyMode::LatencyFirst => (
             decode_bias,
+            owned_decode_group_bias,
             submitter_leased_assignments,
             job_leased_assignments,
             candidate.ready_at.clone(),
         ),
         SchedulerPolicyMode::ResilientEdge => (
             decode_bias,
+            owned_decode_group_bias,
             u32::from(!matches!(
                 candidate.candidate.group_status.as_str(),
                 "decode_ready" | "prefill_member"
@@ -1130,6 +1143,59 @@ mod tests {
 
         let same_owner = classify_candidate(&candidate, "worker-peer", "2026-01-01T00:05:00Z");
         assert_eq!(same_owner, Ok("2026-01-01T00:00:01Z".into()));
+    }
+
+    #[test]
+    fn latency_prefers_filling_owned_decode_group_before_fresh_ready_group() {
+        let mut owned = base_candidate(SchedulerPhase::Decode);
+        owned.assignment_id = "owned".into();
+        owned.group_status = "decode_leased".into();
+        owned.decode_queue_status = Some("ready".into());
+        owned.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        owned.group_lease_owner_device_id = Some("worker-1".into());
+        owned.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+
+        let mut fresh = owned.clone();
+        fresh.assignment_id = "fresh".into();
+        fresh.group_lease_owner_device_id = None;
+        fresh.group_lease_expires_at = None;
+        fresh.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let owned = RunnableCandidate {
+            ready_at: owned.decode_ready_at.clone().unwrap(),
+            candidate: owned,
+        };
+        let fresh = RunnableCandidate {
+            ready_at: fresh.decode_ready_at.clone().unwrap(),
+            candidate: fresh,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &owned,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &fresh,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
     }
 
     #[test]
