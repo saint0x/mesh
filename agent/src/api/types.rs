@@ -564,6 +564,8 @@ pub struct DecodeBatchEventStatus {
     pub completion_tokens: u32,
     pub execution_time_ms: u64,
     pub batch_size: Option<u32>,
+    pub target_session_count: Option<u32>,
+    pub target_batch_size: Option<u32>,
     pub active_decode_sessions: Option<u32>,
     pub batch_kv_tokens: Option<u32>,
     pub deferred_decode_sessions: Option<u32>,

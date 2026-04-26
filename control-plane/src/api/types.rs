@@ -860,6 +860,10 @@ pub struct DecodeBatchEventStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_session_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub active_decode_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_kv_tokens: Option<u32>,

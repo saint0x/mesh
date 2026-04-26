@@ -336,6 +336,10 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         "029_add_decode_batch_group_key.sql" => {
             column_exists(conn, "inference_decode_queue", "batch_group_key")?
         }
+        "030_add_target_fields_to_decode_batch_events.sql" => {
+            column_exists(conn, "inference_decode_batch_events", "target_session_count")?
+                && column_exists(conn, "inference_decode_batch_events", "target_batch_size")?
+        }
         _ => false,
     })
 }

@@ -192,6 +192,8 @@ struct PersistedDecodeBatchEvent {
     completion_tokens: u32,
     execution_time_ms: u64,
     batch_size: Option<u32>,
+    target_session_count: Option<u32>,
+    target_batch_size: Option<u32>,
     active_decode_sessions: Option<u32>,
     batch_kv_tokens: Option<u32>,
     deferred_decode_sessions: Option<u32>,
@@ -1408,6 +1410,8 @@ fn convert_persisted_decode_batch_event(
         completion_tokens: event.completion_tokens,
         execution_time_ms: event.execution_time_ms,
         batch_size: event.batch_size,
+        target_session_count: event.target_session_count,
+        target_batch_size: event.target_batch_size,
         active_decode_sessions: event.active_decode_sessions,
         batch_kv_tokens: event.batch_kv_tokens,
         deferred_decode_sessions: event.deferred_decode_sessions,
@@ -1838,8 +1842,9 @@ fn load_recent_decode_batch_events(
         .prepare(
             r#"
             SELECT event_id, session_id, job_id, network_id, device_id, segment_id,
-                   completion_tokens, execution_time_ms, batch_size, active_decode_sessions,
-                   batch_kv_tokens, deferred_decode_sessions, kv_cache_seq_len, observed_at
+                   completion_tokens, execution_time_ms, batch_size, target_session_count,
+                   target_batch_size, active_decode_sessions, batch_kv_tokens,
+                   deferred_decode_sessions, kv_cache_seq_len, observed_at
             FROM inference_decode_batch_events
             WHERE session_id = ?
             ORDER BY observed_at DESC, event_id DESC
@@ -1859,11 +1864,13 @@ fn load_recent_decode_batch_events(
                 completion_tokens: row.get::<_, i64>(6)? as u32,
                 execution_time_ms: row.get::<_, i64>(7)? as u64,
                 batch_size: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-                active_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
-                batch_kv_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
-                deferred_decode_sessions: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
-                kv_cache_seq_len: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
-                observed_at: row.get(13)?,
+                target_session_count: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                target_batch_size: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                active_decode_sessions: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                batch_kv_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                deferred_decode_sessions: row.get::<_, Option<i64>>(13)?.map(|v| v as u32),
+                kv_cache_seq_len: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+                observed_at: row.get(15)?,
             })
         })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -3547,13 +3554,31 @@ fn report_assignment_progress(
                 |row| row.get(0),
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        let decode_batch_targets = tx
+            .query_row(
+                r#"
+                SELECT lease_target_session_count, lease_target_batch_size
+                FROM inference_decode_queue
+                WHERE session_id = ?
+                "#,
+                params![&session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.map(|v| v as u32),
+                        row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         tx.execute(
             r#"
             INSERT INTO inference_decode_batch_events (
                 session_id, job_id, network_id, device_id, segment_id, completion_tokens,
-                execution_time_ms, batch_size, active_decode_sessions, batch_kv_tokens,
-                deferred_decode_sessions, kv_cache_seq_len, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                execution_time_ms, batch_size, target_session_count, target_batch_size,
+                active_decode_sessions, batch_kv_tokens, deferred_decode_sessions,
+                kv_cache_seq_len, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 session_id,
@@ -3564,6 +3589,14 @@ fn report_assignment_progress(
                 i64::from(req.completion_tokens),
                 req.execution_time_ms as i64,
                 req.batch_size.map(i64::from),
+                decode_batch_targets
+                    .as_ref()
+                    .and_then(|targets| targets.0)
+                    .map(i64::from),
+                decode_batch_targets
+                    .as_ref()
+                    .and_then(|targets| targets.1)
+                    .map(i64::from),
                 req.active_decode_sessions.map(i64::from),
                 req.batch_kv_tokens.map(i64::from),
                 req.deferred_decode_sessions.map(i64::from),
@@ -5356,6 +5389,22 @@ mod tests {
                 .and_then(|session| session.recent_decode_batches.first())
                 .and_then(|event| event.batch_size),
             Some(2)
+        );
+        assert_eq!(
+            status_after_frontier
+                .session
+                .as_ref()
+                .and_then(|session| session.recent_decode_batches.first())
+                .and_then(|event| event.target_session_count),
+            Some(1)
+        );
+        assert_eq!(
+            status_after_frontier
+                .session
+                .as_ref()
+                .and_then(|session| session.recent_decode_batches.first())
+                .and_then(|event| event.target_batch_size),
+            Some(1)
         );
 
         let events = crate::api::ledger::list_ledger_events(
