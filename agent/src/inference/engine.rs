@@ -115,6 +115,8 @@ pub struct DecodeBatchPlan {
     pub slots: Vec<DecodeBatchSlot>,
     pub deferred: Vec<DecodeTask>,
     pub total_kv_tokens: usize,
+    pub deferred_for_capacity: usize,
+    pub deferred_for_kv_budget: usize,
 }
 
 impl DecodeBatchPlan {

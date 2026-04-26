@@ -30,6 +30,30 @@ pub struct InferenceStats {
     /// Total all-reduce time in milliseconds
     pub total_allreduce_time_ms: AtomicU64,
 
+    /// Number of decode microbatches executed by the runtime.
+    pub decode_microbatches_executed: AtomicU64,
+
+    /// Total number of decode sessions admitted across all microbatches.
+    pub decode_sessions_batched: AtomicU64,
+
+    /// Number of decode microbatches that contained more than one session.
+    pub decode_multi_session_microbatches: AtomicU64,
+
+    /// Peak decode batch size observed by the runtime.
+    pub decode_batch_size_peak: AtomicU64,
+
+    /// Total KV-token footprint admitted across decode microbatches.
+    pub decode_batch_kv_tokens_total: AtomicU64,
+
+    /// Total number of queued decode sessions deferred from admitted batches.
+    pub decode_batch_deferred_sessions: AtomicU64,
+
+    /// Number of decode sessions deferred because the batch was already full.
+    pub decode_batch_capacity_deferrals: AtomicU64,
+
+    /// Number of decode sessions deferred because the KV-token budget would be exceeded.
+    pub decode_batch_kv_budget_deferrals: AtomicU64,
+
     /// Number of checkpoints created
     pub checkpoints_created: AtomicU64,
 
@@ -132,6 +156,14 @@ impl InferenceStats {
             total_prompt_tokens: AtomicU64::new(0),
             total_inference_time_ms: AtomicU64::new(0),
             total_allreduce_time_ms: AtomicU64::new(0),
+            decode_microbatches_executed: AtomicU64::new(0),
+            decode_sessions_batched: AtomicU64::new(0),
+            decode_multi_session_microbatches: AtomicU64::new(0),
+            decode_batch_size_peak: AtomicU64::new(0),
+            decode_batch_kv_tokens_total: AtomicU64::new(0),
+            decode_batch_deferred_sessions: AtomicU64::new(0),
+            decode_batch_capacity_deferrals: AtomicU64::new(0),
+            decode_batch_kv_budget_deferrals: AtomicU64::new(0),
             checkpoints_created: AtomicU64::new(0),
             checkpoint_recoveries: AtomicU64::new(0),
             recovery_attempts: AtomicU64::new(0),
@@ -201,6 +233,46 @@ impl InferenceStats {
         self.allreduce_operations.fetch_add(1, Ordering::Relaxed);
         self.total_allreduce_time_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_decode_microbatch(
+        &self,
+        batch_size: usize,
+        kv_tokens: usize,
+        deferred_sessions: usize,
+        deferred_for_capacity: usize,
+        deferred_for_kv_budget: usize,
+    ) {
+        let batch_size = batch_size as u64;
+        self.decode_microbatches_executed
+            .fetch_add(1, Ordering::Relaxed);
+        self.decode_sessions_batched
+            .fetch_add(batch_size, Ordering::Relaxed);
+        if batch_size > 1 {
+            self.decode_multi_session_microbatches
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.decode_batch_kv_tokens_total
+            .fetch_add(kv_tokens as u64, Ordering::Relaxed);
+        self.decode_batch_deferred_sessions
+            .fetch_add(deferred_sessions as u64, Ordering::Relaxed);
+        self.decode_batch_capacity_deferrals
+            .fetch_add(deferred_for_capacity as u64, Ordering::Relaxed);
+        self.decode_batch_kv_budget_deferrals
+            .fetch_add(deferred_for_kv_budget as u64, Ordering::Relaxed);
+
+        let mut current_peak = self.decode_batch_size_peak.load(Ordering::Relaxed);
+        while batch_size > current_peak {
+            match self.decode_batch_size_peak.compare_exchange_weak(
+                current_peak,
+                batch_size,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_peak = observed,
+            }
+        }
     }
 
     /// Record a layer processed
@@ -337,6 +409,14 @@ impl InferenceStats {
         self.total_allreduce_time_ms.load(Ordering::Relaxed) as f64 / ops as f64
     }
 
+    pub fn avg_decode_batch_size(&self) -> f64 {
+        let microbatches = self.decode_microbatches_executed.load(Ordering::Relaxed);
+        if microbatches == 0 {
+            return 0.0;
+        }
+        self.decode_sessions_batched.load(Ordering::Relaxed) as f64 / microbatches as f64
+    }
+
     /// Get average inference time per job in milliseconds
     pub fn avg_inference_time_ms(&self) -> f64 {
         let jobs = self.jobs_completed.load(Ordering::Relaxed);
@@ -378,6 +458,7 @@ impl InferenceStats {
         let checkpoints = self.checkpoints_created.load(Ordering::Relaxed);
         let recoveries = self.checkpoint_recoveries.load(Ordering::Relaxed);
         let recovery_attempts = self.recovery_attempts.load(Ordering::Relaxed);
+        let decode_microbatches = self.decode_microbatches_executed.load(Ordering::Relaxed);
 
         info!(
             jobs_completed = jobs_completed,
@@ -386,6 +467,24 @@ impl InferenceStats {
             success_rate = format!("{:.1}%", self.success_rate() * 100.0),
             avg_tokens_per_second = format!("{:.2}", self.avg_tokens_per_second()),
             avg_allreduce_latency_ms = format!("{:.2}", self.avg_allreduce_latency_ms()),
+            decode_microbatches_executed = decode_microbatches,
+            avg_decode_batch_size = format!("{:.2}", self.avg_decode_batch_size()),
+            decode_multi_session_microbatches = self
+                .decode_multi_session_microbatches
+                .load(Ordering::Relaxed),
+            decode_batch_size_peak = self.decode_batch_size_peak.load(Ordering::Relaxed),
+            decode_batch_kv_tokens_total = self
+                .decode_batch_kv_tokens_total
+                .load(Ordering::Relaxed),
+            decode_batch_deferred_sessions = self
+                .decode_batch_deferred_sessions
+                .load(Ordering::Relaxed),
+            decode_batch_capacity_deferrals = self
+                .decode_batch_capacity_deferrals
+                .load(Ordering::Relaxed),
+            decode_batch_kv_budget_deferrals = self
+                .decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed),
             checkpoints_created = checkpoints,
             checkpoint_recoveries = recoveries,
             recovery_attempts = recovery_attempts,
@@ -508,6 +607,41 @@ impl InferenceStats {
                 .load(Ordering::Relaxed)
         );
 
+        println!("\n{}", "Decode Batching:".bold());
+        println!(
+            "  Microbatches:        {}",
+            self.decode_microbatches_executed.load(Ordering::Relaxed)
+        );
+        println!("  Avg Batch Size:      {:.2}", self.avg_decode_batch_size());
+        println!(
+            "  Peak Batch Size:     {}",
+            self.decode_batch_size_peak.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Multi-session Batches:{}",
+            self.decode_multi_session_microbatches
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  KV Tokens Admitted:  {}",
+            self.decode_batch_kv_tokens_total.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Deferred Sessions:   {}",
+            self.decode_batch_deferred_sessions
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Capacity Deferrals:  {}",
+            self.decode_batch_capacity_deferrals
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  KV Budget Deferrals: {}",
+            self.decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed)
+        );
+
         println!("\n{}", "Fault Tolerance:".bold());
         println!(
             "  Checkpoints:         {}",
@@ -576,6 +710,50 @@ impl InferenceStats {
             &mut map,
             "total_allreduce_time_ms",
             self.total_allreduce_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_microbatches_executed",
+            self.decode_microbatches_executed.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_sessions_batched",
+            self.decode_sessions_batched.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_multi_session_microbatches",
+            self.decode_multi_session_microbatches
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_batch_size_peak",
+            self.decode_batch_size_peak.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_batch_kv_tokens_total",
+            self.decode_batch_kv_tokens_total.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_batch_deferred_sessions",
+            self.decode_batch_deferred_sessions
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_batch_capacity_deferrals",
+            self.decode_batch_capacity_deferrals
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_batch_kv_budget_deferrals",
+            self.decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed),
         );
         insert_u64(
             &mut map,
@@ -801,6 +979,10 @@ impl InferenceStats {
             serde_json::Value::from(self.avg_allreduce_latency_ms()),
         );
         map.insert(
+            "avg_decode_batch_size".to_string(),
+            serde_json::Value::from(self.avg_decode_batch_size()),
+        );
+        map.insert(
             "uptime".to_string(),
             serde_json::Value::from(self.uptime_string()),
         );
@@ -881,6 +1063,50 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_decode_microbatch_metrics() {
+        let stats = InferenceStats::new();
+
+        stats.record_decode_microbatch(1, 128, 0, 0, 0);
+        stats.record_decode_microbatch(3, 512, 2, 1, 1);
+
+        assert_eq!(
+            stats.decode_microbatches_executed.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(stats.decode_sessions_batched.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            stats
+                .decode_multi_session_microbatches
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stats.decode_batch_size_peak.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            stats.decode_batch_kv_tokens_total.load(Ordering::Relaxed),
+            640
+        );
+        assert_eq!(
+            stats
+                .decode_batch_deferred_sessions
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats
+                .decode_batch_capacity_deferrals
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stats.avg_decode_batch_size(), 2.0);
+    }
+
+    #[test]
     fn test_stats_checkpoints() {
         let stats = InferenceStats::new();
 
@@ -912,6 +1138,7 @@ mod tests {
 
         assert_eq!(json["jobs_completed"], 1);
         assert_eq!(json["total_tokens_generated"], 50);
+        assert_eq!(json["avg_decode_batch_size"], 0.0);
     }
 
     #[test]

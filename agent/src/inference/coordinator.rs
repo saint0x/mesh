@@ -396,6 +396,8 @@ impl InferenceCoordinator {
         let mut total_kv_tokens = 0_usize;
         let mut slots = Vec::new();
         let mut deferred = Vec::new();
+        let mut deferred_for_capacity = 0_usize;
+        let mut deferred_for_kv_budget = 0_usize;
         let mut queue = std::mem::take(&mut self.decode_queue);
 
         while let Some(task) = queue.pop_front() {
@@ -412,6 +414,11 @@ impl InferenceCoordinator {
             let kv_exhausted = !slots.is_empty()
                 && total_kv_tokens.saturating_add(kv_tokens) > policy.max_total_kv_tokens;
             if batch_full || kv_exhausted {
+                if batch_full {
+                    deferred_for_capacity = deferred_for_capacity.saturating_add(1);
+                } else {
+                    deferred_for_kv_budget = deferred_for_kv_budget.saturating_add(1);
+                }
                 deferred.push(task);
                 continue;
             }
@@ -436,6 +443,8 @@ impl InferenceCoordinator {
             slots,
             deferred,
             total_kv_tokens,
+            deferred_for_capacity,
+            deferred_for_kv_budget,
         }
     }
 
@@ -1192,6 +1201,13 @@ impl InferenceCoordinator {
                         .to_string(),
                 ));
             }
+            self.stats.record_decode_microbatch(
+                batch.slots.len(),
+                batch.total_kv_tokens,
+                batch.deferred.len(),
+                batch.deferred_for_capacity,
+                batch.deferred_for_kv_budget,
+            );
             let batch_size = u32::try_from(batch.slots.len()).unwrap_or(u32::MAX);
 
             let outcomes = self.execute_decode_microbatch(batch, position).await?;
