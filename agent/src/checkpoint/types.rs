@@ -7,6 +7,8 @@ use sha2::Digest;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::inference::ExecutionPhase;
+
 /// Configuration for checkpoint management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointConfig {
@@ -145,6 +147,9 @@ pub struct CheckpointedRequest {
     /// Job ID
     pub job_id: Uuid,
 
+    /// Session ID within the serving engine plan.
+    pub session_id: Uuid,
+
     /// Network ID
     pub network_id: String,
 
@@ -156,6 +161,9 @@ pub struct CheckpointedRequest {
 
     /// Executor ID
     pub executor_id: String,
+
+    /// Execution phase active when the snapshot was taken.
+    pub phase: ExecutionPhase,
 }
 
 /// Generation config stored in checkpoint
@@ -274,10 +282,12 @@ mod tests {
             ),
             request: CheckpointedRequest {
                 job_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
                 network_id: "net-1".to_string(),
                 model_id: "llama-70b".to_string(),
                 prompt_tokens: vec![1, 2, 3, 4, 5],
                 executor_id: "exec-1".to_string(),
+                phase: ExecutionPhase::Decode,
             },
             generated_tokens: vec![100, 101, 102],
             config: CheckpointedConfig {
@@ -319,10 +329,12 @@ mod tests {
             ),
             request: CheckpointedRequest {
                 job_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
                 network_id: "net".to_string(),
                 model_id: "model".to_string(),
                 prompt_tokens: vec![1, 2, 3],
                 executor_id: "exec".to_string(),
+                phase: ExecutionPhase::Decode,
             },
             generated_tokens: vec![100, 101],
             config: CheckpointedConfig {
@@ -366,10 +378,12 @@ mod tests {
             },
             request: CheckpointedRequest {
                 job_id,
+                session_id: Uuid::new_v4(),
                 network_id: "net".to_string(),
                 model_id: "model".to_string(),
                 prompt_tokens: vec![],
                 executor_id: "exec".to_string(),
+                phase: ExecutionPhase::Decode,
             },
             generated_tokens: vec![],
             config: CheckpointedConfig {

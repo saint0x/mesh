@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::engine::ExecutionPhase;
+
 /// Configuration for text generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationConfig {
@@ -62,6 +64,12 @@ pub struct InferenceRequest {
     /// Generation configuration
     pub config: GenerationConfig,
 
+    /// Session identifier within the serving engine plan.
+    pub session_id: Uuid,
+
+    /// Execution phase requested by the control plane.
+    pub phase: ExecutionPhase,
+
     /// Executor ID (for credit tracking)
     pub executor_id: String,
 
@@ -83,6 +91,8 @@ impl InferenceRequest {
             model_id,
             prompt_tokens,
             config: GenerationConfig::default(),
+            session_id: Uuid::new_v4(),
+            phase: ExecutionPhase::Prefill,
             executor_id,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -96,6 +106,28 @@ impl InferenceRequest {
         self.config = config;
         self
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceProgressUpdate {
+    pub phase: ExecutionPhase,
+    pub completion_tokens: u32,
+    pub execution_time_ms: u64,
+    pub time_to_first_token_ms: Option<u64>,
+    pub kv_cache_seq_len: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SegmentExecutionResult {
+    PrefillComplete {
+        job_id: Uuid,
+        session_id: Uuid,
+        completion_tokens: u32,
+        execution_time_ms: u64,
+        time_to_first_token_ms: u64,
+        kv_cache_seq_len: u32,
+    },
+    Completed(InferenceResult),
 }
 
 /// Result of an inference job

@@ -26,8 +26,14 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use super::artifact_loader::{ArtifactShardLoader, ShardLoader};
-use super::forward_pass::{ForwardPass, ModelWeights};
-use super::job::{InferenceJob, InferenceRequest, InferenceResult};
+use super::backend::{CandleExecutionBackend, ExecutionBackend};
+use super::engine::{EngineSessionState, ExecutionPhase, TransportCapabilityTier};
+use super::forward_pass::ModelWeights;
+use super::job::{
+    InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
+    SegmentExecutionResult,
+};
+use super::kv_cache::KVCache;
 use super::stats::InferenceStats;
 
 /// Configuration for the inference coordinator
@@ -196,11 +202,17 @@ pub struct InferenceCoordinator {
     /// Cached weights per model (model_id -> weights)
     weight_cache: RwLock<HashMap<String, Arc<ModelWeights>>>,
 
-    /// Active forward pass state for the currently executing job
-    active_forward_pass: Option<ForwardPass>,
+    /// Engine-owned session runtime state.
+    sessions: HashMap<Uuid, ActiveSession>,
 
     /// Governs checkpoint recovery cadence and node-level recovery load.
     recovery_governor: RecoveryGovernor,
+}
+
+struct ActiveSession {
+    engine_state: EngineSessionState,
+    backend: Box<dyn ExecutionBackend>,
+    job: InferenceJob,
 }
 
 impl InferenceCoordinator {
@@ -223,9 +235,63 @@ impl InferenceCoordinator {
             shard_registry,
             loader,
             weight_cache: RwLock::new(HashMap::new()),
-            active_forward_pass: None,
+            sessions: HashMap::new(),
             recovery_governor: RecoveryGovernor::default(),
         }
+    }
+
+    fn build_session_state(
+        &self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+        provider: crate::provider::ExecutionProviderKind,
+    ) -> EngineSessionState {
+        EngineSessionState::new(
+            request.session_id,
+            ExecutionPhase::Prefill,
+            request.executor_id.clone(),
+            vec![request.executor_id.clone()],
+            vec![request.executor_id.clone()],
+            provider,
+            position.shard_column_range,
+            TransportCapabilityTier::DirectTcp,
+            request.config.max_tokens,
+            request.prompt_tokens.len(),
+        )
+    }
+
+    async fn ensure_session_backend<'a>(
+        &'a mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> Result<&'a mut ActiveSession> {
+        if !self.sessions.contains_key(&request.session_id) {
+            let weights = self
+                .get_or_load_weights(&request.model_id, position)
+                .await?;
+            let backend = CandleExecutionBackend::new(
+                (*weights).clone(),
+                position.position,
+                position.shard_column_range.0 as usize,
+                position.shard_column_range.1 as usize,
+                position.total_workers,
+                self.config.allreduce_timeout,
+            )?;
+            let provider = backend.provider_kind();
+            let state = self.build_session_state(request, position, provider);
+            self.sessions.insert(
+                request.session_id,
+                ActiveSession {
+                    engine_state: state,
+                    backend: Box::new(backend),
+                    job: InferenceJob::new(request.clone(), self.config.total_layers),
+                },
+            );
+        }
+
+        self.sessions.get_mut(&request.session_id).ok_or_else(|| {
+            AgentError::Execution("session backend vanished during initialization".to_string())
+        })
     }
 
     /// Set the checkpoint manager
@@ -240,6 +306,58 @@ impl InferenceCoordinator {
     /// Get reference to statistics
     pub fn stats(&self) -> &Arc<InferenceStats> {
         &self.stats
+    }
+
+    pub fn has_session(&self, session_id: Uuid) -> bool {
+        self.sessions.contains_key(&session_id)
+    }
+
+    pub async fn export_session_checkpoint_bytes(&mut self, session_id: Uuid) -> Result<Vec<u8>> {
+        let Some(manager) = self.checkpoint_manager.clone() else {
+            return Err(AgentError::Execution(
+                "Checkpoint manager is not configured for session handoff export".to_string(),
+            ));
+        };
+        let job_snapshot = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "Session {} is not active for checkpoint export",
+                    session_id
+                ))
+            })?
+            .job
+            .clone();
+        let (kv_cache, sequence_position) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| -> Result<(Option<KVCache>, Option<u32>)> {
+                let cache = session
+                    .backend
+                    .export_kv_cache()?
+                    .map(|bytes| KVCache::from_bytes(&bytes))
+                    .transpose()?;
+                Ok((cache, Some(session.backend.sequence_position() as u32)))
+            })
+            .transpose()?
+            .unwrap_or((None, None));
+        manager
+            .save_checkpoint(&job_snapshot, kv_cache.as_ref(), sequence_position)
+            .await?;
+        manager
+            .export_latest_checkpoint_bytes(job_snapshot.request.job_id)
+            .await?
+            .ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "Checkpoint export for job {} produced no bytes",
+                    job_snapshot.request.job_id
+                ))
+            })
+    }
+
+    pub fn checkpoint_manager(&self) -> Option<Arc<crate::checkpoint::CheckpointManager>> {
+        self.checkpoint_manager.clone()
     }
 
     /// Get reference to swarm
@@ -380,8 +498,49 @@ impl InferenceCoordinator {
         &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResult> {
-        self.process_inference_with_progress(request, |_, _| async { Ok(()) })
+        self.process_inference_with_progress(request, |_| async { Ok(()) })
             .await
+    }
+
+    #[instrument(skip(self, request, on_progress), fields(job_id = %request.job_id, session_id = %request.session_id, phase = ?request.phase))]
+    pub async fn process_segment_with_progress<F, Fut>(
+        &mut self,
+        request: InferenceRequest,
+        mut on_progress: F,
+    ) -> Result<SegmentExecutionResult>
+    where
+        F: FnMut(InferenceProgressUpdate) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let position = self.position.clone().ok_or_else(|| {
+            AgentError::Execution("Worker is not part of a ring topology".to_string())
+        })?;
+
+        info!(
+            job_id = %request.job_id,
+            session_id = %request.session_id,
+            phase = ?request.phase,
+            model = %request.model_id,
+            prompt_tokens = request.prompt_tokens.len(),
+            max_tokens = request.config.max_tokens,
+            "Starting execution segment"
+        );
+
+        self.ensure_session_backend(&request, &position).await?;
+        match request.phase {
+            ExecutionPhase::Prefill => {
+                let result = self
+                    .run_prefill_segment(&request, &position, &mut on_progress)
+                    .await?;
+                Ok(result)
+            }
+            ExecutionPhase::Decode => {
+                let result = self
+                    .run_decode_segment(&request, &position, &mut on_progress)
+                    .await?;
+                Ok(result)
+            }
+        }
     }
 
     #[instrument(skip(self, request, on_progress), fields(job_id = %request.job_id))]
@@ -391,7 +550,7 @@ impl InferenceCoordinator {
         mut on_progress: F,
     ) -> Result<InferenceResult>
     where
-        F: FnMut(u32, u64) -> Fut,
+        F: FnMut(InferenceProgressUpdate) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         // Check if we're in a ring and clone position to avoid borrow issues
@@ -456,7 +615,7 @@ impl InferenceCoordinator {
         }
 
         let execution_time_ms = start.elapsed().as_millis() as u64;
-        self.active_forward_pass = None;
+        self.sessions.remove(&request.session_id);
 
         match result {
             Ok(()) => {
@@ -502,7 +661,7 @@ impl InferenceCoordinator {
         on_progress: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(u32, u64) -> Fut,
+        F: FnMut(InferenceProgressUpdate) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         let max_tokens = job.request.config.max_tokens;
@@ -537,12 +696,29 @@ impl InferenceCoordinator {
                 "Generated token"
             );
 
-            if job
+            if job.current_token_idx == 1 {
+                on_progress(InferenceProgressUpdate {
+                    phase: ExecutionPhase::Prefill,
+                    completion_tokens: job.current_token_idx,
+                    execution_time_ms: job.elapsed().as_millis() as u64,
+                    time_to_first_token_ms: job.time_to_first_token().map(|d| d.as_millis() as u64),
+                    kv_cache_seq_len: None,
+                })
+                .await?;
+                last_reported_completion_tokens = job.current_token_idx;
+            } else if job
                 .current_token_idx
                 .saturating_sub(last_reported_completion_tokens)
                 >= progress_report_interval
             {
-                on_progress(job.current_token_idx, job.elapsed().as_millis() as u64).await?;
+                on_progress(InferenceProgressUpdate {
+                    phase: ExecutionPhase::Decode,
+                    completion_tokens: job.current_token_idx,
+                    execution_time_ms: job.elapsed().as_millis() as u64,
+                    time_to_first_token_ms: None,
+                    kv_cache_seq_len: None,
+                })
+                .await?;
                 last_reported_completion_tokens = job.current_token_idx;
             }
 
@@ -560,7 +736,14 @@ impl InferenceCoordinator {
         }
 
         if job.current_token_idx > last_reported_completion_tokens {
-            on_progress(job.current_token_idx, job.elapsed().as_millis() as u64).await?;
+            on_progress(InferenceProgressUpdate {
+                phase: ExecutionPhase::Decode,
+                completion_tokens: job.current_token_idx,
+                execution_time_ms: job.elapsed().as_millis() as u64,
+                time_to_first_token_ms: None,
+                kv_cache_seq_len: None,
+            })
+            .await?;
         }
 
         Ok(())
@@ -585,31 +768,20 @@ impl InferenceCoordinator {
         // Clone model_id to avoid borrow issues
         let model_id = job.request.model_id.clone();
 
-        // Load weights using the verified artifact loader
         debug!(
             job_id = %job.request.job_id,
             position = position.position,
             model_id = %model_id,
-            "Loading model weights"
+            "Resolving session backend"
         );
 
-        let weights = self.get_or_load_weights(&model_id, position).await?;
-
-        if self.active_forward_pass.is_none() {
-            self.active_forward_pass = Some(ForwardPass::new(
-                (*weights).clone(),
-                position.position,
-                position.shard_column_range.0 as usize,
-                position.shard_column_range.1 as usize,
-                position.total_workers,
-                self.config.allreduce_timeout,
-            )?);
-        }
-
-        let mut forward_pass = self
-            .active_forward_pass
-            .take()
-            .expect("active forward pass must be initialized");
+        self.ensure_session_backend(&job.request, position).await?;
+        let mut session = self
+            .sessions
+            .remove(&job.request.session_id)
+            .ok_or_else(|| {
+                AgentError::Execution("session backend missing at execution time".to_string())
+            })?;
 
         let next_token = {
             let mut worker_ring = WorkerRing::new(
@@ -633,7 +805,9 @@ impl InferenceCoordinator {
                     prompt_tokens = job.request.prompt_tokens.len(),
                     "Running prompt prefill"
                 );
-                forward_pass
+                session.engine_state.assignment.phase = ExecutionPhase::Prefill;
+                session
+                    .backend
                     .prefill(
                         &job.request.prompt_tokens,
                         &mut worker_ring,
@@ -650,24 +824,26 @@ impl InferenceCoordinator {
                 debug!(
                     job_id = %job.request.job_id,
                     decode_token = decode_token,
-                    cache_seq_len = forward_pass.cache_seq_len(),
+                    cache_seq_len = session.backend.cache_seq_len(),
                     "Running incremental decode step"
                 );
-                forward_pass
+                session.engine_state.assignment.phase = ExecutionPhase::Decode;
+                session
+                    .backend
                     .decode_step(decode_token, &mut worker_ring, job.request.job_id)
                     .await?
             };
 
-            let seed = job.request.job_id.as_u128() as u64 ^ forward_pass.position as u64;
-            forward_pass.sample(
+            let seed =
+                job.request.job_id.as_u128() as u64 ^ session.backend.sequence_position() as u64;
+            session.backend.sample(
                 &logits,
                 job.request.config.temperature,
                 job.request.config.top_p,
                 seed,
             )
         };
-
-        self.active_forward_pass = Some(forward_pass);
+        self.sessions.insert(job.request.session_id, session);
 
         let elapsed = start.elapsed().as_millis() as u64;
         debug!(
@@ -679,11 +855,12 @@ impl InferenceCoordinator {
 
         // Record statistics
         self.stats.record_allreduce(elapsed);
-        if let Some(pass) = self.active_forward_pass.as_ref() {
+        let layer_count = self.config.total_layers;
+        if let Some(session) = self.sessions.get(&job.request.session_id) {
             self.stats
-                .record_allreduce_breakdown(pass.last_allreduce_metrics);
+                .record_allreduce_breakdown(session.backend.last_allreduce_metrics());
         }
-        for _ in 0..weights.config.num_layers {
+        for _ in 0..layer_count {
             self.stats.record_layer();
         }
         self.sync_tensor_plane_metrics();
@@ -707,13 +884,21 @@ impl InferenceCoordinator {
                 "Creating checkpoint"
             );
 
-            let kv_cache = self.active_forward_pass.as_ref().map(|pass| &pass.kv_cache);
-            let sequence_position = self
-                .active_forward_pass
-                .as_ref()
-                .map(|pass| pass.position as u32);
+            let (kv_cache, sequence_position) = self
+                .sessions
+                .get(&job.request.session_id)
+                .map(|session| -> Result<(Option<KVCache>, Option<u32>)> {
+                    let cache = session
+                        .backend
+                        .export_kv_cache()?
+                        .map(|bytes| KVCache::from_bytes(&bytes))
+                        .transpose()?;
+                    Ok((cache, Some(session.backend.sequence_position() as u32)))
+                })
+                .transpose()?
+                .unwrap_or((None, None));
             manager
-                .save_checkpoint(job, kv_cache, sequence_position)
+                .save_checkpoint(job, kv_cache.as_ref(), sequence_position)
                 .await?;
             self.stats.record_checkpoint();
         }
@@ -726,21 +911,10 @@ impl InferenceCoordinator {
         if let Some(manager) = self.checkpoint_manager.clone() {
             if let Some(job) = manager.load_checkpoint(job_id).await? {
                 if let Some(position) = self.position.clone() {
-                    let weights = self
-                        .get_or_load_weights(&job.request.model_id, &position)
-                        .await?;
-
-                    let mut forward_pass = ForwardPass::new(
-                        (*weights).clone(),
-                        position.position,
-                        position.shard_column_range.0 as usize,
-                        position.shard_column_range.1 as usize,
-                        position.total_workers,
-                        self.config.allreduce_timeout,
-                    )?;
+                    let session = self.ensure_session_backend(&job.request, &position).await?;
+                    session.job = job.clone();
 
                     if let Some(kv_cache) = manager.load_checkpoint_kv_cache(job_id).await? {
-                        forward_pass.kv_cache = kv_cache;
                         let sequence_position = manager
                             .load_checkpoint_sequence_position(job_id)
                             .await?
@@ -750,17 +924,12 @@ impl InferenceCoordinator {
                                         .to_string(),
                                 )
                             })?;
-                        if forward_pass.kv_cache.seq_len() != sequence_position as usize {
-                            return Err(AgentError::Execution(format!(
-                                "Recovered checkpoint sequence_position {} does not match KV cache length {}",
-                                sequence_position,
-                                forward_pass.kv_cache.seq_len()
-                            )));
-                        }
-                        forward_pass.position = sequence_position as usize;
+                        session
+                            .backend
+                            .import_kv_cache(&kv_cache.to_bytes()?, sequence_position as usize)?;
+                    } else {
+                        session.backend.clear();
                     }
-
-                    self.active_forward_pass = Some(forward_pass);
                 }
 
                 self.stats.record_recovery();
@@ -810,6 +979,352 @@ impl InferenceCoordinator {
             self.stats.record_recovery_checkpoint_miss();
         }
         Ok(recovered)
+    }
+
+    async fn recover_session_from_checkpoint(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> Result<bool> {
+        let Some(manager) = self.checkpoint_manager.clone() else {
+            return Ok(false);
+        };
+
+        let Some(recovered_job) = manager.load_checkpoint(request.job_id).await? else {
+            return Ok(false);
+        };
+
+        if recovered_job.request.session_id != request.session_id {
+            return Err(AgentError::Execution(format!(
+                "Checkpoint session {} does not match requested session {}",
+                recovered_job.request.session_id, request.session_id
+            )));
+        }
+
+        let session = self
+            .ensure_session_backend(&recovered_job.request, position)
+            .await?;
+        session.job = recovered_job.clone();
+
+        if let Some(kv_cache) = manager.load_checkpoint_kv_cache(request.job_id).await? {
+            let sequence_position = manager
+                .load_checkpoint_sequence_position(request.job_id)
+                .await?
+                .ok_or_else(|| {
+                    AgentError::Execution(
+                        "Checkpoint missing sequence_position for KV recovery".to_string(),
+                    )
+                })?;
+            session
+                .backend
+                .import_kv_cache(&kv_cache.to_bytes()?, sequence_position as usize)?;
+        } else {
+            session.backend.clear();
+        }
+
+        Ok(true)
+    }
+
+    async fn run_prefill_segment<F, Fut>(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+        on_progress: &mut F,
+    ) -> Result<SegmentExecutionResult>
+    where
+        F: FnMut(InferenceProgressUpdate) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        if request.prompt_tokens.is_empty() {
+            return Err(AgentError::Execution(
+                "Inference request must contain at least one prompt token".to_string(),
+            ));
+        }
+
+        let segment_start = Instant::now();
+        let job_snapshot = {
+            let session = self.ensure_session_backend(request, position).await?;
+            if !session.job.generated_tokens.is_empty() {
+                return Err(AgentError::Execution(format!(
+                    "Prefill segment for session {} was requested after generation already started",
+                    request.session_id
+                )));
+            }
+            session.job.clone()
+        };
+        {
+            let mut active = self.active_job.write().await;
+            *active = Some(job_snapshot);
+        }
+
+        let next_token = {
+            let mut session = self.sessions.remove(&request.session_id).ok_or_else(|| {
+                AgentError::Execution(
+                    "session backend missing at prefill execution time".to_string(),
+                )
+            })?;
+            let mut worker_ring = WorkerRing::new(
+                position.position,
+                position.total_workers,
+                position.left_neighbor,
+                position.right_neighbor,
+                position.left_neighbor_tensor_addr,
+                position.right_neighbor_tensor_addr,
+                self.tensor_plane_mut(),
+            );
+            session.engine_state.assignment.phase = ExecutionPhase::Prefill;
+            let logits = session
+                .backend
+                .prefill(&request.prompt_tokens, &mut worker_ring, request.job_id)
+                .await?;
+            let seed = request.job_id.as_u128() as u64 ^ session.backend.sequence_position() as u64;
+            let next_token = session.backend.sample(
+                &logits,
+                request.config.temperature,
+                request.config.top_p,
+                seed,
+            );
+            self.sessions.insert(request.session_id, session);
+            next_token
+        };
+
+        let execution_time_ms = segment_start.elapsed().as_millis() as u64;
+        let completion_tokens = {
+            let session = self.sessions.get_mut(&request.session_id).ok_or_else(|| {
+                AgentError::Execution("session state vanished after prefill".to_string())
+            })?;
+            session.job.add_token(next_token);
+            session.job.request.phase = ExecutionPhase::Decode;
+            session.job.current_layer = self.config.total_layers;
+            session.job.clone()
+        };
+        let kv_cache_seq_len = self
+            .sessions
+            .get(&request.session_id)
+            .map(|session| session.backend.cache_seq_len() as u32)
+            .unwrap_or(request.prompt_tokens.len() as u32);
+
+        on_progress(InferenceProgressUpdate {
+            phase: ExecutionPhase::Prefill,
+            completion_tokens: completion_tokens.current_token_idx,
+            execution_time_ms,
+            time_to_first_token_ms: completion_tokens
+                .time_to_first_token()
+                .map(|d| d.as_millis() as u64),
+            kv_cache_seq_len: Some(kv_cache_seq_len),
+        })
+        .await?;
+
+        if self.config.checkpointing_enabled {
+            self.checkpoint(&completion_tokens).await?;
+            if let Some(session) = self.sessions.get_mut(&request.session_id) {
+                session.job.mark_checkpointed();
+            }
+        }
+
+        {
+            let mut active = self.active_job.write().await;
+            *active = None;
+        }
+
+        self.record_generation_metrics(request.session_id, execution_time_ms);
+
+        Ok(SegmentExecutionResult::PrefillComplete {
+            job_id: request.job_id,
+            session_id: request.session_id,
+            completion_tokens: completion_tokens.current_token_idx,
+            execution_time_ms,
+            time_to_first_token_ms: completion_tokens
+                .time_to_first_token()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(execution_time_ms),
+            kv_cache_seq_len,
+        })
+    }
+
+    async fn run_decode_segment<F, Fut>(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+        on_progress: &mut F,
+    ) -> Result<SegmentExecutionResult>
+    where
+        F: FnMut(InferenceProgressUpdate) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        if !self.sessions.contains_key(&request.session_id) {
+            let recovered = self
+                .recover_session_from_checkpoint(request, position)
+                .await?;
+            if recovered {
+                info!(
+                    job_id = %request.job_id,
+                    session_id = %request.session_id,
+                    "Recovered decode segment session state from checkpoint"
+                );
+            }
+        }
+
+        let job_snapshot = {
+            let session = self.sessions.get(&request.session_id).ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "Decode segment for session {} cannot start before prefill state exists",
+                    request.session_id
+                ))
+            })?;
+            if session.job.generated_tokens.is_empty() {
+                return Err(AgentError::Execution(format!(
+                    "Decode segment for session {} cannot start without a sampled prefill token",
+                    request.session_id
+                )));
+            }
+            session.job.clone()
+        };
+        {
+            let mut active = self.active_job.write().await;
+            *active = Some(job_snapshot);
+        }
+
+        let segment_start = Instant::now();
+        let progress_report_interval = request.config.progress_report_interval.max(1);
+        let mut last_reported_completion_tokens = self
+            .sessions
+            .get(&request.session_id)
+            .map(|session| session.job.current_token_idx)
+            .unwrap_or(0);
+
+        loop {
+            let should_stop = {
+                let session = self.sessions.get(&request.session_id).ok_or_else(|| {
+                    AgentError::Execution("decode session vanished during execution".to_string())
+                })?;
+                session.job.is_complete()
+            };
+            if should_stop {
+                break;
+            }
+
+            let next_token = {
+                let session = self.sessions.get(&request.session_id).ok_or_else(|| {
+                    AgentError::Execution(
+                        "decode session vanished before token generation".to_string(),
+                    )
+                })?;
+                if session.job.elapsed() > self.config.job_timeout {
+                    return Err(AgentError::Execution("Inference job timed out".to_string()));
+                }
+                self.generate_next_token_for_session(request.session_id, position)
+                    .await?
+            };
+
+            let current_token_idx = {
+                let checkpoint_snapshot = {
+                    let session = self.sessions.get_mut(&request.session_id).ok_or_else(|| {
+                        AgentError::Execution(
+                            "decode session vanished after token generation".to_string(),
+                        )
+                    })?;
+                    session.job.add_token(next_token);
+                    if self.config.checkpointing_enabled && session.job.should_checkpoint() {
+                        Some(session.job.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(job_snapshot) = checkpoint_snapshot {
+                    self.checkpoint(&job_snapshot).await?;
+                    if let Some(session) = self.sessions.get_mut(&request.session_id) {
+                        session.job.mark_checkpointed();
+                    }
+                }
+                self.sessions
+                    .get(&request.session_id)
+                    .ok_or_else(|| {
+                        AgentError::Execution(
+                            "decode session vanished after token generation".to_string(),
+                        )
+                    })?
+                    .job
+                    .current_token_idx
+            };
+
+            if current_token_idx.saturating_sub(last_reported_completion_tokens)
+                >= progress_report_interval
+            {
+                let kv_cache_seq_len = self
+                    .sessions
+                    .get(&request.session_id)
+                    .map(|session| session.backend.cache_seq_len() as u32);
+                on_progress(InferenceProgressUpdate {
+                    phase: ExecutionPhase::Decode,
+                    completion_tokens: current_token_idx,
+                    execution_time_ms: segment_start.elapsed().as_millis() as u64,
+                    time_to_first_token_ms: None,
+                    kv_cache_seq_len,
+                })
+                .await?;
+                last_reported_completion_tokens = current_token_idx;
+            }
+        }
+
+        let execution_time_ms = segment_start.elapsed().as_millis() as u64;
+        let session = self.sessions.remove(&request.session_id).ok_or_else(|| {
+            AgentError::Execution("decode session vanished before finalization".to_string())
+        })?;
+        let mut result = session.job.into_result();
+        if execution_time_ms > result.execution_time_ms {
+            result.execution_time_ms = execution_time_ms;
+        }
+
+        if result.completion_tokens > last_reported_completion_tokens {
+            on_progress(InferenceProgressUpdate {
+                phase: ExecutionPhase::Decode,
+                completion_tokens: result.completion_tokens,
+                execution_time_ms,
+                time_to_first_token_ms: None,
+                kv_cache_seq_len: None,
+            })
+            .await?;
+        }
+
+        {
+            let mut active = self.active_job.write().await;
+            *active = None;
+        }
+
+        self.stats.record_success(
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.execution_time_ms,
+        );
+        self.record_generation_metrics(request.session_id, execution_time_ms);
+
+        Ok(SegmentExecutionResult::Completed(result))
+    }
+
+    async fn generate_next_token_for_session(
+        &mut self,
+        session_id: Uuid,
+        position: &WorkerPosition,
+    ) -> Result<u32> {
+        let session = self.sessions.get(&session_id).ok_or_else(|| {
+            AgentError::Execution("session missing before decode token generation".to_string())
+        })?;
+        let mut job = session.job.clone();
+        self.generate_next_token(&mut job, position).await
+    }
+
+    fn record_generation_metrics(&self, session_id: Uuid, elapsed_ms: u64) {
+        self.stats.record_allreduce(elapsed_ms);
+        let layer_count = self.config.total_layers;
+        if let Some(session) = self.sessions.get(&session_id) {
+            self.stats
+                .record_allreduce_breakdown(session.backend.last_allreduce_metrics());
+        }
+        for _ in 0..layer_count {
+            self.stats.record_layer();
+        }
+        self.sync_tensor_plane_metrics();
     }
 
     /// Run the coordinator event loop

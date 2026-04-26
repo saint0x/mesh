@@ -141,6 +141,38 @@ impl CheckpointManager {
             .and_then(|checkpoint| checkpoint.sequence_position))
     }
 
+    pub async fn export_latest_checkpoint_bytes(&self, job_id: Uuid) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .load_latest_checkpoint(job_id)
+            .await?
+            .map(|checkpoint| checkpoint.to_cbor())
+            .transpose()
+            .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?)
+    }
+
+    pub async fn import_checkpoint_bytes(&self, bytes: &[u8]) -> Result<CheckpointMetadata> {
+        let checkpoint = Checkpoint::from_cbor(bytes)
+            .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
+        let job_dir = self
+            .config
+            .checkpoint_dir
+            .join(checkpoint.metadata.job_id.to_string());
+        std::fs::create_dir_all(&job_dir)?;
+        let file_path = checkpoint.file_path(&self.config.checkpoint_dir);
+        std::fs::write(&file_path, bytes)?;
+
+        let mut metadata = checkpoint.metadata.clone();
+        metadata.size_bytes = bytes.len() as u64;
+        metadata.data_hash = checkpoint.compute_hash();
+
+        {
+            let mut cache = self.metadata_cache.write().await;
+            cache.push(metadata.clone());
+        }
+
+        Ok(metadata)
+    }
+
     /// List all checkpoints for a job
     pub async fn list_checkpoints(&self, job_id: Uuid) -> Result<Vec<CheckpointMetadata>> {
         let job_dir = self.config.checkpoint_dir.join(job_id.to_string());
@@ -289,10 +321,12 @@ impl CheckpointManager {
 
         let request = CheckpointedRequest {
             job_id: job.request.job_id,
+            session_id: job.request.session_id,
             network_id: job.request.network_id.clone(),
             model_id: job.request.model_id.clone(),
             prompt_tokens: job.request.prompt_tokens.clone(),
             executor_id: job.request.executor_id.clone(),
+            phase: job.request.phase,
         };
 
         let config = CheckpointedConfig {
@@ -389,6 +423,8 @@ impl CheckpointManager {
             model_id: checkpoint.request.model_id,
             prompt_tokens: checkpoint.request.prompt_tokens,
             config,
+            session_id: checkpoint.request.session_id,
+            phase: checkpoint.request.phase,
             executor_id: checkpoint.request.executor_id,
             created_at: checkpoint.metadata.created_at,
         };
@@ -486,6 +522,62 @@ mod tests {
         assert_eq!(restored_job.request.job_id, job_id);
         assert_eq!(restored_job.generated_tokens, vec![100, 101, 102]);
         assert_eq!(restored_job.current_token_idx, 3);
+    }
+
+    #[tokio::test]
+    async fn test_export_and_import_checkpoint_bytes() {
+        let source_dir = TempDir::new().unwrap();
+        let source_manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: source_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            "worker-source".to_string(),
+        )
+        .unwrap();
+        let job = create_test_job();
+        let job_id = job.request.job_id;
+
+        source_manager
+            .save_checkpoint(&job, None, Some(3))
+            .await
+            .unwrap();
+        let bytes = source_manager
+            .export_latest_checkpoint_bytes(job_id)
+            .await
+            .unwrap()
+            .expect("expected exported checkpoint bytes");
+
+        let target_dir = TempDir::new().unwrap();
+        let target_manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: target_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            "worker-target".to_string(),
+        )
+        .unwrap();
+
+        let imported = target_manager
+            .import_checkpoint_bytes(&bytes)
+            .await
+            .unwrap();
+        assert_eq!(imported.job_id, job_id);
+
+        let restored = target_manager
+            .load_checkpoint(job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.request.session_id, job.request.session_id);
+        assert_eq!(restored.generated_tokens, vec![100, 101, 102]);
+        assert_eq!(
+            target_manager
+                .load_checkpoint_sequence_position(job_id)
+                .await
+                .unwrap(),
+            Some(3)
+        );
     }
 
     #[tokio::test]

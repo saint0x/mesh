@@ -262,6 +262,36 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
                     "reported_completion_tokens",
                 )?
         }
+        "014_add_execution_plan_to_inference_jobs.sql" => {
+            column_exists(conn, "inference_jobs", "execution_plan_json")?
+        }
+        "015_add_phase_timing_to_inference_jobs.sql" => {
+            column_exists(conn, "inference_jobs", "time_to_first_token_ms")?
+                && column_exists(conn, "inference_jobs", "prefill_completed_at")?
+        }
+        "016_add_active_segment_to_inference_jobs.sql" => {
+            column_exists(conn, "inference_jobs", "active_segment_id")?
+        }
+        "017_add_assignment_segment_lifecycle.sql" => {
+            column_exists(conn, "inference_job_assignments", "active_segment_id")?
+                && column_exists(
+                    conn,
+                    "inference_job_assignments",
+                    "last_completed_segment_id",
+                )?
+                && column_exists(conn, "inference_job_assignments", "segment_completed_at")?
+        }
+        "018_create_inference_sessions.sql" => table_exists(conn, "inference_sessions")?,
+        "019_create_inference_session_replicas.sql" => {
+            table_exists(conn, "inference_session_replicas")?
+        }
+        "020_create_inference_session_checkpoints.sql" => {
+            table_exists(conn, "inference_session_checkpoints")?
+        }
+        "021_create_inference_serving_groups.sql" => {
+            table_exists(conn, "inference_serving_groups")?
+        }
+        "022_create_inference_decode_queue.sql" => table_exists(conn, "inference_decode_queue")?,
         _ => false,
     })
 }

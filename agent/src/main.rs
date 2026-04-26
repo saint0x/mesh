@@ -40,7 +40,8 @@ use agent::pki::{
 };
 use agent::{
     api::types::{
-        PeerPunchPlan, ReportInferenceAssignmentProgressRequest, RingTopologyResponse, WorkerInfo,
+        ExecutionGroupMember, InferenceExecutionLease, PeerPunchPlan, ProgressEventKind,
+        ReportInferenceAssignmentProgressRequest, RingTopologyResponse, WorkerInfo,
     },
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
@@ -694,6 +695,59 @@ fn build_worker_position_from_topology(
     })
 }
 
+fn assigned_member<'a>(
+    lease: &'a InferenceExecutionLease,
+    device_id: &Uuid,
+) -> Result<&'a ExecutionGroupMember> {
+    let active_group = lease
+        .execution_plan
+        .execution_groups
+        .iter()
+        .find(|group| group.group_id == lease.active_segment.execution_group_id)
+        .context("Active execution group missing from execution lease")?;
+    active_group
+        .members
+        .iter()
+        .find(|member| member.device_id == device_id.to_string())
+        .context("Current worker missing from execution lease")
+}
+
+fn active_group<'a>(
+    lease: &'a InferenceExecutionLease,
+) -> Result<&'a agent::api::types::ExecutionGroup> {
+    lease
+        .execution_plan
+        .execution_groups
+        .iter()
+        .find(|group| group.group_id == lease.active_segment.execution_group_id)
+        .context("Active execution group missing from execution lease")
+}
+
+fn topology_from_execution_lease(lease: &InferenceExecutionLease) -> RingTopologyResponse {
+    let group = active_group(lease).expect("active execution group should exist");
+    RingTopologyResponse {
+        workers: group
+            .members
+            .iter()
+            .map(|member| WorkerInfo {
+                device_id: member.device_id.clone(),
+                peer_id: member.peer_id.clone(),
+                position: member.ring_position,
+                status: member.status.clone(),
+                contributed_memory: member.contributed_memory,
+                shard: member.shard.clone(),
+                left_neighbor: member.left_neighbor.clone(),
+                right_neighbor: member.right_neighbor.clone(),
+                connectivity_state: member.connectivity_state.clone(),
+                listen_addrs: member.listen_addrs.clone(),
+                direct_candidates: member.direct_candidates.clone(),
+            })
+            .collect(),
+        ring_stable: true,
+        peer_punch_plans: group.peer_punch_plans.clone(),
+    }
+}
+
 fn find_peer_punch_plan(
     topology: &RingTopologyResponse,
     source_device_id: &Uuid,
@@ -797,6 +851,7 @@ struct InferenceJobStatusResponse {
     completion: Option<String>,
     completion_tokens: u32,
     execution_time_ms: u64,
+    time_to_first_token_ms: Option<u64>,
     reserved_credits: f64,
     settled_credits: f64,
     released_credits: f64,
@@ -1239,6 +1294,7 @@ async fn cmd_runtime() -> Result<()> {
     let inference_config_task = config.clone();
     let runtime_endpoint_clone = runtime_endpoint.clone();
     tokio::spawn(async move {
+        use agent::checkpoint::{CheckpointConfig, CheckpointManager};
         use agent::inference::coordinator::{InferenceConfig, InferenceCoordinator};
         use agent::inference::job::{GenerationConfig, InferenceRequest};
         use uuid::Uuid;
@@ -1373,8 +1429,23 @@ async fn cmd_runtime() -> Result<()> {
             );
         }
 
+        let checkpoint_manager = match CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: inference_runtime_config.checkpoint_dir.clone(),
+                ..CheckpointConfig::default()
+            },
+            device_id.to_string(),
+        ) {
+            Ok(manager) => std::sync::Arc::new(manager),
+            Err(e) => {
+                error!(error = %e, "Failed to initialize checkpoint manager");
+                return;
+            }
+        };
+
         let mut coordinator =
-            InferenceCoordinator::new(inference_swarm, tensor_plane, inference_runtime_config);
+            InferenceCoordinator::new(inference_swarm, tensor_plane, inference_runtime_config)
+                .with_checkpoint_manager(checkpoint_manager);
 
         info!("Inference coordinator initialized - starting assignment loop");
 
@@ -1445,43 +1516,42 @@ async fn cmd_runtime() -> Result<()> {
                 }
             };
 
+            let lease_member = match assigned_member(&assignment, &device_id) {
+                Ok(member) => member,
+                Err(e) => {
+                    error!(job_id = %job_id, error = %e, "Lease did not include current worker");
+                    continue;
+                }
+            };
+
             info!(
                 job_id = %job_id,
-                assignment_id = %assignment.assignment_id,
+                lease_id = %assignment.lease_id,
+                ring_position = lease_member.ring_position,
                 model = %assignment.model_id,
-                prompt_len = assignment.prompt_tokens.len(),
-                requested_max_tokens = assignment.max_tokens,
+                phase = ?assignment.active_segment.phase,
+                session_status = %assignment.session.status,
+                session_kv_owner = %assignment.session.kv_owner_device_id,
+                session_kv_seq = ?assignment.session.kv_sequence_position,
+                prompt_len = assignment.active_segment.prompt_tokens.len(),
+                requested_max_tokens = assignment.active_segment.max_tokens,
                 allowed_completion_tokens = assignment.available_completion_tokens,
                 reserved_credits = assignment.reserved_credits,
                 "Claimed distributed inference assignment"
             );
 
-            match reqwest::Client::new()
-                .get(&topology_url)
-                .send()
-                .await
-                .and_then(|response| response.error_for_status())
-            {
-                Ok(response) => match response.json::<RingTopologyResponse>().await {
-                    Ok(topology) => {
-                        match build_worker_position_from_topology(&topology, &device_id) {
-                            Ok(position) => {
-                                if let Err(e) = coordinator.join_ring(position.clone()) {
-                                    error!(error = %e, "Failed to refresh ring position from topology");
-                                } else {
-                                    ring_position = Some(position);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to build worker position for assignment")
-                            }
-                        }
+            let lease_topology = topology_from_execution_lease(&assignment);
+            match build_worker_position_from_topology(&lease_topology, &device_id) {
+                Ok(position) => {
+                    if let Err(e) = coordinator.join_ring(position.clone()) {
+                        error!(error = %e, "Failed to apply ring position from execution lease");
+                    } else {
+                        ring_position = Some(position);
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to parse topology during assignment refresh")
-                    }
-                },
-                Err(e) => warn!(error = %e, "Failed to refresh topology during assignment"),
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to build worker position from execution lease")
+                }
             }
 
             if ring_position.is_none() {
@@ -1491,10 +1561,13 @@ async fn cmd_runtime() -> Result<()> {
                         job_id,
                         agent::api::types::ReportInferenceAssignmentRequest {
                             device_id: device_id.to_string(),
+                            segment_id: assignment.active_segment.segment_id.clone(),
                             success: false,
                             completion: None,
                             completion_tokens: None,
                             execution_time_ms: 0,
+                            time_to_first_token_ms: None,
+                            kv_cache_seq_len: None,
                             error: Some("worker not in ring topology".to_string()),
                         },
                     )
@@ -1514,14 +1587,24 @@ async fn cmd_runtime() -> Result<()> {
                 job_id,
                 network_id: assignment.network_id.clone(),
                 model_id: assignment.model_id.clone(),
-                prompt_tokens: assignment.prompt_tokens.clone(),
+                prompt_tokens: assignment.active_segment.prompt_tokens.clone(),
                 config: GenerationConfig {
                     max_tokens: assignment
                         .available_completion_tokens
-                        .min(assignment.max_tokens),
-                    temperature: assignment.temperature,
-                    top_p: assignment.top_p,
+                        .min(assignment.active_segment.max_tokens),
+                    temperature: assignment.active_segment.temperature,
+                    top_p: assignment.active_segment.top_p,
                     ..Default::default()
+                },
+                session_id: Uuid::parse_str(&assignment.active_segment.session_id)
+                    .unwrap_or(job_id),
+                phase: match assignment.active_segment.phase {
+                    agent::api::types::ExecutionPhase::Prefill => {
+                        agent::inference::ExecutionPhase::Prefill
+                    }
+                    agent::api::types::ExecutionPhase::Decode => {
+                        agent::inference::ExecutionPhase::Decode
+                    }
                 },
                 executor_id: device_id.to_string(),
                 created_at: std::time::SystemTime::now()
@@ -1529,19 +1612,141 @@ async fn cmd_runtime() -> Result<()> {
                     .unwrap()
                     .as_secs(),
             };
+            let active_segment_id = assignment.active_segment.segment_id.clone();
+            let local_replica = assignment.session.local_replica.clone();
+            let session_checkpoint = assignment.session.checkpoint.clone();
+
+            if matches!(
+                assignment.active_segment.phase,
+                agent::api::types::ExecutionPhase::Decode
+            ) {
+                let decode_ready = local_replica
+                    .as_ref()
+                    .map(|replica| {
+                        matches!(replica.status.as_str(), "decode_ready" | "decode_active")
+                            && replica.kv_sequence_position.is_some()
+                    })
+                    .unwrap_or(false);
+                if !decode_ready {
+                    error!(
+                        job_id = %job_id,
+                        segment_id = %active_segment_id,
+                        replica_status = ?local_replica.as_ref().map(|r| r.status.as_str()),
+                        replica_kv_seq = ?local_replica.as_ref().and_then(|r| r.kv_sequence_position),
+                        "Decode lease rejected because local replica is not resume-ready"
+                    );
+                    let _ = registration_client
+                        .report_inference_result(
+                            job_id,
+                            agent::api::types::ReportInferenceAssignmentRequest {
+                                device_id: device_id.to_string(),
+                                segment_id: active_segment_id.clone(),
+                                success: false,
+                                completion: None,
+                                completion_tokens: None,
+                                execution_time_ms: 0,
+                                time_to_first_token_ms: None,
+                                kv_cache_seq_len: None,
+                                error: Some(
+                                    "decode lease missing local resume-ready KV replica"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .await;
+                    continue;
+                }
+            }
+
+            if matches!(
+                assignment.active_segment.phase,
+                agent::api::types::ExecutionPhase::Decode
+            ) && !coordinator.has_session(request.session_id)
+            {
+                if let Some(checkpoint) = session_checkpoint.as_ref() {
+                    if checkpoint.source_device_id != device_id.to_string() {
+                        match registration_client
+                            .download_inference_session_checkpoint(job_id, request.session_id)
+                            .await
+                        {
+                            Ok(Some(bytes)) => {
+                                let Some(manager) = coordinator.checkpoint_manager() else {
+                                    error!(
+                                        job_id = %job_id,
+                                        session_id = %request.session_id,
+                                        "Checkpoint manager missing before remote decode import"
+                                    );
+                                    continue;
+                                };
+                                if let Err(e) = manager.import_checkpoint_bytes(&bytes).await {
+                                    error!(
+                                        job_id = %job_id,
+                                        session_id = %request.session_id,
+                                        error = %e,
+                                        "Failed to import remote session checkpoint before decode"
+                                    );
+                                } else {
+                                    info!(
+                                        job_id = %job_id,
+                                        session_id = %request.session_id,
+                                        checkpoint_id = %checkpoint.checkpoint_id,
+                                        source_device_id = %checkpoint.source_device_id,
+                                        "Imported remote session checkpoint before decode"
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    job_id = %job_id,
+                                    session_id = %request.session_id,
+                                    "Decode lease referenced remote checkpoint but no payload was available yet"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    job_id = %job_id,
+                                    session_id = %request.session_id,
+                                    error = %e,
+                                    "Failed to download remote session checkpoint before decode"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             match coordinator
-                .process_inference_with_progress(request, |completion_tokens, execution_time_ms| {
+                .process_segment_with_progress(request, |progress| {
                     let registration_client = registration_client.clone();
                     let device_id = device_id;
+                    let segment_id = active_segment_id.clone();
+                    let segment_id_for_request = segment_id.clone();
                     async move {
                         registration_client
                             .report_inference_progress(
                                 job_id,
                                 ReportInferenceAssignmentProgressRequest {
                                     device_id: device_id.to_string(),
-                                    completion_tokens,
-                                    execution_time_ms,
+                                    segment_id: segment_id_for_request,
+                                    phase: match progress.phase {
+                                        agent::inference::ExecutionPhase::Prefill => {
+                                            agent::api::types::ExecutionPhase::Prefill
+                                        }
+                                        agent::inference::ExecutionPhase::Decode => {
+                                            agent::api::types::ExecutionPhase::Decode
+                                        }
+                                    },
+                                    event: if progress.phase
+                                        == agent::inference::ExecutionPhase::Prefill
+                                    {
+                                        ProgressEventKind::PrefillComplete
+                                    } else {
+                                        ProgressEventKind::DecodeProgress
+                                    },
+                                    completion_tokens: progress.completion_tokens,
+                                    execution_time_ms: progress.execution_time_ms,
+                                    time_to_first_token_ms: progress.time_to_first_token_ms,
+                                    kv_cache_seq_len: progress.kv_cache_seq_len,
                                 },
                             )
                             .await
@@ -1549,7 +1754,61 @@ async fn cmd_runtime() -> Result<()> {
                 })
                 .await
             {
-                Ok(result) => {
+                Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
+                    kv_cache_seq_len,
+                    ..
+                }) => {
+                    if !matches!(
+                        assignment.session.kv_transfer_policy,
+                        agent::api::types::KvTransferPolicy::CoLocated
+                    ) {
+                        match coordinator
+                            .export_session_checkpoint_bytes(
+                                Uuid::parse_str(&assignment.active_segment.session_id)
+                                    .unwrap_or(job_id),
+                            )
+                            .await
+                        {
+                            Ok(bytes) => {
+                                if let Err(e) = registration_client
+                                    .upload_inference_session_checkpoint(
+                                        job_id,
+                                        agent::api::types::UploadInferenceSessionCheckpointRequest {
+                                            device_id: device_id.to_string(),
+                                            session_id: assignment.active_segment.session_id.clone(),
+                                            segment_id: active_segment_id.clone(),
+                                            phase: agent::api::types::ExecutionPhase::Prefill,
+                                            kv_sequence_position: kv_cache_seq_len,
+                                            checkpoint_hex: hex::encode(bytes),
+                                        },
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        job_id = %job_id,
+                                        segment_id = %active_segment_id,
+                                        error = %e,
+                                        "Failed to upload prefill session checkpoint"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    job_id = %job_id,
+                                    segment_id = %active_segment_id,
+                                    error = %e,
+                                    "Failed to export prefill session checkpoint"
+                                );
+                            }
+                        }
+                    }
+                    info!(
+                        job_id = %job_id,
+                        segment_id = %active_segment_id,
+                        "Prefill segment completed and session retained for decode handoff"
+                    );
+                }
+                Ok(agent::inference::SegmentExecutionResult::Completed(result)) => {
                     let completion = result.generated_tokens.as_ref().and_then(|tokens| {
                         match agent::model_assets::decode_tokens(&assignment.model_id, tokens) {
                             Ok(text) => Some(text),
@@ -1570,10 +1829,13 @@ async fn cmd_runtime() -> Result<()> {
                             job_id,
                             agent::api::types::ReportInferenceAssignmentRequest {
                                 device_id: device_id.to_string(),
+                                segment_id: active_segment_id.clone(),
                                 success: result.success,
                                 completion,
                                 completion_tokens: Some(result.completion_tokens),
                                 execution_time_ms: result.execution_time_ms,
+                                time_to_first_token_ms: result.time_to_first_token_ms,
+                                kv_cache_seq_len: None,
                                 error: result.error.clone(),
                             },
                         )
@@ -1589,10 +1851,13 @@ async fn cmd_runtime() -> Result<()> {
                             job_id,
                             agent::api::types::ReportInferenceAssignmentRequest {
                                 device_id: device_id.to_string(),
+                                segment_id: active_segment_id.clone(),
                                 success: false,
                                 completion: None,
                                 completion_tokens: None,
                                 execution_time_ms: 0,
+                                time_to_first_token_ms: None,
+                                kv_cache_seq_len: None,
                                 error: Some(e.to_string()),
                             },
                         )
@@ -2343,6 +2608,9 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
     println!("  Status:          {}", status.status);
     println!("  Tokens:          {}", status.completion_tokens);
     println!("  Execution Time:  {}ms", status.execution_time_ms);
+    if let Some(ttft) = status.time_to_first_token_ms {
+        println!("  TTFT:            {}ms", ttft);
+    }
     println!("  Reserved Credits:{:.3}", status.reserved_credits);
     println!("  Settled Credits: {:.3}", status.settled_credits);
     println!("  Released Credits:{:.3}", status.released_credits);

@@ -42,7 +42,9 @@
 //! - [`artifact_loader`]: Verified safetensors shard loading
 
 pub mod artifact_loader;
+pub mod backend;
 pub mod coordinator;
+pub mod engine;
 pub mod forward_pass;
 pub mod job;
 pub mod kv_cache;
@@ -50,9 +52,17 @@ pub mod stats;
 pub mod tensor_ops;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
+pub use backend::{CandleExecutionBackend, ExecutionBackend};
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
+pub use engine::{
+    BackendInstanceSpec, EngineSessionState, ExecutionPhase, KvTransferPolicy, SessionAssignment,
+    TransportCapabilityTier,
+};
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
-pub use job::{GenerationConfig, InferenceJob, InferenceRequest, InferenceResult};
+pub use job::{
+    GenerationConfig, InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
+    SegmentExecutionResult,
+};
 pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};
 pub use stats::InferenceStats;
 pub use tensor_ops::{Tensor1D, Tensor2D};

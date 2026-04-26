@@ -70,6 +70,14 @@ pub fn create_router(state: AppState) -> Router {
             post(inference::report_inference_progress),
         )
         .route(
+            "/api/inference/jobs/:job_id/session-checkpoints",
+            post(inference::upload_inference_session_checkpoint),
+        )
+        .route(
+            "/api/inference/jobs/:job_id/session-checkpoints/:session_id",
+            get(inference::download_inference_session_checkpoint),
+        )
+        .route(
             "/api/inference/jobs/:job_id",
             get(inference::get_inference_job_status).delete(inference::cancel_inference_job),
         )

@@ -347,6 +347,109 @@ pub struct TopologyVersionResponse {
 
 // ==================== Distributed Inference API Types ====================
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceRuntimeMode {
+    FitFirst,
+    ThroughputFirst,
+    LatencyFirst,
+    ResilientEdge,
+}
+
+impl Default for InferenceRuntimeMode {
+    fn default() -> Self {
+        Self::ThroughputFirst
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    Prefill,
+    Decode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressEventKind {
+    PrefillComplete,
+    DecodeProgress,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvTransferPolicy {
+    CoLocated,
+    ExportOnHandoff,
+    RemoteAccess,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportCapabilityTier {
+    RelayFallback,
+    DirectTcp,
+    DirectPreferred,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionGroupMember {
+    pub device_id: String,
+    pub peer_id: String,
+    pub ring_position: u32,
+    pub status: String,
+    pub contributed_memory: u64,
+    pub shard: ShardInfo,
+    pub left_neighbor: String,
+    pub right_neighbor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectivity_state: Option<DeviceConnectivityState>,
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub direct_candidates: Vec<DirectPeerCandidate>,
+    pub assigned_capacity_units: u32,
+    pub execution_provider: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionGroup {
+    pub group_id: String,
+    pub model_id: String,
+    pub phase: ExecutionPhase,
+    pub transport_tier: TransportCapabilityTier,
+    pub kv_transfer_policy: KvTransferPolicy,
+    pub total_capacity_units: u32,
+    pub members: Vec<ExecutionGroupMember>,
+    #[serde(default)]
+    pub peer_punch_plans: Vec<PeerPunchPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionSegment {
+    pub segment_id: String,
+    pub session_id: String,
+    pub execution_group_id: String,
+    pub phase: ExecutionPhase,
+    pub prompt_tokens: Vec<u32>,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub kv_owner_device_id: String,
+    pub shard_owner_device_ids: Vec<String>,
+    pub participant_device_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceExecutionPlan {
+    pub plan_id: String,
+    #[serde(default)]
+    pub runtime_mode: InferenceRuntimeMode,
+    pub execution_groups: Vec<ExecutionGroup>,
+    pub segments: Vec<ExecutionSegment>,
+    pub initial_segment_id: String,
+}
+
 /// Request to submit a distributed inference job
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitInferenceRequest {
@@ -383,27 +486,27 @@ pub struct SubmitInferenceResponse {
     pub reserved_credits: f64,
     /// Model-normalized completion token ceiling enforced for this job
     pub available_completion_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_plan: Option<InferenceExecutionPlan>,
     /// Error message if failed
     pub error: Option<String>,
 }
 
-/// Worker assignment for a distributed inference job
+/// Worker execution lease for a distributed inference job
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceAssignment {
-    pub assignment_id: String,
+pub struct InferenceExecutionLease {
+    pub lease_id: String,
     pub job_id: String,
     pub network_id: String,
     pub device_id: String,
-    pub ring_position: u32,
     pub model_id: String,
-    pub prompt_tokens: Vec<u32>,
-    pub max_tokens: u32,
-    pub temperature: f32,
-    pub top_p: f32,
     pub reserved_credits: f64,
     pub available_completion_tokens: u32,
     pub model_size_factor: f64,
     pub lease_expires_at: String,
+    pub execution_plan: InferenceExecutionPlan,
+    pub active_segment: ExecutionSegment,
+    pub session: InferenceSessionLease,
 }
 
 /// Request for a worker to claim its next assignment
@@ -417,7 +520,7 @@ pub struct ClaimInferenceAssignmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimInferenceAssignmentResponse {
     pub success: bool,
-    pub assignment: Option<InferenceAssignment>,
+    pub assignment: Option<InferenceExecutionLease>,
 }
 
 /// Request to acknowledge worker execution start
@@ -430,10 +533,15 @@ pub struct AcknowledgeInferenceAssignmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportInferenceAssignmentRequest {
     pub device_id: String,
+    pub segment_id: String,
     pub success: bool,
     pub completion: Option<String>,
     pub completion_tokens: Option<u32>,
     pub execution_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache_seq_len: Option<u32>,
     pub error: Option<String>,
 }
 
@@ -441,8 +549,109 @@ pub struct ReportInferenceAssignmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportInferenceAssignmentProgressRequest {
     pub device_id: String,
+    pub segment_id: String,
+    pub phase: ExecutionPhase,
+    pub event: ProgressEventKind,
     pub completion_tokens: u32,
     pub execution_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache_seq_len: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSessionStatus {
+    pub session_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_checkpoint_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_checkpoint_created_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(default)]
+    pub replicas: Vec<InferenceSessionReplicaStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSessionLease {
+    pub session_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_checkpoint_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_checkpoint_created_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_replica: Option<InferenceSessionReplicaStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSessionCheckpointStatus {
+    pub checkpoint_id: String,
+    pub source_device_id: String,
+    pub source_segment_id: String,
+    pub phase: ExecutionPhase,
+    pub kv_sequence_position: u32,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSessionReplicaStatus {
+    pub device_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_created_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadInferenceSessionCheckpointRequest {
+    pub device_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    pub phase: ExecutionPhase,
+    pub kv_sequence_position: u32,
+    pub checkpoint_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadInferenceSessionCheckpointResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<InferenceSessionCheckpointPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSessionCheckpointPayload {
+    pub metadata: InferenceSessionCheckpointStatus,
+    pub checkpoint_hex: String,
 }
 
 /// Response describing a submitted inference job
@@ -456,6 +665,10 @@ pub struct InferenceJobStatusResponse {
     pub completion: Option<String>,
     pub completion_tokens: u32,
     pub execution_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
     pub reserved_credits: f64,
     pub settled_credits: f64,
     pub released_credits: f64,
@@ -463,6 +676,10 @@ pub struct InferenceJobStatusResponse {
     pub model_size_factor: f64,
     pub error: Option<String>,
     pub assignments: Vec<InferenceJobAssignmentStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_plan: Option<InferenceExecutionPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<InferenceSessionStatus>,
 }
 
 /// Assignment status inside a job status response

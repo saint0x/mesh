@@ -1,8 +1,9 @@
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
-    ClaimInferenceAssignmentResponse, HeartbeatRequest, HeartbeatResponse, InferenceAssignment,
-    RegisterDeviceRequest, RegisterDeviceResponse, ReportInferenceAssignmentProgressRequest,
-    ReportInferenceAssignmentRequest,
+    ClaimInferenceAssignmentResponse, DownloadInferenceSessionCheckpointResponse, HeartbeatRequest,
+    HeartbeatResponse, InferenceExecutionLease, RegisterDeviceRequest, RegisterDeviceResponse,
+    ReportInferenceAssignmentProgressRequest, ReportInferenceAssignmentRequest,
+    UploadInferenceSessionCheckpointRequest,
 };
 use crate::connectivity::{
     build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
@@ -252,7 +253,7 @@ impl RegistrationClient {
         &self,
         device_id: Uuid,
         network_id: &str,
-    ) -> Result<Option<InferenceAssignment>> {
+    ) -> Result<Option<InferenceExecutionLease>> {
         let url = format!("{}/api/inference/assignments/claim", self.control_plane_url);
         let response = self
             .client
@@ -380,6 +381,84 @@ impl RegistrationClient {
         }
 
         Ok(())
+    }
+
+    pub async fn upload_inference_session_checkpoint(
+        &self,
+        job_id: Uuid,
+        request: UploadInferenceSessionCheckpointRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-checkpoints",
+            self.control_plane_url, job_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("Session checkpoint upload failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Session checkpoint upload failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn download_inference_session_checkpoint(
+        &self,
+        job_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<Option<Vec<u8>>> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-checkpoints/{}",
+            self.control_plane_url, job_id, session_id
+        );
+        let response =
+            self.client.get(&url).send().await.map_err(|e| {
+                AgentError::Http(format!("Session checkpoint download failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Session checkpoint download failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        let body: DownloadInferenceSessionCheckpointResponse =
+            response.json().await.map_err(|e| {
+                AgentError::Serialization(format!(
+                    "Failed to parse session checkpoint download: {}",
+                    e
+                ))
+            })?;
+
+        body.checkpoint
+            .map(|checkpoint| {
+                hex::decode(checkpoint.checkpoint_hex).map_err(|e| {
+                    AgentError::Serialization(format!(
+                        "Downloaded session checkpoint had invalid hex payload: {}",
+                        e
+                    ))
+                })
+            })
+            .transpose()
     }
 }
 
