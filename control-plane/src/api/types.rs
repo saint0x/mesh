@@ -1293,6 +1293,25 @@ pub struct SchedulerBatchMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_batch_kv_tokens: Option<u32>,
     pub deferred_decode_sessions: u32,
+    pub kv_residency_slice_count: u32,
+    pub remote_kv_residency_slice_count: u32,
+    pub pinned_kv_residency_slice_count: u32,
+    pub evictable_kv_residency_slice_count: u32,
+    pub kv_cached_tokens: u64,
+    pub kv_payload_bytes: u64,
+    pub kv_transfer_count: u32,
+    pub active_kv_transfer_count: u32,
+    pub kv_transfer_bytes_total: u64,
+    pub kv_transfer_bytes_transferred: u64,
+    pub checkpoint_fallback_transfer_count: u32,
+    pub checkpoint_fallback_rate: f64,
+    pub recent_regroup_event_count: u32,
+    pub recent_regroup_failure_count: u32,
+    pub recent_recovery_sample_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_avg_recovery_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_peak_recovery_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "name": "observability-operations",
+  "steps": [
+    {
+      "name": "network scheduler status exposes kv transfer regroup and recovery metrics",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_network_scheduler_status_exposes_queue_groups_and_kv_residency",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "job scheduler status exposes lease and observability metrics",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_job_scheduler_status_tracks_regroup_and_leases",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

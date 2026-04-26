@@ -506,7 +506,18 @@ impl Database {
         require_network_exists(&conn, network_id)?;
         reconcile_kv_tracking_state(&conn)?;
         let decode_queue = load_decode_queue_entries(&conn, network_id, None)?;
-        let metrics = load_scheduler_batch_metrics(&conn, network_id, None, &decode_queue)?;
+        let kv_residency = load_kv_residency_summaries(&conn, network_id, None)?;
+        let regroup_events = load_regroup_events(&conn, network_id, None)?;
+        let scheduler_events = load_scheduler_events(&conn, network_id, None)?;
+        let metrics = load_scheduler_batch_metrics(
+            &conn,
+            network_id,
+            None,
+            &decode_queue,
+            &kv_residency,
+            &regroup_events,
+            &scheduler_events,
+        )?;
 
         Ok(NetworkSchedulerStatusResponse {
             success: true,
@@ -515,9 +526,9 @@ impl Database {
             metrics,
             decode_queue,
             serving_groups: load_serving_group_snapshots(&conn, network_id, None)?,
-            kv_residency: load_kv_residency_summaries(&conn, network_id, None)?,
-            regroup_events: load_regroup_events(&conn, network_id, None)?,
-            scheduler_events: load_scheduler_events(&conn, network_id, None)?,
+            kv_residency,
+            regroup_events,
+            scheduler_events,
         })
     }
 
@@ -546,8 +557,18 @@ impl Database {
             .optional()?
             .ok_or_else(|| DbError::NotFound(format!("Inference job not found: {}", job_id)))?;
         let decode_queue = load_decode_queue_entries(&conn, &network_id, Some(job_id))?;
-        let metrics =
-            load_scheduler_batch_metrics(&conn, &network_id, Some(job_id), &decode_queue)?;
+        let kv_residency = load_kv_residency_summaries(&conn, &network_id, Some(job_id))?;
+        let regroup_events = load_regroup_events(&conn, &network_id, Some(job_id))?;
+        let scheduler_events = load_scheduler_events(&conn, &network_id, Some(job_id))?;
+        let metrics = load_scheduler_batch_metrics(
+            &conn,
+            &network_id,
+            Some(job_id),
+            &decode_queue,
+            &kv_residency,
+            &regroup_events,
+            &scheduler_events,
+        )?;
 
         Ok(JobSchedulerStatusResponse {
             success: true,
@@ -561,9 +582,9 @@ impl Database {
             metrics,
             decode_queue,
             serving_groups: load_serving_group_snapshots(&conn, &network_id, Some(job_id))?,
-            kv_residency: load_kv_residency_summaries(&conn, &network_id, Some(job_id))?,
-            regroup_events: load_regroup_events(&conn, &network_id, Some(job_id))?,
-            scheduler_events: load_scheduler_events(&conn, &network_id, Some(job_id))?,
+            kv_residency,
+            regroup_events,
+            scheduler_events,
         })
     }
 }
@@ -1105,6 +1126,9 @@ fn load_scheduler_batch_metrics(
     network_id: &str,
     job_id: Option<&str>,
     decode_queue: &[DecodeQueueEntryStatus],
+    kv_residency: &[KvResidencySummary],
+    _regroup_events: &[RegroupEventStatus],
+    scheduler_events: &[SchedulerEventStatus],
 ) -> Result<SchedulerBatchMetrics> {
     let mut runnable_sessions = 0_u32;
     let mut blocked_sessions = 0_u32;
@@ -1192,6 +1216,69 @@ fn load_scheduler_batch_metrics(
         )?
     };
 
+    let mut kv_residency_slice_count = 0_u32;
+    let mut remote_kv_residency_slice_count = 0_u32;
+    let mut pinned_kv_residency_slice_count = 0_u32;
+    let mut evictable_kv_residency_slice_count = 0_u32;
+    let mut kv_cached_tokens = 0_u64;
+    let mut kv_payload_bytes = 0_u64;
+    let mut kv_transfer_count = 0_u32;
+    let mut active_kv_transfer_count = 0_u32;
+    let mut kv_transfer_bytes_total = 0_u64;
+    let mut kv_transfer_bytes_transferred = 0_u64;
+    let mut checkpoint_fallback_transfer_count = 0_u32;
+
+    for summary in kv_residency {
+        for slice in &summary.residency_slices {
+            kv_residency_slice_count += 1;
+            if matches!(slice.residency_kind, KvResidencyKind::RemoteReference) {
+                remote_kv_residency_slice_count += 1;
+            }
+            if slice.pinned_for_decode {
+                pinned_kv_residency_slice_count += 1;
+            }
+            if slice.eviction_eligible {
+                evictable_kv_residency_slice_count += 1;
+            }
+            kv_cached_tokens += u64::from(slice.cached_tokens.unwrap_or(0));
+            kv_payload_bytes += slice.payload_size_bytes.unwrap_or(0);
+        }
+        for transfer in &summary.transfers {
+            kv_transfer_count += 1;
+            if transfer.status != "completed"
+                && transfer.status != "failed"
+                && transfer.status != "cancelled"
+            {
+                active_kv_transfer_count += 1;
+            }
+            kv_transfer_bytes_total += transfer.bytes_total.unwrap_or(0);
+            kv_transfer_bytes_transferred += transfer.bytes_transferred.unwrap_or(0);
+            if transfer.transfer_kind.contains("checkpoint") {
+                checkpoint_fallback_transfer_count += 1;
+            }
+        }
+    }
+
+    let checkpoint_fallback_rate = if kv_transfer_count == 0 {
+        0.0
+    } else {
+        checkpoint_fallback_transfer_count as f64 / kv_transfer_count as f64
+    };
+
+    let recent_regroup_event_count = scheduler_events
+        .iter()
+        .filter(|event| event.event_kind.starts_with("decode_regroup_"))
+        .count() as u32;
+    let recent_regroup_failure_count = scheduler_events
+        .iter()
+        .filter(|event| event.event_kind == "decode_regroup_failed")
+        .count() as u32;
+    let (
+        recent_recovery_sample_count,
+        recent_avg_recovery_latency_ms,
+        recent_peak_recovery_latency_ms,
+    ) = compute_recent_recovery_latency_metrics(conn, network_id, job_id)?;
+
     Ok(SchedulerBatchMetrics {
         decode_queue_depth: decode_queue.len() as u32,
         runnable_sessions,
@@ -1205,7 +1292,122 @@ fn load_scheduler_batch_metrics(
         peak_active_decode_sessions: telemetry.2,
         peak_batch_kv_tokens: telemetry.3,
         deferred_decode_sessions: telemetry.4,
+        kv_residency_slice_count,
+        remote_kv_residency_slice_count,
+        pinned_kv_residency_slice_count,
+        evictable_kv_residency_slice_count,
+        kv_cached_tokens,
+        kv_payload_bytes,
+        kv_transfer_count,
+        active_kv_transfer_count,
+        kv_transfer_bytes_total,
+        kv_transfer_bytes_transferred,
+        checkpoint_fallback_transfer_count,
+        checkpoint_fallback_rate,
+        recent_regroup_event_count,
+        recent_regroup_failure_count,
+        recent_recovery_sample_count,
+        recent_avg_recovery_latency_ms,
+        recent_peak_recovery_latency_ms,
     })
+}
+
+fn compute_recent_recovery_latency_metrics(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<(u32, Option<u64>, Option<u64>)> {
+    if let Some(job_id) = job_id {
+        conn.query_row(
+            r#"
+            WITH regroup_starts AS (
+                SELECT session_id, created_at
+                FROM inference_scheduler_events
+                WHERE network_id = ?1
+                  AND job_id = ?2
+                  AND event_kind LIKE 'decode_regroup_%'
+                  AND event_kind != 'decode_regroup_failed'
+                  AND session_id IS NOT NULL
+            ),
+            recoveries AS (
+                SELECT
+                    starts.session_id,
+                    starts.created_at AS started_at,
+                    MIN(events.created_at) AS recovered_at
+                FROM regroup_starts starts
+                JOIN inference_scheduler_events events
+                  ON events.network_id = ?1
+                 AND events.job_id = ?2
+                 AND events.session_id = starts.session_id
+                 AND events.created_at > starts.created_at
+                 AND (
+                        events.event_kind IN ('decode_queue_ready', 'decode_queue_unblocked', 'decode_claimed')
+                     OR events.queue_status IN ('ready', 'leased', 'active')
+                 )
+                GROUP BY starts.session_id, starts.created_at
+            )
+            SELECT
+                COUNT(*),
+                AVG((julianday(recovered_at) - julianday(started_at)) * 86400000.0),
+                MAX((julianday(recovered_at) - julianday(started_at)) * 86400000.0)
+            FROM recoveries
+            WHERE recovered_at IS NOT NULL
+            "#,
+            [network_id, job_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<f64>>(1)?.map(|value| value.round() as u64),
+                    row.get::<_, Option<f64>>(2)?.map(|value| value.round() as u64),
+                ))
+            },
+        )
+        .map_err(Into::into)
+    } else {
+        conn.query_row(
+            r#"
+            WITH regroup_starts AS (
+                SELECT session_id, created_at
+                FROM inference_scheduler_events
+                WHERE network_id = ?1
+                  AND event_kind LIKE 'decode_regroup_%'
+                  AND event_kind != 'decode_regroup_failed'
+                  AND session_id IS NOT NULL
+            ),
+            recoveries AS (
+                SELECT
+                    starts.session_id,
+                    starts.created_at AS started_at,
+                    MIN(events.created_at) AS recovered_at
+                FROM regroup_starts starts
+                JOIN inference_scheduler_events events
+                  ON events.network_id = ?1
+                 AND events.session_id = starts.session_id
+                 AND events.created_at > starts.created_at
+                 AND (
+                        events.event_kind IN ('decode_queue_ready', 'decode_queue_unblocked', 'decode_claimed')
+                     OR events.queue_status IN ('ready', 'leased', 'active')
+                 )
+                GROUP BY starts.session_id, starts.created_at
+            )
+            SELECT
+                COUNT(*),
+                AVG((julianday(recovered_at) - julianday(started_at)) * 86400000.0),
+                MAX((julianday(recovered_at) - julianday(started_at)) * 86400000.0)
+            FROM recoveries
+            WHERE recovered_at IS NOT NULL
+            "#,
+            [network_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<f64>>(1)?.map(|value| value.round() as u64),
+                    row.get::<_, Option<f64>>(2)?.map(|value| value.round() as u64),
+                ))
+            },
+        )
+        .map_err(Into::into)
+    }
 }
 
 fn load_kv_residency_summaries(
@@ -1895,6 +2097,24 @@ mod tests {
 
         conn.execute(
             r#"
+            INSERT INTO inference_session_kv_transfers (
+                transfer_id, session_id, job_id, network_id, model_id, segment_id, group_id,
+                batch_group_key, source_device_id, target_device_id, transfer_kind, status,
+                checkpoint_id, remote_access_uri, kv_sequence_position, bytes_total,
+                bytes_transferred, started_at, completed_at, updated_at, last_error
+            ) VALUES (
+                'transfer-2', 'session-1', 'job-1', 'net-1', 'model-1', 'segment-decode',
+                'group-decode', 'batch-group-1', 'worker-a', 'worker-c', 'checkpoint_handoff',
+                'running', 'ckpt-1', '/api/inference/jobs/job-1/session-checkpoints/session-1',
+                3, 10, 4, '2026-04-25T12:00:07Z', NULL, '2026-04-25T12:00:08Z', NULL
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert active KV transfer");
+
+        conn.execute(
+            r#"
             INSERT INTO inference_prompt_cache_entries (
                 session_id, job_id, network_id, model_id, cache_key, prefix_token_count,
                 overlap_token_count, prompt_tokens_json, owner_device_id, checkpoint_id,
@@ -1981,6 +2201,35 @@ mod tests {
             [],
         )
         .expect("Failed to insert decode queue row");
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_scheduler_events (
+                network_id, job_id, session_id, device_id, segment_id, group_id, batch_group_key,
+                event_kind, queue_status, detail, created_at
+            ) VALUES
+            (
+                'net-1', 'job-1', 'session-1', 'worker-a', 'segment-decode', 'group-decode',
+                'batch-group-1', 'decode_regroup_transfer', 'blocked_on_transfer',
+                'Pause decode and wait for checkpoint transfer to regroup members',
+                '2026-04-25T12:00:07Z'
+            ),
+            (
+                'net-1', 'job-1', 'session-1', 'worker-a', 'segment-decode', 'group-decode',
+                'batch-group-1', 'decode_queue_unblocked', 'ready',
+                'Checkpoint transfer completed and decode queue resumed',
+                '2026-04-25T12:00:11Z'
+            ),
+            (
+                'net-1', 'job-1', 'session-1', 'worker-a', 'segment-decode', 'group-decode',
+                'batch-group-1', 'decode_regroup_failed', 'failed',
+                'Regroup failed after replacement attempt',
+                '2026-04-25T12:00:13Z'
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert scheduler events");
     }
 
     #[test]
@@ -2366,6 +2615,23 @@ mod tests {
         assert_eq!(status.metrics.peak_active_decode_sessions, Some(3));
         assert_eq!(status.metrics.peak_batch_kv_tokens, Some(11));
         assert_eq!(status.metrics.deferred_decode_sessions, 1);
+        assert_eq!(status.metrics.kv_residency_slice_count, 2);
+        assert_eq!(status.metrics.remote_kv_residency_slice_count, 1);
+        assert_eq!(status.metrics.pinned_kv_residency_slice_count, 2);
+        assert_eq!(status.metrics.evictable_kv_residency_slice_count, 0);
+        assert_eq!(status.metrics.kv_cached_tokens, 6);
+        assert_eq!(status.metrics.kv_payload_bytes, 6);
+        assert_eq!(status.metrics.kv_transfer_count, 2);
+        assert_eq!(status.metrics.active_kv_transfer_count, 1);
+        assert_eq!(status.metrics.kv_transfer_bytes_total, 13);
+        assert_eq!(status.metrics.kv_transfer_bytes_transferred, 7);
+        assert_eq!(status.metrics.checkpoint_fallback_transfer_count, 2);
+        assert!((status.metrics.checkpoint_fallback_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(status.metrics.recent_regroup_event_count, 2);
+        assert_eq!(status.metrics.recent_regroup_failure_count, 1);
+        assert_eq!(status.metrics.recent_recovery_sample_count, 1);
+        assert_eq!(status.metrics.recent_avg_recovery_latency_ms, Some(4_000));
+        assert_eq!(status.metrics.recent_peak_recovery_latency_ms, Some(4_000));
         assert_eq!(
             status.decode_queue[0].blocked_reason.as_deref(),
             Some("prefill_incomplete")
@@ -2403,7 +2669,7 @@ mod tests {
         assert_eq!(status.kv_residency.len(), 1);
         assert_eq!(status.kv_residency[0].replicas.len(), 2);
         assert_eq!(status.kv_residency[0].residency_slices.len(), 2);
-        assert_eq!(status.kv_residency[0].transfers.len(), 1);
+        assert_eq!(status.kv_residency[0].transfers.len(), 2);
         assert_eq!(status.kv_residency[0].prompt_cache_entries.len(), 1);
         assert_eq!(
             status.kv_residency[0]
@@ -2450,6 +2716,10 @@ mod tests {
         assert_eq!(status.metrics.decode_queue_depth, 1);
         assert_eq!(status.metrics.leased_sessions, 1);
         assert_eq!(status.metrics.blocked_sessions, 0);
+        assert_eq!(status.metrics.kv_transfer_count, 2);
+        assert_eq!(status.metrics.active_kv_transfer_count, 1);
+        assert_eq!(status.metrics.recent_regroup_event_count, 2);
+        assert_eq!(status.metrics.recent_recovery_sample_count, 1);
         assert_eq!(
             status.serving_groups[0]
                 .workload

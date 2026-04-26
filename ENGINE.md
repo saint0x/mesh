@@ -147,11 +147,11 @@ explicit-segment serving stack into the full production `zip` engine.
 ## 9. Observability And Operations
 
 - ✅ Add metrics for scheduler backlog, runnable sessions, blocked sessions, and batch size
-- Planned: Add metrics for KV residency, transfer volume, and checkpoint fallback rate
-- Planned: Add metrics for regroup frequency and recovery latency
+- ✅ Add metrics for KV residency, transfer volume, and checkpoint fallback rate
+- ✅ Add metrics for regroup frequency and recovery latency
 - ✅ Add structured event log for scheduler decisions
 - ✅ Add operator views in UI/API for session placement and queue state
-- Planned: Add production-readiness runbooks for scheduler stalls, KV pressure, and failover
+- ✅ Add production-readiness runbooks for scheduler stalls, KV pressure, and failover
 
 ## 10. Testing And Verification
 

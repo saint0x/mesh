@@ -33,6 +33,11 @@ Mesh still owns the broader product shell around `zip`:
 - worker CLI and process lifecycle
 - relay, UI, and operator workflows
 
+## Operations
+
+Operator runbooks for the production engine live in
+[runbooks/README.md](/Users/deepsaint/Desktop/meshnet/runbooks/README.md).
+
 ## How It Works
 
 Mesh is split into two layers:
