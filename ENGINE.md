@@ -170,7 +170,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Land authoritative planning, explicit segments, session authority, and checkpoint handoff
 - ✅ Build real scheduler ownership over active decode planning and claim-time routing
 - ✅ Add explicit decode queue state and serving-group ownership records
-- In progress: Add continuous batching in the agent/runtime and scheduler
+- ✅ Add continuous batching in the agent/runtime and scheduler
 - ✅ Expand KV management from checkpoint handoff to live residency management
 - ✅ Add regroup/failover
 - ✅ Constrain planning with richer manifests

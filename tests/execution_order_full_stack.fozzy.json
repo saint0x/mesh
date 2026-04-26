@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "name": "execution-order-full-stack",
+  "steps": [
+    {
+      "name": "authoritative pooled decode scheduling stays intact at claim time",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_decode_batch_targets_pool_across_shared_decode_participants",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "runtime decode loop honors scheduler-owned batch targets",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_honors_scheduler_batch_targets",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "scheduler status exposes live KV residency and transfer state",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_network_scheduler_status_exposes_queue_groups_and_kv_residency",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "decode regroup can pause for transfer and recover correctly",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_pauses_decode_until_checkpoint_transfer_for_replacement",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "planner still enforces manifest-driven hybrid layout legality",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::planner::tests::planner_supports_hybrid_layouts_with_pipeline_partition_metadata",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "transport serving channels still open multiple streams for throughput mode",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_prepare_serving_peer_channels_opens_multiple_streams_for_throughput",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}
