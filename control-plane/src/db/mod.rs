@@ -10,8 +10,7 @@ pub mod models;
 use crate::api::types::{
     DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
     JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencySummary, KvTransferPolicy,
-    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics,
-    SchedulerJobSummary,
+    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics, SchedulerJobSummary,
     ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
     ServingGroupWorkloadStatus,
 };
@@ -321,7 +320,11 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         }
         "026_add_decode_batch_pressure_to_inference_sessions.sql" => {
             column_exists(conn, "inference_sessions", "latest_batch_kv_tokens")?
-                && column_exists(conn, "inference_sessions", "latest_deferred_decode_sessions")?
+                && column_exists(
+                    conn,
+                    "inference_sessions",
+                    "latest_deferred_decode_sessions",
+                )?
         }
         "027_create_inference_decode_batch_events.sql" => {
             table_exists(conn, "inference_decode_batch_events")?
@@ -870,8 +873,7 @@ fn load_serving_group_workloads(
             entry.peak_active_decode_sessions,
             latest_active_decode_sessions,
         );
-        entry.peak_batch_kv_tokens =
-            max_opt(entry.peak_batch_kv_tokens, latest_batch_kv_tokens);
+        entry.peak_batch_kv_tokens = max_opt(entry.peak_batch_kv_tokens, latest_batch_kv_tokens);
         entry.deferred_decode_sessions += latest_deferred_decode_sessions.unwrap_or(0);
     }
 

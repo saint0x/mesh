@@ -4,7 +4,7 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    ClaimInferenceAssignmentRequest, InferenceExecutionPlan, InferenceRuntimeMode,
+    ClaimInferenceAssignmentRequest, InferenceExecutionPlan, InferenceRuntimeMode, WorkClaimMode,
 };
 use crate::connectivity::{DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::DeviceCapabilities;
@@ -492,7 +492,18 @@ fn load_scheduler_candidates(
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    Ok(candidates)
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| claim_mode_matches(req.claim_mode, candidate.phase))
+        .collect())
+}
+
+fn claim_mode_matches(mode: WorkClaimMode, phase: SchedulerPhase) -> bool {
+    match mode {
+        WorkClaimMode::Any => true,
+        WorkClaimMode::Prefill => matches!(phase, SchedulerPhase::Prefill),
+        WorkClaimMode::Decode => matches!(phase, SchedulerPhase::Decode),
+    }
 }
 
 fn parse_scheduler_phase(value: &str) -> Result<SchedulerPhase, String> {

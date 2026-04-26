@@ -67,6 +67,22 @@ pub fn create_router(state: AppState) -> Router {
             post(inference::claim_inference_assignment),
         )
         .route(
+            "/api/inference/decode/claim",
+            post(inference::claim_inference_assignment),
+        )
+        .route(
+            "/api/inference/decode/queue",
+            get(inference::observe_decode_queue_state),
+        )
+        .route(
+            "/api/inference/decode/leases/:lease_id/renew",
+            post(inference::renew_decode_lease),
+        )
+        .route(
+            "/api/inference/decode/leases/:lease_id/release",
+            post(inference::release_decode_lease),
+        )
+        .route(
             "/api/inference/jobs/:job_id/ack",
             post(inference::acknowledge_inference_assignment),
         )

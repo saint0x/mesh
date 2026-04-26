@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use rusqlite::{params, OptionalExtension};
@@ -11,12 +11,15 @@ use uuid::Uuid;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
-    ClaimInferenceAssignmentResponse, DownloadInferenceSessionCheckpointResponse,
-    InferenceExecutionLease, InferenceExecutionPlan, InferenceJobAssignmentStatus,
-    InferenceJobStatusResponse, InferenceSessionCheckpointPayload,
-    InferenceSessionCheckpointStatus, InferenceSessionLease, InferenceSessionStatus,
+    ClaimInferenceAssignmentResponse, DecodeLeaseStatus,
+    DownloadInferenceSessionCheckpointResponse, InferenceExecutionLease, InferenceExecutionPlan,
+    InferenceJobAssignmentStatus, InferenceJobStatusResponse, InferenceSchedulerQueueState,
+    InferenceSessionCheckpointPayload, InferenceSessionCheckpointStatus, InferenceSessionLease,
+    InferenceSessionStatus, ObserveDecodeQueueStateResponse, ReleaseDecodeLeaseRequest,
+    ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest, RenewDecodeLeaseResponse,
     ReportInferenceAssignmentProgressRequest, ReportInferenceAssignmentRequest,
-    SubmitInferenceRequest, SubmitInferenceResponse, UploadInferenceSessionCheckpointRequest,
+    ServingSessionMetadata, SubmitInferenceRequest, SubmitInferenceResponse,
+    UploadInferenceSessionCheckpointRequest,
 };
 use crate::connectivity::InferenceSchedulingPolicy;
 use crate::consumption_policy::{
@@ -194,6 +197,19 @@ struct PersistedDecodeBatchEvent {
     deferred_decode_sessions: Option<u32>,
     kv_cache_seq_len: Option<u32>,
     observed_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ObserveDecodeQueueStateQuery {
+    device_id: String,
+    network_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct QueueObservation {
+    queue_state: InferenceSchedulerQueueState,
+    serving_session: Option<ServingSessionMetadata>,
+    decode_lease: Option<DecodeLeaseStatus>,
 }
 
 #[instrument(skip(state))]
@@ -568,11 +584,132 @@ pub async fn claim_inference_assignment(
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
-    let execution_lease = assignment.map(build_execution_lease).transpose()?;
+    let execution_lease = assignment.clone().map(build_execution_lease).transpose()?;
+    let queue_observation = if req.include_queue_state || req.include_serving_session {
+        let active_session_id = execution_lease
+            .as_ref()
+            .map(|lease| lease.session.session_id.clone());
+        let db = state.db.clone();
+        let network_id = req.network_id.clone();
+        let device_id = req.device_id.clone();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                load_queue_observation(&db, &network_id, &device_id, active_session_id)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??,
+        )
+    } else {
+        None
+    };
 
     Ok(Json(ClaimInferenceAssignmentResponse {
         success: true,
         assignment: execution_lease,
+        queue_state: queue_observation
+            .as_ref()
+            .map(|observation| observation.queue_state.clone()),
+        decode_lease: queue_observation
+            .as_ref()
+            .and_then(|observation| observation.decode_lease.clone()),
+        serving_session: queue_observation
+            .as_ref()
+            .and_then(|observation| observation.serving_session.clone()),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn observe_decode_queue_state(
+    State(state): State<AppState>,
+    Query(query): Query<ObserveDecodeQueueStateQuery>,
+) -> ApiResult<Json<ObserveDecodeQueueStateResponse>> {
+    if query.device_id.is_empty() || query.network_id.is_empty() {
+        return Err(ApiError::BadRequest(
+            "device_id and network_id must be provided".to_string(),
+        ));
+    }
+
+    let db = state.db.clone();
+    let query_clone = query.clone();
+    let observation = tokio::task::spawn_blocking(move || {
+        load_queue_observation(&db, &query_clone.network_id, &query_clone.device_id, None)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(ObserveDecodeQueueStateResponse {
+        success: true,
+        queue_state: Some(observation.queue_state),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn renew_decode_lease(
+    State(state): State<AppState>,
+    Path(lease_id): Path<String>,
+    Json(req): Json<RenewDecodeLeaseRequest>,
+) -> ApiResult<Json<RenewDecodeLeaseResponse>> {
+    if lease_id.is_empty()
+        || req.device_id.is_empty()
+        || req.network_id.is_empty()
+        || req.session_id.is_empty()
+        || req.segment_id.is_empty()
+    {
+        return Err(ApiError::BadRequest(
+            "lease_id, device_id, network_id, session_id, and segment_id must be provided"
+                .to_string(),
+        ));
+    }
+
+    let db = state.db.clone();
+    let lease_id_clone = lease_id.clone();
+    let req_clone = req.clone();
+    let queue_observation = tokio::task::spawn_blocking(move || {
+        renew_decode_lease_state(&db, &lease_id_clone, &req_clone)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(RenewDecodeLeaseResponse {
+        success: true,
+        decode_lease: queue_observation.decode_lease,
+        queue_state: Some(queue_observation.queue_state),
+        serving_session: queue_observation.serving_session,
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn release_decode_lease(
+    State(state): State<AppState>,
+    Path(lease_id): Path<String>,
+    Json(req): Json<ReleaseDecodeLeaseRequest>,
+) -> ApiResult<Json<ReleaseDecodeLeaseResponse>> {
+    if lease_id.is_empty()
+        || req.device_id.is_empty()
+        || req.network_id.is_empty()
+        || req.session_id.is_empty()
+        || req.segment_id.is_empty()
+        || req.reason.is_empty()
+    {
+        return Err(ApiError::BadRequest(
+            "lease_id, device_id, network_id, session_id, segment_id, and reason must be provided"
+                .to_string(),
+        ));
+    }
+
+    let db = state.db.clone();
+    let lease_id_clone = lease_id.clone();
+    let req_clone = req.clone();
+    let queue_observation = tokio::task::spawn_blocking(move || {
+        release_decode_lease_state(&db, &lease_id_clone, &req_clone)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+
+    Ok(Json(ReleaseDecodeLeaseResponse {
+        success: true,
+        queue_state: Some(queue_observation.queue_state),
+        serving_session: queue_observation.serving_session,
     }))
 }
 
@@ -636,6 +773,573 @@ fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExec
             }),
         },
     })
+}
+
+fn load_queue_observation(
+    db: &crate::db::Database,
+    network_id: &str,
+    device_id: &str,
+    preferred_session_id: Option<String>,
+) -> ApiResult<QueueObservation> {
+    let conn = db.get_conn()?;
+    let observed_at = now_rfc3339()?;
+
+    let global_counts = conn
+        .query_row(
+            r#"
+            SELECT
+                COUNT(*),
+                SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status IN ('blocked_on_prefill', 'blocked_on_transfer') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)
+            FROM inference_decode_queue
+            WHERE network_id = ?
+            "#,
+            params![network_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default() as u32,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or_default() as u32,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or_default() as u32,
+                    row.get::<_, Option<i64>>(4)?.unwrap_or_default() as u32,
+                ))
+            },
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let local_counts = conn
+        .query_row(
+            r#"
+            SELECT
+                COUNT(*),
+                SUM(CASE WHEN dq.status = 'ready' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN dq.status IN ('blocked_on_prefill', 'blocked_on_transfer') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN dq.status = 'leased' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN dq.status = 'active' THEN 1 ELSE 0 END)
+            FROM inference_decode_queue dq
+            WHERE dq.network_id = ?
+              AND EXISTS (
+                    SELECT 1
+                    FROM inference_job_assignments a
+                    WHERE a.job_id = dq.job_id
+                      AND a.device_id = ?
+                      AND a.active_segment_id = dq.segment_id
+              )
+            "#,
+            params![network_id, device_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default() as u32,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or_default() as u32,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or_default() as u32,
+                    row.get::<_, Option<i64>>(4)?.unwrap_or_default() as u32,
+                ))
+            },
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let active_row = conn
+        .query_row(
+            r#"
+            SELECT dq.session_id, dq.segment_id
+            FROM inference_decode_queue dq
+            WHERE dq.network_id = ?
+              AND EXISTS (
+                    SELECT 1
+                    FROM inference_job_assignments a
+                    WHERE a.job_id = dq.job_id
+                      AND a.device_id = ?
+                      AND a.active_segment_id = dq.segment_id
+              )
+            ORDER BY
+                CASE dq.status
+                    WHEN 'active' THEN 0
+                    WHEN 'leased' THEN 1
+                    WHEN 'ready' THEN 2
+                    WHEN 'blocked_on_transfer' THEN 3
+                    WHEN 'blocked_on_prefill' THEN 4
+                    ELSE 5
+                END,
+                dq.updated_at DESC
+            LIMIT 1
+            "#,
+            params![network_id, device_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let active_session_id =
+        preferred_session_id.or_else(|| active_row.as_ref().map(|r| r.0.clone()));
+    let active_segment_id = active_row.as_ref().map(|r| r.1.clone());
+    let serving_session = if let Some(session_id) = active_session_id.clone() {
+        load_serving_session_metadata(&conn, &session_id, device_id)?
+    } else {
+        None
+    };
+    let decode_lease = serving_session
+        .as_ref()
+        .and_then(|session| session.decode_lease.clone());
+
+    let status = if local_counts.4 > 0 {
+        Some("active".to_string())
+    } else if local_counts.3 > 0 {
+        Some("leased".to_string())
+    } else if local_counts.1 > 0 {
+        Some("ready".to_string())
+    } else if local_counts.2 > 0 {
+        Some("blocked".to_string())
+    } else if global_counts.0 > 0 {
+        Some("idle".to_string())
+    } else {
+        Some("empty".to_string())
+    };
+
+    Ok(QueueObservation {
+        queue_state: InferenceSchedulerQueueState {
+            network_id: network_id.to_string(),
+            device_id: Some(device_id.to_string()),
+            status,
+            observed_at: Some(observed_at),
+            queued_sessions: Some(global_counts.0),
+            ready_sessions: Some(global_counts.1),
+            blocked_sessions: Some(global_counts.2),
+            leased_sessions: Some(global_counts.3),
+            active_sessions: Some(global_counts.4),
+            local_queued_sessions: Some(local_counts.0),
+            local_ready_sessions: Some(local_counts.1),
+            local_blocked_sessions: Some(local_counts.2),
+            local_leased_sessions: Some(local_counts.3),
+            local_active_sessions: Some(local_counts.4),
+            active_session_id,
+            active_segment_id,
+            queue_depth: Some(global_counts.0),
+        },
+        serving_session,
+        decode_lease,
+    })
+}
+
+fn load_serving_session_metadata(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    device_id: &str,
+) -> ApiResult<Option<ServingSessionMetadata>> {
+    let mut session = conn
+        .query_row(
+            r#"
+            SELECT s.session_id, s.status, s.active_segment_id, s.kv_owner_device_id, s.kv_transfer_policy,
+                   s.kv_sequence_position, s.latest_batch_size, s.latest_active_decode_sessions,
+                   s.latest_batch_kv_tokens, s.latest_deferred_decode_sessions,
+                   dq.lease_target_session_count, dq.lease_target_batch_size, dq.status, dq.ready_at,
+                   s.kv_checkpoint_device_id, s.kv_checkpoint_created_at, s.updated_at, s.last_error
+            FROM inference_sessions s
+            LEFT JOIN inference_decode_queue dq ON dq.session_id = s.session_id
+            WHERE s.session_id = ?
+            "#,
+            params![session_id],
+            |row| {
+                Ok(PersistedSessionStatus {
+                    session_id: row.get(0)?,
+                    status: row.get(1)?,
+                    active_segment_id: row.get(2)?,
+                    kv_owner_device_id: row.get(3)?,
+                    kv_transfer_policy: row.get(4)?,
+                    kv_sequence_position: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    latest_batch_size: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    latest_active_decode_sessions: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+                    latest_batch_kv_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+                    latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                    lease_target_session_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                    lease_target_batch_size: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                    kv_checkpoint_device_id: row.get(14)?,
+                    kv_checkpoint_created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    last_error: row.get(17)?,
+                    checkpoint: None,
+                    replicas: Vec::new(),
+                    recent_decode_batches: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let Some(mut session) = session.take() else {
+        return Ok(None);
+    };
+
+    session.checkpoint = load_latest_session_checkpoint_status(conn, &session.session_id)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT device_id, status, active_segment_id, kv_sequence_position,
+                   checkpoint_created_at, updated_at, last_error
+            FROM inference_session_replicas
+            WHERE session_id = ?
+            ORDER BY device_id ASC
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    session.replicas = stmt
+        .query_map(params![&session.session_id], |row| {
+            Ok(PersistedSessionReplicaStatus {
+                device_id: row.get(0)?,
+                status: row.get(1)?,
+                active_segment_id: row.get(2)?,
+                kv_sequence_position: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                checkpoint_created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                last_error: row.get(6)?,
+            })
+        })
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let decode_lease = load_decode_lease_status(conn, &session.session_id)?;
+    let queue_row = conn
+        .query_row(
+            "SELECT status, ready_at FROM inference_decode_queue WHERE session_id = ?",
+            params![&session.session_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let current_phase = match session.status.as_str() {
+        status if status.starts_with("prefill") => Some(crate::api::types::ExecutionPhase::Prefill),
+        status if status.starts_with("decode") => Some(crate::api::types::ExecutionPhase::Decode),
+        _ => decode_lease
+            .as_ref()
+            .map(|_| crate::api::types::ExecutionPhase::Decode),
+    };
+    let local_replica = session
+        .replicas
+        .iter()
+        .find(|replica| replica.device_id == device_id)
+        .cloned()
+        .map(|replica| crate::api::types::InferenceSessionReplicaStatus {
+            device_id: replica.device_id,
+            status: replica.status,
+            active_segment_id: replica.active_segment_id,
+            kv_sequence_position: replica.kv_sequence_position,
+            checkpoint_created_at: replica.checkpoint_created_at,
+            updated_at: replica.updated_at,
+            last_error: replica.last_error,
+        });
+
+    Ok(Some(ServingSessionMetadata {
+        session_id: session.session_id,
+        status: session.status,
+        active_segment_id: session.active_segment_id,
+        current_phase,
+        kv_owner_device_id: session.kv_owner_device_id,
+        kv_transfer_policy: parse_kv_transfer_policy(&session.kv_transfer_policy)?,
+        kv_sequence_position: session.kv_sequence_position,
+        latest_batch_size: session.latest_batch_size,
+        latest_active_decode_sessions: session.latest_active_decode_sessions,
+        latest_batch_kv_tokens: session.latest_batch_kv_tokens,
+        latest_deferred_decode_sessions: session.latest_deferred_decode_sessions,
+        lease_target_session_count: session.lease_target_session_count,
+        lease_target_batch_size: session.lease_target_batch_size,
+        queue_status: queue_row.as_ref().and_then(|row| row.0.clone()),
+        ready_at: queue_row.and_then(|row| row.1),
+        updated_at: session.updated_at,
+        last_error: session.last_error,
+        checkpoint: session
+            .checkpoint
+            .map(convert_persisted_session_checkpoint_status)
+            .transpose()?,
+        local_replica,
+        replicas: session
+            .replicas
+            .into_iter()
+            .map(|replica| crate::api::types::InferenceSessionReplicaStatus {
+                device_id: replica.device_id,
+                status: replica.status,
+                active_segment_id: replica.active_segment_id,
+                kv_sequence_position: replica.kv_sequence_position,
+                checkpoint_created_at: replica.checkpoint_created_at,
+                updated_at: replica.updated_at,
+                last_error: replica.last_error,
+            })
+            .collect(),
+        decode_lease,
+    }))
+}
+
+fn load_decode_lease_status(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> ApiResult<Option<DecodeLeaseStatus>> {
+    conn.query_row(
+        r#"
+        SELECT a.assignment_id, a.job_id, dq.session_id, dq.segment_id, dq.status,
+               a.acknowledged_at, dq.ready_at, dq.lease_owner_device_id, dq.lease_expires_at,
+               dq.lease_target_session_count, dq.lease_target_batch_size, dq.updated_at, dq.last_error
+        FROM inference_decode_queue dq
+        LEFT JOIN inference_job_assignments a
+          ON a.job_id = dq.job_id
+         AND a.active_segment_id = dq.segment_id
+         AND (
+                dq.lease_owner_device_id IS NULL
+                OR a.device_id = dq.lease_owner_device_id
+             )
+        WHERE dq.session_id = ?
+        LIMIT 1
+        "#,
+        params![session_id],
+        |row| {
+            Ok(DecodeLeaseStatus {
+                lease_id: row
+                    .get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| format!("session-{}", session_id)),
+                job_id: row.get(1)?,
+                session_id: row.get(2)?,
+                segment_id: row.get(3)?,
+                status: row.get(4)?,
+                acknowledged_at: row.get(5)?,
+                ready_at: row.get(6)?,
+                lease_owner_device_id: row.get(7)?,
+                lease_expires_at: row.get(8)?,
+                lease_target_session_count: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                lease_target_batch_size: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                last_renewed_at: row.get(11)?,
+                last_error: row.get(12)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
+fn renew_decode_lease_state(
+    db: &crate::db::Database,
+    lease_id: &str,
+    req: &RenewDecodeLeaseRequest,
+) -> ApiResult<QueueObservation> {
+    let mut conn = db.get_conn()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let now = now_rfc3339()?;
+    let lease_expires =
+        format_time(OffsetDateTime::now_utc() + Duration::seconds(ASSIGNMENT_LEASE_SECS))?;
+
+    let matched = tx
+        .query_row(
+            r#"
+            SELECT a.job_id
+            FROM inference_job_assignments a
+            INNER JOIN inference_decode_queue dq
+              ON dq.job_id = a.job_id
+             AND dq.segment_id = a.active_segment_id
+            WHERE a.assignment_id = ?
+              AND a.device_id = ?
+              AND a.network_id = ?
+              AND dq.session_id = ?
+              AND dq.segment_id = ?
+            "#,
+            params![
+                lease_id,
+                &req.device_id,
+                &req.network_id,
+                &req.session_id,
+                &req.segment_id
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    if matched.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "Decode lease {} not found for session {}",
+            lease_id, req.session_id
+        )));
+    }
+
+    tx.execute(
+        r#"
+        UPDATE inference_job_assignments
+        SET lease_expires_at = CASE
+                WHEN status = 'leased' THEN ?
+                ELSE lease_expires_at
+            END
+        WHERE assignment_id = ?
+          AND device_id = ?
+          AND network_id = ?
+        "#,
+        params![&lease_expires, lease_id, &req.device_id, &req.network_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    tx.execute(
+        r#"
+        UPDATE inference_decode_queue
+        SET lease_owner_device_id = ?,
+            lease_expires_at = CASE
+                WHEN status = 'leased' THEN ?
+                ELSE lease_expires_at
+            END,
+            updated_at = ?,
+            last_error = NULL
+        WHERE session_id = ?
+          AND segment_id = ?
+        "#,
+        params![
+            &req.device_id,
+            &lease_expires,
+            &now,
+            &req.session_id,
+            &req.segment_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    load_queue_observation(
+        db,
+        &req.network_id,
+        &req.device_id,
+        Some(req.session_id.clone()),
+    )
+}
+
+fn release_decode_lease_state(
+    db: &crate::db::Database,
+    lease_id: &str,
+    req: &ReleaseDecodeLeaseRequest,
+) -> ApiResult<QueueObservation> {
+    let mut conn = db.get_conn()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let now = now_rfc3339()?;
+
+    let queue_status = tx
+        .query_row(
+            r#"
+            SELECT dq.status
+            FROM inference_job_assignments a
+            INNER JOIN inference_decode_queue dq
+              ON dq.job_id = a.job_id
+             AND dq.segment_id = a.active_segment_id
+            WHERE a.assignment_id = ?
+              AND a.device_id = ?
+              AND a.network_id = ?
+              AND dq.session_id = ?
+              AND dq.segment_id = ?
+            "#,
+            params![
+                lease_id,
+                &req.device_id,
+                &req.network_id,
+                &req.session_id,
+                &req.segment_id
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let Some(previous_status) = queue_status else {
+        return Err(ApiError::NotFound(format!(
+            "Decode lease {} not found for session {}",
+            lease_id, req.session_id
+        )));
+    };
+
+    tx.execute(
+        r#"
+        UPDATE inference_job_assignments
+        SET status = 'pending',
+            lease_expires_at = NULL
+        WHERE assignment_id = ?
+          AND device_id = ?
+          AND network_id = ?
+          AND status IN ('leased', 'acknowledged')
+        "#,
+        params![lease_id, &req.device_id, &req.network_id],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    tx.execute(
+        r#"
+        UPDATE inference_serving_groups
+        SET status = 'decode_ready',
+            lease_owner_device_id = NULL,
+            lease_expires_at = NULL,
+            updated_at = ?,
+            last_error = ?
+        WHERE session_id = ?
+          AND group_id = (
+                SELECT group_id
+                FROM inference_decode_queue
+                WHERE session_id = ?
+                  AND segment_id = ?
+            )
+          AND device_id = ?
+          AND phase = 'decode'
+        "#,
+        params![
+            &now,
+            req.error
+                .clone()
+                .unwrap_or_else(|| format!("decode lease released: {}", req.reason)),
+            &req.session_id,
+            &req.session_id,
+            &req.segment_id,
+            &req.device_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    tx.execute(
+        r#"
+        UPDATE inference_decode_queue
+        SET status = CASE
+                WHEN ? = 'active' THEN 'ready'
+                ELSE 'ready'
+            END,
+            lease_owner_device_id = NULL,
+            lease_expires_at = NULL,
+            updated_at = ?,
+            last_error = ?
+        WHERE session_id = ?
+          AND segment_id = ?
+        "#,
+        params![
+            &previous_status,
+            &now,
+            req.error
+                .clone()
+                .unwrap_or_else(|| format!("decode lease released: {}", req.reason)),
+            &req.session_id,
+            &req.segment_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    load_queue_observation(
+        db,
+        &req.network_id,
+        &req.device_id,
+        Some(req.session_id.clone()),
+    )
 }
 
 fn convert_persisted_session_checkpoint_status(
@@ -992,25 +1696,26 @@ fn load_recent_decode_batch_events(
             "#,
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-        Ok(PersistedDecodeBatchEvent {
-            event_id: row.get(0)?,
-            session_id: row.get(1)?,
-            job_id: row.get(2)?,
-            network_id: row.get(3)?,
-            device_id: row.get(4)?,
-            segment_id: row.get(5)?,
-            completion_tokens: row.get::<_, i64>(6)? as u32,
-            execution_time_ms: row.get::<_, i64>(7)? as u64,
-            batch_size: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-            active_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
-            batch_kv_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
-            deferred_decode_sessions: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
-            kv_cache_seq_len: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
-            observed_at: row.get(13)?,
+    let rows = stmt
+        .query_map(params![session_id, limit as i64], |row| {
+            Ok(PersistedDecodeBatchEvent {
+                event_id: row.get(0)?,
+                session_id: row.get(1)?,
+                job_id: row.get(2)?,
+                network_id: row.get(3)?,
+                device_id: row.get(4)?,
+                segment_id: row.get(5)?,
+                completion_tokens: row.get::<_, i64>(6)? as u32,
+                execution_time_ms: row.get::<_, i64>(7)? as u64,
+                batch_size: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+                active_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                batch_kv_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                deferred_decode_sessions: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                kv_cache_seq_len: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                observed_at: row.get(13)?,
+            })
         })
-    })
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
@@ -1544,7 +2249,9 @@ fn claim_assignment(
                     latest_batch_size: row.get::<_, Option<i64>>(21)?.map(|v| v as u32),
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(22)?.map(|v| v as u32),
                     latest_batch_kv_tokens: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
-                    latest_deferred_decode_sessions: row.get::<_, Option<i64>>(24)?.map(|v| v as u32),
+                    latest_deferred_decode_sessions: row
+                        .get::<_, Option<i64>>(24)?
+                        .map(|v| v as u32),
                     lease_target_session_count: row.get::<_, Option<i64>>(25)?.map(|v| v as u32),
                     lease_target_batch_size: row.get::<_, Option<i64>>(26)?.map(|v| v as u32),
                     kv_checkpoint_device_id: row.get(27)?,
@@ -1597,7 +2304,11 @@ fn claim_assignment(
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         if matches!(active.phase, crate::api::types::ExecutionPhase::Decode) {
             let (lease_target_session_count, lease_target_batch_size) =
-                compute_decode_lease_targets(&tx, &assignment.network_id, &active.execution_group_id)?;
+                compute_decode_lease_targets(
+                    &tx,
+                    &assignment.network_id,
+                    &active.execution_group_id,
+                )?;
             assignment.lease_target_session_count = Some(lease_target_session_count);
             assignment.lease_target_batch_size = Some(lease_target_batch_size);
             upsert_decode_queue(
@@ -3768,6 +4479,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.clone(),
                     network_id: network_id.to_string(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -3802,6 +4516,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -3850,6 +4566,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: (*device_id).to_string(),
                     network_id: network_id.to_string(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -3914,6 +4633,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -4224,6 +4946,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -4258,6 +4983,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -4270,6 +4997,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -4309,6 +5039,8 @@ mod tests {
                 active_decode_sessions: Some(2),
                 batch_kv_tokens: Some(2),
                 deferred_decode_sessions: Some(1),
+                scheduler_queue: None,
+                serving_session: None,
             }),
         )
         .await
@@ -4338,6 +5070,8 @@ mod tests {
                 active_decode_sessions: Some(2),
                 batch_kv_tokens: Some(2),
                 deferred_decode_sessions: Some(1),
+                scheduler_queue: None,
+                serving_session: None,
             }),
         )
         .await
@@ -4461,6 +5195,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -4495,6 +5232,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -4553,6 +5292,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -4620,6 +5362,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -4654,6 +5399,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -4706,6 +5453,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -4777,6 +5527,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -4811,6 +5564,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -4966,6 +5721,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -5001,6 +5759,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -5035,6 +5795,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5063,6 +5826,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5188,6 +5954,9 @@ mod tests {
                 Json(ClaimInferenceAssignmentRequest {
                     device_id: device_id.into(),
                     network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
                 }),
             )
             .await
@@ -5222,6 +5991,8 @@ mod tests {
                     active_decode_sessions: None,
                     batch_kv_tokens: None,
                     deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
                 }),
             )
             .await
@@ -5233,6 +6004,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5250,6 +6024,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5304,6 +6081,206 @@ mod tests {
                 .iter()
                 .all(|replica| replica.status == "completed"))
             .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_decode_queue_observation_and_lease_lifecycle_endpoints() {
+        let network_id = "test-network-decode-queue-observation";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "observe".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let plan = submit
+            .execution_plan
+            .clone()
+            .expect("expected execution plan");
+        let prefill_segment_id = plan
+            .segments
+            .iter()
+            .find(|segment| matches!(segment.phase, ExecutionPhase::Prefill))
+            .map(|segment| segment.segment_id.clone())
+            .expect("expected prefill segment");
+
+        for device_id in ["worker-1", "worker-2"] {
+            let claim = claim_inference_assignment(
+                State(state.clone()),
+                Json(ClaimInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                    network_id: network_id.into(),
+                    claim_mode: crate::api::types::WorkClaimMode::Any,
+                    include_queue_state: false,
+                    include_serving_session: false,
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .assignment
+            .expect("expected prefill assignment");
+
+            let _ = acknowledge_inference_assignment(
+                State(state.clone()),
+                Path(claim.job_id.clone()),
+                Json(AcknowledgeInferenceAssignmentRequest {
+                    device_id: device_id.into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let _ = report_inference_progress(
+                State(state.clone()),
+                Path(submit.job_id.clone()),
+                Json(ReportInferenceAssignmentProgressRequest {
+                    device_id: device_id.into(),
+                    segment_id: prefill_segment_id.clone(),
+                    phase: ExecutionPhase::Prefill,
+                    event: ProgressEventKind::PrefillComplete,
+                    completion_tokens: 1,
+                    execution_time_ms: 40,
+                    time_to_first_token_ms: Some(40),
+                    kv_cache_seq_len: Some(1),
+                    batch_size: None,
+                    active_decode_sessions: None,
+                    batch_kv_tokens: None,
+                    deferred_decode_sessions: None,
+                    scheduler_queue: None,
+                    serving_session: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let decode_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Decode,
+                include_queue_state: true,
+                include_serving_session: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let assignment = decode_claim
+            .assignment
+            .clone()
+            .expect("expected decode assignment");
+        assert_eq!(
+            decode_claim
+                .queue_state
+                .as_ref()
+                .and_then(|state| state.local_leased_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            decode_claim
+                .serving_session
+                .as_ref()
+                .and_then(|session| session.queue_status.as_deref()),
+            Some("leased")
+        );
+        assert_eq!(
+            decode_claim
+                .decode_lease
+                .as_ref()
+                .map(|lease| lease.lease_id.as_str()),
+            Some(assignment.lease_id.as_str())
+        );
+
+        let observed = observe_decode_queue_state(
+            State(state.clone()),
+            Query(ObserveDecodeQueueStateQuery {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            observed
+                .queue_state
+                .as_ref()
+                .and_then(|state| state.local_leased_sessions),
+            Some(1)
+        );
+
+        let renewed = renew_decode_lease(
+            State(state.clone()),
+            Path(assignment.lease_id.clone()),
+            Json(RenewDecodeLeaseRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                session_id: assignment.active_segment.session_id.clone(),
+                segment_id: assignment.active_segment.segment_id.clone(),
+                scheduler_queue: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            renewed
+                .decode_lease
+                .as_ref()
+                .and_then(|lease| lease.status.as_deref()),
+            Some("leased")
+        );
+        assert_eq!(
+            renewed
+                .queue_state
+                .as_ref()
+                .and_then(|state| state.local_leased_sessions),
+            Some(1)
+        );
+
+        let released = release_decode_lease(
+            State(state.clone()),
+            Path(assignment.lease_id.clone()),
+            Json(ReleaseDecodeLeaseRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                session_id: assignment.active_segment.session_id.clone(),
+                segment_id: assignment.active_segment.segment_id.clone(),
+                reason: "test_release".into(),
+                error: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            released
+                .queue_state
+                .as_ref()
+                .and_then(|state| state.local_ready_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            released
+                .serving_session
+                .as_ref()
+                .and_then(|session| session.queue_status.as_deref()),
+            Some("ready")
+        );
     }
 
     #[tokio::test]
@@ -5593,6 +6570,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5680,6 +6660,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5694,6 +6677,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5746,6 +6732,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5760,6 +6749,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5828,6 +6820,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5842,6 +6837,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5856,6 +6854,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5924,6 +6925,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5938,6 +6942,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -5952,6 +6959,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6004,6 +7014,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6018,6 +7031,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6096,6 +7112,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6110,6 +7129,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6189,6 +7211,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6227,6 +7252,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await
@@ -6281,6 +7309,9 @@ mod tests {
             Json(ClaimInferenceAssignmentRequest {
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
             }),
         )
         .await

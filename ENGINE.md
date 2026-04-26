@@ -98,6 +98,7 @@ explicit-segment serving stack into the full production `zip` engine.
 
 - ✅ Add scheduler-owned queue tables and serving-group tables
 - ✅ Add decode-step and batch accounting tables
+- ✅ Add worker-facing decode queue observation and decode lease renew/release APIs
 - ⏳ Add KV residency and transfer tables
 - ✅ Add failover/regroup event history tables
 - ⏳ Add migration coverage and backward-incompatible cleanup for superseded fields

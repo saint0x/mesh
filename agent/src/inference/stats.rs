@@ -628,13 +628,11 @@ impl InferenceStats {
         );
         println!(
             "  Deferred Sessions:   {}",
-            self.decode_batch_deferred_sessions
-                .load(Ordering::Relaxed)
+            self.decode_batch_deferred_sessions.load(Ordering::Relaxed)
         );
         println!(
             "  Capacity Deferrals:  {}",
-            self.decode_batch_capacity_deferrals
-                .load(Ordering::Relaxed)
+            self.decode_batch_capacity_deferrals.load(Ordering::Relaxed)
         );
         println!(
             "  KV Budget Deferrals: {}",
@@ -740,14 +738,12 @@ impl InferenceStats {
         insert_u64(
             &mut map,
             "decode_batch_deferred_sessions",
-            self.decode_batch_deferred_sessions
-                .load(Ordering::Relaxed),
+            self.decode_batch_deferred_sessions.load(Ordering::Relaxed),
         );
         insert_u64(
             &mut map,
             "decode_batch_capacity_deferrals",
-            self.decode_batch_capacity_deferrals
-                .load(Ordering::Relaxed),
+            self.decode_batch_capacity_deferrals.load(Ordering::Relaxed),
         );
         insert_u64(
             &mut map,
@@ -1086,9 +1082,7 @@ mod tests {
             640
         );
         assert_eq!(
-            stats
-                .decode_batch_deferred_sessions
-                .load(Ordering::Relaxed),
+            stats.decode_batch_deferred_sessions.load(Ordering::Relaxed),
             2
         );
         assert_eq!(
