@@ -1256,6 +1256,7 @@ fn renew_decode_lease_state(
             lease_id, req.session_id
         )));
     };
+    let pooled_group_key = batch_group_key.clone().unwrap_or_else(|| group_id.clone());
 
     tx.execute(
         r#"
@@ -1264,11 +1265,33 @@ fn renew_decode_lease_state(
                 WHEN status = 'leased' THEN ?
                 ELSE lease_expires_at
             END
-        WHERE assignment_id = ?
+        WHERE assignment_id IN (
+                SELECT a.assignment_id
+                FROM inference_job_assignments a
+                INNER JOIN inference_decode_queue dq
+                  ON dq.job_id = a.job_id
+                 AND dq.segment_id = a.active_segment_id
+                WHERE dq.network_id = ?
+                  AND COALESCE(dq.batch_group_key, dq.group_id) = ?
+                  AND dq.lease_owner_device_id = ?
+                  AND dq.status IN ('leased', 'active')
+                  AND a.device_id = ?
+                  AND a.network_id = ?
+                  AND a.status IN ('leased', 'acknowledged')
+            )
           AND device_id = ?
           AND network_id = ?
         "#,
-        params![&lease_expires, lease_id, &req.device_id, &req.network_id],
+        params![
+            &lease_expires,
+            &req.network_id,
+            &pooled_group_key,
+            &req.device_id,
+            &req.device_id,
+            &req.network_id,
+            &req.device_id,
+            &req.network_id
+        ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
@@ -1282,15 +1305,18 @@ fn renew_decode_lease_state(
             END,
             updated_at = ?,
             last_error = NULL
-        WHERE session_id = ?
-          AND segment_id = ?
+        WHERE network_id = ?
+          AND COALESCE(batch_group_key, group_id) = ?
+          AND lease_owner_device_id = ?
+          AND status IN ('leased', 'active')
         "#,
         params![
             &req.device_id,
             &lease_expires,
             &now,
-            &req.session_id,
-            &req.segment_id
+            &req.network_id,
+            &pooled_group_key,
+            &req.device_id
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -1304,16 +1330,18 @@ fn renew_decode_lease_state(
             END,
             updated_at = ?,
             last_error = NULL
-        WHERE session_id = ?
+        WHERE network_id = ?
           AND group_id = ?
           AND phase = 'decode'
+          AND lease_owner_device_id = ?
         "#,
         params![
             &req.device_id,
             &lease_expires,
             &now,
-            &req.session_id,
-            &group_id
+            &req.network_id,
+            &group_id,
+            &req.device_id
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -1321,7 +1349,7 @@ fn renew_decode_lease_state(
     refresh_decode_batch_targets(
         &tx,
         &req.network_id,
-        batch_group_key.as_deref().unwrap_or(""),
+        &pooled_group_key,
         &group_id,
     )?;
     record_scheduler_event(
@@ -1404,44 +1432,64 @@ fn release_decode_lease_state(
             lease_id, req.session_id
         )));
     };
+    let pooled_group_key = batch_group_key.clone().unwrap_or_else(|| group_id.clone());
 
     tx.execute(
         r#"
         UPDATE inference_job_assignments
         SET status = 'pending',
             lease_expires_at = NULL
-        WHERE assignment_id = ?
+        WHERE assignment_id IN (
+                SELECT a.assignment_id
+                FROM inference_job_assignments a
+                INNER JOIN inference_decode_queue dq
+                  ON dq.job_id = a.job_id
+                 AND dq.segment_id = a.active_segment_id
+                WHERE dq.network_id = ?
+                  AND COALESCE(dq.batch_group_key, dq.group_id) = ?
+                  AND dq.lease_owner_device_id = ?
+                  AND dq.status IN ('leased', 'active')
+                  AND a.device_id = ?
+                  AND a.network_id = ?
+                  AND a.status IN ('leased', 'acknowledged')
+            )
           AND device_id = ?
           AND network_id = ?
           AND status IN ('leased', 'acknowledged')
         "#,
-        params![lease_id, &req.device_id, &req.network_id],
+        params![
+            &req.network_id,
+            &pooled_group_key,
+            &req.device_id,
+            &req.device_id,
+            &req.network_id,
+            &req.device_id,
+            &req.network_id
+        ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     tx.execute(
         r#"
         UPDATE inference_serving_groups
-        SET status = CASE
-                WHEN device_id = ? THEN 'decode_ready'
-                ELSE status
-            END,
+        SET status = 'decode_ready',
             lease_owner_device_id = NULL,
             lease_expires_at = NULL,
             updated_at = ?,
             last_error = ?
-        WHERE session_id = ?
+        WHERE network_id = ?
           AND group_id = ?
           AND phase = 'decode'
+          AND lease_owner_device_id = ?
         "#,
         params![
-            &req.device_id,
             &now,
             req.error
                 .clone()
                 .unwrap_or_else(|| format!("decode lease released: {}", req.reason)),
-            &req.session_id,
-            &group_id
+            &req.network_id,
+            &group_id,
+            &req.device_id
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -1457,8 +1505,10 @@ fn release_decode_lease_state(
             lease_expires_at = NULL,
             updated_at = ?,
             last_error = ?
-        WHERE session_id = ?
-          AND segment_id = ?
+        WHERE network_id = ?
+          AND COALESCE(batch_group_key, group_id) = ?
+          AND lease_owner_device_id = ?
+          AND status IN ('leased', 'active')
         "#,
         params![
             &previous_status,
@@ -1466,8 +1516,9 @@ fn release_decode_lease_state(
             req.error
                 .clone()
                 .unwrap_or_else(|| format!("decode lease released: {}", req.reason)),
-            &req.session_id,
-            &req.segment_id
+            &req.network_id,
+            &pooled_group_key,
+            &req.device_id
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -1475,7 +1526,7 @@ fn release_decode_lease_state(
     refresh_decode_batch_targets(
         &tx,
         &req.network_id,
-        batch_group_key.as_deref().unwrap_or(""),
+        &pooled_group_key,
         &group_id,
     )?;
     record_scheduler_event(
@@ -7414,6 +7465,290 @@ mod tests {
                     .as_ref()
                     .and_then(|session| session.pooled_leased_sessions),
                 Some(2)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_lease_renew_and_release_apply_to_owned_pooled_cohort() {
+        let network_id = "test-network-pooled-decode-lease-lifecycle";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+        let mut job_ids = Vec::new();
+        let mut pooled_group_key = None::<String>;
+        let mut pooled_group_id = None::<String>;
+
+        for prompt in ["first", "second"] {
+            let submit = submit_inference(
+                State(state.clone()),
+                Json(SubmitInferenceRequest {
+                    device_id: "worker-1".into(),
+                    network_id: network_id.into(),
+                    model_id: "llama-70b".into(),
+                    prompt: prompt.into(),
+                    max_tokens: 8,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            job_ids.push(submit.job_id.clone());
+            let plan = submit
+                .execution_plan
+                .clone()
+                .expect("expected execution plan");
+            let decode_segment = plan
+                .segments
+                .iter()
+                .find(|segment| matches!(segment.phase, ExecutionPhase::Decode))
+                .expect("expected decode segment")
+                .clone();
+            let computed_batch_group_key =
+                decode_batch_group_key(&plan, &decode_segment.segment_id).expect("batch key");
+            let conn = state.db.get_conn().unwrap();
+            let (session_id, batch_group_key): (String, Option<String>) = conn
+                .query_row(
+                    r#"
+                    SELECT session_id, batch_group_key
+                    FROM inference_decode_queue
+                    WHERE job_id = ?
+                    "#,
+                    params![submit.job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_jobs
+                SET status = 'running',
+                    active_segment_id = ?,
+                    updated_at = datetime('now')
+                WHERE job_id = ?
+                "#,
+                params![&decode_segment.segment_id, &submit.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_sessions
+                SET status = 'decode_ready',
+                    active_segment_id = ?,
+                    kv_sequence_position = 1,
+                    updated_at = datetime('now')
+                WHERE job_id = ?
+                "#,
+                params![&decode_segment.segment_id, &submit.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_decode_queue
+                SET segment_id = ?,
+                    group_id = ?,
+                    batch_group_key = ?,
+                    status = 'ready',
+                    ready_at = datetime('now'),
+                    lease_owner_device_id = NULL,
+                    lease_expires_at = NULL,
+                    lease_target_session_count = NULL,
+                    lease_target_batch_size = NULL,
+                    updated_at = datetime('now')
+                WHERE session_id = ?
+                "#,
+                params![
+                    &decode_segment.segment_id,
+                    &decode_segment.execution_group_id,
+                    &computed_batch_group_key,
+                    &session_id
+                ],
+            )
+            .unwrap();
+            for device_id in &decode_segment.participant_device_ids {
+                conn.execute(
+                    r#"
+                    UPDATE inference_job_assignments
+                    SET status = 'pending',
+                        active_segment_id = ?,
+                        lease_expires_at = NULL
+                    WHERE job_id = ?
+                      AND device_id = ?
+                    "#,
+                    params![&decode_segment.segment_id, &submit.job_id, device_id],
+                )
+                .unwrap();
+                conn.execute(
+                    r#"
+                    UPDATE inference_serving_groups
+                    SET status = 'decode_ready',
+                        lease_owner_device_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = datetime('now'),
+                        last_error = NULL
+                    WHERE job_id = ?
+                      AND device_id = ?
+                      AND phase = 'decode'
+                    "#,
+                    params![&submit.job_id, device_id],
+                )
+                .unwrap();
+                conn.execute(
+                    r#"
+                    UPDATE inference_session_replicas
+                    SET status = 'decode_ready',
+                        active_segment_id = ?,
+                        kv_sequence_position = 1,
+                        updated_at = datetime('now')
+                    WHERE session_id = ?
+                      AND device_id = ?
+                    "#,
+                    params![&decode_segment.segment_id, &session_id, device_id],
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let batch_group_key =
+                batch_group_key.expect("decode queue row should have a pooled batch group key");
+            if let Some(existing_key) = pooled_group_key.as_ref() {
+                assert_eq!(existing_key, &batch_group_key);
+            } else {
+                pooled_group_key = Some(batch_group_key.clone());
+            }
+            if pooled_group_id.is_none() {
+                pooled_group_id = Some(decode_segment.execution_group_id.clone());
+            }
+        }
+
+        let conn = state.db.get_conn().unwrap();
+        refresh_decode_batch_targets(
+            &conn,
+            network_id,
+            pooled_group_key.as_deref().unwrap(),
+            pooled_group_id.as_deref().unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let decode_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Decode,
+                include_queue_state: true,
+                include_serving_session: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected pooled decode assignment");
+
+        let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
+        assert_eq!(scheduler.decode_queue.len(), 2);
+        assert!(scheduler.decode_queue.iter().all(|session| {
+            session.status == "leased"
+                && session.lease_owner_device_id.as_deref() == Some("worker-1")
+        }));
+
+        let renewed = renew_decode_lease(
+            State(state.clone()),
+            Path(decode_claim.lease_id.clone()),
+            Json(RenewDecodeLeaseRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                session_id: decode_claim.active_segment.session_id.clone(),
+                segment_id: decode_claim.active_segment.segment_id.clone(),
+                scheduler_queue: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            renewed
+                .queue_state
+                .as_ref()
+                .and_then(|state| state.local_leased_sessions),
+            Some(2)
+        );
+        assert_eq!(
+            renewed
+                .decode_lease
+                .as_ref()
+                .and_then(|lease| lease.pooled_leased_sessions),
+            Some(2)
+        );
+
+        let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
+        assert!(scheduler.decode_queue.iter().all(|session| {
+            session.status == "leased"
+                && session.lease_owner_device_id.as_deref() == Some("worker-1")
+        }));
+
+        let released = release_decode_lease(
+            State(state.clone()),
+            Path(decode_claim.lease_id.clone()),
+            Json(ReleaseDecodeLeaseRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                session_id: decode_claim.active_segment.session_id.clone(),
+                segment_id: decode_claim.active_segment.segment_id.clone(),
+                reason: "pooled_release".into(),
+                error: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            released
+                .queue_state
+                .as_ref()
+                .and_then(|state| state.local_ready_sessions),
+            Some(2)
+        );
+        assert_eq!(
+            released
+                .serving_session
+                .as_ref()
+                .and_then(|session| session.pooled_ready_sessions),
+            Some(2)
+        );
+        assert_eq!(
+            released
+                .serving_session
+                .as_ref()
+                .and_then(|session| session.queue_status.as_deref()),
+            Some("ready")
+        );
+
+        let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
+        assert!(scheduler
+            .decode_queue
+            .iter()
+            .all(|session| session.status == "ready" && session.lease_owner_device_id.is_none()));
+
+        for job_id in &job_ids {
+            let status = get_inference_job_status(State(state.clone()), Path(job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_ready_sessions),
+                Some(2)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_leased_sessions),
+                Some(0)
             );
         }
     }
