@@ -148,6 +148,7 @@ struct PersistedSessionStatus {
     last_error: Option<String>,
     checkpoint: Option<PersistedSessionCheckpointStatus>,
     replicas: Vec<PersistedSessionReplicaStatus>,
+    recent_decode_batches: Vec<PersistedDecodeBatchEvent>,
 }
 
 #[derive(Clone)]
@@ -171,6 +172,24 @@ struct PersistedSessionReplicaStatus {
     checkpoint_created_at: Option<String>,
     updated_at: String,
     last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct PersistedDecodeBatchEvent {
+    event_id: i64,
+    session_id: String,
+    job_id: String,
+    network_id: String,
+    device_id: String,
+    segment_id: String,
+    completion_tokens: u32,
+    execution_time_ms: u64,
+    batch_size: Option<u32>,
+    active_decode_sessions: Option<u32>,
+    batch_kv_tokens: Option<u32>,
+    deferred_decode_sessions: Option<u32>,
+    kv_cache_seq_len: Option<u32>,
+    observed_at: String,
 }
 
 #[instrument(skip(state))]
@@ -626,6 +645,27 @@ fn convert_persisted_session_checkpoint_status(
     })
 }
 
+fn convert_persisted_decode_batch_event(
+    event: PersistedDecodeBatchEvent,
+) -> crate::api::types::DecodeBatchEventStatus {
+    crate::api::types::DecodeBatchEventStatus {
+        event_id: event.event_id,
+        session_id: event.session_id,
+        job_id: event.job_id,
+        network_id: event.network_id,
+        device_id: event.device_id,
+        segment_id: event.segment_id,
+        completion_tokens: event.completion_tokens,
+        execution_time_ms: event.execution_time_ms,
+        batch_size: event.batch_size,
+        active_decode_sessions: event.active_decode_sessions,
+        batch_kv_tokens: event.batch_kv_tokens,
+        deferred_decode_sessions: event.deferred_decode_sessions,
+        kv_cache_seq_len: event.kv_cache_seq_len,
+        observed_at: event.observed_at,
+    }
+}
+
 fn active_segment<'a>(
     plan: &'a InferenceExecutionPlan,
     segment_id: &str,
@@ -884,6 +924,47 @@ fn load_latest_session_checkpoint_status(
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
+fn load_recent_decode_batch_events(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    limit: usize,
+) -> ApiResult<Vec<PersistedDecodeBatchEvent>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT event_id, session_id, job_id, network_id, device_id, segment_id,
+                   completion_tokens, execution_time_ms, batch_size, active_decode_sessions,
+                   batch_kv_tokens, deferred_decode_sessions, kv_cache_seq_len, observed_at
+            FROM inference_decode_batch_events
+            WHERE session_id = ?
+            ORDER BY observed_at DESC, event_id DESC
+            LIMIT ?
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+        Ok(PersistedDecodeBatchEvent {
+            event_id: row.get(0)?,
+            session_id: row.get(1)?,
+            job_id: row.get(2)?,
+            network_id: row.get(3)?,
+            device_id: row.get(4)?,
+            segment_id: row.get(5)?,
+            completion_tokens: row.get::<_, i64>(6)? as u32,
+            execution_time_ms: row.get::<_, i64>(7)? as u64,
+            batch_size: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+            active_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+            batch_kv_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+            deferred_decode_sessions: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+            kv_cache_seq_len: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+            observed_at: row.get(13)?,
+        })
+    })
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
 fn load_latest_session_checkpoint_payload(
     db: &crate::db::Database,
     job_id: &str,
@@ -1083,6 +1164,11 @@ pub async fn get_inference_job_status(
                         updated_at: replica.updated_at,
                         last_error: replica.last_error,
                     })
+                    .collect(),
+                recent_decode_batches: session
+                    .recent_decode_batches
+                    .into_iter()
+                    .map(convert_persisted_decode_batch_event)
                     .collect(),
             })
         })
@@ -2474,6 +2560,46 @@ fn report_assignment_progress(
     }
 
     let job_context = load_job_context(&tx, job_id)?;
+    if !prefill_complete
+        && (req.batch_size.is_some()
+            || req.active_decode_sessions.is_some()
+            || req.batch_kv_tokens.is_some()
+            || req.deferred_decode_sessions.is_some())
+    {
+        let observed_at = now_rfc3339()?;
+        let session_id: String = tx
+            .query_row(
+                "SELECT session_id FROM inference_sessions WHERE job_id = ?",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        tx.execute(
+            r#"
+            INSERT INTO inference_decode_batch_events (
+                session_id, job_id, network_id, device_id, segment_id, completion_tokens,
+                execution_time_ms, batch_size, active_decode_sessions, batch_kv_tokens,
+                deferred_decode_sessions, kv_cache_seq_len, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                session_id,
+                job_id,
+                &job_context.network_id,
+                &req.device_id,
+                &req.segment_id,
+                i64::from(req.completion_tokens),
+                req.execution_time_ms as i64,
+                req.batch_size.map(i64::from),
+                req.active_decode_sessions.map(i64::from),
+                req.batch_kv_tokens.map(i64::from),
+                req.deferred_decode_sessions.map(i64::from),
+                req.kv_cache_seq_len.map(i64::from),
+                &observed_at,
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    }
     let settlement_state = load_job_settlement_state(&tx, job_id)?;
     let relevant_participants = job_context
         .execution_plan
@@ -2612,6 +2738,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     last_error: row.get(13)?,
                     checkpoint: None,
                     replicas: Vec::new(),
+                    recent_decode_batches: Vec::new(),
                 })
             },
         )
@@ -2646,6 +2773,8 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        session.recent_decode_batches =
+            load_recent_decode_batch_events(&conn, &session.session_id, 8)?;
         Some(session)
     } else {
         None
@@ -4178,6 +4307,21 @@ mod tests {
                 .as_ref()
                 .and_then(|session| session.latest_deferred_decode_sessions),
             Some(1)
+        );
+        assert_eq!(
+            status_after_frontier
+                .session
+                .as_ref()
+                .map(|session| session.recent_decode_batches.len()),
+            Some(2)
+        );
+        assert_eq!(
+            status_after_frontier
+                .session
+                .as_ref()
+                .and_then(|session| session.recent_decode_batches.first())
+                .and_then(|event| event.batch_size),
+            Some(2)
         );
 
         let events = crate::api::ledger::list_ledger_events(

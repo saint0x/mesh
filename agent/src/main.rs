@@ -2888,6 +2888,20 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
                 println!("    replica_error: {}", error);
             }
         }
+        for event in &session.recent_decode_batches {
+            println!(
+                "  decode_batch event={} device={} segment={} completion={} batch={:?} active={:?} batch_kv={:?} deferred={:?} observed_at={}",
+                event.event_id,
+                event.device_id,
+                event.segment_id,
+                event.completion_tokens,
+                event.batch_size,
+                event.active_decode_sessions,
+                event.batch_kv_tokens,
+                event.deferred_decode_sessions,
+                event.observed_at
+            );
+        }
     }
 
     if let Some(completion) = &status.completion {

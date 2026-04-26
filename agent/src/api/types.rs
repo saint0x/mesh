@@ -539,6 +539,26 @@ pub struct InferenceSessionStatus {
     pub checkpoint: Option<InferenceSessionCheckpointStatus>,
     #[serde(default)]
     pub replicas: Vec<InferenceSessionReplicaStatus>,
+    #[serde(default)]
+    pub recent_decode_batches: Vec<DecodeBatchEventStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodeBatchEventStatus {
+    pub event_id: i64,
+    pub session_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub device_id: String,
+    pub segment_id: String,
+    pub completion_tokens: u32,
+    pub execution_time_ms: u64,
+    pub batch_size: Option<u32>,
+    pub active_decode_sessions: Option<u32>,
+    pub batch_kv_tokens: Option<u32>,
+    pub deferred_decode_sessions: Option<u32>,
+    pub kv_cache_seq_len: Option<u32>,
+    pub observed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
