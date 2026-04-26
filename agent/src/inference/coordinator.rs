@@ -1396,7 +1396,126 @@ impl InferenceCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::ring_allreduce::RingAllReduceMetrics;
     use crate::inference::job::InferenceRequest;
+    use crate::inference::kv_cache::KVCacheSnapshot;
+    use crate::inference::tensor_ops::Tensor1D;
+    use crate::network::TensorPlaneConfig;
+    use crate::provider::ExecutionProviderKind;
+
+    struct TestBackend {
+        cache_seq_len: usize,
+        sequence_position: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionBackend for TestBackend {
+        fn provider_kind(&self) -> ExecutionProviderKind {
+            ExecutionProviderKind::Cpu
+        }
+
+        async fn prefill(
+            &mut self,
+            _tokens: &[u32],
+            _worker_ring: &mut WorkerRing<'_>,
+            _job_id: Uuid,
+        ) -> Result<Tensor1D> {
+            Ok(Tensor1D::zeros(1))
+        }
+
+        async fn decode_step(
+            &mut self,
+            _token: u32,
+            _worker_ring: &mut WorkerRing<'_>,
+            _job_id: Uuid,
+        ) -> Result<Tensor1D> {
+            Ok(Tensor1D::zeros(1))
+        }
+
+        fn sample(&self, _logits: &Tensor1D, _temperature: f32, _top_p: f32, _seed: u64) -> u32 {
+            0
+        }
+
+        fn cache_seq_len(&self) -> usize {
+            self.cache_seq_len
+        }
+
+        fn cache_memory_usage(&self) -> usize {
+            0
+        }
+
+        fn sequence_position(&self) -> usize {
+            self.sequence_position
+        }
+
+        fn last_allreduce_metrics(&self) -> RingAllReduceMetrics {
+            RingAllReduceMetrics::default()
+        }
+
+        fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
+            Ok(None)
+        }
+
+        fn import_kv_cache(&mut self, _snapshot: &KVCacheSnapshot) -> Result<()> {
+            Ok(())
+        }
+
+        fn clear(&mut self) {}
+    }
+
+    fn test_coordinator(config: InferenceConfig) -> InferenceCoordinator {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().expect("test swarm");
+        let tensor_plane = tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(TensorPlane::bind(TensorPlaneConfig::default()))
+            .expect("tensor plane");
+        InferenceCoordinator::new(swarm, tensor_plane, config)
+    }
+
+    fn insert_decode_session(
+        coordinator: &mut InferenceCoordinator,
+        session_id: Uuid,
+        kv_tokens: usize,
+        generated_token: u32,
+    ) {
+        let mut request = InferenceRequest::new(
+            "test-network".to_string(),
+            "llama-70b".to_string(),
+            vec![1, 2, 3],
+            "executor-1".to_string(),
+        );
+        request.session_id = session_id;
+        request.phase = ExecutionPhase::Decode;
+        request.config.max_tokens = 8;
+
+        let mut job = InferenceJob::new(request.clone(), 70);
+        job.add_token(generated_token);
+
+        coordinator.sessions.insert(
+            session_id,
+            ActiveSession {
+                engine_state: EngineSessionState::new(
+                    session_id,
+                    ExecutionPhase::Decode,
+                    "worker-1".to_string(),
+                    vec!["worker-1".to_string()],
+                    vec!["worker-1".to_string()],
+                    ExecutionProviderKind::Cpu,
+                    (0, 1024),
+                    TransportCapabilityTier::DirectPreferred,
+                    request.config.max_tokens,
+                    request.prompt_tokens.len(),
+                ),
+                backend: Box::new(TestBackend {
+                    cache_seq_len: kv_tokens,
+                    sequence_position: kv_tokens,
+                }),
+                job,
+                queued_for_decode: false,
+            },
+        );
+    }
 
     #[test]
     fn test_inference_config_default() {
@@ -1530,5 +1649,57 @@ mod tests {
             .to_string()
             .contains("cannot safely resume decode without KV state"));
         assert!(InferenceCoordinator::ensure_checkpoint_resume_safe(&job, true).is_ok());
+    }
+
+    #[test]
+    fn test_build_next_decode_batch_admits_multiple_sessions() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 8, 11);
+        insert_decode_session(&mut coordinator, session_b, 12, 22);
+
+        coordinator.enqueue_decode_task(session_a).unwrap();
+        coordinator.enqueue_decode_task(session_b).unwrap();
+
+        let batch = coordinator.build_next_decode_batch();
+        assert_eq!(batch.slots.len(), 2);
+        assert_eq!(batch.total_kv_tokens, 20);
+        assert!(batch.deferred.is_empty());
+        assert_eq!(batch.deferred_for_capacity, 0);
+        assert_eq!(batch.deferred_for_kv_budget, 0);
+    }
+
+    #[test]
+    fn test_build_next_decode_batch_defers_sessions_when_kv_budget_is_exhausted() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 10,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let session_c = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 5, 22);
+        insert_decode_session(&mut coordinator, session_c, 6, 33);
+
+        coordinator.enqueue_decode_task(session_a).unwrap();
+        coordinator.enqueue_decode_task(session_b).unwrap();
+        coordinator.enqueue_decode_task(session_c).unwrap();
+
+        let batch = coordinator.build_next_decode_batch();
+        assert_eq!(batch.slots.len(), 2);
+        assert_eq!(batch.total_kv_tokens, 9);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred_for_capacity, 0);
+        assert_eq!(batch.deferred_for_kv_budget, 1);
+        assert_eq!(batch.deferred[0].session_id, session_c);
+        assert_eq!(coordinator.decode_queue.len(), 1);
+        assert_eq!(coordinator.decode_queue[0].session_id, session_c);
     }
 }
