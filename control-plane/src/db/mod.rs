@@ -3,6 +3,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 pub mod models;
@@ -71,17 +72,32 @@ impl Database {
 
         // Create connection manager
         let manager = SqliteConnectionManager::file(connection_string).with_init(move |conn| {
+            conn.busy_timeout(Duration::from_secs(10))?;
             // Enable foreign keys
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             // Enable WAL mode for better concurrency (not applicable to :memory:)
             if !is_memory {
-                conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+                conn.execute_batch(
+                    r#"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                    PRAGMA wal_autocheckpoint = 1000;
+                    PRAGMA temp_store = MEMORY;
+                    "#,
+                )?;
             }
             Ok(())
         });
 
-        // Create connection pool
-        let pool = Pool::builder().max_size(10).build(manager)?;
+        // Create connection pool. SQLite still has a single-writer model, so
+        // allowing this to be tuned is useful for live bring-up and benchmarks
+        // where serialized access can be more stable than maximizing concurrency.
+        let max_pool_size = std::env::var("MESHNET_SQLITE_POOL_MAX_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10);
+        let pool = Pool::builder().max_size(max_pool_size).build(manager)?;
 
         tracing::info!("Database connected successfully");
 
