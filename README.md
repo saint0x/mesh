@@ -1,5 +1,7 @@
 # Mesh
 
+Mesh includes `zip`, the distributed inference engine that powers its serving runtime.
+
 Mesh is a distributed network for sharing model execution across machines on a local network, with a control plane coordinating device registration, ring membership, job dispatch, status, and accounting.
 
 The core idea is simple:
@@ -10,6 +12,26 @@ The core idea is simple:
 - results and credits are recorded durably by the control plane
 
 Mesh has one production execution path. There is no mock or synthetic executor in this repo.
+
+## zip
+
+`zip` is the inference engine embedded in Mesh and is being maintained as a
+separate open-source sibling project alongside this repo.
+
+`zip` owns:
+
+- explicit serving sessions
+- explicit prefill and decode phases
+- backend abstraction for provider-specific execution
+- checkpoint-backed KV handoff
+- runtime decode queue and microbatch planning primitives
+- tensor-plane transport and execution-facing types
+
+Mesh still owns the broader product shell around `zip`:
+
+- durable control-plane scheduling and accounting
+- worker CLI and process lifecycle
+- relay, UI, and operator workflows
 
 ## How It Works
 
@@ -178,7 +200,7 @@ The same canonical artifacts are used across providers. Provider choice changes 
 
 ## Core Components
 
-- `agent`: worker runtime and CLI for device bring-up, pool participation, ring membership, shard loading, inference execution, and dataplane transport. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
+- `agent`: worker runtime and CLI for device bring-up, pool participation, ring membership, shard loading, inference execution, and dataplane transport. It embeds `zip` inside the larger worker process. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
 - `control-plane`: durable coordinator for registration, topology, distributed job dispatch, status polling, and ledger events. See [inference.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/api/inference.rs) and [ring_manager.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/services/ring_manager.rs).
 - `relay-server`: optional connectivity layer for environments that cannot keep workers directly connected. See [relay-server/README.md](/Users/deepsaint/Desktop/meshnet/relay-server/README.md).
 

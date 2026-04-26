@@ -1,4 +1,4 @@
-//! Checkpoint module for fault tolerance in distributed inference
+//! Checkpoint module for fault tolerance in the `zip` inference engine
 //!
 //! This module provides checkpointing functionality that allows inference jobs
 //! to be recovered after worker failures. Checkpoints are saved periodically

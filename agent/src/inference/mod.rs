@@ -1,6 +1,6 @@
-//! Inference module for tensor-parallel distributed inference
+//! zip inference engine module for tensor-parallel distributed inference
 //!
-//! This module provides the orchestration layer for running distributed inference
+//! This module provides the core `zip` orchestration layer for running distributed inference
 //! across a ring of workers using tensor parallelism. Each worker:
 //!
 //! 1. Holds a shard (column range) of the model weights
@@ -33,7 +33,7 @@
 //!
 //! ## Key Components
 //!
-//! - [`InferenceCoordinator`]: Main orchestrator for inference jobs
+//! - [`InferenceCoordinator`]: Main orchestrator for `zip` inference jobs
 //! - [`InferenceJob`]: Represents a single inference request
 //! - [`InferenceStats`]: Tracks inference performance metrics
 //! - [`tensor_ops`]: Tensor operations (matmul, activations, etc.)

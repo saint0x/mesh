@@ -15,6 +15,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 /// Multicast settings for LAN discovery
 pub const BEACON_MULTICAST_ADDR: &str = "239.192.0.1";
 pub const BEACON_MULTICAST_PORT: u16 = 42424;
@@ -26,6 +29,25 @@ pub const CAPABILITY_CAN_SIGN_CERTS: u32 = 0x0001; // Admin can sign member cert
 pub const CAPABILITY_ACCEPTING_JOINS: u32 = 0x0002; // Admin is accepting new pool joins
 pub const CAPABILITY_HAS_RELAY: u32 = 0x0004; // Node has relay server running
 pub const CAPABILITY_HAS_CONTROL_PLANE: u32 = 0x0008; // Node has control plane running
+
+#[cfg(unix)]
+fn set_reuse_port(socket: &socket2::Socket) -> Result<()> {
+    let enabled: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &enabled as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
 
 /// Beacon message types for LAN discovery
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,7 +415,7 @@ impl BeaconListener {
 
         // Set SO_REUSEPORT (REQUIRED on macOS for multicast)
         #[cfg(unix)]
-        socket.set_reuse_port(true)?;
+        set_reuse_port(&socket)?;
 
         // Set nonblocking mode for tokio compatibility
         socket.set_nonblocking(true)?;

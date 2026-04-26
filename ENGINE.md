@@ -1,7 +1,7 @@
-# Engine Roadmap
+# Zip Roadmap
 
 This file tracks the remaining work to turn the current explicit-session,
-explicit-segment serving stack into a production serving engine.
+explicit-segment serving stack into the full production `zip` engine.
 
 ## Status Legend
 
