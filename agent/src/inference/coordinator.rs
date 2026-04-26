@@ -236,6 +236,7 @@ struct ActiveSession {
     backend: Box<dyn ExecutionBackend>,
     job: InferenceJob,
     queued_for_decode: bool,
+    decode_steps_served: u64,
 }
 
 struct DecodeStepOutcome {
@@ -321,6 +322,7 @@ impl InferenceCoordinator {
                     backend: Box::new(backend),
                     job: InferenceJob::new(request.clone(), self.config.total_layers),
                     queued_for_decode: false,
+                    decode_steps_served: 0,
                 },
             );
         }
@@ -398,9 +400,17 @@ impl InferenceCoordinator {
         let mut deferred = Vec::new();
         let mut deferred_for_capacity = 0_usize;
         let mut deferred_for_kv_budget = 0_usize;
-        let mut queue = std::mem::take(&mut self.decode_queue);
+        let mut queue = std::mem::take(&mut self.decode_queue)
+            .into_iter()
+            .collect::<Vec<_>>();
+        queue.sort_by_key(|task| {
+            self.sessions
+                .get(&task.session_id)
+                .map(|session| (session.decode_steps_served, task.fairness_epoch))
+                .unwrap_or((u64::MAX, task.fairness_epoch))
+        });
 
-        while let Some(task) = queue.pop_front() {
+        for task in queue {
             let Some(session) = self.sessions.get(&task.session_id) else {
                 continue;
             };
@@ -1089,6 +1099,7 @@ impl InferenceCoordinator {
             );
             session.job.add_token(sampled_token);
             session.job.current_layer = self.config.total_layers;
+            session.decode_steps_served = session.decode_steps_served.saturating_add(1);
 
             let outcome = DecodeStepOutcome {
                 session_id,
@@ -1513,6 +1524,7 @@ mod tests {
                 }),
                 job,
                 queued_for_decode: false,
+                decode_steps_served: 0,
             },
         );
     }
@@ -1701,5 +1713,38 @@ mod tests {
         assert_eq!(batch.deferred[0].session_id, session_c);
         assert_eq!(coordinator.decode_queue.len(), 1);
         assert_eq!(coordinator.decode_queue[0].session_id, session_c);
+    }
+
+    #[test]
+    fn test_build_next_decode_batch_prefers_less_served_sessions() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 1,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 4, 22);
+        coordinator
+            .sessions
+            .get_mut(&session_a)
+            .expect("session a")
+            .decode_steps_served = 5;
+        coordinator
+            .sessions
+            .get_mut(&session_b)
+            .expect("session b")
+            .decode_steps_served = 1;
+
+        coordinator.enqueue_decode_task(session_a).unwrap();
+        coordinator.enqueue_decode_task(session_b).unwrap();
+
+        let batch = coordinator.build_next_decode_batch();
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, session_b);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred[0].session_id, session_a);
+        assert_eq!(batch.deferred_for_capacity, 1);
     }
 }
