@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::any::Any;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -13,6 +14,8 @@ use super::tensor_ops::Tensor1D;
 
 #[async_trait]
 pub trait ExecutionBackend: Send {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
     fn provider_kind(&self) -> ExecutionProviderKind;
 
     fn optimization_profile(&self) -> BackendOptimizationProfile;
@@ -110,15 +113,18 @@ impl BackendMicrobatchExecutor {
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
-        // Provider-specialized fast paths keep the same runtime API while
-        // allowing Metal/CUDA backends to swap in fused kernels later.
+        if let Some(outputs) = CandleExecutionBackend::decode_step_batch(requests, worker_ring).await?
+        {
+            return Ok(outputs);
+        }
         Self::decode_step_batch_serial(requests, worker_ring).await
     }
 }
 
 pub struct CandleExecutionBackend {
-    provider: ExecutionProviderKind,
-    forward_pass: ForwardPass,
+    pub(crate) model_id: String,
+    pub(crate) provider: ExecutionProviderKind,
+    pub(crate) forward_pass: ForwardPass,
 }
 
 impl CandleExecutionBackend {
@@ -131,6 +137,7 @@ impl CandleExecutionBackend {
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         Ok(Self {
+            model_id: weights.model_id.clone(),
             provider: selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
             forward_pass: ForwardPass::new(
                 weights,
@@ -142,10 +149,82 @@ impl CandleExecutionBackend {
             )?,
         })
     }
+
+    async fn decode_step_batch(
+        requests: &mut [DecodeMicrobatchRequest<'_>],
+        worker_ring: &mut WorkerRing<'_>,
+    ) -> Result<Option<Vec<DecodeMicrobatchOutput>>> {
+        if requests.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut backends = Vec::with_capacity(requests.len());
+        let mut session_ids = Vec::with_capacity(requests.len());
+        let mut job_ids = Vec::with_capacity(requests.len());
+        let mut tokens = Vec::with_capacity(requests.len());
+        let mut expected_model_id = None::<String>;
+        let mut expected_provider = None::<ExecutionProviderKind>;
+
+        for request in requests.iter_mut() {
+            let Some(backend) = request
+                .backend
+                .as_any_mut()
+                .downcast_mut::<CandleExecutionBackend>()
+            else {
+                return Ok(None);
+            };
+
+            if backend.forward_pass.position == 0 {
+                return Ok(None);
+            }
+
+            if let Some(model_id) = &expected_model_id {
+                if model_id != &backend.model_id {
+                    return Ok(None);
+                }
+            } else {
+                expected_model_id = Some(backend.model_id.clone());
+            }
+
+            if let Some(provider) = expected_provider {
+                if provider != backend.provider {
+                    return Ok(None);
+                }
+            } else {
+                expected_provider = Some(backend.provider);
+            }
+
+            backends.push(backend);
+            session_ids.push(request.session_id);
+            job_ids.push(request.job_id);
+            tokens.push(request.token);
+        }
+
+        let step_start = Instant::now();
+        let logits = ForwardPass::decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring)
+            .await?;
+        let execution_time_ms = step_start.elapsed().as_millis() as u64;
+
+        Ok(Some(
+            session_ids
+                .into_iter()
+                .zip(logits)
+                .map(|(session_id, logits)| DecodeMicrobatchOutput {
+                    session_id,
+                    logits,
+                    execution_time_ms,
+                })
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]
 impl ExecutionBackend for CandleExecutionBackend {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn provider_kind(&self) -> ExecutionProviderKind {
         self.provider
     }
@@ -240,6 +319,10 @@ mod tests {
 
     #[async_trait]
     impl ExecutionBackend for ProfileBackend {
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
         fn provider_kind(&self) -> ExecutionProviderKind {
             self.provider
         }

@@ -1046,7 +1046,17 @@ impl InferenceCoordinator {
                 .map(|session| session.backend.export_kv_cache())
                 .transpose()?
                 .flatten();
-            manager.save_checkpoint(job, kv_snapshot.as_ref()).await?;
+            let manager = Arc::clone(manager);
+            let job = job.clone();
+            tokio::spawn(async move {
+                if let Err(error) = manager.save_checkpoint(&job, kv_snapshot.as_ref()).await {
+                    error!(
+                        job_id = %job.request.job_id,
+                        error = %error,
+                        "Asynchronous checkpoint save failed"
+                    );
+                }
+            });
             self.stats.record_checkpoint();
         }
         Ok(())
@@ -1754,6 +1764,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExecutionBackend for TestBackend {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
         fn provider_kind(&self) -> ExecutionProviderKind {
             ExecutionProviderKind::Cpu
         }

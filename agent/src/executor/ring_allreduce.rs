@@ -13,7 +13,7 @@
 
 use crate::errors::{AgentError, Result};
 use crate::inference::InferenceRuntimeMode;
-use crate::network::{AllReducePhase, TensorMessage, TensorPlane};
+use crate::network::{AllReducePhase, TensorChunkHeader, TensorMessage, TensorPlane};
 use crate::provider::ExecutionProviderKind;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,23 @@ impl Tensor {
     /// Check if the tensor is empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub fn chunk_ranges(&self, n: usize) -> Vec<std::ops::Range<usize>> {
+        assert!(n > 0, "Number of chunks must be positive");
+        let chunk_size = self.data.len().div_ceil(n);
+        let mut ranges = Vec::with_capacity(n);
+        let mut start = 0usize;
+        for _ in 0..n {
+            let end = if chunk_size == 0 {
+                start
+            } else {
+                (start + chunk_size).min(self.data.len())
+            };
+            ranges.push(start..end);
+            start = end;
+        }
+        ranges
     }
 }
 
@@ -278,15 +295,14 @@ impl<'a> WorkerRing<'a> {
         let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
         let mut run_metrics = RingAllReduceMetrics::default();
-
-        // Split tensor into n chunks
-        let mut chunks = partial_result.chunk(n);
+        let chunk_ranges = partial_result.chunk_ranges(n);
+        let mut work_buffer = partial_result.data;
 
         info!(
             "Starting ring all-reduce: n={}, my_pos={}, chunks={}",
             n,
             my_pos,
-            chunks.len()
+            chunk_ranges.len()
         );
 
         // PHASE 1: Reduce-Scatter (n-1 steps)
@@ -307,28 +323,42 @@ impl<'a> WorkerRing<'a> {
             );
 
             // Create message for right neighbor
-            let send_msg = TensorMessage::new(
+            let send_range = &chunk_ranges[send_idx];
+            let send_shape = [send_range.len()];
+            let send_header = TensorChunkHeader::new(
                 self.my_position,
                 job_id,
                 layer_idx,
                 AllReducePhase::ReduceScatter,
                 step as u32,
-                chunks[send_idx].data.clone(),
-                chunks[send_idx].shape.clone(),
             );
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) =
-                self.send_to_right_recv_from_left(send_msg).await?;
+                self.send_chunk_to_right_recv_from_left(
+                    send_header,
+                    &work_buffer[send_range.start..send_range.end],
+                    &send_shape,
+                )
+                .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            // Convert received message to Tensor
-            let received_chunk = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
-
-            // Accumulate (element-wise sum)
-            chunks[recv_idx] = chunks[recv_idx].add(&received_chunk)?;
+            let recv_range = &chunk_ranges[recv_idx];
+            if recv_msg.chunk_data.len() != recv_range.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received reduce-scatter chunk len {} but expected {}",
+                    recv_msg.chunk_data.len(),
+                    recv_range.len()
+                )));
+            }
+            for (dst, src) in work_buffer[recv_range.start..recv_range.end]
+                .iter_mut()
+                .zip(recv_msg.chunk_data.iter())
+            {
+                *dst += *src;
+            }
         }
 
         info!("Reduce-scatter complete");
@@ -350,34 +380,43 @@ impl<'a> WorkerRing<'a> {
                 recv_idx
             );
 
-            let send_msg = TensorMessage::new(
+            let send_range = &chunk_ranges[send_idx];
+            let send_shape = [send_range.len()];
+            let send_header = TensorChunkHeader::new(
                 self.my_position,
                 job_id,
                 layer_idx,
                 AllReducePhase::AllGather,
                 step as u32,
-                chunks[send_idx].data.clone(),
-                chunks[send_idx].shape.clone(),
             );
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) =
-                self.send_to_right_recv_from_left(send_msg).await?;
+                self.send_chunk_to_right_recv_from_left(
+                    send_header,
+                    &work_buffer[send_range.start..send_range.end],
+                    &send_shape,
+                )
+                .await?;
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            // In all-gather, we just copy (replace) the received chunk
-            chunks[recv_idx] = Tensor::new(recv_msg.chunk_data, recv_msg.chunk_shape);
+            let recv_range = &chunk_ranges[recv_idx];
+            if recv_msg.chunk_data.len() != recv_range.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received all-gather chunk len {} but expected {}",
+                    recv_msg.chunk_data.len(),
+                    recv_range.len()
+                )));
+            }
+            work_buffer[recv_range.start..recv_range.end].copy_from_slice(&recv_msg.chunk_data);
         }
 
         info!("All-gather complete");
 
-        // Concatenate chunks to get full tensor
-        let full_tensor = Tensor::concat(chunks);
-
         self.last_run_metrics = run_metrics;
-        Ok(Tensor::new(full_tensor.data, original_shape))
+        Ok(Tensor::new(work_buffer, original_shape))
     }
 
     /// Ring all-reduce with timeout
@@ -482,6 +521,50 @@ impl<'a> WorkerRing<'a> {
         );
         Ok((
             tensor,
+            send_started.elapsed().as_millis() as u64,
+            recv_started.elapsed().as_millis() as u64,
+        ))
+    }
+
+    async fn send_chunk_to_right_recv_from_left(
+        &mut self,
+        header: TensorChunkHeader,
+        chunk_data: &[f32],
+        chunk_shape: &[usize],
+    ) -> Result<(TensorMessage, u64, u64)> {
+        let expected_sender_position =
+            (self.my_position + self.total_workers - 1) % self.total_workers;
+        let send_started = std::time::Instant::now();
+        let recv_started = std::time::Instant::now();
+        let (send_result, inbound) = tokio::join!(
+            self.tensor_plane.send_chunk_with_transport_context(
+                self.right_tensor_addr,
+                header,
+                chunk_data,
+                chunk_shape,
+                self.runtime_mode,
+                self.provider,
+            ),
+            self.tensor_plane.recv_matching(|inbound| {
+                let tensor = &inbound.tensor;
+                tensor.sender_position == expected_sender_position
+                    && tensor.job_id == header.job_id
+                    && tensor.layer_idx == header.layer_idx
+                    && tensor.phase == header.phase
+                    && tensor.step == header.step
+            })
+        );
+        send_result?;
+
+        let inbound = inbound.ok_or_else(|| {
+            AgentError::Network(format!(
+                "Tensor plane closed while waiting for {:?} step {} from worker {}",
+                header.phase, header.step, expected_sender_position
+            ))
+        })?;
+
+        Ok((
+            inbound.tensor,
             send_started.elapsed().as_millis() as u64,
             recv_started.elapsed().as_millis() as u64,
         ))

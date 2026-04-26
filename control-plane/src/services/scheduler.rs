@@ -671,6 +671,18 @@ fn load_scheduler_candidates(
     let mut stmt = conn
         .prepare(
             r#"
+            WITH decode_cohort_stats AS (
+                SELECT
+                    network_id,
+                    COALESCE(batch_group_key, group_id) AS cohort_key,
+                    SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready_sessions,
+                    SUM(CASE WHEN status = 'blocked_on_transfer' THEN 1 ELSE 0 END) AS blocked_sessions,
+                    MIN(CASE WHEN status = 'ready' THEN ready_at END) AS oldest_ready_at,
+                    SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END) AS leased_sessions,
+                    SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_sessions
+                FROM inference_decode_queue
+                GROUP BY network_id, COALESCE(batch_group_key, group_id)
+            )
             SELECT
                 a.assignment_id,
                 a.job_id,
@@ -692,42 +704,11 @@ fn load_scheduler_candidates(
                 sg.lease_owner_device_id,
                 sg.lease_expires_at,
                 dq.lease_target_session_count,
-                COALESCE((
-                    SELECT SUM(CASE WHEN peer.status = 'ready' THEN 1 ELSE 0 END)
-                    FROM inference_decode_queue peer
-                    WHERE peer.network_id = a.network_id
-                      AND COALESCE(peer.batch_group_key, peer.group_id) =
-                          COALESCE(dq.batch_group_key, dq.group_id)
-                ), 0),
-                COALESCE((
-                    SELECT SUM(CASE WHEN peer.status = 'blocked_on_transfer' THEN 1 ELSE 0 END)
-                    FROM inference_decode_queue peer
-                    WHERE peer.network_id = a.network_id
-                      AND COALESCE(peer.batch_group_key, peer.group_id) =
-                          COALESCE(dq.batch_group_key, dq.group_id)
-                ), 0),
-                (
-                    SELECT MIN(peer.ready_at)
-                    FROM inference_decode_queue peer
-                    WHERE peer.network_id = a.network_id
-                      AND COALESCE(peer.batch_group_key, peer.group_id) =
-                          COALESCE(dq.batch_group_key, dq.group_id)
-                      AND peer.status = 'ready'
-                ),
-                COALESCE((
-                    SELECT SUM(CASE WHEN peer.status = 'leased' THEN 1 ELSE 0 END)
-                    FROM inference_decode_queue peer
-                    WHERE peer.network_id = a.network_id
-                      AND COALESCE(peer.batch_group_key, peer.group_id) =
-                          COALESCE(dq.batch_group_key, dq.group_id)
-                ), 0),
-                COALESCE((
-                    SELECT SUM(CASE WHEN peer.status = 'active' THEN 1 ELSE 0 END)
-                    FROM inference_decode_queue peer
-                    WHERE peer.network_id = a.network_id
-                      AND COALESCE(peer.batch_group_key, peer.group_id) =
-                          COALESCE(dq.batch_group_key, dq.group_id)
-                ), 0)
+                COALESCE(stats.ready_sessions, 0),
+                COALESCE(stats.blocked_sessions, 0),
+                stats.oldest_ready_at,
+                COALESCE(stats.leased_sessions, 0),
+                COALESCE(stats.active_sessions, 0)
             FROM inference_job_assignments a
             INNER JOIN inference_jobs j ON j.job_id = a.job_id
             INNER JOIN inference_sessions s ON s.job_id = j.job_id
@@ -735,6 +716,9 @@ fn load_scheduler_candidates(
                 ON sg.job_id = a.job_id AND sg.device_id = a.device_id
             LEFT JOIN inference_decode_queue dq
                 ON dq.session_id = s.session_id AND sg.phase = 'decode'
+            LEFT JOIN decode_cohort_stats stats
+                ON stats.network_id = a.network_id
+               AND stats.cohort_key = COALESCE(dq.batch_group_key, dq.group_id)
             WHERE a.device_id = ?
               AND a.network_id = ?
               AND a.active_segment_id = j.active_segment_id
@@ -759,40 +743,63 @@ fn load_scheduler_candidates(
 
     let rows = stmt.query_map(params![&req.device_id, &req.network_id], |row| {
         let phase: String = row.get(9)?;
-        Ok(SchedulerCandidate {
-            assignment_id: row.get(0)?,
-            job_id: row.get(1)?,
-            session_id: row.get(2)?,
-            model_id: row.get(3)?,
-            runtime_mode: parse_runtime_mode(
-                serde_json::from_str::<InferenceExecutionPlan>(&row.get::<_, String>(4)?)
-                    .map_err(|err| to_from_sql_error(err.to_string()))?
-                    .runtime_mode,
-            ),
-            submitted_by_device_id: row.get(5)?,
-            created_at: row.get(6)?,
-            assigned_at: row.get(7)?,
-            phase: parse_scheduler_phase(&phase).map_err(to_from_sql_error)?,
-            group_status: row.get(11)?,
-            decode_queue_status: row.get(12)?,
-            decode_ready_at: row.get(13)?,
-            decode_lease_owner_device_id: row.get(14)?,
-            decode_lease_expires_at: row.get(15)?,
-            decode_updated_at: row.get(16)?,
-            group_lease_owner_device_id: row.get(17)?,
-            group_lease_expires_at: row.get(18)?,
-            decode_lease_target_session_count: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            decode_cohort_ready_sessions: row.get::<_, i64>(20)? as u32,
-            decode_cohort_blocked_sessions: row.get::<_, i64>(21)? as u32,
-            decode_cohort_oldest_ready_at: row.get(22)?,
-            decode_cohort_leased_sessions: row.get::<_, i64>(23)? as u32,
-            decode_cohort_active_sessions: row.get::<_, i64>(24)? as u32,
-        })
+        Ok((
+            row.get::<_, String>(4)?,
+            SchedulerCandidate {
+                assignment_id: row.get(0)?,
+                job_id: row.get(1)?,
+                session_id: row.get(2)?,
+                model_id: row.get(3)?,
+                runtime_mode: SchedulerPolicyMode::FitFirst,
+                submitted_by_device_id: row.get(5)?,
+                created_at: row.get(6)?,
+                assigned_at: row.get(7)?,
+                phase: parse_scheduler_phase(&phase).map_err(to_from_sql_error)?,
+                group_status: row.get(11)?,
+                decode_queue_status: row.get(12)?,
+                decode_ready_at: row.get(13)?,
+                decode_lease_owner_device_id: row.get(14)?,
+                decode_lease_expires_at: row.get(15)?,
+                decode_updated_at: row.get(16)?,
+                group_lease_owner_device_id: row.get(17)?,
+                group_lease_expires_at: row.get(18)?,
+                decode_lease_target_session_count: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+                decode_cohort_ready_sessions: row.get::<_, i64>(20)? as u32,
+                decode_cohort_blocked_sessions: row.get::<_, i64>(21)? as u32,
+                decode_cohort_oldest_ready_at: row.get(22)?,
+                decode_cohort_leased_sessions: row.get::<_, i64>(23)? as u32,
+                decode_cohort_active_sessions: row.get::<_, i64>(24)? as u32,
+            },
+        ))
     });
-    let candidates = rows
+    let rows = rows
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let mut runtime_mode_cache = std::collections::HashMap::new();
+    let candidates = rows
+        .into_iter()
+        .map(|(execution_plan_json, mut candidate)| {
+            let runtime_mode = if let Some(runtime_mode) = runtime_mode_cache.get(&execution_plan_json)
+            {
+                *runtime_mode
+            } else {
+                let runtime_mode = parse_runtime_mode(
+                    serde_json::from_str::<InferenceExecutionPlan>(&execution_plan_json)
+                        .map_err(|err| {
+                            ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
+                                to_from_sql_error(err.to_string()),
+                            )))
+                        })?
+                        .runtime_mode,
+                );
+                runtime_mode_cache.insert(execution_plan_json, runtime_mode);
+                runtime_mode
+            };
+            candidate.runtime_mode = runtime_mode;
+            Ok(candidate)
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
     Ok(candidates
         .into_iter()
         .filter(|candidate| claim_mode_matches(req.claim_mode, candidate.phase))

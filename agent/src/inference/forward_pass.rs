@@ -824,6 +824,176 @@ impl ForwardPass {
         self.compute_logits(&hidden)
     }
 
+    pub async fn decode_microbatch(
+        backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
+        tokens: &[u32],
+        job_ids: &[Uuid],
+        worker_ring: &mut WorkerRing<'_>,
+    ) -> Result<Vec<Tensor1D>> {
+        if backends.is_empty() || tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if backends.len() != tokens.len() || backends.len() != job_ids.len() {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Decode microbatch shape mismatch: backends={} tokens={} job_ids={}",
+                backends.len(),
+                tokens.len(),
+                job_ids.len()
+            )));
+        }
+
+        let (config, device_weights, worker_position, total_workers, allreduce_timeout) = {
+            let template = &backends[0].forward_pass;
+            (
+                template.config.clone(),
+                template.device_weights.clone(),
+                template.worker_position,
+                template.total_workers,
+                template.allreduce_timeout,
+            )
+        };
+        let batch_job_id = job_ids[0];
+
+        let mut positions = Vec::with_capacity(backends.len());
+        for backend in backends.iter() {
+            let forward_pass = &backend.forward_pass;
+            if forward_pass.position == 0 {
+                return Err(crate::errors::AgentError::Execution(
+                    "Decode microbatch requested before prompt prefill".to_string(),
+                ));
+            }
+            if forward_pass.kv_cache.seq_len() != forward_pass.position {
+                return Err(crate::errors::AgentError::Execution(format!(
+                    "Forward pass position {} diverged from KV cache length {}",
+                    forward_pass.position,
+                    forward_pass.kv_cache.seq_len()
+                )));
+            }
+            positions.push(forward_pass.position as u32);
+        }
+
+        let ids = CandleTensor::from_vec(
+            tokens.to_vec(),
+            tokens.len(),
+            device_weights.embedding.device(),
+        )
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+        let mut hidden = device_weights.embedding.embedding(&ids).map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+        let mut metrics = RingAllReduceMetrics::default();
+
+        for layer_idx in 0..config.num_layers {
+            let layer = device_weights.layers[layer_idx].clone();
+            let normed = rms_norm_candle(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
+            let q_partial = normed.matmul(&layer.w_q).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let k_partial = normed.matmul(&layer.w_k).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let v_partial = normed.matmul(&layer.w_v).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+
+            let mut kv_caches = backends
+                .iter_mut()
+                .map(|backend| &mut backend.forward_pass.kv_cache)
+                .collect::<Vec<_>>();
+            let attn_output = attention_output_device_batch(
+                &mut kv_caches,
+                &config,
+                worker_position,
+                total_workers,
+                layer_idx,
+                &positions,
+                q_partial,
+                k_partial,
+                v_partial,
+            )?;
+
+            let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let o_full = Self::ring_allreduce_candle_batch(
+                &o_partial,
+                worker_ring,
+                batch_job_id,
+                layer_idx as u32,
+                allreduce_timeout,
+                &mut metrics,
+            )
+            .await?;
+            let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+
+            let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
+            let gate_partial = mlp_normed.matmul(&layer.w_gate).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let up_partial = mlp_normed.matmul(&layer.w_up).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let gate_activated = silu_candle(&gate_partial)?;
+            let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let down_partial = mlp_hidden.matmul(&layer.w_down).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let down_full = Self::ring_allreduce_candle_batch(
+                &down_partial,
+                worker_ring,
+                batch_job_id,
+                layer_idx as u32,
+                allreduce_timeout,
+                &mut metrics,
+            )
+            .await?;
+            hidden = post_attn.broadcast_add(&down_full).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+        }
+
+        hidden = rms_norm_candle(&hidden, &device_weights.final_norm, config.rms_norm_eps)?;
+        let logits_2d = hidden
+            .matmul(&device_weights.lm_head)
+            .map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+        let dims = logits_2d.dims();
+        let mut logits = Vec::with_capacity(dims[0]);
+        for row_idx in 0..dims[0] {
+            let row = logits_2d.narrow(0, row_idx, 1).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            logits.push(Tensor1D::new(
+                row.flatten_all()
+                    .map_err(|e| {
+                        crate::errors::AgentError::Execution(format!(
+                            "GPU tensor backend error: {}",
+                            e
+                        ))
+                    })?
+                    .to_vec1::<f32>()
+                    .map_err(|e| {
+                        crate::errors::AgentError::Execution(format!(
+                            "GPU tensor backend error: {}",
+                            e
+                        ))
+                    })?,
+            ));
+        }
+        for backend in backends.iter_mut() {
+            backend.forward_pass.position += 1;
+            backend.forward_pass.last_allreduce_metrics = metrics;
+        }
+        Ok(logits)
+    }
+
     /// Helper: Convert Tensor2D to ring all-reduce format and back
     async fn ring_allreduce_candle(
         &mut self,
@@ -844,6 +1014,24 @@ impl ForwardPass {
             .accumulate(worker_ring.last_run_metrics());
 
         // Convert back to 2D
+        let host = Tensor2D::from_allreduce_tensor(&reduced)?;
+        to_candle_2d(&host)
+    }
+
+    async fn ring_allreduce_candle_batch(
+        tensor: &CandleTensor,
+        worker_ring: &mut WorkerRing<'_>,
+        job_id: Uuid,
+        layer_idx: u32,
+        allreduce_timeout: std::time::Duration,
+        metrics: &mut RingAllReduceMetrics,
+    ) -> Result<CandleTensor> {
+        let host = from_candle_2d(tensor)?;
+        let flat = host.to_allreduce_tensor();
+        let reduced = worker_ring
+            .ring_all_reduce_with_timeout(flat, job_id, layer_idx, allreduce_timeout)
+            .await?;
+        metrics.accumulate(worker_ring.last_run_metrics());
         let host = Tensor2D::from_allreduce_tensor(&reduced)?;
         to_candle_2d(&host)
     }
@@ -1059,6 +1247,219 @@ fn attention_output_device(
     CandleTensor::cat(&refs, 1).map_err(|e| {
         crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
     })
+}
+
+fn attention_output_device_batch(
+    kv_caches: &mut [&mut KVCache],
+    config: &ModelConfig,
+    worker_position: u32,
+    total_workers: u32,
+    layer_idx: usize,
+    absolute_positions: &[u32],
+    q_local: CandleTensor,
+    k_local: CandleTensor,
+    v_local: CandleTensor,
+) -> Result<CandleTensor> {
+    let batch_size = q_local.dims()[0];
+    if kv_caches.len() != batch_size || absolute_positions.len() != batch_size {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Batched attention state mismatch: caches={} positions={} batch={}",
+            kv_caches.len(),
+            absolute_positions.len(),
+            batch_size
+        )));
+    }
+    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Unsupported attention geometry: hidden_dim {} num_heads {}",
+            config.hidden_dim, config.num_heads
+        )));
+    }
+    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+
+    let head_dim = config.hidden_dim / config.num_heads;
+    let kv_hidden_dim = config.num_kv_heads * head_dim;
+    let q_dims = q_local.dims();
+    let k_dims = k_local.dims();
+    let v_dims = v_local.dims();
+    let q_cols = q_dims[1];
+    let k_cols = k_dims[1];
+    let v_cols = v_dims[1];
+
+    if q_cols % head_dim != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local query projection width {} is not a multiple of head_dim {}",
+            q_cols, head_dim
+        )));
+    }
+    if k_cols % head_dim != 0 || v_cols % head_dim != 0 {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local KV projection widths must be multiples of head_dim {}: k={} v={}",
+            head_dim, k_cols, v_cols
+        )));
+    }
+    let expected_q_cols = partition_columns(config.hidden_dim, worker_position, total_workers);
+    if q_cols != expected_q_cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local query projection width mismatch: expected {}, got {}",
+            expected_q_cols, q_cols
+        )));
+    }
+    let expected_kv_cols = partition_columns(kv_hidden_dim, worker_position, total_workers);
+    if k_cols != expected_kv_cols || v_cols != expected_kv_cols {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Local KV projection width mismatch: expected {}, got k={} v={}",
+            expected_kv_cols, k_cols, v_cols
+        )));
+    }
+
+    let local_q_heads = q_cols / head_dim;
+    let local_kv_heads = k_cols / head_dim;
+    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
+    let q_head_start =
+        partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
+    let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
+
+    let q_rope = apply_rope_candle(
+        &q_local,
+        batch_size,
+        q_cols,
+        absolute_positions,
+        head_dim,
+        config.rope_base,
+    )?;
+    let k_rope = apply_rope_candle(
+        &k_local,
+        batch_size,
+        k_cols,
+        absolute_positions,
+        head_dim,
+        config.rope_base,
+    )?;
+
+    let k_rope_host = from_candle_2d(&k_rope)?;
+    let v_host = from_candle_2d(&v_local)?;
+    let mut cached_lengths = Vec::with_capacity(batch_size);
+    let mut max_cached_len = 0usize;
+    for row_idx in 0..batch_size {
+        let prefix_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
+        validate_positions(&[absolute_positions[row_idx]], prefix_len)?;
+
+        let row_start_k = row_idx * k_cols;
+        let row_end_k = row_start_k + k_cols;
+        let row_start_v = row_idx * v_cols;
+        let row_end_v = row_start_v + v_cols;
+        kv_caches[row_idx].append_layer(
+            layer_idx,
+            Tensor2D::new(k_rope_host.data[row_start_k..row_end_k].to_vec(), 1, k_cols)?,
+            Tensor2D::new(v_host.data[row_start_v..row_end_v].to_vec(), 1, v_cols)?,
+        )?;
+        let cached_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
+        max_cached_len = max_cached_len.max(cached_len);
+        cached_lengths.push(cached_len);
+    }
+
+    let mut expanded_k = vec![0.0f32; batch_size * local_q_heads * max_cached_len * head_dim];
+    let mut expanded_v = vec![0.0f32; batch_size * local_q_heads * max_cached_len * head_dim];
+    let mut mask = vec![f32::NEG_INFINITY; batch_size * local_q_heads * max_cached_len];
+
+    for row_idx in 0..batch_size {
+        let (cached_k, cached_v) = kv_caches[row_idx].get_layer_kv(layer_idx)?;
+        let cached_len = cached_lengths[row_idx];
+        for local_q_idx in 0..local_q_heads {
+            let global_q_head = q_head_start + local_q_idx;
+            let global_kv_head = global_q_head / q_heads_per_kv_head;
+            if global_kv_head < kv_head_start || global_kv_head >= kv_head_start + local_kv_heads {
+                return Err(crate::errors::AgentError::Execution(format!(
+                    "Local KV head ownership mismatch: q_head {} maps to kv_head {}, local kv range {}..{}",
+                    global_q_head,
+                    global_kv_head,
+                    kv_head_start,
+                    kv_head_start + local_kv_heads
+                )));
+            }
+            let local_kv_idx = global_kv_head - kv_head_start;
+            let head_base = ((row_idx * local_q_heads) + local_q_idx) * max_cached_len * head_dim;
+            for seq_idx in 0..cached_len {
+                let src_offset = seq_idx * k_cols + local_kv_idx * head_dim;
+                let dst_offset = head_base + seq_idx * head_dim;
+                expanded_k[dst_offset..dst_offset + head_dim]
+                    .copy_from_slice(&cached_k.data[src_offset..src_offset + head_dim]);
+                expanded_v[dst_offset..dst_offset + head_dim]
+                    .copy_from_slice(&cached_v.data[src_offset..src_offset + head_dim]);
+                mask[(row_idx * local_q_heads + local_q_idx) * max_cached_len + seq_idx] = 0.0;
+            }
+        }
+    }
+
+    let q_heads = q_rope
+        .reshape((batch_size, local_q_heads, head_dim))
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?
+        .reshape((batch_size * local_q_heads, 1, head_dim))
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+    let k_heads = CandleTensor::from_vec(
+        expanded_k,
+        (batch_size * local_q_heads, max_cached_len, head_dim),
+        q_local.device(),
+    )
+    .map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?
+    .transpose(1, 2)
+    .map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let v_heads = CandleTensor::from_vec(
+        expanded_v,
+        (batch_size * local_q_heads, max_cached_len, head_dim),
+        q_local.device(),
+    )
+    .map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+
+    let scores = q_heads.matmul(&k_heads).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let scores = scores
+        .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+    let attn_mask = CandleTensor::from_vec(
+        mask,
+        (batch_size * local_q_heads, 1, max_cached_len),
+        q_local.device(),
+    )
+    .map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let masked = scores.broadcast_add(&attn_mask).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let probs = candle_nn::ops::softmax(&masked, 2).map_err(|e| {
+        crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+    })?;
+    let output = probs
+        .matmul(&v_heads)
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?
+        .reshape((batch_size, local_q_heads * head_dim))
+        .map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+
+    Ok(output)
 }
 
 /// Simplified forward pass for testing without ring all-reduce

@@ -10,6 +10,7 @@ use crate::errors::{AgentError, Result};
 use crate::inference::job::InferenceJob;
 use crate::inference::kv_cache::{KVCache, KVCacheSnapshot};
 use std::path::Path;
+use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -79,11 +80,11 @@ impl CheckpointManager {
             .config
             .checkpoint_dir
             .join(job.request.job_id.to_string());
-        std::fs::create_dir_all(&job_dir)?;
+        fs::create_dir_all(&job_dir).await?;
 
         // Write checkpoint file
         let file_path = checkpoint.file_path(&self.config.checkpoint_dir);
-        std::fs::write(&file_path, &data)?;
+        fs::write(&file_path, &data).await?;
 
         // Update metadata with actual size
         let mut metadata = checkpoint.metadata.clone();
@@ -195,9 +196,9 @@ impl CheckpointManager {
             .config
             .checkpoint_dir
             .join(checkpoint.metadata.job_id.to_string());
-        std::fs::create_dir_all(&job_dir)?;
+        fs::create_dir_all(&job_dir).await?;
         let file_path = checkpoint.file_path(&self.config.checkpoint_dir);
-        std::fs::write(&file_path, &bytes)?;
+        fs::write(&file_path, &bytes).await?;
 
         let mut metadata = checkpoint.metadata.clone();
         metadata.size_bytes = bytes.len() as u64;
@@ -397,7 +398,7 @@ impl CheckpointManager {
 
     /// Load a checkpoint from file
     async fn load_checkpoint_file(&self, path: &Path) -> Result<Checkpoint> {
-        let data = std::fs::read(path)?;
+        let data = fs::read(path).await?;
         let checkpoint = Checkpoint::from_cbor(&data)
             .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
         checkpoint.validate().map_err(|e| {

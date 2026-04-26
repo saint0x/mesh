@@ -196,24 +196,14 @@ impl LayerKVCache {
                         existing_keys.rows, existing_keys.cols, new_keys.rows, new_keys.cols
                     )));
                 }
-                // Concatenate with existing cache
-                let new_k_data = [existing_keys.data.as_slice(), new_keys.data.as_slice()].concat();
-                let new_v_data =
-                    [existing_values.data.as_slice(), new_values.data.as_slice()].concat();
+                existing_keys.data.reserve(new_keys.data.len());
+                existing_keys.data.extend_from_slice(&new_keys.data);
+                existing_values.data.reserve(new_values.data.len());
+                existing_values.data.extend_from_slice(&new_values.data);
 
-                let new_rows = existing_keys.rows + new_keys.rows;
-
-                self.keys = Some(Tensor2D {
-                    data: new_k_data,
-                    rows: new_rows,
-                    cols: existing_keys.cols,
-                });
-                self.values = Some(Tensor2D {
-                    data: new_v_data,
-                    rows: new_rows,
-                    cols: existing_values.cols,
-                });
-                self.seq_len = new_rows;
+                existing_keys.rows += new_keys.rows;
+                existing_values.rows += new_values.rows;
+                self.seq_len = existing_keys.rows;
             }
             _ => {
                 // First update - just store

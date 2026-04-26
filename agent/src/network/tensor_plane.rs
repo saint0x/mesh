@@ -14,7 +14,7 @@ use crate::errors::{AgentError, Result};
 use crate::inference::InferenceRuntimeMode;
 use crate::provider::ExecutionProviderKind;
 
-use super::tensor_message::{AllReducePhase, TensorMessage, TensorTrafficClass};
+use super::tensor_message::{AllReducePhase, TensorChunkHeader, TensorMessage, TensorTrafficClass};
 
 pub const DATA_PLANE_ENDPOINT_PREFIX: &str = "dataplane://";
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -776,14 +776,66 @@ impl TensorPlane {
         .await
     }
 
+    pub async fn send_chunk_with_transport_context(
+        &self,
+        target: SocketAddr,
+        header: TensorChunkHeader,
+        chunk_data: &[f32],
+        chunk_shape: &[usize],
+        runtime_mode: InferenceRuntimeMode,
+        provider: ExecutionProviderKind,
+    ) -> Result<()> {
+        let traffic_class = match header.phase {
+            AllReducePhase::Barrier => TensorTrafficClass::LatencyCritical,
+            AllReducePhase::AllGather => TensorTrafficClass::Interactive,
+            AllReducePhase::ReduceScatter => TensorTrafficClass::Bulk,
+        };
+        let encoded = header.encode_binary(chunk_data, chunk_shape);
+        self.send_encoded_with_transport_policy(
+            target,
+            &encoded,
+            header.size_bytes(chunk_data.len(), chunk_shape.len()).max(1),
+            Some(header.phase),
+            TransportSendPolicy {
+                traffic_class,
+                desired_stream_count: preferred_stream_count(
+                    traffic_class,
+                    runtime_mode,
+                    provider,
+                    self.state.max_concurrent_outbound_streams_per_peer,
+                ),
+                fallback_policy: fallback_policy_for_runtime_mode(runtime_mode),
+            },
+        )
+        .await
+    }
+
     async fn send_with_transport_policy(
         &self,
         target: SocketAddr,
         message: &TensorMessage,
         policy: TransportSendPolicy,
     ) -> Result<()> {
+        let encoded = message.encode_binary();
+        self.send_encoded_with_transport_policy(
+            target,
+            &encoded,
+            message.size_bytes().max(1),
+            Some(message.phase),
+            policy,
+        )
+        .await
+    }
+
+    async fn send_encoded_with_transport_policy(
+        &self,
+        target: SocketAddr,
+        encoded_message: &[u8],
+        message_bytes: usize,
+        phase: Option<AllReducePhase>,
+        policy: TransportSendPolicy,
+    ) -> Result<()> {
         let send_started = Instant::now();
-        let message_bytes = message.size_bytes().max(1);
         if message_bytes > self.state.max_message_bytes {
             self.state
                 .metrics
@@ -931,7 +983,9 @@ impl TensorPlane {
                 .fetch_add(bandwidth_wait.as_millis() as u64, Ordering::Relaxed);
             tokio::time::sleep(bandwidth_wait).await;
         }
-        let send_result = self.send_on_policy_stream(target, message, policy).await;
+        let send_result = self
+            .send_on_policy_stream(target, encoded_message, policy)
+            .await;
         if let Err(error) = send_result {
             drop(outbound_permit);
             drop(bulk_outbound_permit);
@@ -942,12 +996,9 @@ impl TensorPlane {
             .metrics
             .bytes_sent
             .fetch_add(message_bytes as u64, Ordering::Relaxed);
-        record_phase_bytes(
-            &self.state.metrics,
-            message.phase,
-            message_bytes as u64,
-            true,
-        );
+        if let Some(phase) = phase {
+            record_phase_bytes(&self.state.metrics, phase, message_bytes as u64, true);
+        }
         self.state
             .metrics
             .send_count
@@ -967,7 +1018,7 @@ impl TensorPlane {
     async fn send_on_policy_stream(
         &self,
         target: SocketAddr,
-        message: &TensorMessage,
+        encoded_message: &[u8],
         policy: TransportSendPolicy,
     ) -> Result<()> {
         let mut last_error = None;
@@ -985,7 +1036,11 @@ impl TensorPlane {
                 let mut stream_guard = stream.lock().await;
                 tokio::time::timeout(
                     self.state.io_timeout,
-                    write_tensor_message(&mut *stream_guard, message, self.state.max_message_bytes),
+                    write_preencoded_tensor_message(
+                        &mut *stream_guard,
+                        encoded_message,
+                        self.state.max_message_bytes,
+                    ),
                 )
                 .await
             };
@@ -1404,21 +1459,17 @@ where
 
     let mut buf = vec![0u8; len];
     io.read_exact(&mut buf).await?;
-    ciborium::from_reader(&buf[..])
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    TensorMessage::decode_binary(&buf)
 }
 
-async fn write_tensor_message<T>(
+async fn write_preencoded_tensor_message<T>(
     io: &mut T,
-    message: &TensorMessage,
+    buf: &[u8],
     max_message_bytes: usize,
 ) -> std::io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
 {
-    let mut buf = Vec::new();
-    ciborium::into_writer(message, &mut buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if buf.len() > max_message_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1432,7 +1483,6 @@ where
 
     io.write_all(&(buf.len() as u32).to_be_bytes()).await?;
     io.write_all(&buf).await?;
-    io.flush().await?;
     Ok(())
 }
 
