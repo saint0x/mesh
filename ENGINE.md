@@ -64,6 +64,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Keep pooled decode lease targets authoritative when sibling sessions are blocked on transfer
 - ✅ Renew and release owned pooled decode cohorts at cohort scope instead of single-session scope
 - ✅ Promote owned pooled decode cohorts to active at cohort scope when decode is acknowledged
+- ✅ Refresh remaining pooled decode targets when a sibling session completes or fails
 - ✅ Persist target-versus-actual decode batch event history
 - ✅ Expose pooled decode cohort visibility on lease and session status surfaces
 - ✅ Add microbatch formation across multiple active sessions
