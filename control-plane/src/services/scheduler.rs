@@ -599,6 +599,7 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
         let remaining_capacity = target.saturating_sub(cohort_fill);
         let remaining_rank = match mode {
             SchedulerPolicyMode::FitFirst => remaining_capacity.min(31),
+            SchedulerPolicyMode::ResilientEdge => remaining_capacity.min(31),
             _ => 31u32.saturating_sub(remaining_capacity.min(31)),
         };
         let fill_density_rank = match mode {
@@ -3178,6 +3179,90 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_broader < latency_narrower);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_smaller_owned_decode_cohort_when_transfer_exposure_ties_while_latency_prefers_broader_one() {
+        let mut broader = base_candidate(SchedulerPhase::Decode);
+        broader.assignment_id = "broader".into();
+        broader.group_status = "decode_leased".into();
+        broader.decode_queue_status = Some("leased".into());
+        broader.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        broader.group_lease_owner_device_id = Some("worker-1".into());
+        broader.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        broader.decode_lease_target_session_count = Some(6);
+        broader.decode_cohort_leased_sessions = 1;
+        broader.decode_cohort_active_sessions = 1;
+        broader.decode_cohort_ready_sessions = 1;
+        broader.decode_cohort_blocked_sessions = 1;
+        broader.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut smaller = broader.clone();
+        smaller.assignment_id = "smaller".into();
+        smaller.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        smaller.decode_lease_target_session_count = Some(4);
+
+        let broader = RunnableCandidate {
+            ready_at: broader.decode_ready_at.clone().unwrap(),
+            candidate: broader,
+        };
+        let smaller = RunnableCandidate {
+            ready_at: smaller.decode_ready_at.clone().unwrap(),
+            candidate: smaller,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_smaller = rank_candidate(
+            &smaller,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_broader = rank_candidate(
+            &broader,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_smaller < resilient_broader);
+
+        let latency_broader = rank_candidate(
+            &broader,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_smaller = rank_candidate(
+            &smaller,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_broader < latency_smaller);
     }
 
     #[test]
