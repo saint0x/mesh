@@ -402,69 +402,72 @@ fn mode_rank(
 ) -> (u8, u8, u8, u32, u32, String) {
     let decode_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Decode);
     let prefill_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Prefill);
-    let owned_decode_group_under_target_bias = u8::from(
-        !matches!(candidate.candidate.phase, SchedulerPhase::Decode)
-            || candidate
-                .candidate
-                .group_lease_owner_device_id
-                .as_deref()
-                .is_none()
-            || candidate
-                .candidate
-                .decode_lease_target_session_count
-                .map(|target| {
-                    candidate
-                        .candidate
-                        .decode_cohort_leased_sessions
-                        .saturating_add(candidate.candidate.decode_cohort_active_sessions)
-                        >= target
-                })
-                .unwrap_or(true),
-    );
-    let owned_decode_group_bias = u8::from(
-        !matches!(candidate.candidate.phase, SchedulerPhase::Decode)
-            || candidate
-                .candidate
-                .group_lease_owner_device_id
-                .as_deref()
-                .is_none(),
-    );
+    let decode_group_fill_bias = decode_group_fill_bias(candidate);
     match mode {
         SchedulerPolicyMode::FitFirst => (
             prefill_bias,
-            owned_decode_group_under_target_bias,
-            owned_decode_group_bias,
+            decode_group_fill_bias,
+            decode_bias,
             submitter_leased_assignments,
             job_leased_assignments,
             candidate.candidate.created_at.clone(),
         ),
         SchedulerPolicyMode::ThroughputFirst => (
             decode_bias,
-            owned_decode_group_under_target_bias,
-            owned_decode_group_bias,
+            decode_group_fill_bias,
+            0,
             job_leased_assignments,
             submitter_leased_assignments,
             candidate.ready_at.clone(),
         ),
         SchedulerPolicyMode::LatencyFirst => (
             decode_bias,
-            owned_decode_group_under_target_bias,
-            owned_decode_group_bias,
+            decode_group_fill_bias,
+            0,
             submitter_leased_assignments,
             job_leased_assignments,
             candidate.ready_at.clone(),
         ),
         SchedulerPolicyMode::ResilientEdge => (
             decode_bias,
-            owned_decode_group_under_target_bias,
-            owned_decode_group_bias,
-            u32::from(!matches!(
+            decode_group_fill_bias,
+            u8::from(!matches!(
                 candidate.candidate.group_status.as_str(),
                 "decode_ready" | "prefill_member"
             )),
             submitter_leased_assignments.saturating_add(job_leased_assignments),
+            0,
             candidate.ready_at.clone(),
         ),
+    }
+}
+
+fn decode_group_fill_bias(candidate: &RunnableCandidate) -> u8 {
+    if !matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
+        return 0;
+    }
+
+    let is_owned = candidate
+        .candidate
+        .group_lease_owner_device_id
+        .as_deref()
+        .is_some();
+    if !is_owned {
+        return 1;
+    }
+
+    let cohort_fill = candidate
+        .candidate
+        .decode_cohort_leased_sessions
+        .saturating_add(candidate.candidate.decode_cohort_active_sessions);
+    let target = candidate
+        .candidate
+        .decode_lease_target_session_count
+        .unwrap_or(cohort_fill.max(1));
+    if cohort_fill < target {
+        0
+    } else {
+        2
     }
 }
 
@@ -1277,6 +1280,65 @@ mod tests {
         let policy = InferenceSchedulingPolicy::default();
         let left = rank_candidate(
             &under_target,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &satisfied,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_opens_fresh_ready_group_once_owned_group_reaches_target() {
+        let mut satisfied = base_candidate(SchedulerPhase::Decode);
+        satisfied.assignment_id = "satisfied".into();
+        satisfied.group_status = "decode_leased".into();
+        satisfied.decode_queue_status = Some("ready".into());
+        satisfied.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        satisfied.group_lease_owner_device_id = Some("worker-1".into());
+        satisfied.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        satisfied.decode_lease_target_session_count = Some(2);
+        satisfied.decode_cohort_leased_sessions = 1;
+        satisfied.decode_cohort_active_sessions = 1;
+
+        let mut fresh = satisfied.clone();
+        fresh.assignment_id = "fresh".into();
+        fresh.group_status = "decode_ready".into();
+        fresh.group_lease_owner_device_id = None;
+        fresh.group_lease_expires_at = None;
+        fresh.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        fresh.decode_cohort_leased_sessions = 0;
+        fresh.decode_cohort_active_sessions = 0;
+
+        let satisfied = RunnableCandidate {
+            ready_at: satisfied.decode_ready_at.clone().unwrap(),
+            candidate: satisfied,
+        };
+        let fresh = RunnableCandidate {
+            ready_at: fresh.decode_ready_at.clone().unwrap(),
+            candidate: fresh,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &fresh,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,

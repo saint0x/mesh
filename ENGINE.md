@@ -14,6 +14,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Make decode scheduling honor serving-group lease ownership
 - ✅ Prefer filling an already owned decode group before opening a fresh ready group
 - ✅ Prefer continuing to fill an owned decode group until its pooled target is satisfied
+- ✅ Open fresh ready decode groups once an owned group has reached its pooled target
 - Planned: Add admission control across multiple concurrent jobs and models
 - Planned: Add topology-aware pool partitioning for prefill-heavy vs decode-heavy work
 - In progress: Add scheduler scoring that reasons about queue age, latency target, throughput target, and resiliency target
