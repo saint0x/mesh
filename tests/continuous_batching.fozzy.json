@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "name": "continuous-batching",
+  "steps": [
+    {
+      "name": "agent admits multiple decode sessions into a single microbatch",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_admits_multiple_sessions",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "agent fairness prefers less served sessions under decode contention",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_prefers_less_served_sessions",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "agent defers sessions when KV budget is exhausted",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_defers_sessions_when_kv_budget_is_exhausted",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "scheduler-issued batch targets are honored by the runtime decode loop",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_honors_scheduler_batch_targets",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "pressure-soak",
+  "steps": [
+    {
+      "name": "decode queue pressure repeatedly preserves mixed-workload scheduling intent",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::scheduler::tests::mixed_workload_latency_prefers_fresh_ready_runway_while_throughput_prefers_owned_leased_decode",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 8
+    },
+    {
+      "name": "repeated KV budget pressure continues deferring excess decode sessions safely",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_defers_sessions_when_kv_budget_is_exhausted",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 8
+    },
+    {
+      "name": "stale KV tracking cleanup remains stable under repeated status loads",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_kv_tracking_cleanup_marks_stale_transfers_and_terminal_residency",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 8
+    }
+  ]
+}

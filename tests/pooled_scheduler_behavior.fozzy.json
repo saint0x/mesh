@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "name": "pooled-scheduler-behavior",
+  "steps": [
+    {
+      "name": "latency mode continues filling an owned decode group until target is satisfied",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::scheduler::tests::latency_prefers_continuing_owned_decode_group_until_target_is_satisfied",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "claiming decode work leases sibling ready sessions across the pooled cohort",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_decode_batch_targets_pool_across_shared_decode_participants",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "owned pooled cohorts renew and release at cohort scope",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "test_decode_lease_renew_and_release_apply_to_owned_pooled_cohort",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "throughput mode prefers draining leased owned decode work before fresh ready work",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::scheduler::tests::throughput_prefers_draining_leased_owned_decode_before_opening_fresh_ready_group",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

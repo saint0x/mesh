@@ -159,11 +159,11 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add targeted Rust tests for decode-group shrink and final-segment completion
 - ✅ Add targeted Rust tests for checkpoint upload/download and handoff validation
 - ✅ Add deterministic Fozzy doctor/test/trace/replay/ci coverage for current dispatch path
-- In progress: Add deterministic Fozzy coverage for pooled scheduler behavior
-- Planned: Add deterministic Fozzy coverage for continuous batching
+- ✅ Add deterministic Fozzy coverage for pooled scheduler behavior
+- ✅ Add deterministic Fozzy coverage for continuous batching
 - ✅ Add deterministic Fozzy coverage for failover and regroup
 - ✅ Add host-backed scenarios that exercise runtime-mode-specific behavior
-- Planned: Add longer soak scenarios for queue pressure and KV pressure
+- ✅ Add longer soak scenarios for queue pressure and KV pressure
 
 ## 11. Current Execution Order
 
