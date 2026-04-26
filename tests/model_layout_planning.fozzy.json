@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "name": "model-layout-planning",
+  "steps": [
+    {
+      "name": "planner supports hybrid layouts with explicit pipeline partition metadata",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::planner::tests::planner_supports_hybrid_layouts_with_pipeline_partition_metadata",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "planner selects a legal provider-constrained variant when the first variant is illegal",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::planner::tests::planner_selects_valid_provider_constrained_variant_when_first_variant_is_illegal",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "planner rejects invalid pipeline partition metadata",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::planner::tests::planner_rejects_invalid_pipeline_partition_metadata",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "decode replan still rejects invalid regroup choices under manifest legality",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::planner::tests::refresh_decode_plan_refuses_invalid_regroup",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

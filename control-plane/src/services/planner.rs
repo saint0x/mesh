@@ -8,7 +8,9 @@ use crate::api::types::{
 };
 use crate::connectivity::{ConnectivityPath, DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::{DeviceCapabilities, Tier};
-use crate::model_assets::{self, ModelManifest, ResolvedServingLayout};
+use crate::model_assets::{
+    self, ModelManifest, ResolvedServingLayout, ServingLayoutKind, ServingLayoutRule,
+};
 use crate::provider::ExecutionProviderKind;
 use crate::services::ring_manager::{RingTopology, WorkerTopologyInfo};
 
@@ -361,36 +363,178 @@ fn candidate_groups(
     runtime_mode: InferenceRuntimeMode,
 ) -> Vec<Vec<ExecutionGroupMember>> {
     let mut candidates = Vec::new();
-    let prefers_shrink = matches!(phase, ExecutionPhase::Decode)
-        && matches!(
-            runtime_mode,
-            InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst
-        );
-
-    if prefers_shrink {
-        for member in ranked_full_replica_members(members, manifest.tensor_parallelism_dim) {
-            push_unique_candidate(&mut candidates, vec![member]);
-        }
-    }
-
-    let full_group = members.to_vec();
-    push_unique_candidate(&mut candidates, full_group);
-
-    if let Some(group) = canonical_tensor_parallel_group(members, manifest.tensor_parallelism_dim) {
-        push_unique_candidate(&mut candidates, group);
-    }
-
-    let all_replicas = all_full_replica_members(members, manifest.tensor_parallelism_dim);
-    if !all_replicas.is_empty() {
-        push_unique_candidate(&mut candidates, all_replicas.clone());
-        if !prefers_shrink {
-            for member in rank_members(&all_replicas) {
-                push_unique_candidate(&mut candidates, vec![member]);
-            }
+    for rule in manifest.layout_rules_for_phase(phase) {
+        for candidate in candidates_for_rule(manifest, members, runtime_mode, &rule) {
+            push_unique_candidate(&mut candidates, candidate);
         }
     }
 
     candidates
+}
+
+fn candidates_for_rule(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    runtime_mode: InferenceRuntimeMode,
+    rule: &ServingLayoutRule,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    match rule.layout {
+        ServingLayoutKind::TensorParallel => {
+            tensor_parallel_candidates(manifest, members, rule.tensor_parallel_degree)
+        }
+        ServingLayoutKind::FullReplica => {
+            full_replica_candidates(manifest, members, runtime_mode, rule)
+        }
+        ServingLayoutKind::Pipeline => pipeline_candidates(manifest, members, rule),
+        ServingLayoutKind::TensorPipelineHybrid => {
+            tensor_pipeline_hybrid_candidates(manifest, members, rule)
+        }
+    }
+}
+
+fn tensor_parallel_candidates(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    exact_degree: Option<u32>,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    let mut candidates = Vec::new();
+    if let Some(group) = canonical_tensor_parallel_group(members, manifest.tensor_parallelism_dim) {
+        if exact_degree.is_none() || exact_degree == Some(group.len() as u32) {
+            candidates.push(group);
+        }
+    }
+    candidates
+}
+
+fn full_replica_candidates(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    runtime_mode: InferenceRuntimeMode,
+    rule: &ServingLayoutRule,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    let replicas = ranked_full_replica_members(members, manifest.tensor_parallelism_dim);
+    if replicas.is_empty() {
+        return Vec::new();
+    }
+    let sizes = ordered_candidate_sizes(
+        replicas.len(),
+        rule.min_members,
+        rule.max_members,
+        runtime_mode,
+    );
+    sizes
+        .into_iter()
+        .filter(|size| *size > 0 && *size <= replicas.len())
+        .map(|size| replicas.iter().take(size).cloned().collect::<Vec<_>>())
+        .collect()
+}
+
+fn pipeline_candidates(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    rule: &ServingLayoutRule,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    let Some(pipeline_degree) = rule.pipeline_parallel_degree.map(|value| value as usize) else {
+        return Vec::new();
+    };
+    let replicas = sorted_full_replica_members(members, manifest.tensor_parallelism_dim);
+    contiguous_windows(&replicas, pipeline_degree)
+}
+
+fn tensor_pipeline_hybrid_candidates(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    rule: &ServingLayoutRule,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    let Some(pipeline_degree) = rule.pipeline_parallel_degree.map(|value| value as usize) else {
+        return Vec::new();
+    };
+    let Some(tensor_degree) = rule.tensor_parallel_degree.map(|value| value as usize) else {
+        return Vec::new();
+    };
+    let total_members = pipeline_degree.saturating_mul(tensor_degree);
+    if total_members == 0 {
+        return Vec::new();
+    }
+    let mut sorted = members.to_vec();
+    sorted.sort_by_key(|member| member.ring_position);
+
+    contiguous_windows(&sorted, total_members)
+        .into_iter()
+        .filter(|candidate| {
+            (0..pipeline_degree).all(|stage_index| {
+                let start = stage_index * tensor_degree;
+                let end = start + tensor_degree;
+                stage_chunk_covers_tensor_parallel_span(
+                    &candidate[start..end],
+                    manifest.tensor_parallelism_dim,
+                )
+            })
+        })
+        .collect()
+}
+
+fn ordered_candidate_sizes(
+    available: usize,
+    min_members: Option<u32>,
+    max_members: Option<u32>,
+    runtime_mode: InferenceRuntimeMode,
+) -> Vec<usize> {
+    let min = min_members.unwrap_or(1) as usize;
+    let max = max_members.unwrap_or(available as u32) as usize;
+    let upper = max.min(available);
+    if min > upper {
+        return Vec::new();
+    }
+    let mut sizes = (min..=upper).collect::<Vec<_>>();
+    match runtime_mode {
+        InferenceRuntimeMode::ThroughputFirst => sizes.sort_unstable_by(|a, b| b.cmp(a)),
+        InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => {
+            sizes.sort_unstable()
+        }
+        InferenceRuntimeMode::LatencyFirst => sizes.sort_unstable(),
+    }
+    sizes
+}
+
+fn sorted_full_replica_members(
+    members: &[ExecutionGroupMember],
+    tensor_parallelism_dim: u32,
+) -> Vec<ExecutionGroupMember> {
+    let mut replicas = all_full_replica_members(members, tensor_parallelism_dim);
+    replicas.sort_by_key(|member| member.ring_position);
+    replicas
+}
+
+fn contiguous_windows(
+    members: &[ExecutionGroupMember],
+    width: usize,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    if width == 0 || members.len() < width {
+        return Vec::new();
+    }
+    (0..=members.len() - width)
+        .map(|start| members[start..start + width].to_vec())
+        .collect()
+}
+
+fn stage_chunk_covers_tensor_parallel_span(
+    members: &[ExecutionGroupMember],
+    tensor_parallelism_dim: u32,
+) -> bool {
+    let mut intervals = members
+        .iter()
+        .map(|member| (member.shard.column_start, member.shard.column_end))
+        .collect::<Vec<_>>();
+    intervals.sort_unstable_by_key(|(start, end)| (*start, *end));
+    let mut cursor = 0;
+    for (start, end) in intervals {
+        if start != cursor || end <= start {
+            return false;
+        }
+        cursor = end;
+    }
+    cursor == tensor_parallelism_dim
 }
 
 fn push_unique_candidate(
@@ -607,8 +751,8 @@ mod tests {
         InferenceSchedulingPolicy,
     };
     use crate::model_assets::{
-        self, ModelExecutionLayout, ModelManifest, ProviderConstraints, ServingLayoutKind,
-        ServingLayoutRule,
+        self, ModelExecutionLayout, ModelManifest, PipelineStageLayerRange, ProviderConstraints,
+        ServingLayoutKind, ServingLayoutRule,
     };
     use crate::services::ring_manager::{ModelShard, WorkerTopologyInfo};
 
@@ -791,23 +935,28 @@ mod tests {
             model_id: "planner-provider-guard".to_string(),
             tensor_parallelism_dim: 20,
             total_model_bytes: 1024 * 1024,
+            transformer_layer_count: None,
             tokenizer_file: "tokenizer.json".to_string(),
             tokenizer_config_file: "tokenizer_config.json".to_string(),
             execution_layout: ModelExecutionLayout {
                 prefill: vec![ServingLayoutRule {
+                    variant_name: Some("prefill_tp".to_string()),
                     layout: ServingLayoutKind::TensorParallel,
                     min_members: None,
                     max_members: None,
                     tensor_parallel_degree: Some(2),
                     pipeline_parallel_degree: None,
+                    pipeline_stages: Vec::new(),
                     provider_constraints: ProviderConstraints::default(),
                 }],
                 decode: vec![ServingLayoutRule {
+                    variant_name: Some("decode_cuda_replica".to_string()),
                     layout: ServingLayoutKind::FullReplica,
                     min_members: Some(1),
                     max_members: Some(1),
                     tensor_parallel_degree: None,
                     pipeline_parallel_degree: None,
+                    pipeline_stages: Vec::new(),
                     provider_constraints: ProviderConstraints {
                         allowed_providers: vec!["cuda".to_string()],
                         requires_homogeneous: false,
@@ -864,39 +1013,66 @@ mod tests {
     }
 
     #[test]
-    fn planner_refuses_unsupported_hybrid_layouts() {
+    fn planner_supports_hybrid_layouts_with_pipeline_partition_metadata() {
         model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
-            model_id: "planner-hybrid-guard".to_string(),
+            model_id: "planner-hybrid-supported".to_string(),
             tensor_parallelism_dim: 20,
             total_model_bytes: 1024 * 1024,
+            transformer_layer_count: Some(24),
             tokenizer_file: "tokenizer.json".to_string(),
             tokenizer_config_file: "tokenizer_config.json".to_string(),
             execution_layout: ModelExecutionLayout {
                 prefill: vec![ServingLayoutRule {
+                    variant_name: Some("prefill_hybrid".to_string()),
                     layout: ServingLayoutKind::TensorPipelineHybrid,
                     min_members: None,
                     max_members: None,
                     tensor_parallel_degree: Some(2),
                     pipeline_parallel_degree: Some(2),
+                    pipeline_stages: vec![
+                        PipelineStageLayerRange {
+                            stage_index: 0,
+                            layer_start: 0,
+                            layer_end: 12,
+                        },
+                        PipelineStageLayerRange {
+                            stage_index: 1,
+                            layer_start: 12,
+                            layer_end: 24,
+                        },
+                    ],
                     provider_constraints: ProviderConstraints::default(),
                 }],
                 decode: vec![ServingLayoutRule {
-                    layout: ServingLayoutKind::TensorPipelineHybrid,
-                    min_members: None,
-                    max_members: None,
-                    tensor_parallel_degree: Some(1),
+                    variant_name: Some("decode_pipeline".to_string()),
+                    layout: ServingLayoutKind::Pipeline,
+                    min_members: Some(2),
+                    max_members: Some(2),
+                    tensor_parallel_degree: None,
                     pipeline_parallel_degree: Some(2),
+                    pipeline_stages: vec![
+                        PipelineStageLayerRange {
+                            stage_index: 0,
+                            layer_start: 0,
+                            layer_end: 12,
+                        },
+                        PipelineStageLayerRange {
+                            stage_index: 1,
+                            layer_start: 12,
+                            layer_end: 24,
+                        },
+                    ],
                     provider_constraints: ProviderConstraints::default(),
                 }],
             },
         });
         model_assets::clear_model_asset_cache();
 
-        let err = ExecutionPlanner::plan(
+        let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
-                model_id: "planner-hybrid-guard".to_string(),
+                model_id: "planner-hybrid-supported".to_string(),
                 prompt: "hello".to_string(),
                 max_tokens: 32,
                 temperature: 0.7,
@@ -904,29 +1080,207 @@ mod tests {
             },
             &[1, 2, 3],
             &RingTopology {
-                workers: vec![worker_with_model_range(
-                    "planner-hybrid-guard",
-                    "a",
-                    0,
-                    0,
-                    20,
-                )],
+                workers: vec![
+                    worker_with_model_range("planner-hybrid-supported", "a", 0, 0, 10),
+                    worker_with_model_range("planner-hybrid-supported", "b", 1, 10, 20),
+                    worker_with_model_range("planner-hybrid-supported", "c", 2, 0, 10),
+                    worker_with_model_range("planner-hybrid-supported", "d", 3, 10, 20),
+                    worker_with_model_range("planner-hybrid-supported", "e", 4, 0, 20),
+                    worker_with_model_range("planner-hybrid-supported", "f", 5, 0, 20),
+                ],
                 ring_stable: true,
                 peer_punch_plans: vec![],
             },
             &InferenceSchedulingPolicy::default(),
-            &[PlannerDeviceMetadata {
-                assigned_capacity_units: 16,
-                execution_provider: "cuda".to_string(),
-            }],
+            &[
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 8,
+                    execution_provider: "cuda".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 8,
+                    execution_provider: "cuda".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 16,
+                    execution_provider: "cuda".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 16,
+                    execution_provider: "cuda".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 24,
+                    execution_provider: "cuda".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 20,
+                    execution_provider: "cuda".to_string(),
+                },
+            ],
         )
-        .unwrap_err();
+        .unwrap();
 
+        assert_eq!(plan.execution_groups.len(), 2);
+        assert_eq!(plan.execution_groups[0].members.len(), 4);
+        assert_eq!(plan.execution_groups[1].members.len(), 2);
+        assert_eq!(
+            plan.execution_groups[1]
+                .members
+                .iter()
+                .map(|member| member.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e", "f"]
+        );
+    }
+
+    #[test]
+    fn planner_selects_valid_provider_constrained_variant_when_first_variant_is_illegal() {
+        model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
+            model_id: "planner-provider-variant".to_string(),
+            tensor_parallelism_dim: 20,
+            total_model_bytes: 1024 * 1024,
+            transformer_layer_count: None,
+            tokenizer_file: "tokenizer.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
+            execution_layout: ModelExecutionLayout {
+                prefill: vec![ServingLayoutRule {
+                    variant_name: Some("prefill_tp".to_string()),
+                    layout: ServingLayoutKind::TensorParallel,
+                    min_members: None,
+                    max_members: None,
+                    tensor_parallel_degree: Some(2),
+                    pipeline_parallel_degree: None,
+                    pipeline_stages: Vec::new(),
+                    provider_constraints: ProviderConstraints::default(),
+                }],
+                decode: vec![
+                    ServingLayoutRule {
+                        variant_name: Some("cuda_replica".to_string()),
+                        layout: ServingLayoutKind::FullReplica,
+                        min_members: Some(1),
+                        max_members: Some(1),
+                        tensor_parallel_degree: None,
+                        pipeline_parallel_degree: None,
+                        pipeline_stages: Vec::new(),
+                        provider_constraints: ProviderConstraints {
+                            allowed_providers: vec!["cuda".to_string()],
+                            requires_homogeneous: false,
+                        },
+                    },
+                    ServingLayoutRule {
+                        variant_name: Some("metal_tp".to_string()),
+                        layout: ServingLayoutKind::TensorParallel,
+                        min_members: Some(2),
+                        max_members: Some(2),
+                        tensor_parallel_degree: Some(2),
+                        pipeline_parallel_degree: None,
+                        pipeline_stages: Vec::new(),
+                        provider_constraints: ProviderConstraints {
+                            allowed_providers: vec!["metal".to_string()],
+                            requires_homogeneous: true,
+                        },
+                    },
+                ],
+            },
+        });
+        model_assets::clear_model_asset_cache();
+
+        let plan = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-provider-variant".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-provider-variant", "a", 0, 0, 10),
+                    worker_with_model_range("planner-provider-variant", "b", 1, 10, 20),
+                    worker_with_model_range("planner-provider-variant", "c", 2, 0, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 16,
+                    execution_provider: "metal".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let decode_group = plan
+            .execution_groups
+            .iter()
+            .find(|group| matches!(group.phase, ExecutionPhase::Decode))
+            .expect("expected decode group");
+        assert_eq!(
+            decode_group
+                .members
+                .iter()
+                .map(|member| member.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn planner_rejects_invalid_pipeline_partition_metadata() {
+        model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
+            model_id: "planner-invalid-pipeline".to_string(),
+            tensor_parallelism_dim: 20,
+            total_model_bytes: 1024 * 1024,
+            transformer_layer_count: Some(24),
+            tokenizer_file: "tokenizer.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
+            execution_layout: ModelExecutionLayout {
+                prefill: vec![ServingLayoutRule {
+                    variant_name: Some("bad_pipeline".to_string()),
+                    layout: ServingLayoutKind::TensorPipelineHybrid,
+                    min_members: None,
+                    max_members: None,
+                    tensor_parallel_degree: Some(2),
+                    pipeline_parallel_degree: Some(2),
+                    pipeline_stages: vec![
+                        PipelineStageLayerRange {
+                            stage_index: 0,
+                            layer_start: 0,
+                            layer_end: 8,
+                        },
+                        PipelineStageLayerRange {
+                            stage_index: 1,
+                            layer_start: 10,
+                            layer_end: 24,
+                        },
+                    ],
+                    provider_constraints: ProviderConstraints::default(),
+                }],
+                decode: Vec::new(),
+            },
+        });
+        model_assets::clear_model_asset_cache();
+
+        let err = model_assets::load_model_manifest("planner-invalid-pipeline").unwrap_err();
         match err {
-            ApiError::Conflict(message) => {
-                assert!(message.contains("tensor/pipeline hybrid layouts"));
+            ApiError::BadRequest(message) => {
+                assert!(message.contains("starting at 10, expected 8"));
             }
-            other => panic!("expected conflict, got {other:?}"),
+            other => panic!("expected bad request, got {other:?}"),
         }
     }
 

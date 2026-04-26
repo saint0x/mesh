@@ -25,7 +25,16 @@ pub struct ProviderConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineStageLayerRange {
+    pub stage_index: u32,
+    pub layer_start: u32,
+    pub layer_end: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServingLayoutRule {
+    #[serde(default)]
+    pub variant_name: Option<String>,
     pub layout: ServingLayoutKind,
     #[serde(default)]
     pub min_members: Option<u32>,
@@ -35,6 +44,8 @@ pub struct ServingLayoutRule {
     pub tensor_parallel_degree: Option<u32>,
     #[serde(default)]
     pub pipeline_parallel_degree: Option<u32>,
+    #[serde(default)]
+    pub pipeline_stages: Vec<PipelineStageLayerRange>,
     #[serde(default)]
     pub provider_constraints: ProviderConstraints,
 }
@@ -49,8 +60,12 @@ pub struct ModelExecutionLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServingLayout {
+    pub variant_name: Option<String>,
     pub layout: ServingLayoutKind,
     pub member_count: usize,
+    pub tensor_parallel_degree: u32,
+    pub pipeline_parallel_degree: u32,
+    pub pipeline_stages: Vec<PipelineStageLayerRange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +73,8 @@ pub struct ModelManifest {
     pub model_id: String,
     pub tensor_parallelism_dim: u32,
     pub total_model_bytes: u64,
+    #[serde(default)]
+    pub transformer_layer_count: Option<u32>,
     #[serde(default = "default_tokenizer_file")]
     pub tokenizer_file: String,
     #[serde(default = "default_tokenizer_config_file")]
@@ -76,11 +93,13 @@ fn default_tokenizer_config_file() -> String {
 
 fn default_prefill_layout_rules() -> Vec<ServingLayoutRule> {
     vec![ServingLayoutRule {
+        variant_name: Some("default_tensor_parallel".to_string()),
         layout: ServingLayoutKind::TensorParallel,
         min_members: None,
         max_members: None,
         tensor_parallel_degree: None,
         pipeline_parallel_degree: None,
+        pipeline_stages: Vec::new(),
         provider_constraints: ProviderConstraints::default(),
     }]
 }
@@ -88,19 +107,23 @@ fn default_prefill_layout_rules() -> Vec<ServingLayoutRule> {
 fn default_decode_layout_rules() -> Vec<ServingLayoutRule> {
     vec![
         ServingLayoutRule {
+            variant_name: Some("default_full_replica".to_string()),
             layout: ServingLayoutKind::FullReplica,
             min_members: None,
             max_members: None,
             tensor_parallel_degree: None,
             pipeline_parallel_degree: None,
+            pipeline_stages: Vec::new(),
             provider_constraints: ProviderConstraints::default(),
         },
         ServingLayoutRule {
+            variant_name: Some("default_tensor_parallel".to_string()),
             layout: ServingLayoutKind::TensorParallel,
             min_members: None,
             max_members: None,
             tensor_parallel_degree: None,
             pipeline_parallel_degree: None,
+            pipeline_stages: Vec::new(),
             provider_constraints: ProviderConstraints::default(),
         },
     ]
@@ -168,6 +191,7 @@ fn validate_manifest(
     }
     validate_layout_rules(
         path,
+        manifest.transformer_layer_count,
         manifest.tensor_parallelism_dim,
         &manifest.execution_layout,
     )?;
@@ -177,6 +201,7 @@ fn validate_manifest(
 
 fn validate_layout_rules(
     path: &Path,
+    transformer_layer_count: Option<u32>,
     tensor_parallelism_dim: u32,
     layout: &ModelExecutionLayout,
 ) -> Result<(), ApiError> {
@@ -216,10 +241,47 @@ fn validate_layout_rules(
             if matches!(
                 rule.layout,
                 ServingLayoutKind::Pipeline | ServingLayoutKind::TensorPipelineHybrid
-            ) && rule.pipeline_parallel_degree == Some(0)
+            ) {
+                let Some(pipeline_degree) = rule.pipeline_parallel_degree else {
+                    return Err(ApiError::BadRequest(format!(
+                        "Model manifest {} declares {} layout rule {} without pipeline_parallel_degree",
+                        path.display(),
+                        phase_name,
+                        index
+                    )));
+                };
+                if pipeline_degree == 0 {
+                    return Err(ApiError::BadRequest(format!(
+                        "Model manifest {} declares {} layout rule {} with pipeline_parallel_degree=0",
+                        path.display(),
+                        phase_name,
+                        index
+                    )));
+                }
+                validate_pipeline_stage_metadata(
+                    path,
+                    phase_name,
+                    index,
+                    transformer_layer_count,
+                    pipeline_degree,
+                    &rule.pipeline_stages,
+                )?;
+            }
+            if matches!(rule.layout, ServingLayoutKind::TensorPipelineHybrid)
+                && rule.tensor_parallel_degree.is_none()
             {
                 return Err(ApiError::BadRequest(format!(
-                    "Model manifest {} declares {} layout rule {} with pipeline_parallel_degree=0",
+                    "Model manifest {} declares {} layout rule {} without tensor_parallel_degree",
+                    path.display(),
+                    phase_name,
+                    index
+                )));
+            }
+            if matches!(rule.layout, ServingLayoutKind::Pipeline)
+                && rule.tensor_parallel_degree.is_some()
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "Model manifest {} declares {} layout rule {} with unexpected tensor_parallel_degree",
                     path.display(),
                     phase_name,
                     index
@@ -228,6 +290,90 @@ fn validate_layout_rules(
         }
     }
 
+    Ok(())
+}
+
+fn validate_pipeline_stage_metadata(
+    path: &Path,
+    phase_name: &str,
+    index: usize,
+    transformer_layer_count: Option<u32>,
+    pipeline_degree: u32,
+    stages: &[PipelineStageLayerRange],
+) -> Result<(), ApiError> {
+    let total_layers = transformer_layer_count.ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "Model manifest {} declares {} pipeline layout rule {} without transformer_layer_count",
+            path.display(),
+            phase_name,
+            index
+        ))
+    })?;
+    if total_layers == 0 {
+        return Err(ApiError::BadRequest(format!(
+            "Model manifest {} declares transformer_layer_count=0 for {} pipeline layout rule {}",
+            path.display(),
+            phase_name,
+            index
+        )));
+    }
+    if stages.len() != pipeline_degree as usize {
+        return Err(ApiError::BadRequest(format!(
+            "Model manifest {} declares {} pipeline layout rule {} with {} stage ranges, expected {}",
+            path.display(),
+            phase_name,
+            index,
+            stages.len(),
+            pipeline_degree
+        )));
+    }
+    let mut sorted = stages.to_vec();
+    sorted.sort_by_key(|stage| stage.stage_index);
+    let mut cursor = 0;
+    for (expected_stage, stage) in sorted.iter().enumerate() {
+        if stage.stage_index != expected_stage as u32 {
+            return Err(ApiError::BadRequest(format!(
+                "Model manifest {} declares {} pipeline layout rule {} with non-contiguous stage index {}",
+                path.display(),
+                phase_name,
+                index,
+                stage.stage_index
+            )));
+        }
+        if stage.layer_start >= stage.layer_end {
+            return Err(ApiError::BadRequest(format!(
+                "Model manifest {} declares {} pipeline layout rule {} stage {} with empty layer range {}..{}",
+                path.display(),
+                phase_name,
+                index,
+                stage.stage_index,
+                stage.layer_start,
+                stage.layer_end
+            )));
+        }
+        if stage.layer_start != cursor {
+            return Err(ApiError::BadRequest(format!(
+                "Model manifest {} declares {} pipeline layout rule {} stage {} starting at {}, expected {}",
+                path.display(),
+                phase_name,
+                index,
+                stage.stage_index,
+                stage.layer_start,
+                cursor
+            )));
+        }
+        cursor = stage.layer_end;
+    }
+    if cursor != total_layers {
+        return Err(ApiError::BadRequest(format!(
+            "Model manifest {} declares {} pipeline layout rule {} covering layers 0..{}, expected 0..{}",
+            path.display(),
+            phase_name,
+            index,
+            cursor,
+            total_layers
+        )));
+    }
     Ok(())
 }
 
@@ -341,12 +487,7 @@ pub fn validate_execution_group_members(
     let mut errors = Vec::with_capacity(rules.len());
     for rule in rules {
         match validate_against_rule(manifest, members, &rule) {
-            Ok(()) => {
-                return Ok(ResolvedServingLayout {
-                    layout: rule.layout,
-                    member_count: members.len(),
-                });
-            }
+            Ok(layout) => return Ok(layout),
             Err(err) => errors.push(format!("{:?}: {}", rule.layout, err)),
         }
     }
@@ -371,25 +512,41 @@ fn validate_against_rule(
     manifest: &ModelManifest,
     members: &[ExecutionGroupMember],
     rule: &ServingLayoutRule,
-) -> Result<(), String> {
+) -> Result<ResolvedServingLayout, String> {
     validate_member_count(members, rule)?;
     validate_member_shards(manifest, members)?;
     validate_provider_constraints(members, &rule.provider_constraints)?;
 
-    match rule.layout {
+    let layout = match rule.layout {
         ServingLayoutKind::TensorParallel => {
-            validate_tensor_parallel_layout(manifest, members, rule.tensor_parallel_degree)
+            validate_tensor_parallel_layout(manifest, members, rule.tensor_parallel_degree)?;
+            ResolvedServingLayout {
+                variant_name: rule.variant_name.clone(),
+                layout: rule.layout,
+                member_count: members.len(),
+                tensor_parallel_degree: rule.tensor_parallel_degree.unwrap_or(members.len() as u32),
+                pipeline_parallel_degree: 1,
+                pipeline_stages: Vec::new(),
+            }
         }
-        ServingLayoutKind::FullReplica => validate_full_replica_layout(manifest, members),
-        ServingLayoutKind::Pipeline => Err(
-            "pipeline layouts are declared but not yet supported by planner legality checks"
-                .to_string(),
-        ),
-        ServingLayoutKind::TensorPipelineHybrid => Err(
-            "tensor/pipeline hybrid layouts are declared but not yet supported by planner legality checks"
-                .to_string(),
-        ),
-    }
+        ServingLayoutKind::FullReplica => {
+            validate_full_replica_layout(manifest, members)?;
+            ResolvedServingLayout {
+                variant_name: rule.variant_name.clone(),
+                layout: rule.layout,
+                member_count: members.len(),
+                tensor_parallel_degree: 1,
+                pipeline_parallel_degree: 1,
+                pipeline_stages: Vec::new(),
+            }
+        }
+        ServingLayoutKind::Pipeline => validate_pipeline_layout(manifest, members, rule)?,
+        ServingLayoutKind::TensorPipelineHybrid => {
+            validate_tensor_pipeline_hybrid_layout(manifest, members, rule)?
+        }
+    };
+
+    Ok(layout)
 }
 
 fn validate_member_count(
@@ -558,6 +715,73 @@ fn validate_full_replica_layout(
     Ok(())
 }
 
+fn validate_pipeline_layout(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    rule: &ServingLayoutRule,
+) -> Result<ResolvedServingLayout, String> {
+    validate_full_replica_layout(manifest, members)?;
+    let pipeline_degree = rule
+        .pipeline_parallel_degree
+        .ok_or_else(|| "pipeline layouts require pipeline_parallel_degree".to_string())?;
+    if members.len() as u32 != pipeline_degree {
+        return Err(format!(
+            "requires pipeline_parallel_degree={}, found {} members",
+            pipeline_degree,
+            members.len()
+        ));
+    }
+    Ok(ResolvedServingLayout {
+        variant_name: rule.variant_name.clone(),
+        layout: rule.layout,
+        member_count: members.len(),
+        tensor_parallel_degree: 1,
+        pipeline_parallel_degree: pipeline_degree,
+        pipeline_stages: rule.pipeline_stages.clone(),
+    })
+}
+
+fn validate_tensor_pipeline_hybrid_layout(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    rule: &ServingLayoutRule,
+) -> Result<ResolvedServingLayout, String> {
+    let pipeline_degree = rule.pipeline_parallel_degree.ok_or_else(|| {
+        "tensor/pipeline hybrid layouts require pipeline_parallel_degree".to_string()
+    })?;
+    let tensor_degree = rule.tensor_parallel_degree.ok_or_else(|| {
+        "tensor/pipeline hybrid layouts require tensor_parallel_degree".to_string()
+    })?;
+    let expected_members = pipeline_degree
+        .checked_mul(tensor_degree)
+        .ok_or_else(|| "hybrid layout member count overflow".to_string())?;
+    if members.len() as u32 != expected_members {
+        return Err(format!(
+            "requires tensor_parallel_degree={} and pipeline_parallel_degree={}, found {} members",
+            tensor_degree,
+            pipeline_degree,
+            members.len()
+        ));
+    }
+
+    let mut sorted = members.to_vec();
+    sorted.sort_by_key(|member| member.ring_position);
+    for stage_index in 0..pipeline_degree as usize {
+        let start = stage_index * tensor_degree as usize;
+        let end = start + tensor_degree as usize;
+        validate_tensor_parallel_layout(manifest, &sorted[start..end], Some(tensor_degree))?;
+    }
+
+    Ok(ResolvedServingLayout {
+        variant_name: rule.variant_name.clone(),
+        layout: rule.layout,
+        member_count: members.len(),
+        tensor_parallel_degree: tensor_degree,
+        pipeline_parallel_degree: pipeline_degree,
+        pipeline_stages: rule.pipeline_stages.clone(),
+    })
+}
+
 #[cfg(test)]
 pub fn clear_model_asset_cache() {
     if let Ok(mut cache) = model_asset_cache().write() {
@@ -631,6 +855,7 @@ pub mod testsupport {
             model_id: model_id.to_string(),
             tensor_parallelism_dim,
             total_model_bytes: 1024 * 1024,
+            transformer_layer_count: None,
             tokenizer_file: "tokenizer.json".to_string(),
             tokenizer_config_file: "tokenizer_config.json".to_string(),
             execution_layout: ModelExecutionLayout::default(),

@@ -115,13 +115,13 @@ explicit-segment serving stack into the full production `zip` engine.
 
 ## 6. Model Layout And Planning Constraints
 
-- In progress: Replace shard-span-only decode validity with manifest-driven execution validity
-- Planned: Add multiple legal layouts per model
-- Planned: Add pipeline partitioning metadata
-- Planned: Add mixed tensor/pipeline execution layouts
-- Planned: Add provider-constrained layout variants
-- In progress: Add planner validation against manifest-declared execution constraints
-- Planned: Add tests that prove invalid regroup/replan choices are rejected
+- ✅ Replace shard-span-only decode validity with manifest-driven execution validity
+- ✅ Add multiple legal layouts per model
+- ✅ Add pipeline partitioning metadata
+- ✅ Add mixed tensor/pipeline execution layouts
+- ✅ Add provider-constrained layout variants
+- ✅ Add planner validation against manifest-declared execution constraints
+- ✅ Add tests that prove invalid regroup/replan choices are rejected
 
 ## 7. Transport And Collective Evolution
 
@@ -173,5 +173,5 @@ explicit-segment serving stack into the full production `zip` engine.
 - In progress: Add continuous batching in the agent/runtime and scheduler
 - In progress: Expand KV management from checkpoint handoff to live residency management
 - ✅ Add regroup/failover
-- In progress: Constrain planning with richer manifests
+- ✅ Constrain planning with richer manifests
 - Planned: Deepen backend/provider optimization after engine control flow is stable
