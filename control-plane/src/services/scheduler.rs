@@ -410,7 +410,7 @@ fn mode_rank(
 ) -> (u8, u32, u8, String, u32, u32, String) {
     let decode_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Decode);
     let prefill_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Prefill);
-    let decode_group_fill_rank = decode_group_fill_rank(candidate);
+    let decode_group_fill_rank = decode_group_fill_rank(mode, candidate);
     let owned_cohort_age_order = owned_decode_latency_cohort_age_order(candidate, mode);
     let cohort_order_time = decode_group_order_time(candidate);
     match mode {
@@ -545,7 +545,7 @@ fn decode_session_lease_rank(candidate: &RunnableCandidate) -> &'static str {
     }
 }
 
-fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
+fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandidate) -> u32 {
     if !matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
         return 0;
     }
@@ -570,9 +570,14 @@ fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
             .decode_lease_target_session_count
             .unwrap_or(1)
             .min(31);
-        let fresh_score = (fresh_ready << 10)
-            .saturating_add((31u32.saturating_sub(fresh_blocked)) << 5)
-            .saturating_add(fresh_target);
+        let fresh_score = match mode {
+            SchedulerPolicyMode::ThroughputFirst => (fresh_target << 10)
+                .saturating_add(fresh_ready << 5)
+                .saturating_add(31u32.saturating_sub(fresh_blocked)),
+            _ => (fresh_ready << 10)
+                .saturating_add((31u32.saturating_sub(fresh_blocked)) << 5)
+                .saturating_add(fresh_target),
+        };
         return 1_999_999u32.saturating_sub(fresh_score);
     }
 
@@ -2310,6 +2315,87 @@ mod tests {
             &HashMap::new(),
         );
         assert!(throughput_owned < throughput_fresh);
+    }
+
+    #[test]
+    fn throughput_prefers_larger_fresh_decode_cohort_while_latency_prefers_ready_runway() {
+        let mut larger_target = base_candidate(SchedulerPhase::Decode);
+        larger_target.assignment_id = "larger-target".into();
+        larger_target.group_status = "decode_ready".into();
+        larger_target.decode_queue_status = Some("ready".into());
+        larger_target.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        larger_target.decode_lease_target_session_count = Some(5);
+        larger_target.decode_cohort_ready_sessions = 1;
+        larger_target.decode_cohort_blocked_sessions = 0;
+        larger_target.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut more_ready = larger_target.clone();
+        more_ready.assignment_id = "more-ready".into();
+        more_ready.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        more_ready.decode_lease_target_session_count = Some(3);
+        more_ready.decode_cohort_ready_sessions = 3;
+
+        let larger_target = RunnableCandidate {
+            ready_at: larger_target.decode_ready_at.clone().unwrap(),
+            candidate: larger_target,
+        };
+        let more_ready = RunnableCandidate {
+            ready_at: more_ready.decode_ready_at.clone().unwrap(),
+            candidate: more_ready,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let throughput_larger = rank_candidate(
+            &larger_target,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_ready = rank_candidate(
+            &more_ready,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_larger < throughput_ready);
+
+        let latency_larger = rank_candidate(
+            &larger_target,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_ready = rank_candidate(
+            &more_ready,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_ready < latency_larger);
     }
 
     #[test]
