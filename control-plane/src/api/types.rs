@@ -943,6 +943,8 @@ pub struct DecodeQueueEntryStatus {
     pub network_id: String,
     pub segment_id: String,
     pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_group_key: Option<String>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
