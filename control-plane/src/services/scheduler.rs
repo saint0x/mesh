@@ -334,7 +334,7 @@ fn rank_candidate(
     active_capacity_by_model: &HashMap<String, u32>,
     leased_assignments_by_submitter: &HashMap<String, u32>,
     leased_assignments_by_job: &HashMap<String, u32>,
-) -> (u8, u8, u8, u8, u8, u8, u8, u32, u32, String, String, String) {
+) -> (u8, u8, u8, u8, u8, u32, u8, u32, u32, String, String, String) {
     let submitter_active_jobs = active_jobs_by_submitter
         .get(&candidate.candidate.submitted_by_device_id)
         .copied()
@@ -399,14 +399,14 @@ fn mode_rank(
     candidate: &RunnableCandidate,
     submitter_leased_assignments: u32,
     job_leased_assignments: u32,
-) -> (u8, u8, u8, u32, u32, String) {
+) -> (u8, u32, u8, u32, u32, String) {
     let decode_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Decode);
     let prefill_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Prefill);
-    let decode_group_fill_bias = decode_group_fill_bias(candidate);
+    let decode_group_fill_rank = decode_group_fill_rank(candidate);
     match mode {
         SchedulerPolicyMode::FitFirst => (
             prefill_bias,
-            decode_group_fill_bias,
+            decode_group_fill_rank,
             decode_bias,
             submitter_leased_assignments,
             job_leased_assignments,
@@ -414,7 +414,7 @@ fn mode_rank(
         ),
         SchedulerPolicyMode::ThroughputFirst => (
             decode_bias,
-            decode_group_fill_bias,
+            decode_group_fill_rank,
             0,
             job_leased_assignments,
             submitter_leased_assignments,
@@ -422,7 +422,7 @@ fn mode_rank(
         ),
         SchedulerPolicyMode::LatencyFirst => (
             decode_bias,
-            decode_group_fill_bias,
+            decode_group_fill_rank,
             0,
             submitter_leased_assignments,
             job_leased_assignments,
@@ -430,7 +430,7 @@ fn mode_rank(
         ),
         SchedulerPolicyMode::ResilientEdge => (
             decode_bias,
-            decode_group_fill_bias,
+            decode_group_fill_rank,
             u8::from(!matches!(
                 candidate.candidate.group_status.as_str(),
                 "decode_ready" | "prefill_member"
@@ -442,7 +442,7 @@ fn mode_rank(
     }
 }
 
-fn decode_group_fill_bias(candidate: &RunnableCandidate) -> u8 {
+fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
     if !matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
         return 0;
     }
@@ -453,7 +453,7 @@ fn decode_group_fill_bias(candidate: &RunnableCandidate) -> u8 {
         .as_deref()
         .is_some();
     if !is_owned {
-        return 1;
+        return 1_000_000;
     }
 
     let cohort_fill = candidate
@@ -465,9 +465,10 @@ fn decode_group_fill_bias(candidate: &RunnableCandidate) -> u8 {
         .decode_lease_target_session_count
         .unwrap_or(cohort_fill.max(1));
     if cohort_fill < target {
-        0
+        let remaining_capacity = target.saturating_sub(cohort_fill);
+        1_000u32.saturating_sub(remaining_capacity.min(1_000))
     } else {
-        2
+        2_000_000
     }
 }
 
@@ -1351,6 +1352,63 @@ mod tests {
         );
         let right = rank_candidate(
             &satisfied,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_owned_group_with_more_remaining_pooled_capacity() {
+        let mut more_remaining = base_candidate(SchedulerPhase::Decode);
+        more_remaining.assignment_id = "more-remaining".into();
+        more_remaining.group_status = "decode_leased".into();
+        more_remaining.decode_queue_status = Some("ready".into());
+        more_remaining.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        more_remaining.group_lease_owner_device_id = Some("worker-1".into());
+        more_remaining.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        more_remaining.decode_lease_target_session_count = Some(5);
+        more_remaining.decode_cohort_leased_sessions = 1;
+        more_remaining.decode_cohort_active_sessions = 1;
+
+        let mut less_remaining = more_remaining.clone();
+        less_remaining.assignment_id = "less-remaining".into();
+        less_remaining.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        less_remaining.decode_lease_target_session_count = Some(3);
+        less_remaining.decode_cohort_leased_sessions = 1;
+        less_remaining.decode_cohort_active_sessions = 1;
+
+        let more_remaining = RunnableCandidate {
+            ready_at: more_remaining.decode_ready_at.clone().unwrap(),
+            candidate: more_remaining,
+        };
+        let less_remaining = RunnableCandidate {
+            ready_at: less_remaining.decode_ready_at.clone().unwrap(),
+            candidate: less_remaining,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &more_remaining,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &less_remaining,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
