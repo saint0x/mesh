@@ -337,7 +337,7 @@ fn rank_candidate(
     active_capacity_by_model: &HashMap<String, u32>,
     leased_assignments_by_submitter: &HashMap<String, u32>,
     leased_assignments_by_job: &HashMap<String, u32>,
-) -> (u8, u8, u8, u8, u8, u32, u8, u32, u32, String, String, String) {
+) -> (u8, u8, u8, u8, u8, u32, u8, String, u32, u32, String, String) {
     let submitter_active_jobs = active_jobs_by_submitter
         .get(&candidate.candidate.submitted_by_device_id)
         .copied()
@@ -371,7 +371,11 @@ fn rank_candidate(
         submitter_leased_assignments,
         job_leased_assignments,
     );
-    let session_order_time = decode_session_order_time(candidate);
+    let session_order_key = format!(
+        "{}:{}",
+        decode_session_order_time(candidate),
+        candidate.candidate.assignment_id
+    );
 
     (
         fairness_rank.0,
@@ -384,8 +388,8 @@ fn rank_candidate(
         policy_rank.3,
         policy_rank.4,
         policy_rank.5,
-        session_order_time,
-        candidate.candidate.assignment_id.clone(),
+        policy_rank.6,
+        session_order_key,
     )
 }
 
@@ -403,16 +407,18 @@ fn mode_rank(
     candidate: &RunnableCandidate,
     submitter_leased_assignments: u32,
     job_leased_assignments: u32,
-) -> (u8, u32, u8, u32, u32, String) {
+) -> (u8, u32, u8, String, u32, u32, String) {
     let decode_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Decode);
     let prefill_bias = u8::from(candidate.candidate.phase != SchedulerPhase::Prefill);
     let decode_group_fill_rank = decode_group_fill_rank(candidate);
+    let owned_cohort_age_order = owned_decode_latency_cohort_age_order(candidate, mode);
     let cohort_order_time = decode_group_order_time(candidate);
     match mode {
         SchedulerPolicyMode::FitFirst => (
             prefill_bias,
             decode_group_fill_rank,
             decode_bias,
+            owned_cohort_age_order,
             submitter_leased_assignments,
             job_leased_assignments,
             candidate.candidate.created_at.clone(),
@@ -421,6 +427,7 @@ fn mode_rank(
             decode_bias,
             decode_group_fill_rank,
             0,
+            owned_cohort_age_order,
             job_leased_assignments,
             submitter_leased_assignments,
             cohort_order_time.clone(),
@@ -429,6 +436,7 @@ fn mode_rank(
             decode_bias,
             decode_group_fill_rank,
             0,
+            owned_cohort_age_order,
             submitter_leased_assignments,
             job_leased_assignments,
             cohort_order_time,
@@ -440,11 +448,39 @@ fn mode_rank(
                 candidate.candidate.group_status.as_str(),
                 "decode_ready" | "prefill_member"
             )),
+            owned_cohort_age_order,
             submitter_leased_assignments.saturating_add(job_leased_assignments),
             0,
             decode_group_order_time(candidate),
         ),
     }
+}
+
+fn owned_decode_latency_cohort_age_order(
+    candidate: &RunnableCandidate,
+    mode: SchedulerPolicyMode,
+) -> String {
+    if matches!(mode, SchedulerPolicyMode::LatencyFirst)
+        && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
+        && candidate
+            .candidate
+            .group_lease_owner_device_id
+            .as_deref()
+            .is_some()
+    {
+        let cohort_fill = candidate
+            .candidate
+            .decode_cohort_leased_sessions
+            .saturating_add(candidate.candidate.decode_cohort_active_sessions);
+        let target = candidate
+            .candidate
+            .decode_lease_target_session_count
+            .unwrap_or(cohort_fill.max(1));
+        if cohort_fill < target {
+            return decode_group_order_time(candidate);
+        }
+    }
+    "9999-12-31T23:59:59Z".to_string()
 }
 
 fn decode_group_order_time(candidate: &RunnableCandidate) -> String {
@@ -2001,6 +2037,64 @@ mod tests {
         );
         let right = rank_candidate(
             &less_ready,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_older_owned_decode_cohort_before_lease_count_noise_when_fill_ties() {
+        let mut older = base_candidate(SchedulerPhase::Decode);
+        older.assignment_id = "older".into();
+        older.group_status = "decode_leased".into();
+        older.decode_queue_status = Some("leased".into());
+        older.decode_ready_at = Some("2026-01-01T00:00:05Z".into());
+        older.group_lease_owner_device_id = Some("worker-1".into());
+        older.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        older.decode_lease_target_session_count = Some(5);
+        older.decode_cohort_leased_sessions = 2;
+        older.decode_cohort_active_sessions = 1;
+        older.decode_cohort_ready_sessions = 2;
+        older.decode_cohort_blocked_sessions = 1;
+        older.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut newer = older.clone();
+        newer.assignment_id = "newer".into();
+        newer.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        newer.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:03Z".into());
+
+        let older = RunnableCandidate {
+            ready_at: older.decode_ready_at.clone().unwrap(),
+            candidate: older,
+        };
+        let newer = RunnableCandidate {
+            ready_at: newer.decode_ready_at.clone().unwrap(),
+            candidate: newer,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &older,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([("submitter-a".to_string(), 5)]),
+            &HashMap::from([("job-a".to_string(), 5)]),
+        );
+        let right = rank_candidate(
+            &newer,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
