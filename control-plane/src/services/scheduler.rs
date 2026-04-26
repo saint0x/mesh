@@ -488,7 +488,9 @@ fn owned_decode_latency_cohort_age_order(
 ) -> String {
     if matches!(
         mode,
-        SchedulerPolicyMode::ThroughputFirst | SchedulerPolicyMode::FitFirst
+        SchedulerPolicyMode::ThroughputFirst
+            | SchedulerPolicyMode::FitFirst
+            | SchedulerPolicyMode::ResilientEdge
     )
         && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
         && candidate
@@ -506,6 +508,7 @@ fn owned_decode_latency_cohort_age_order(
         SchedulerPolicyMode::LatencyFirst
             | SchedulerPolicyMode::ThroughputFirst
             | SchedulerPolicyMode::FitFirst
+            | SchedulerPolicyMode::ResilientEdge
     )
         && matches!(candidate.candidate.phase, SchedulerPhase::Decode)
         && candidate
@@ -3505,6 +3508,118 @@ mod tests {
             &HashMap::new(),
         );
         assert!(fit_older < fit_newer);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_older_fresh_decode_cohort_before_lease_count_noise_when_scores_tie() {
+        let mut older = base_candidate(SchedulerPhase::Decode);
+        older.assignment_id = "older-resilient-fresh".into();
+        older.group_status = "decode_ready".into();
+        older.decode_queue_status = Some("ready".into());
+        older.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        older.decode_lease_target_session_count = Some(3);
+        older.decode_cohort_ready_sessions = 1;
+        older.decode_cohort_blocked_sessions = 0;
+        older.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut newer = older.clone();
+        newer.assignment_id = "newer-resilient-fresh".into();
+        newer.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        newer.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:03Z".into());
+
+        let older = RunnableCandidate {
+            ready_at: older.decode_ready_at.clone().unwrap(),
+            candidate: older,
+        };
+        let newer = RunnableCandidate {
+            ready_at: newer.decode_ready_at.clone().unwrap(),
+            candidate: newer,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_older = rank_candidate(
+            &older,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            9,
+            9,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_newer = rank_candidate(
+            &newer,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            3,
+            3,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_older < resilient_newer);
+    }
+
+    #[test]
+    fn resilient_edge_prefers_older_owned_decode_cohort_before_lease_count_noise_when_fill_ties() {
+        let mut older = base_candidate(SchedulerPhase::Decode);
+        older.assignment_id = "older-resilient-owned".into();
+        older.group_status = "decode_leased".into();
+        older.decode_queue_status = Some("leased".into());
+        older.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        older.group_lease_owner_device_id = Some("worker-1".into());
+        older.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        older.decode_lease_target_session_count = Some(3);
+        older.decode_cohort_leased_sessions = 1;
+        older.decode_cohort_active_sessions = 0;
+        older.decode_cohort_ready_sessions = 1;
+        older.decode_cohort_blocked_sessions = 0;
+        older.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut newer = older.clone();
+        newer.assignment_id = "newer-resilient-owned".into();
+        newer.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        newer.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:03Z".into());
+
+        let older = RunnableCandidate {
+            ready_at: older.decode_ready_at.clone().unwrap(),
+            candidate: older,
+        };
+        let newer = RunnableCandidate {
+            ready_at: newer.decode_ready_at.clone().unwrap(),
+            candidate: newer,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let resilient_older = rank_candidate(
+            &older,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            9,
+            9,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let resilient_newer = rank_candidate(
+            &newer,
+            SchedulerPolicyMode::ResilientEdge,
+            &policy,
+            3,
+            3,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(resilient_older < resilient_newer);
     }
 
     #[test]
