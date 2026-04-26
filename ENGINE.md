@@ -30,6 +30,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ In `throughput_first`, prefer draining already leased owned decode work before opening fresh ready decode groups
 - ✅ In `throughput_first`, prefer larger fresh decode cohort opportunities before lower-latency smaller fresh cohorts
 - ✅ In `throughput_first`, prefer denser owned decode cohorts before broader but colder owned cohorts
+- ✅ In `throughput_first`, prefer warmer equally dense owned decode cohorts before broader but colder owned cohorts
 - ✅ In `fit_first`, prefer smaller fresh decode cohort opportunities before larger fresh cohorts
 - ✅ In `fit_first`, prefer owned decode cohorts with less remaining capacity before broader owned cohorts
 - ✅ In `fit_first`, prefer thinner owned decode cohorts before denser owned cohorts when remaining capacity ties

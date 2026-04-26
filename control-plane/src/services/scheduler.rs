@@ -610,8 +610,8 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
         let (primary_rank, secondary_rank, tertiary_rank, quaternary_rank) = match mode {
             SchedulerPolicyMode::ThroughputFirst => (
                 fill_density_rank,
-                remaining_rank,
                 ready_rank,
+                remaining_rank,
                 blocked_rank,
             ),
             SchedulerPolicyMode::ResilientEdge => (
@@ -2838,6 +2838,90 @@ mod tests {
             &HashMap::new(),
         );
         assert!(latency_broader < latency_denser);
+    }
+
+    #[test]
+    fn throughput_prefers_ready_runway_in_equally_dense_owned_decode_cohorts_while_latency_prefers_broader_one() {
+        let mut broader_colder = base_candidate(SchedulerPhase::Decode);
+        broader_colder.assignment_id = "broader-colder".into();
+        broader_colder.group_status = "decode_leased".into();
+        broader_colder.decode_queue_status = Some("leased".into());
+        broader_colder.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        broader_colder.group_lease_owner_device_id = Some("worker-1".into());
+        broader_colder.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        broader_colder.decode_lease_target_session_count = Some(6);
+        broader_colder.decode_cohort_leased_sessions = 2;
+        broader_colder.decode_cohort_active_sessions = 1;
+        broader_colder.decode_cohort_ready_sessions = 1;
+        broader_colder.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut warmer_narrower = broader_colder.clone();
+        warmer_narrower.assignment_id = "warmer-narrower".into();
+        warmer_narrower.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        warmer_narrower.decode_lease_target_session_count = Some(5);
+        warmer_narrower.decode_cohort_ready_sessions = 3;
+
+        let broader_colder = RunnableCandidate {
+            ready_at: broader_colder.decode_ready_at.clone().unwrap(),
+            candidate: broader_colder,
+        };
+        let warmer_narrower = RunnableCandidate {
+            ready_at: warmer_narrower.decode_ready_at.clone().unwrap(),
+            candidate: warmer_narrower,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let throughput_warmer = rank_candidate(
+            &warmer_narrower,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let throughput_broader = rank_candidate(
+            &broader_colder,
+            SchedulerPolicyMode::ThroughputFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(throughput_warmer < throughput_broader);
+
+        let latency_broader = rank_candidate(
+            &broader_colder,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_warmer = rank_candidate(
+            &warmer_narrower,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_broader < latency_warmer);
     }
 
     #[test]
