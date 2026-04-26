@@ -27,7 +27,7 @@ explicit-segment serving stack into the full production `zip` engine.
 ## 2. Decode Queue And Continuous Batching
 
 - ✅ Add explicit decode work queue records in the control plane
-- ✅ Add decode-step ownership and lease semantics
+- ✅ Add decode-step ownership, lease semantics, and batch lease targets
 - ✅ Add microbatch formation across multiple active sessions
 - ✅ Add fairness policy for per-session decode participation inside a batch
 - ✅ Add KV-budget-aware admission for decode steps

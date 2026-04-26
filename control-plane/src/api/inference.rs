@@ -64,6 +64,8 @@ struct PersistedLeaseRecord {
     latest_active_decode_sessions: Option<u32>,
     latest_batch_kv_tokens: Option<u32>,
     latest_deferred_decode_sessions: Option<u32>,
+    lease_target_session_count: Option<u32>,
+    lease_target_batch_size: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
     kv_checkpoint_created_at: Option<String>,
     session_updated_at: String,
@@ -142,6 +144,8 @@ struct PersistedSessionStatus {
     latest_active_decode_sessions: Option<u32>,
     latest_batch_kv_tokens: Option<u32>,
     latest_deferred_decode_sessions: Option<u32>,
+    lease_target_session_count: Option<u32>,
+    lease_target_batch_size: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
     kv_checkpoint_created_at: Option<String>,
     updated_at: String,
@@ -441,6 +445,8 @@ pub async fn submit_inference(
                 None,
                 None,
                 None,
+                None,
+                None,
                 &now,
             )?;
         }
@@ -611,6 +617,8 @@ fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExec
             latest_active_decode_sessions: assignment.latest_active_decode_sessions,
             latest_batch_kv_tokens: assignment.latest_batch_kv_tokens,
             latest_deferred_decode_sessions: assignment.latest_deferred_decode_sessions,
+            lease_target_session_count: assignment.lease_target_session_count,
+            lease_target_batch_size: assignment.lease_target_batch_size,
             kv_checkpoint_device_id: assignment.kv_checkpoint_device_id,
             kv_checkpoint_created_at: assignment.kv_checkpoint_created_at,
             updated_at: assignment.session_updated_at,
@@ -856,6 +864,8 @@ fn upsert_decode_queue(
     ready_at: Option<&str>,
     lease_owner_device_id: Option<&str>,
     lease_expires_at: Option<&str>,
+    lease_target_session_count: Option<u32>,
+    lease_target_batch_size: Option<u32>,
     last_error: Option<&str>,
     now: &str,
 ) -> ApiResult<()> {
@@ -863,8 +873,9 @@ fn upsert_decode_queue(
         r#"
         INSERT INTO inference_decode_queue (
             session_id, job_id, network_id, segment_id, group_id, status, ready_at,
-            lease_owner_device_id, lease_expires_at, last_error, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            lease_owner_device_id, lease_expires_at, lease_target_session_count,
+            lease_target_batch_size, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
             segment_id = excluded.segment_id,
             group_id = excluded.group_id,
@@ -872,6 +883,8 @@ fn upsert_decode_queue(
             ready_at = excluded.ready_at,
             lease_owner_device_id = excluded.lease_owner_device_id,
             lease_expires_at = excluded.lease_expires_at,
+            lease_target_session_count = excluded.lease_target_session_count,
+            lease_target_batch_size = excluded.lease_target_batch_size,
             last_error = excluded.last_error,
             updated_at = excluded.updated_at
         "#,
@@ -885,12 +898,49 @@ fn upsert_decode_queue(
             ready_at,
             lease_owner_device_id,
             lease_expires_at,
+            lease_target_session_count.map(i64::from),
+            lease_target_batch_size.map(i64::from),
             last_error,
             now
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(())
+}
+
+fn compute_decode_lease_targets(
+    conn: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    group_id: &str,
+) -> ApiResult<(u32, u32)> {
+    let (target_session_count, observed_peak): (u32, Option<u32>) = conn
+        .query_row(
+            r#"
+            SELECT
+                COUNT(*),
+                MAX(COALESCE(s.latest_active_decode_sessions, s.latest_batch_size))
+            FROM inference_decode_queue dq
+            LEFT JOIN inference_sessions s
+              ON s.session_id = dq.session_id
+            WHERE dq.network_id = ?1
+              AND dq.group_id = ?2
+              AND dq.status IN ('ready', 'leased', 'active')
+            "#,
+            params![network_id, group_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                ))
+            },
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let target_session_count = target_session_count.max(1);
+    let target_batch_size = observed_peak
+        .map(|peak| peak.min(target_session_count).max(1))
+        .unwrap_or(target_session_count);
+    Ok((target_session_count, target_batch_size))
 }
 
 fn load_latest_session_checkpoint_status(
@@ -1144,6 +1194,8 @@ pub async fn get_inference_job_status(
                 latest_active_decode_sessions: session.latest_active_decode_sessions,
                 latest_batch_kv_tokens: session.latest_batch_kv_tokens,
                 latest_deferred_decode_sessions: session.latest_deferred_decode_sessions,
+                lease_target_session_count: session.lease_target_session_count,
+                lease_target_batch_size: session.lease_target_batch_size,
                 kv_checkpoint_device_id: session.kv_checkpoint_device_id,
                 kv_checkpoint_created_at: session.kv_checkpoint_created_at,
                 updated_at: session.updated_at,
@@ -1445,7 +1497,7 @@ fn claim_assignment(
 
     let selected_assignment_id = select_claim_assignment_id(&tx, req, &scheduling_policy)?;
 
-    let row = if let Some(selected_assignment_id) = selected_assignment_id {
+    let mut row = if let Some(selected_assignment_id) = selected_assignment_id {
         tx.query_row(
             r#"
             SELECT
@@ -1456,13 +1508,15 @@ fn claim_assignment(
                 s.session_id, s.status, s.active_segment_id, s.kv_owner_device_id,
                 s.kv_transfer_policy, s.kv_sequence_position, s.latest_batch_size,
                 s.latest_active_decode_sessions, s.latest_batch_kv_tokens,
-                s.latest_deferred_decode_sessions, s.kv_checkpoint_device_id,
+                s.latest_deferred_decode_sessions, dq.lease_target_session_count,
+                dq.lease_target_batch_size, s.kv_checkpoint_device_id,
                 s.kv_checkpoint_created_at, s.updated_at,
                 r.status, r.active_segment_id, r.kv_sequence_position,
                 r.checkpoint_created_at, r.updated_at, r.last_error
             FROM inference_job_assignments a
             INNER JOIN inference_jobs j ON j.job_id = a.job_id
             INNER JOIN inference_sessions s ON s.job_id = j.job_id
+            LEFT JOIN inference_decode_queue dq ON dq.session_id = s.session_id
             INNER JOIN inference_session_replicas r
                 ON r.session_id = s.session_id AND r.device_id = a.device_id
             WHERE a.assignment_id = ?
@@ -1491,15 +1545,17 @@ fn claim_assignment(
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(22)?.map(|v| v as u32),
                     latest_batch_kv_tokens: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
                     latest_deferred_decode_sessions: row.get::<_, Option<i64>>(24)?.map(|v| v as u32),
-                    kv_checkpoint_device_id: row.get(25)?,
-                    kv_checkpoint_created_at: row.get(26)?,
-                    session_updated_at: row.get(27)?,
-                    replica_status: row.get(28)?,
-                    replica_active_segment_id: row.get(29)?,
-                    replica_kv_sequence_position: row.get::<_, Option<i64>>(30)?.map(|v| v as u32),
-                    replica_checkpoint_created_at: row.get(31)?,
-                    replica_updated_at: row.get(32)?,
-                    replica_last_error: row.get(33)?,
+                    lease_target_session_count: row.get::<_, Option<i64>>(25)?.map(|v| v as u32),
+                    lease_target_batch_size: row.get::<_, Option<i64>>(26)?.map(|v| v as u32),
+                    kv_checkpoint_device_id: row.get(27)?,
+                    kv_checkpoint_created_at: row.get(28)?,
+                    session_updated_at: row.get(29)?,
+                    replica_status: row.get(30)?,
+                    replica_active_segment_id: row.get(31)?,
+                    replica_kv_sequence_position: row.get::<_, Option<i64>>(32)?.map(|v| v as u32),
+                    replica_checkpoint_created_at: row.get(33)?,
+                    replica_updated_at: row.get(34)?,
+                    replica_last_error: row.get(35)?,
                 })
             },
         )
@@ -1509,7 +1565,7 @@ fn claim_assignment(
         None
     };
 
-    if let Some(assignment) = &row {
+    if let Some(assignment) = row.as_mut() {
         tx.execute(
             r#"
             UPDATE inference_job_assignments
@@ -1540,6 +1596,10 @@ fn claim_assignment(
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         if matches!(active.phase, crate::api::types::ExecutionPhase::Decode) {
+            let (lease_target_session_count, lease_target_batch_size) =
+                compute_decode_lease_targets(&tx, &assignment.network_id, &active.execution_group_id)?;
+            assignment.lease_target_session_count = Some(lease_target_session_count);
+            assignment.lease_target_batch_size = Some(lease_target_batch_size);
             upsert_decode_queue(
                 &tx,
                 &assignment.session_id,
@@ -1551,6 +1611,8 @@ fn claim_assignment(
                 Some(&now_str),
                 Some(&assignment.device_id),
                 Some(&lease_expires),
+                Some(lease_target_session_count),
+                Some(lease_target_batch_size),
                 None,
                 &now_str,
             )?;
@@ -2359,6 +2421,8 @@ fn report_assignment_progress(
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     &now,
                 )?;
                 for device_id in &next_participants {
@@ -2712,12 +2776,14 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
     let session = conn
         .query_row(
             r#"
-            SELECT session_id, status, active_segment_id, kv_owner_device_id, kv_transfer_policy,
-                   kv_sequence_position, latest_batch_size, latest_active_decode_sessions,
-                   latest_batch_kv_tokens, latest_deferred_decode_sessions,
-                   kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at, last_error
-            FROM inference_sessions
-            WHERE job_id = ?
+            SELECT s.session_id, s.status, s.active_segment_id, s.kv_owner_device_id, s.kv_transfer_policy,
+                   s.kv_sequence_position, s.latest_batch_size, s.latest_active_decode_sessions,
+                   s.latest_batch_kv_tokens, s.latest_deferred_decode_sessions,
+                   dq.lease_target_session_count, dq.lease_target_batch_size,
+                   s.kv_checkpoint_device_id, s.kv_checkpoint_created_at, s.updated_at, s.last_error
+            FROM inference_sessions s
+            LEFT JOIN inference_decode_queue dq ON dq.session_id = s.session_id
+            WHERE s.job_id = ?
             "#,
             params![job_id],
             |row| {
@@ -2732,10 +2798,12 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
                     latest_batch_kv_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
                     latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
-                    kv_checkpoint_device_id: row.get(10)?,
-                    kv_checkpoint_created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
-                    last_error: row.get(13)?,
+                    lease_target_session_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                    lease_target_batch_size: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                    kv_checkpoint_device_id: row.get(12)?,
+                    kv_checkpoint_created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                    last_error: row.get(15)?,
                     checkpoint: None,
                     replicas: Vec::new(),
                     recent_decode_batches: Vec::new(),
@@ -4211,6 +4279,8 @@ mod tests {
             .expect("expected decode assignment");
 
             assert_eq!(decode_claim.active_segment.segment_id, decode_segment_id);
+            assert_eq!(decode_claim.session.lease_target_session_count, Some(1));
+            assert_eq!(decode_claim.session.lease_target_batch_size, Some(1));
 
             let _ = acknowledge_inference_assignment(
                 State(state.clone()),

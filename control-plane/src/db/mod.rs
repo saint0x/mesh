@@ -315,6 +315,21 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         "024_create_inference_regroup_events.sql" => {
             table_exists(conn, "inference_regroup_events")?
         }
+        "025_add_decode_batch_telemetry_to_inference_sessions.sql" => {
+            column_exists(conn, "inference_sessions", "latest_batch_size")?
+                && column_exists(conn, "inference_sessions", "latest_active_decode_sessions")?
+        }
+        "026_add_decode_batch_pressure_to_inference_sessions.sql" => {
+            column_exists(conn, "inference_sessions", "latest_batch_kv_tokens")?
+                && column_exists(conn, "inference_sessions", "latest_deferred_decode_sessions")?
+        }
+        "027_create_inference_decode_batch_events.sql" => {
+            table_exists(conn, "inference_decode_batch_events")?
+        }
+        "028_add_decode_lease_batch_targets.sql" => {
+            column_exists(conn, "inference_decode_queue", "lease_target_session_count")?
+                && column_exists(conn, "inference_decode_queue", "lease_target_batch_size")?
+        }
         _ => false,
     })
 }
@@ -529,7 +544,9 @@ fn load_decode_queue_entries(
             r#"
             SELECT session_id, job_id, network_id, segment_id, group_id, status,
                    blocked_reason, blocked_since, block_detail, ready_at,
-                   lease_owner_device_id, lease_expires_at, last_error, updated_at
+                   lease_owner_device_id, lease_expires_at,
+                   lease_target_session_count, lease_target_batch_size,
+                   last_error, updated_at
             FROM inference_decode_queue
             WHERE network_id = ?1 AND job_id = ?2
             ORDER BY updated_at ASC, session_id ASC
@@ -549,8 +566,10 @@ fn load_decode_queue_entries(
                 ready_at: row.get(9)?,
                 lease_owner_device_id: row.get(10)?,
                 lease_expires_at: row.get(11)?,
-                last_error: row.get(12)?,
-                updated_at: row.get(13)?,
+                lease_target_session_count: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                lease_target_batch_size: row.get::<_, Option<i64>>(13)?.map(|v| v as u32),
+                last_error: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })?;
         collect_rows(rows)
@@ -559,7 +578,9 @@ fn load_decode_queue_entries(
             r#"
             SELECT session_id, job_id, network_id, segment_id, group_id, status,
                    blocked_reason, blocked_since, block_detail, ready_at,
-                   lease_owner_device_id, lease_expires_at, last_error, updated_at
+                   lease_owner_device_id, lease_expires_at,
+                   lease_target_session_count, lease_target_batch_size,
+                   last_error, updated_at
             FROM inference_decode_queue
             WHERE network_id = ?1
             ORDER BY updated_at ASC, session_id ASC
@@ -579,8 +600,10 @@ fn load_decode_queue_entries(
                 ready_at: row.get(9)?,
                 lease_owner_device_id: row.get(10)?,
                 lease_expires_at: row.get(11)?,
-                last_error: row.get(12)?,
-                updated_at: row.get(13)?,
+                lease_target_session_count: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                lease_target_batch_size: row.get::<_, Option<i64>>(13)?.map(|v| v as u32),
+                last_error: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })?;
         collect_rows(rows)

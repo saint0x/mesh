@@ -587,6 +587,10 @@ pub struct InferenceSessionStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_deferred_decode_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_session_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_created_at: Option<String>,
@@ -619,6 +623,10 @@ pub struct InferenceSessionLease {
     pub latest_batch_kv_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_deferred_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_session_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -766,6 +774,10 @@ pub struct DecodeQueueEntryStatus {
     pub lease_owner_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_session_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub updated_at: String,
