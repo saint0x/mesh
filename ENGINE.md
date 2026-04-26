@@ -61,6 +61,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add decode-step ownership, lease semantics, and batch lease targets
 - ✅ Make the agent runtime honor scheduler-issued decode batch targets
 - ✅ Pool decode batch targets across sessions that share the same serving participants
+- ✅ Keep pooled decode lease targets authoritative when sibling sessions are blocked on transfer
 - ✅ Persist target-versus-actual decode batch event history
 - ✅ Expose pooled decode cohort visibility on lease and session status surfaces
 - ✅ Add microbatch formation across multiple active sessions

@@ -72,6 +72,7 @@ struct PersistedLeaseRecord {
     pooled_batch_group_key: Option<String>,
     pooled_total_sessions: Option<u32>,
     pooled_ready_sessions: Option<u32>,
+    pooled_blocked_sessions: Option<u32>,
     pooled_leased_sessions: Option<u32>,
     pooled_active_sessions: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
@@ -157,6 +158,7 @@ struct PersistedSessionStatus {
     pooled_batch_group_key: Option<String>,
     pooled_total_sessions: Option<u32>,
     pooled_ready_sessions: Option<u32>,
+    pooled_blocked_sessions: Option<u32>,
     pooled_leased_sessions: Option<u32>,
     pooled_active_sessions: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
@@ -196,6 +198,7 @@ struct DecodeLeaseCohortStatus {
     pooled_batch_group_key: Option<String>,
     pooled_total_sessions: Option<u32>,
     pooled_ready_sessions: Option<u32>,
+    pooled_blocked_sessions: Option<u32>,
     pooled_leased_sessions: Option<u32>,
     pooled_active_sessions: Option<u32>,
 }
@@ -799,6 +802,7 @@ fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExec
             pooled_batch_group_key: assignment.pooled_batch_group_key,
             pooled_total_sessions: assignment.pooled_total_sessions,
             pooled_ready_sessions: assignment.pooled_ready_sessions,
+            pooled_blocked_sessions: assignment.pooled_blocked_sessions,
             pooled_leased_sessions: assignment.pooled_leased_sessions,
             pooled_active_sessions: assignment.pooled_active_sessions,
             kv_checkpoint_device_id: assignment.kv_checkpoint_device_id,
@@ -1003,6 +1007,7 @@ fn load_serving_session_metadata(
                     pooled_batch_group_key: None,
                     pooled_total_sessions: None,
                     pooled_ready_sessions: None,
+                    pooled_blocked_sessions: None,
                     pooled_leased_sessions: None,
                     pooled_active_sessions: None,
                     kv_checkpoint_device_id: row.get(14)?,
@@ -1035,6 +1040,7 @@ fn load_serving_session_metadata(
     session.pooled_batch_group_key = cohort.pooled_batch_group_key;
     session.pooled_total_sessions = cohort.pooled_total_sessions;
     session.pooled_ready_sessions = cohort.pooled_ready_sessions;
+    session.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
     session.pooled_leased_sessions = cohort.pooled_leased_sessions;
     session.pooled_active_sessions = cohort.pooled_active_sessions;
     session.checkpoint = load_latest_session_checkpoint_status(conn, &session.session_id)?;
@@ -1118,6 +1124,7 @@ fn load_serving_session_metadata(
         pooled_batch_group_key: session.pooled_batch_group_key,
         pooled_total_sessions: session.pooled_total_sessions,
         pooled_ready_sessions: session.pooled_ready_sessions,
+        pooled_blocked_sessions: session.pooled_blocked_sessions,
         pooled_leased_sessions: session.pooled_leased_sessions,
         pooled_active_sessions: session.pooled_active_sessions,
         queue_status: queue_row.as_ref().and_then(|row| row.0.clone()),
@@ -1186,6 +1193,7 @@ fn load_decode_lease_status(
                 pooled_batch_group_key: cohort.pooled_batch_group_key.clone(),
                 pooled_total_sessions: cohort.pooled_total_sessions,
                 pooled_ready_sessions: cohort.pooled_ready_sessions,
+                pooled_blocked_sessions: cohort.pooled_blocked_sessions,
                 pooled_leased_sessions: cohort.pooled_leased_sessions,
                 pooled_active_sessions: cohort.pooled_active_sessions,
                 last_renewed_at: row.get(11)?,
@@ -1799,7 +1807,7 @@ fn compute_decode_lease_targets(
               ON s.session_id = dq.session_id
             WHERE dq.network_id = ?1
               AND COALESCE(dq.batch_group_key, dq.group_id) = ?2
-              AND dq.status IN ('ready', 'leased', 'active')
+              AND dq.status IN ('ready', 'leased', 'active', 'blocked_on_transfer')
             "#,
             params![network_id, &pooled_group_key],
             |row| {
@@ -1838,7 +1846,7 @@ fn refresh_decode_batch_targets(
             lease_target_batch_size = ?
         WHERE network_id = ?
           AND COALESCE(batch_group_key, group_id) = ?
-          AND status IN ('ready', 'leased', 'active')
+          AND status IN ('ready', 'leased', 'active', 'blocked_on_transfer')
         "#,
         params![
             i64::from(target_session_count),
@@ -2073,6 +2081,7 @@ fn load_decode_lease_cohort_status(
             SELECT
                 COUNT(*),
                 SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status IN ('blocked_on_prefill', 'blocked_on_transfer') THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)
             FROM inference_decode_queue
@@ -2085,8 +2094,9 @@ fn load_decode_lease_cohort_status(
                     pooled_batch_group_key: Some(pooled_group_key.clone()),
                     pooled_total_sessions: Some(row.get::<_, i64>(0)? as u32),
                     pooled_ready_sessions: Some(row.get::<_, i64>(1)? as u32),
-                    pooled_leased_sessions: Some(row.get::<_, i64>(2)? as u32),
-                    pooled_active_sessions: Some(row.get::<_, i64>(3)? as u32),
+                    pooled_blocked_sessions: Some(row.get::<_, i64>(2)? as u32),
+                    pooled_leased_sessions: Some(row.get::<_, i64>(3)? as u32),
+                    pooled_active_sessions: Some(row.get::<_, i64>(4)? as u32),
                 })
             },
         )
@@ -2414,6 +2424,7 @@ pub async fn get_inference_job_status(
                 pooled_batch_group_key: session.pooled_batch_group_key,
                 pooled_total_sessions: session.pooled_total_sessions,
                 pooled_ready_sessions: session.pooled_ready_sessions,
+                pooled_blocked_sessions: session.pooled_blocked_sessions,
                 pooled_leased_sessions: session.pooled_leased_sessions,
                 pooled_active_sessions: session.pooled_active_sessions,
                 kv_checkpoint_device_id: session.kv_checkpoint_device_id,
@@ -2772,6 +2783,7 @@ fn claim_assignment(
                     pooled_batch_group_key: None,
                     pooled_total_sessions: None,
                     pooled_ready_sessions: None,
+                    pooled_blocked_sessions: None,
                     pooled_leased_sessions: None,
                     pooled_active_sessions: None,
                     kv_checkpoint_device_id: row.get(27)?,
@@ -2884,6 +2896,7 @@ fn claim_assignment(
             assignment.pooled_batch_group_key = cohort.pooled_batch_group_key;
             assignment.pooled_total_sessions = cohort.pooled_total_sessions;
             assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
+            assignment.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
             assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
             assignment.pooled_active_sessions = cohort.pooled_active_sessions;
             record_scheduler_event(
@@ -4204,6 +4217,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     pooled_batch_group_key: None,
                     pooled_total_sessions: None,
                     pooled_ready_sessions: None,
+                    pooled_blocked_sessions: None,
                     pooled_leased_sessions: None,
                     pooled_active_sessions: None,
                     kv_checkpoint_device_id: row.get(12)?,
@@ -4233,6 +4247,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
         session.pooled_batch_group_key = cohort.pooled_batch_group_key;
         session.pooled_total_sessions = cohort.pooled_total_sessions;
         session.pooled_ready_sessions = cohort.pooled_ready_sessions;
+        session.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
         session.pooled_leased_sessions = cohort.pooled_leased_sessions;
         session.pooled_active_sessions = cohort.pooled_active_sessions;
         session.checkpoint = load_latest_session_checkpoint_status(&conn, &session.session_id)?;
@@ -7401,6 +7416,276 @@ mod tests {
                 Some(2)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_decode_batch_targets_include_blocked_transfer_siblings_in_pooled_target() {
+        let network_id = "test-network-pooled-blocked-transfer-targets";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+        let mut job_ids = Vec::new();
+        let mut pooled_group_key = None::<String>;
+        let mut pooled_group_id = None::<String>;
+        let mut blocked_session_id = None::<String>;
+
+        for (prompt, queue_status, session_status, group_status) in [
+            ("ready", "ready", "decode_ready", "decode_ready"),
+            (
+                "blocked",
+                "blocked_on_transfer",
+                "decode_pending_transfer",
+                "decode_pending_transfer",
+            ),
+        ] {
+            let submit = submit_inference(
+                State(state.clone()),
+                Json(SubmitInferenceRequest {
+                    device_id: "worker-1".into(),
+                    network_id: network_id.into(),
+                    model_id: "llama-70b".into(),
+                    prompt: prompt.into(),
+                    max_tokens: 8,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            job_ids.push(submit.job_id.clone());
+            let plan = submit
+                .execution_plan
+                .clone()
+                .expect("expected execution plan");
+            let decode_segment = plan
+                .segments
+                .iter()
+                .find(|segment| matches!(segment.phase, ExecutionPhase::Decode))
+                .expect("expected decode segment")
+                .clone();
+            let computed_batch_group_key =
+                decode_batch_group_key(&plan, &decode_segment.segment_id).expect("batch key");
+            let conn = state.db.get_conn().unwrap();
+            let (session_id, _group_id, batch_group_key): (String, String, Option<String>) = conn
+                .query_row(
+                    r#"
+                    SELECT session_id, group_id, batch_group_key
+                    FROM inference_decode_queue
+                    WHERE job_id = ?
+                    "#,
+                    params![submit.job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            if queue_status == "blocked_on_transfer" {
+                blocked_session_id = Some(session_id.clone());
+            }
+            conn.execute(
+                r#"
+                UPDATE inference_jobs
+                SET status = 'running',
+                    active_segment_id = ?,
+                    updated_at = datetime('now')
+                WHERE job_id = ?
+                "#,
+                params![&decode_segment.segment_id, &submit.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_sessions
+                SET status = ?,
+                    active_segment_id = ?,
+                    kv_sequence_position = 1,
+                    updated_at = datetime('now')
+                WHERE job_id = ?
+                "#,
+                params![session_status, &decode_segment.segment_id, &submit.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                UPDATE inference_decode_queue
+                SET segment_id = ?,
+                    group_id = ?,
+                    batch_group_key = ?,
+                    status = ?,
+                    ready_at = CASE
+                        WHEN ? = 'ready' THEN datetime('now')
+                        ELSE NULL
+                    END,
+                    lease_owner_device_id = NULL,
+                    lease_expires_at = NULL,
+                    lease_target_session_count = NULL,
+                    lease_target_batch_size = NULL,
+                    updated_at = datetime('now')
+                WHERE session_id = ?
+                "#,
+                params![
+                    &decode_segment.segment_id,
+                    &decode_segment.execution_group_id,
+                    &computed_batch_group_key,
+                    queue_status,
+                    queue_status,
+                    &session_id
+                ],
+            )
+            .unwrap();
+            for device_id in &decode_segment.participant_device_ids {
+                conn.execute(
+                    r#"
+                    UPDATE inference_job_assignments
+                    SET status = 'pending',
+                        active_segment_id = ?,
+                        lease_expires_at = NULL
+                    WHERE job_id = ?
+                      AND device_id = ?
+                    "#,
+                    params![&decode_segment.segment_id, &submit.job_id, device_id],
+                )
+                .unwrap();
+                conn.execute(
+                    r#"
+                    UPDATE inference_serving_groups
+                    SET status = ?,
+                        lease_owner_device_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = datetime('now'),
+                        last_error = NULL
+                    WHERE job_id = ?
+                      AND device_id = ?
+                      AND phase = 'decode'
+                    "#,
+                    params![group_status, &submit.job_id, device_id],
+                )
+                .unwrap();
+                conn.execute(
+                    r#"
+                    UPDATE inference_session_replicas
+                    SET status = ?,
+                        active_segment_id = ?,
+                        kv_sequence_position = 1,
+                        updated_at = datetime('now')
+                    WHERE session_id = ?
+                      AND device_id = ?
+                    "#,
+                    params![session_status, &decode_segment.segment_id, &session_id, device_id],
+                )
+                .unwrap();
+            }
+
+            let batch_group_key =
+                batch_group_key.expect("decode queue row should have a pooled batch group key");
+            if let Some(existing_key) = pooled_group_key.as_ref() {
+                assert_eq!(existing_key, &batch_group_key);
+            } else {
+                pooled_group_key = Some(batch_group_key.clone());
+            }
+            if pooled_group_id.is_none() {
+                pooled_group_id = Some(decode_segment.execution_group_id.clone());
+            }
+        }
+
+        let conn = state.db.get_conn().unwrap();
+        refresh_decode_batch_targets(
+            &conn,
+            network_id,
+            pooled_group_key.as_deref().unwrap(),
+            pooled_group_id.as_deref().unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
+        assert_eq!(scheduler.decode_queue.len(), 2);
+        assert!(scheduler.decode_queue.iter().all(|session| {
+            session.lease_target_session_count == Some(2)
+                && session.lease_target_batch_size == Some(2)
+        }));
+
+        for job_id in &job_ids {
+            let status = get_inference_job_status(State(state.clone()), Path(job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.lease_target_session_count),
+                Some(2)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_blocked_sessions),
+                Some(1)
+            );
+        }
+
+        let decode_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Decode,
+                include_queue_state: true,
+                include_serving_session: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected decode assignment");
+        assert_eq!(decode_claim.session.lease_target_session_count, Some(2));
+        assert_eq!(decode_claim.session.lease_target_batch_size, Some(2));
+        assert_eq!(decode_claim.session.pooled_blocked_sessions, Some(1));
+
+        let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
+        let queue_statuses = scheduler
+            .decode_queue
+            .iter()
+            .map(|session| session.status.clone())
+            .collect::<Vec<_>>();
+        assert!(queue_statuses.contains(&"leased".to_string()));
+        assert!(queue_statuses.contains(&"blocked_on_transfer".to_string()));
+        assert!(scheduler.decode_queue.iter().all(|session| {
+            session.lease_target_session_count == Some(2)
+                && session.lease_target_batch_size == Some(2)
+        }));
+
+        let blocked_session_id = blocked_session_id.expect("blocked session should exist");
+        let blocked_status = get_inference_job_status(
+            State(state.clone()),
+            Path(
+                job_ids
+                    .iter()
+                    .find(|job_id| {
+                        let conn = state.db.get_conn().unwrap();
+                        let current_session_id: String = conn
+                            .query_row(
+                                "SELECT session_id FROM inference_sessions WHERE job_id = ?",
+                                params![job_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        current_session_id == blocked_session_id
+                    })
+                    .expect("blocked job id should exist")
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            blocked_status
+                .session
+                .as_ref()
+                .and_then(|session| session.pooled_blocked_sessions),
+            Some(1)
+        );
     }
 
     #[tokio::test]

@@ -309,6 +309,8 @@ pub struct DecodeLeaseStatus {
     #[serde(default)]
     pub pooled_ready_sessions: Option<u32>,
     #[serde(default)]
+    pub pooled_blocked_sessions: Option<u32>,
+    #[serde(default)]
     pub pooled_leased_sessions: Option<u32>,
     #[serde(default)]
     pub pooled_active_sessions: Option<u32>,
@@ -348,6 +350,8 @@ pub struct ServingSessionMetadata {
     pub pooled_total_sessions: Option<u32>,
     #[serde(default)]
     pub pooled_ready_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_blocked_sessions: Option<u32>,
     #[serde(default)]
     pub pooled_leased_sessions: Option<u32>,
     #[serde(default)]
@@ -488,6 +492,7 @@ pub struct InferenceSessionLease {
     pub pooled_batch_group_key: Option<String>,
     pub pooled_total_sessions: Option<u32>,
     pub pooled_ready_sessions: Option<u32>,
+    pub pooled_blocked_sessions: Option<u32>,
     pub pooled_leased_sessions: Option<u32>,
     pub pooled_active_sessions: Option<u32>,
     pub kv_checkpoint_device_id: Option<String>,

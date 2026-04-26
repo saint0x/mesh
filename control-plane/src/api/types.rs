@@ -662,6 +662,8 @@ pub struct DecodeLeaseStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_ready_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_blocked_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_leased_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_active_sessions: Option<u32>,
@@ -701,6 +703,8 @@ pub struct ServingSessionMetadata {
     pub pooled_total_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_ready_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_blocked_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_leased_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -799,6 +803,8 @@ pub struct InferenceSessionStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_ready_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_blocked_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_leased_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_active_sessions: Option<u32>,
@@ -845,6 +851,8 @@ pub struct InferenceSessionLease {
     pub pooled_total_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_ready_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_blocked_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_leased_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
