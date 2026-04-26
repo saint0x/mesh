@@ -656,6 +656,16 @@ pub struct DecodeLeaseStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_batch_group_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_total_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_ready_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_leased_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_active_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_renewed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -685,6 +695,16 @@ pub struct ServingSessionMetadata {
     pub lease_target_session_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_batch_group_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_total_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_ready_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_leased_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_active_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -773,6 +793,16 @@ pub struct InferenceSessionStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_batch_group_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_total_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_ready_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_leased_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_active_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_created_at: Option<String>,
@@ -809,6 +839,16 @@ pub struct InferenceSessionLease {
     pub lease_target_session_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_batch_group_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_total_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_ready_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_leased_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pooled_active_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_checkpoint_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

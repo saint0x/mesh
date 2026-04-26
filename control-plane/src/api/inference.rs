@@ -69,6 +69,11 @@ struct PersistedLeaseRecord {
     latest_deferred_decode_sessions: Option<u32>,
     lease_target_session_count: Option<u32>,
     lease_target_batch_size: Option<u32>,
+    pooled_batch_group_key: Option<String>,
+    pooled_total_sessions: Option<u32>,
+    pooled_ready_sessions: Option<u32>,
+    pooled_leased_sessions: Option<u32>,
+    pooled_active_sessions: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
     kv_checkpoint_created_at: Option<String>,
     session_updated_at: String,
@@ -149,6 +154,11 @@ struct PersistedSessionStatus {
     latest_deferred_decode_sessions: Option<u32>,
     lease_target_session_count: Option<u32>,
     lease_target_batch_size: Option<u32>,
+    pooled_batch_group_key: Option<String>,
+    pooled_total_sessions: Option<u32>,
+    pooled_ready_sessions: Option<u32>,
+    pooled_leased_sessions: Option<u32>,
+    pooled_active_sessions: Option<u32>,
     kv_checkpoint_device_id: Option<String>,
     kv_checkpoint_created_at: Option<String>,
     updated_at: String,
@@ -179,6 +189,15 @@ struct PersistedSessionReplicaStatus {
     checkpoint_created_at: Option<String>,
     updated_at: String,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct DecodeLeaseCohortStatus {
+    pooled_batch_group_key: Option<String>,
+    pooled_total_sessions: Option<u32>,
+    pooled_ready_sessions: Option<u32>,
+    pooled_leased_sessions: Option<u32>,
+    pooled_active_sessions: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -761,6 +780,11 @@ fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExec
             latest_deferred_decode_sessions: assignment.latest_deferred_decode_sessions,
             lease_target_session_count: assignment.lease_target_session_count,
             lease_target_batch_size: assignment.lease_target_batch_size,
+            pooled_batch_group_key: assignment.pooled_batch_group_key,
+            pooled_total_sessions: assignment.pooled_total_sessions,
+            pooled_ready_sessions: assignment.pooled_ready_sessions,
+            pooled_leased_sessions: assignment.pooled_leased_sessions,
+            pooled_active_sessions: assignment.pooled_active_sessions,
             kv_checkpoint_device_id: assignment.kv_checkpoint_device_id,
             kv_checkpoint_created_at: assignment.kv_checkpoint_created_at,
             updated_at: assignment.session_updated_at,
@@ -960,6 +984,11 @@ fn load_serving_session_metadata(
                     latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
                     lease_target_session_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
                     lease_target_batch_size: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                    pooled_batch_group_key: None,
+                    pooled_total_sessions: None,
+                    pooled_ready_sessions: None,
+                    pooled_leased_sessions: None,
+                    pooled_active_sessions: None,
                     kv_checkpoint_device_id: row.get(14)?,
                     kv_checkpoint_created_at: row.get(15)?,
                     updated_at: row.get(16)?,
@@ -977,6 +1006,7 @@ fn load_serving_session_metadata(
         return Ok(None);
     };
 
+    let cohort = load_decode_lease_cohort_status(conn, &session.session_id)?;
     let (lease_target_session_count, lease_target_batch_size) =
         resolve_session_decode_lease_targets(
             conn,
@@ -986,6 +1016,11 @@ fn load_serving_session_metadata(
         )?;
     session.lease_target_session_count = lease_target_session_count;
     session.lease_target_batch_size = lease_target_batch_size;
+    session.pooled_batch_group_key = cohort.pooled_batch_group_key;
+    session.pooled_total_sessions = cohort.pooled_total_sessions;
+    session.pooled_ready_sessions = cohort.pooled_ready_sessions;
+    session.pooled_leased_sessions = cohort.pooled_leased_sessions;
+    session.pooled_active_sessions = cohort.pooled_active_sessions;
     session.checkpoint = load_latest_session_checkpoint_status(conn, &session.session_id)?;
     let mut stmt = conn
         .prepare(
@@ -1064,6 +1099,11 @@ fn load_serving_session_metadata(
         latest_deferred_decode_sessions: session.latest_deferred_decode_sessions,
         lease_target_session_count: session.lease_target_session_count,
         lease_target_batch_size: session.lease_target_batch_size,
+        pooled_batch_group_key: session.pooled_batch_group_key,
+        pooled_total_sessions: session.pooled_total_sessions,
+        pooled_ready_sessions: session.pooled_ready_sessions,
+        pooled_leased_sessions: session.pooled_leased_sessions,
+        pooled_active_sessions: session.pooled_active_sessions,
         queue_status: queue_row.as_ref().and_then(|row| row.0.clone()),
         ready_at: queue_row.and_then(|row| row.1),
         updated_at: session.updated_at,
@@ -1094,6 +1134,7 @@ fn load_decode_lease_status(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> ApiResult<Option<DecodeLeaseStatus>> {
+    let cohort = load_decode_lease_cohort_status(conn, session_id)?;
     conn.query_row(
         r#"
         SELECT a.assignment_id, a.job_id, dq.session_id, dq.segment_id, dq.status,
@@ -1126,6 +1167,11 @@ fn load_decode_lease_status(
                 lease_expires_at: row.get(8)?,
                 lease_target_session_count: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
                 lease_target_batch_size: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                pooled_batch_group_key: cohort.pooled_batch_group_key.clone(),
+                pooled_total_sessions: cohort.pooled_total_sessions,
+                pooled_ready_sessions: cohort.pooled_ready_sessions,
+                pooled_leased_sessions: cohort.pooled_leased_sessions,
+                pooled_active_sessions: cohort.pooled_active_sessions,
                 last_renewed_at: row.get(11)?,
                 last_error: row.get(12)?,
             })
@@ -1774,6 +1820,61 @@ fn resolve_session_decode_lease_targets(
     Ok((Some(target_session_count), Some(target_batch_size)))
 }
 
+fn load_decode_lease_cohort_status(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> ApiResult<DecodeLeaseCohortStatus> {
+    let queue_row = conn
+        .query_row(
+            r#"
+            SELECT network_id, group_id, batch_group_key
+            FROM inference_decode_queue
+            WHERE session_id = ?
+            "#,
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let Some((network_id, group_id, batch_group_key)) = queue_row else {
+        return Ok(DecodeLeaseCohortStatus::default());
+    };
+
+    let pooled_group_key = batch_group_key.unwrap_or(group_id);
+    let cohort = conn
+        .query_row(
+            r#"
+            SELECT
+                COUNT(*),
+                SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)
+            FROM inference_decode_queue
+            WHERE network_id = ?
+              AND COALESCE(batch_group_key, group_id) = ?
+            "#,
+            params![&network_id, &pooled_group_key],
+            |row| {
+                Ok(DecodeLeaseCohortStatus {
+                    pooled_batch_group_key: Some(pooled_group_key.clone()),
+                    pooled_total_sessions: Some(row.get::<_, i64>(0)? as u32),
+                    pooled_ready_sessions: Some(row.get::<_, i64>(1)? as u32),
+                    pooled_leased_sessions: Some(row.get::<_, i64>(2)? as u32),
+                    pooled_active_sessions: Some(row.get::<_, i64>(3)? as u32),
+                })
+            },
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(cohort)
+}
+
 fn decode_batch_group_key(
     plan: &InferenceExecutionPlan,
     segment_id: &str,
@@ -2059,6 +2160,11 @@ pub async fn get_inference_job_status(
                 latest_deferred_decode_sessions: session.latest_deferred_decode_sessions,
                 lease_target_session_count: session.lease_target_session_count,
                 lease_target_batch_size: session.lease_target_batch_size,
+                pooled_batch_group_key: session.pooled_batch_group_key,
+                pooled_total_sessions: session.pooled_total_sessions,
+                pooled_ready_sessions: session.pooled_ready_sessions,
+                pooled_leased_sessions: session.pooled_leased_sessions,
+                pooled_active_sessions: session.pooled_active_sessions,
                 kv_checkpoint_device_id: session.kv_checkpoint_device_id,
                 kv_checkpoint_created_at: session.kv_checkpoint_created_at,
                 updated_at: session.updated_at,
@@ -2412,6 +2518,11 @@ fn claim_assignment(
                         .map(|v| v as u32),
                     lease_target_session_count: row.get::<_, Option<i64>>(25)?.map(|v| v as u32),
                     lease_target_batch_size: row.get::<_, Option<i64>>(26)?.map(|v| v as u32),
+                    pooled_batch_group_key: None,
+                    pooled_total_sessions: None,
+                    pooled_ready_sessions: None,
+                    pooled_leased_sessions: None,
+                    pooled_active_sessions: None,
                     kv_checkpoint_device_id: row.get(27)?,
                     kv_checkpoint_created_at: row.get(28)?,
                     session_updated_at: row.get(29)?,
@@ -2494,6 +2605,12 @@ fn claim_assignment(
                 &batch_group_key,
                 &active.execution_group_id,
             )?;
+            let cohort = load_decode_lease_cohort_status(&tx, &assignment.session_id)?;
+            assignment.pooled_batch_group_key = cohort.pooled_batch_group_key;
+            assignment.pooled_total_sessions = cohort.pooled_total_sessions;
+            assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
+            assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
+            assignment.pooled_active_sessions = cohort.pooled_active_sessions;
         }
     }
 
@@ -3742,6 +3859,11 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
                     lease_target_session_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
                     lease_target_batch_size: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                    pooled_batch_group_key: None,
+                    pooled_total_sessions: None,
+                    pooled_ready_sessions: None,
+                    pooled_leased_sessions: None,
+                    pooled_active_sessions: None,
                     kv_checkpoint_device_id: row.get(12)?,
                     kv_checkpoint_created_at: row.get(13)?,
                     updated_at: row.get(14)?,
@@ -3756,6 +3878,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     let session = if let Some(mut session) = session {
+        let cohort = load_decode_lease_cohort_status(&conn, &session.session_id)?;
         let (lease_target_session_count, lease_target_batch_size) =
             resolve_session_decode_lease_targets(
                 &conn,
@@ -3765,6 +3888,11 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
             )?;
         session.lease_target_session_count = lease_target_session_count;
         session.lease_target_batch_size = lease_target_batch_size;
+        session.pooled_batch_group_key = cohort.pooled_batch_group_key;
+        session.pooled_total_sessions = cohort.pooled_total_sessions;
+        session.pooled_ready_sessions = cohort.pooled_ready_sessions;
+        session.pooled_leased_sessions = cohort.pooled_leased_sessions;
+        session.pooled_active_sessions = cohort.pooled_active_sessions;
         session.checkpoint = load_latest_session_checkpoint_status(&conn, &session.session_id)?;
         let mut stmt = conn
             .prepare(
@@ -6483,6 +6611,34 @@ mod tests {
                 .map(|lease| lease.lease_id.as_str()),
             Some(assignment.lease_id.as_str())
         );
+        assert_eq!(
+            decode_claim
+                .decode_lease
+                .as_ref()
+                .and_then(|lease| lease.pooled_total_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            decode_claim
+                .decode_lease
+                .as_ref()
+                .and_then(|lease| lease.pooled_leased_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            decode_claim
+                .serving_session
+                .as_ref()
+                .and_then(|session| session.pooled_total_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            decode_claim
+                .serving_session
+                .as_ref()
+                .and_then(|session| session.pooled_leased_sessions),
+            Some(1)
+        );
 
         let observed = observe_decode_queue_state(
             State(state.clone()),
@@ -6522,6 +6678,13 @@ mod tests {
                 .as_ref()
                 .and_then(|lease| lease.status.as_deref()),
             Some("leased")
+        );
+        assert_eq!(
+            renewed
+                .decode_lease
+                .as_ref()
+                .and_then(|lease| lease.pooled_total_sessions),
+            Some(1)
         );
         assert_eq!(
             renewed
@@ -6671,6 +6834,34 @@ mod tests {
                     .as_ref()
                     .and_then(|session| session.lease_target_batch_size),
                 Some(2)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_total_sessions),
+                Some(2)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_ready_sessions),
+                Some(2)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_leased_sessions),
+                Some(0)
+            );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.pooled_active_sessions),
+                Some(0)
             );
         }
     }

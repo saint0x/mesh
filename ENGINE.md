@@ -25,6 +25,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Make the agent runtime honor scheduler-issued decode batch targets
 - ✅ Pool decode batch targets across sessions that share the same serving participants
 - ✅ Persist target-versus-actual decode batch event history
+- ✅ Expose pooled decode cohort visibility on lease and session status surfaces
 - ✅ Add microbatch formation across multiple active sessions
 - ✅ Add fairness policy for per-session decode participation inside a batch
 - ✅ Add KV-budget-aware admission for decode steps

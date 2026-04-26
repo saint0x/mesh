@@ -785,9 +785,21 @@ fn log_scheduler_queue_state(
             serving_session.and_then(|session| session.latest_batch_kv_tokens),
         serving_latest_deferred_decode_sessions =
             serving_session.and_then(|session| session.latest_deferred_decode_sessions),
+        serving_pooled_total_sessions =
+            serving_session.and_then(|session| session.pooled_total_sessions),
+        serving_pooled_ready_sessions =
+            serving_session.and_then(|session| session.pooled_ready_sessions),
+        serving_pooled_leased_sessions =
+            serving_session.and_then(|session| session.pooled_leased_sessions),
+        serving_pooled_active_sessions =
+            serving_session.and_then(|session| session.pooled_active_sessions),
         decode_lease_id = decode_lease.map(|lease| lease.lease_id.as_str()),
         decode_lease_status = decode_lease.and_then(|lease| lease.status.as_deref()),
         decode_lease_expires_at = decode_lease.and_then(|lease| lease.lease_expires_at.as_deref()),
+        decode_pooled_total_sessions = decode_lease.and_then(|lease| lease.pooled_total_sessions),
+        decode_pooled_ready_sessions = decode_lease.and_then(|lease| lease.pooled_ready_sessions),
+        decode_pooled_leased_sessions = decode_lease.and_then(|lease| lease.pooled_leased_sessions),
+        decode_pooled_active_sessions = decode_lease.and_then(|lease| lease.pooled_active_sessions),
         "Observed scheduler queue and serving session state"
     );
 }
@@ -1677,6 +1689,22 @@ async fn cmd_runtime() -> Result<()> {
                     .as_ref()
                     .and_then(|lease| lease.lease_target_batch_size)
                     .or(assignment.session.lease_target_batch_size),
+                decode_pooled_total_sessions = decode_lease
+                    .as_ref()
+                    .and_then(|lease| lease.pooled_total_sessions)
+                    .or(assignment.session.pooled_total_sessions),
+                decode_pooled_ready_sessions = decode_lease
+                    .as_ref()
+                    .and_then(|lease| lease.pooled_ready_sessions)
+                    .or(assignment.session.pooled_ready_sessions),
+                decode_pooled_leased_sessions = decode_lease
+                    .as_ref()
+                    .and_then(|lease| lease.pooled_leased_sessions)
+                    .or(assignment.session.pooled_leased_sessions),
+                decode_pooled_active_sessions = decode_lease
+                    .as_ref()
+                    .and_then(|lease| lease.pooled_active_sessions)
+                    .or(assignment.session.pooled_active_sessions),
                 "Claimed distributed inference assignment"
             );
 

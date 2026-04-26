@@ -303,6 +303,16 @@ pub struct DecodeLeaseStatus {
     #[serde(default)]
     pub lease_target_batch_size: Option<u32>,
     #[serde(default)]
+    pub pooled_batch_group_key: Option<String>,
+    #[serde(default)]
+    pub pooled_total_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_ready_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_leased_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_active_sessions: Option<u32>,
+    #[serde(default)]
     pub last_renewed_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -332,6 +342,16 @@ pub struct ServingSessionMetadata {
     pub lease_target_session_count: Option<u32>,
     #[serde(default)]
     pub lease_target_batch_size: Option<u32>,
+    #[serde(default)]
+    pub pooled_batch_group_key: Option<String>,
+    #[serde(default)]
+    pub pooled_total_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_ready_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_leased_sessions: Option<u32>,
+    #[serde(default)]
+    pub pooled_active_sessions: Option<u32>,
     #[serde(default)]
     pub queue_status: Option<String>,
     #[serde(default)]
@@ -465,6 +485,11 @@ pub struct InferenceSessionLease {
     pub latest_deferred_decode_sessions: Option<u32>,
     pub lease_target_session_count: Option<u32>,
     pub lease_target_batch_size: Option<u32>,
+    pub pooled_batch_group_key: Option<String>,
+    pub pooled_total_sessions: Option<u32>,
+    pub pooled_ready_sessions: Option<u32>,
+    pub pooled_leased_sessions: Option<u32>,
+    pub pooled_active_sessions: Option<u32>,
     pub kv_checkpoint_device_id: Option<String>,
     pub kv_checkpoint_created_at: Option<String>,
     pub updated_at: String,
