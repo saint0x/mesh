@@ -597,7 +597,10 @@ fn decode_group_fill_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandida
         .unwrap_or(cohort_fill.max(1));
     if cohort_fill < target {
         let remaining_capacity = target.saturating_sub(cohort_fill);
-        let remaining_rank = 31u32.saturating_sub(remaining_capacity.min(31));
+        let remaining_rank = match mode {
+            SchedulerPolicyMode::FitFirst => remaining_capacity.min(31),
+            _ => 31u32.saturating_sub(remaining_capacity.min(31)),
+        };
         let fill_density_rank = 31u32.saturating_sub(cohort_fill.min(31));
         let ready_rank = 31u32.saturating_sub(candidate.candidate.decode_cohort_ready_sessions.min(31));
         let blocked_rank = candidate.candidate.decode_cohort_blocked_sessions.min(31);
@@ -2563,6 +2566,87 @@ mod tests {
             &HashMap::new(),
         );
         assert!(throughput_larger < throughput_smaller);
+    }
+
+    #[test]
+    fn fit_first_prefers_owned_decode_cohort_with_less_remaining_capacity_while_latency_prefers_more() {
+        let mut more_remaining = base_candidate(SchedulerPhase::Decode);
+        more_remaining.assignment_id = "more-remaining".into();
+        more_remaining.group_status = "decode_leased".into();
+        more_remaining.decode_queue_status = Some("ready".into());
+        more_remaining.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        more_remaining.group_lease_owner_device_id = Some("worker-1".into());
+        more_remaining.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        more_remaining.decode_lease_target_session_count = Some(5);
+        more_remaining.decode_cohort_leased_sessions = 1;
+        more_remaining.decode_cohort_active_sessions = 1;
+
+        let mut less_remaining = more_remaining.clone();
+        less_remaining.assignment_id = "less-remaining".into();
+        less_remaining.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        less_remaining.decode_lease_target_session_count = Some(3);
+
+        let more_remaining = RunnableCandidate {
+            ready_at: more_remaining.decode_ready_at.clone().unwrap(),
+            candidate: more_remaining,
+        };
+        let less_remaining = RunnableCandidate {
+            ready_at: less_remaining.decode_ready_at.clone().unwrap(),
+            candidate: less_remaining,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let fit_more = rank_candidate(
+            &more_remaining,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fit_less = rank_candidate(
+            &less_remaining,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(fit_less < fit_more);
+
+        let latency_more = rank_candidate(
+            &more_remaining,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let latency_less = rank_candidate(
+            &less_remaining,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(latency_more < latency_less);
     }
 
     #[test]
