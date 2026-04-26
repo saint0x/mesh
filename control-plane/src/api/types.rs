@@ -802,6 +802,23 @@ pub struct ServingGroupMemberStatus {
     pub last_error: Option<String>,
 }
 
+/// Current decode workload carried by a serving group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServingGroupWorkloadStatus {
+    pub queued_sessions: u32,
+    pub runnable_sessions: u32,
+    pub blocked_sessions: u32,
+    pub leased_sessions: u32,
+    pub active_sessions: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_active_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_batch_kv_tokens: Option<u32>,
+    pub deferred_decode_sessions: u32,
+}
+
 /// Serving-group snapshot for scheduler/operator status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServingGroupStatus {
@@ -814,6 +831,8 @@ pub struct ServingGroupStatus {
     pub member_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<ServingGroupLeaseStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload: Option<ServingGroupWorkloadStatus>,
     #[serde(default)]
     pub members: Vec<ServingGroupMemberStatus>,
 }

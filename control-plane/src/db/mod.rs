@@ -13,6 +13,7 @@ use crate::api::types::{
     NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics,
     SchedulerJobSummary,
     ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
+    ServingGroupWorkloadStatus,
 };
 
 /// Database-related errors
@@ -355,6 +356,19 @@ struct ServingGroupRow {
     member: ServingGroupMemberStatus,
 }
 
+#[derive(Default)]
+struct ServingGroupWorkloadAccumulator {
+    queued_sessions: u32,
+    runnable_sessions: u32,
+    blocked_sessions: u32,
+    leased_sessions: u32,
+    active_sessions: u32,
+    peak_batch_size: Option<u32>,
+    peak_active_decode_sessions: Option<u32>,
+    peak_batch_kv_tokens: Option<u32>,
+    deferred_decode_sessions: u32,
+}
+
 #[derive(Clone)]
 struct KvSessionRow {
     session_id: String,
@@ -578,6 +592,7 @@ fn load_serving_group_snapshots(
     network_id: &str,
     job_id: Option<&str>,
 ) -> Result<Vec<ServingGroupStatus>> {
+    let workloads = load_serving_group_workloads(conn, network_id, job_id)?;
     let rows = if let Some(job_id) = job_id {
         let mut stmt = conn.prepare(
             r#"
@@ -694,6 +709,7 @@ fn load_serving_group_snapshots(
                         "pending".to_string()
                     },
                 }),
+            workload: None,
             members: Vec::new(),
         });
         entry.member_count += 1;
@@ -720,7 +736,132 @@ fn load_serving_group_snapshots(
         entry.members.push(row.member);
     }
 
+    for group in groups.values_mut() {
+        if let Some(workload) = workloads.get(&(group.session_id.clone(), group.group_id.clone())) {
+            group.workload = Some(ServingGroupWorkloadStatus {
+                queued_sessions: workload.queued_sessions,
+                runnable_sessions: workload.runnable_sessions,
+                blocked_sessions: workload.blocked_sessions,
+                leased_sessions: workload.leased_sessions,
+                active_sessions: workload.active_sessions,
+                peak_batch_size: workload.peak_batch_size,
+                peak_active_decode_sessions: workload.peak_active_decode_sessions,
+                peak_batch_kv_tokens: workload.peak_batch_kv_tokens,
+                deferred_decode_sessions: workload.deferred_decode_sessions,
+            });
+        }
+    }
+
     Ok(groups.into_values().collect())
+}
+
+fn load_serving_group_workloads(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<BTreeMap<(String, String), ServingGroupWorkloadAccumulator>> {
+    type WorkloadRow = (
+        String,
+        String,
+        String,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+    );
+
+    let rows: Vec<WorkloadRow> = if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT dq.session_id, dq.group_id, dq.status,
+                   s.latest_batch_size, s.latest_active_decode_sessions,
+                   s.latest_batch_kv_tokens, s.latest_deferred_decode_sessions
+            FROM inference_decode_queue dq
+            LEFT JOIN inference_sessions s
+              ON s.session_id = dq.session_id
+            WHERE dq.network_id = ?1 AND dq.job_id = ?2
+            ORDER BY dq.session_id ASC, dq.group_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+                row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+            ))
+        })?;
+        collect_rows(rows)?
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT dq.session_id, dq.group_id, dq.status,
+                   s.latest_batch_size, s.latest_active_decode_sessions,
+                   s.latest_batch_kv_tokens, s.latest_deferred_decode_sessions
+            FROM inference_decode_queue dq
+            LEFT JOIN inference_sessions s
+              ON s.session_id = dq.session_id
+            WHERE dq.network_id = ?1
+            ORDER BY dq.session_id ASC, dq.group_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+                row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+            ))
+        })?;
+        collect_rows(rows)?
+    };
+
+    let mut workloads = BTreeMap::<(String, String), ServingGroupWorkloadAccumulator>::new();
+    for (
+        session_id,
+        group_id,
+        status,
+        latest_batch_size,
+        latest_active_decode_sessions,
+        latest_batch_kv_tokens,
+        latest_deferred_decode_sessions,
+    ) in rows
+    {
+        let entry = workloads.entry((session_id, group_id)).or_default();
+        entry.queued_sessions += 1;
+        match status.as_str() {
+            "ready" => entry.runnable_sessions += 1,
+            "blocked_on_prefill" | "blocked_on_transfer" => entry.blocked_sessions += 1,
+            "leased" => entry.leased_sessions += 1,
+            "active" => entry.active_sessions += 1,
+            _ => {}
+        }
+        entry.peak_batch_size = max_opt(entry.peak_batch_size, latest_batch_size);
+        entry.peak_active_decode_sessions = max_opt(
+            entry.peak_active_decode_sessions,
+            latest_active_decode_sessions,
+        );
+        entry.peak_batch_kv_tokens =
+            max_opt(entry.peak_batch_kv_tokens, latest_batch_kv_tokens);
+        entry.deferred_decode_sessions += latest_deferred_decode_sessions.unwrap_or(0);
+    }
+
+    Ok(workloads)
+}
+
+fn max_opt(current: Option<u32>, next: Option<u32>) -> Option<u32> {
+    match (current, next) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 fn load_scheduler_batch_metrics(
@@ -1505,6 +1646,27 @@ mod tests {
         assert_eq!(status.serving_groups[0].member_count, 2);
         assert_eq!(
             status.serving_groups[0]
+                .workload
+                .as_ref()
+                .map(|workload| workload.queued_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            status.serving_groups[0]
+                .workload
+                .as_ref()
+                .map(|workload| workload.blocked_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            status.serving_groups[0]
+                .workload
+                .as_ref()
+                .and_then(|workload| workload.peak_batch_size),
+            Some(2)
+        );
+        assert_eq!(
+            status.serving_groups[0]
                 .lease
                 .as_ref()
                 .and_then(|lease| lease.owner_device_id.as_deref()),
@@ -1550,6 +1712,20 @@ mod tests {
         assert_eq!(status.metrics.decode_queue_depth, 1);
         assert_eq!(status.metrics.leased_sessions, 1);
         assert_eq!(status.metrics.blocked_sessions, 0);
+        assert_eq!(
+            status.serving_groups[0]
+                .workload
+                .as_ref()
+                .map(|workload| workload.leased_sessions),
+            Some(1)
+        );
+        assert_eq!(
+            status.serving_groups[0]
+                .workload
+                .as_ref()
+                .map(|workload| workload.blocked_sessions),
+            Some(0)
+        );
         assert_eq!(
             status.decode_queue[0].lease_owner_device_id.as_deref(),
             Some("worker-a")

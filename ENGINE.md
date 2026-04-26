@@ -110,7 +110,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ☐ Add metrics for KV residency, transfer volume, and checkpoint fallback rate
 - ☐ Add metrics for regroup frequency and recovery latency
 - ⏳ Add structured event log for scheduler decisions
-- ⏳ Add operator views in UI/API for session placement and queue state
+- ✅ Add operator views in UI/API for session placement and queue state
 - ☐ Add production-readiness runbooks for scheduler stalls, KV pressure, and failover
 
 ## 10. Testing And Verification
