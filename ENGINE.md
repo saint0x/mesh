@@ -21,6 +21,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Prefer fresh decode cohorts with less transfer debt when immediate ready runway ties
 - ✅ Break final fresh decode cohort ties by cohort age instead of individual session row age
 - ✅ Prefer the oldest ready session inside the winning fresh decode cohort
+- ✅ Lease sibling ready decode sessions in the same pooled cohort up to the scheduler target when a worker claims decode work
 - Planned: Add admission control across multiple concurrent jobs and models
 - Planned: Add topology-aware pool partitioning for prefill-heavy vs decode-heavy work
 - In progress: Add scheduler scoring that reasons about queue age, latency target, throughput target, and resiliency target
