@@ -8,6 +8,7 @@ use crate::api::types::{
 };
 use crate::connectivity::{ConnectivityPath, DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::{DeviceCapabilities, Tier};
+use crate::model_assets::{self, ModelManifest, ResolvedServingLayout};
 use crate::provider::ExecutionProviderKind;
 use crate::services::ring_manager::{RingTopology, WorkerTopologyInfo};
 
@@ -33,24 +34,35 @@ impl ExecutionPlanner {
             ));
         }
 
-        let members = topology
+        let available_members = topology
             .workers
             .iter()
             .zip(device_metadata.iter())
             .map(|(worker, metadata)| build_member(worker, metadata))
             .collect::<Vec<_>>();
-        let total_capacity_units = members
+        let runtime_mode = derive_runtime_mode(scheduling_policy, &available_members);
+        let prefill_members = select_execution_members(
+            &req.model_id,
+            ExecutionPhase::Prefill,
+            &available_members,
+            runtime_mode,
+        )?;
+        let decode_members = select_execution_members(
+            &req.model_id,
+            ExecutionPhase::Decode,
+            &available_members,
+            runtime_mode,
+        )?;
+        let total_capacity_units = prefill_members
             .iter()
             .map(|member| member.assigned_capacity_units)
             .sum();
-        let runtime_mode = derive_runtime_mode(scheduling_policy, &members);
-        let transport_tier = classify_transport_tier(&members);
-        let kv_owner_device_id = select_kv_owner(&members);
-        let prefill_participant_device_ids = members
+        let transport_tier = classify_transport_tier(&prefill_members);
+        let kv_owner_device_id = select_kv_owner(&prefill_members);
+        let prefill_participant_device_ids = prefill_members
             .iter()
             .map(|member| member.device_id.clone())
             .collect::<Vec<_>>();
-        let decode_members = select_decode_members(&members, runtime_mode);
         let decode_transport_tier = classify_transport_tier(&decode_members);
         let decode_kv_owner_device_id = select_kv_owner(&decode_members);
         let decode_participant_device_ids = decode_members
@@ -75,7 +87,7 @@ impl ExecutionPlanner {
             transport_tier,
             kv_transfer_policy: KvTransferPolicy::CoLocated,
             total_capacity_units,
-            members: members.clone(),
+            members: prefill_members.clone(),
             peer_punch_plans: peer_punch_plans.clone(),
         };
         let decode_group = ExecutionGroup {
@@ -83,7 +95,7 @@ impl ExecutionPlanner {
             model_id: req.model_id.clone(),
             phase: ExecutionPhase::Decode,
             transport_tier: decode_transport_tier,
-            kv_transfer_policy: if same_participants(&members, &decode_members) {
+            kv_transfer_policy: if same_participants(&prefill_members, &decode_members) {
                 KvTransferPolicy::CoLocated
             } else if matches!(runtime_mode, InferenceRuntimeMode::ResilientEdge) {
                 KvTransferPolicy::RemoteAccess
@@ -145,29 +157,31 @@ impl ExecutionPlanner {
             ));
         }
 
-        let required_coverage = required_decode_coverage(plan).ok_or_else(|| {
-            ApiError::Internal(format!(
-                "Execution plan {} is missing a valid prefill coverage span",
-                plan.plan_id
-            ))
-        })?;
-
-        let members = topology
+        let available_members = topology
             .workers
             .iter()
             .zip(device_metadata.iter())
             .map(|(worker, metadata)| build_member(worker, metadata))
             .collect::<Vec<_>>();
-        if !covers_span(&members, required_coverage) {
-            return Err(ApiError::Conflict(format!(
-                "Live topology no longer covers required shard span {}..{} for decode",
-                required_coverage.0, required_coverage.1
-            )));
-        }
-
-        let runtime_mode = derive_runtime_mode(scheduling_policy, &members);
-        let decode_members =
-            select_decode_members_for_span(&members, runtime_mode, required_coverage);
+        let runtime_mode = derive_runtime_mode(scheduling_policy, &available_members);
+        let model_id = phase_model_id(plan, ExecutionPhase::Decode).ok_or_else(|| {
+            ApiError::Internal(format!(
+                "Execution plan {} is missing a decode group",
+                plan.plan_id
+            ))
+        })?;
+        let decode_members = select_execution_members(
+            &model_id,
+            ExecutionPhase::Decode,
+            &available_members,
+            runtime_mode,
+        )
+        .map_err(|err| {
+            ApiError::Conflict(format!(
+                "Live topology can no longer form an execution-valid decode group: {}",
+                err
+            ))
+        })?;
         let prefill_members = plan
             .execution_groups
             .iter()
@@ -238,6 +252,14 @@ impl ExecutionPlanner {
     }
 }
 
+pub fn validate_serving_group_legality(
+    model_id: &str,
+    phase: ExecutionPhase,
+    members: &[ExecutionGroupMember],
+) -> ApiResult<ResolvedServingLayout> {
+    model_assets::validate_execution_group(model_id, phase, members)
+}
+
 fn build_member(
     worker: &WorkerTopologyInfo,
     metadata: &PlannerDeviceMetadata,
@@ -306,29 +328,98 @@ fn select_kv_owner(members: &[ExecutionGroupMember]) -> String {
         .unwrap_or_default()
 }
 
-fn select_decode_members(
+fn select_execution_members(
+    model_id: &str,
+    phase: ExecutionPhase,
     members: &[ExecutionGroupMember],
     runtime_mode: InferenceRuntimeMode,
-) -> Vec<ExecutionGroupMember> {
-    let Some(full_coverage) = coverage_span(members) else {
-        return members.to_vec();
-    };
+) -> ApiResult<Vec<ExecutionGroupMember>> {
+    let manifest = model_assets::load_model_manifest(model_id)?;
+    let candidates = candidate_groups(&manifest, phase, members, runtime_mode);
+    let mut errors = Vec::new();
 
-    select_decode_members_for_span(members, runtime_mode, full_coverage)
-}
-
-fn select_decode_members_for_span(
-    members: &[ExecutionGroupMember],
-    runtime_mode: InferenceRuntimeMode,
-    required_coverage: (u32, u32),
-) -> Vec<ExecutionGroupMember> {
-    if !matches!(
-        runtime_mode,
-        InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst
-    ) {
-        return members.to_vec();
+    for candidate in candidates {
+        match validate_serving_group_legality(model_id, phase, &candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(ApiError::Conflict(err)) => errors.push(err),
+            Err(err) => return Err(err),
+        }
     }
 
+    Err(ApiError::Conflict(format!(
+        "no execution-valid {:?} group could be formed for model {}: {}",
+        phase,
+        model_id,
+        errors.join("; ")
+    )))
+}
+
+fn candidate_groups(
+    manifest: &ModelManifest,
+    phase: ExecutionPhase,
+    members: &[ExecutionGroupMember],
+    runtime_mode: InferenceRuntimeMode,
+) -> Vec<Vec<ExecutionGroupMember>> {
+    let mut candidates = Vec::new();
+    let prefers_shrink = matches!(phase, ExecutionPhase::Decode)
+        && matches!(
+            runtime_mode,
+            InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst
+        );
+
+    if prefers_shrink {
+        for member in ranked_full_replica_members(members, manifest.tensor_parallelism_dim) {
+            push_unique_candidate(&mut candidates, vec![member]);
+        }
+    }
+
+    let full_group = members.to_vec();
+    push_unique_candidate(&mut candidates, full_group);
+
+    if let Some(group) = canonical_tensor_parallel_group(members, manifest.tensor_parallelism_dim) {
+        push_unique_candidate(&mut candidates, group);
+    }
+
+    let all_replicas = all_full_replica_members(members, manifest.tensor_parallelism_dim);
+    if !all_replicas.is_empty() {
+        push_unique_candidate(&mut candidates, all_replicas.clone());
+        if !prefers_shrink {
+            for member in rank_members(&all_replicas) {
+                push_unique_candidate(&mut candidates, vec![member]);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn push_unique_candidate(
+    candidates: &mut Vec<Vec<ExecutionGroupMember>>,
+    mut candidate: Vec<ExecutionGroupMember>,
+) {
+    if candidate.is_empty() {
+        return;
+    }
+    candidate.sort_by_key(|member| member.ring_position);
+
+    let candidate_ids = candidate
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .collect::<Vec<_>>();
+    if candidates.iter().any(|existing| {
+        existing
+            .iter()
+            .map(|member| member.device_id.as_str())
+            .collect::<Vec<_>>()
+            == candidate_ids
+    }) {
+        return;
+    }
+
+    candidates.push(candidate);
+}
+
+fn rank_members(members: &[ExecutionGroupMember]) -> Vec<ExecutionGroupMember> {
     let mut ranked = members.to_vec();
     ranked.sort_by(|left, right| {
         right
@@ -337,82 +428,66 @@ fn select_decode_members_for_span(
             .then_with(|| right.contributed_memory.cmp(&left.contributed_memory))
             .then_with(|| left.ring_position.cmp(&right.ring_position))
     });
+    ranked
+}
 
+fn ranked_full_replica_members(
+    members: &[ExecutionGroupMember],
+    tensor_parallelism_dim: u32,
+) -> Vec<ExecutionGroupMember> {
+    rank_members(&all_full_replica_members(members, tensor_parallelism_dim))
+}
+
+fn all_full_replica_members(
+    members: &[ExecutionGroupMember],
+    tensor_parallelism_dim: u32,
+) -> Vec<ExecutionGroupMember> {
+    members
+        .iter()
+        .filter(|member| {
+            member.shard.column_start == 0 && member.shard.column_end == tensor_parallelism_dim
+        })
+        .cloned()
+        .collect()
+}
+
+fn canonical_tensor_parallel_group(
+    members: &[ExecutionGroupMember],
+    tensor_parallelism_dim: u32,
+) -> Option<Vec<ExecutionGroupMember>> {
+    let mut ranked = members.to_vec();
+    ranked.sort_by(|left, right| {
+        left.shard
+            .column_start
+            .cmp(&right.shard.column_start)
+            .then_with(|| left.shard.column_end.cmp(&right.shard.column_end))
+            .then_with(|| {
+                right
+                    .assigned_capacity_units
+                    .cmp(&left.assigned_capacity_units)
+            })
+            .then_with(|| right.contributed_memory.cmp(&left.contributed_memory))
+    });
+
+    let mut cursor = 0;
     let mut selected = Vec::new();
-    for member in ranked {
-        selected.push(member);
-        if covers_span(&selected, required_coverage) && selected.len() < members.len() {
-            selected.sort_by_key(|member| member.ring_position);
-            return selected;
-        }
+    while cursor < tensor_parallelism_dim {
+        let next = ranked
+            .iter()
+            .find(|member| member.shard.column_start == cursor && member.shard.column_end > cursor)?
+            .clone();
+        cursor = next.shard.column_end;
+        selected.push(next);
     }
 
-    members.to_vec()
+    Some(selected)
 }
 
-fn covers_span(members: &[ExecutionGroupMember], required_coverage: (u32, u32)) -> bool {
-    if required_coverage.0 >= required_coverage.1 {
-        return false;
-    }
-
-    let mut intervals = members
+fn phase_model_id(plan: &InferenceExecutionPlan, phase: ExecutionPhase) -> Option<String> {
+    plan.execution_groups
         .iter()
-        .map(|member| (member.shard.column_start, member.shard.column_end))
-        .filter(|(start, end)| *end > required_coverage.0 && *start < required_coverage.1)
-        .collect::<Vec<_>>();
-    intervals.sort_unstable_by_key(|interval| (interval.0, interval.1));
-
-    let mut cursor = required_coverage.0;
-    for (start, end) in intervals {
-        if start > cursor {
-            return false;
-        }
-        cursor = cursor.max(end);
-        if cursor >= required_coverage.1 {
-            return true;
-        }
-    }
-
-    cursor >= required_coverage.1
-}
-
-fn required_decode_coverage(plan: &InferenceExecutionPlan) -> Option<(u32, u32)> {
-    let prefill_group = plan
-        .execution_groups
-        .iter()
-        .find(|group| matches!(group.phase, ExecutionPhase::Prefill))?;
-    coverage_span(&prefill_group.members)
-}
-
-fn coverage_span(members: &[ExecutionGroupMember]) -> Option<(u32, u32)> {
-    let min_start = members
-        .iter()
-        .map(|member| member.shard.column_start)
-        .min()?;
-    let max_end = members.iter().map(|member| member.shard.column_end).max()?;
-    if min_start >= max_end {
-        return None;
-    }
-
-    let mut intervals = members
-        .iter()
-        .map(|member| (member.shard.column_start, member.shard.column_end))
-        .collect::<Vec<_>>();
-    intervals.sort_unstable_by_key(|interval| (interval.0, interval.1));
-
-    let mut cursor = min_start;
-    for (start, end) in intervals {
-        if start > cursor {
-            return None;
-        }
-        cursor = cursor.max(end);
-    }
-
-    if cursor == max_end {
-        Some((min_start, max_end))
-    } else {
-        None
-    }
+        .find(|group| group.phase == phase)
+        .map(|group| group.model_id.clone())
 }
 
 fn same_participants(left: &[ExecutionGroupMember], right: &[ExecutionGroupMember]) -> bool {
@@ -531,13 +606,19 @@ mod tests {
         DirectCandidateSource, DirectCandidateTransport, DirectPeerCandidate,
         InferenceSchedulingPolicy,
     };
+    use crate::model_assets::{
+        self, ModelExecutionLayout, ModelManifest, ProviderConstraints, ServingLayoutKind,
+        ServingLayoutRule,
+    };
     use crate::services::ring_manager::{ModelShard, WorkerTopologyInfo};
 
-    fn worker(id: &str, pos: u32) -> WorkerTopologyInfo {
-        worker_with_range(id, pos, pos * 10, pos * 10 + 10)
-    }
-
-    fn worker_with_range(id: &str, pos: u32, start: u32, end: u32) -> WorkerTopologyInfo {
+    fn worker_with_model_range(
+        model_id: &str,
+        id: &str,
+        pos: u32,
+        start: u32,
+        end: u32,
+    ) -> WorkerTopologyInfo {
         WorkerTopologyInfo {
             device_id: id.to_string(),
             peer_id: format!("peer-{}", id),
@@ -545,7 +626,7 @@ mod tests {
             status: "online".to_string(),
             contributed_memory: 1024,
             shard: ModelShard {
-                model_id: "model".to_string(),
+                model_id: model_id.to_string(),
                 column_range: (start, end),
                 estimated_memory: 1024,
             },
@@ -570,11 +651,14 @@ mod tests {
 
     #[test]
     fn planner_builds_authoritative_group() {
+        model_assets::testsupport::ensure_test_model("planner-authoritative", 20);
+        model_assets::clear_model_asset_cache();
+
         let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
-                model_id: "model".to_string(),
+                model_id: "planner-authoritative".to_string(),
                 prompt: "hello".to_string(),
                 max_tokens: 32,
                 temperature: 0.7,
@@ -582,7 +666,10 @@ mod tests {
             },
             &[1, 2, 3],
             &RingTopology {
-                workers: vec![worker("a", 0), worker("b", 1)],
+                workers: vec![
+                    worker_with_model_range("planner-authoritative", "a", 0, 0, 10),
+                    worker_with_model_range("planner-authoritative", "b", 1, 10, 20),
+                ],
                 ring_stable: true,
                 peer_punch_plans: vec![crate::services::ring_manager::PeerPunchPlan {
                     source_device_id: "a".to_string(),
@@ -622,11 +709,14 @@ mod tests {
 
     #[test]
     fn planner_can_shrink_decode_group_when_fast_subset_covers_model() {
+        model_assets::testsupport::ensure_test_model("planner-shrink", 20);
+        model_assets::clear_model_asset_cache();
+
         let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
-                model_id: "model".to_string(),
+                model_id: "planner-shrink".to_string(),
                 prompt: "hello".to_string(),
                 max_tokens: 32,
                 temperature: 0.7,
@@ -635,9 +725,9 @@ mod tests {
             &[1, 2, 3],
             &RingTopology {
                 workers: vec![
-                    worker_with_range("a", 0, 0, 10),
-                    worker_with_range("b", 1, 10, 20),
-                    worker_with_range("c", 2, 0, 20),
+                    worker_with_model_range("planner-shrink", "a", 0, 0, 10),
+                    worker_with_model_range("planner-shrink", "b", 1, 10, 20),
+                    worker_with_model_range("planner-shrink", "c", 2, 0, 20),
                 ],
                 ring_stable: true,
                 peer_punch_plans: vec![],
@@ -665,6 +755,20 @@ mod tests {
             .iter()
             .find(|group| matches!(group.phase, ExecutionPhase::Decode))
             .expect("expected decode group");
+        let prefill_group = plan
+            .execution_groups
+            .iter()
+            .find(|group| matches!(group.phase, ExecutionPhase::Prefill))
+            .expect("expected prefill group");
+        assert_eq!(prefill_group.members.len(), 2);
+        assert_eq!(
+            prefill_group
+                .members
+                .iter()
+                .map(|member| member.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
         assert_eq!(decode_group.members.len(), 1);
         assert_eq!(decode_group.members[0].device_id, "c");
         assert!(matches!(
@@ -679,5 +783,211 @@ mod tests {
             .expect("expected decode segment");
         assert_eq!(decode_segment.participant_device_ids, vec!["c".to_string()]);
         assert_eq!(decode_segment.kv_owner_device_id, "c");
+    }
+
+    #[test]
+    fn planner_refuses_decode_group_when_manifest_provider_constraints_fail() {
+        model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
+            model_id: "planner-provider-guard".to_string(),
+            tensor_parallelism_dim: 20,
+            total_model_bytes: 1024 * 1024,
+            tokenizer_file: "tokenizer.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
+            execution_layout: ModelExecutionLayout {
+                prefill: vec![ServingLayoutRule {
+                    layout: ServingLayoutKind::TensorParallel,
+                    min_members: None,
+                    max_members: None,
+                    tensor_parallel_degree: Some(2),
+                    pipeline_parallel_degree: None,
+                    provider_constraints: ProviderConstraints::default(),
+                }],
+                decode: vec![ServingLayoutRule {
+                    layout: ServingLayoutKind::FullReplica,
+                    min_members: Some(1),
+                    max_members: Some(1),
+                    tensor_parallel_degree: None,
+                    pipeline_parallel_degree: None,
+                    provider_constraints: ProviderConstraints {
+                        allowed_providers: vec!["cuda".to_string()],
+                        requires_homogeneous: false,
+                    },
+                }],
+            },
+        });
+        model_assets::clear_model_asset_cache();
+
+        let err = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-provider-guard".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-provider-guard", "a", 0, 0, 10),
+                    worker_with_model_range("planner-provider-guard", "b", 1, 10, 20),
+                    worker_with_model_range("planner-provider-guard", "c", 2, 0, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 16,
+                    execution_provider: "metal".to_string(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        match err {
+            ApiError::Conflict(message) => {
+                assert!(message.contains("allowed providers are cuda"));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planner_refuses_unsupported_hybrid_layouts() {
+        model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
+            model_id: "planner-hybrid-guard".to_string(),
+            tensor_parallelism_dim: 20,
+            total_model_bytes: 1024 * 1024,
+            tokenizer_file: "tokenizer.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
+            execution_layout: ModelExecutionLayout {
+                prefill: vec![ServingLayoutRule {
+                    layout: ServingLayoutKind::TensorPipelineHybrid,
+                    min_members: None,
+                    max_members: None,
+                    tensor_parallel_degree: Some(2),
+                    pipeline_parallel_degree: Some(2),
+                    provider_constraints: ProviderConstraints::default(),
+                }],
+                decode: vec![ServingLayoutRule {
+                    layout: ServingLayoutKind::TensorPipelineHybrid,
+                    min_members: None,
+                    max_members: None,
+                    tensor_parallel_degree: Some(1),
+                    pipeline_parallel_degree: Some(2),
+                    provider_constraints: ProviderConstraints::default(),
+                }],
+            },
+        });
+        model_assets::clear_model_asset_cache();
+
+        let err = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-hybrid-guard".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![worker_with_model_range(
+                    "planner-hybrid-guard",
+                    "a",
+                    0,
+                    0,
+                    20,
+                )],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[PlannerDeviceMetadata {
+                assigned_capacity_units: 16,
+                execution_provider: "cuda".to_string(),
+            }],
+        )
+        .unwrap_err();
+
+        match err {
+            ApiError::Conflict(message) => {
+                assert!(message.contains("tensor/pipeline hybrid layouts"));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_decode_plan_refuses_invalid_regroup() {
+        model_assets::testsupport::ensure_test_model("planner-refresh", 20);
+        model_assets::clear_model_asset_cache();
+
+        let original = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-refresh".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-refresh", "a", 0, 0, 10),
+                    worker_with_model_range("planner-refresh", "b", 1, 10, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+                PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let err = ExecutionPlanner::refresh_decode_plan(
+            &original,
+            &RingTopology {
+                workers: vec![worker_with_model_range("planner-refresh", "a", 0, 0, 10)],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[PlannerDeviceMetadata {
+                assigned_capacity_units: 4,
+                execution_provider: "metal".to_string(),
+            }],
+        )
+        .unwrap_err();
+
+        match err {
+            ApiError::Conflict(message) => {
+                assert!(message.contains("execution-valid decode group"));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
     }
 }

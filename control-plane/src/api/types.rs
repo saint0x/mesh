@@ -695,3 +695,181 @@ pub struct InferenceJobAssignmentStatus {
     pub execution_provider: Option<String>,
     pub execution_time_ms: u64,
 }
+
+/// Queue entry visibility for operator-facing scheduler status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodeQueueEntryStatus {
+    pub session_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub segment_id: String,
+    pub group_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_owner_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+/// Current group-level lease surfaced for operator inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServingGroupLeaseStatus {
+    pub lease_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+    pub status: String,
+}
+
+/// Member status inside a serving group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServingGroupMemberStatus {
+    pub device_id: String,
+    pub ring_position: u32,
+    pub shard_column_start: u32,
+    pub shard_column_end: u32,
+    pub assigned_capacity_units: u32,
+    pub execution_provider: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_lease_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Serving-group snapshot for scheduler/operator status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServingGroupStatus {
+    pub group_id: String,
+    pub session_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub phase: ExecutionPhase,
+    pub member_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<ServingGroupLeaseStatus>,
+    #[serde(default)]
+    pub members: Vec<ServingGroupMemberStatus>,
+}
+
+/// Durable regroup/status transition event for execution groups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegroupEventStatus {
+    pub event_id: i64,
+    pub session_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub phase: ExecutionPhase,
+    pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    pub event_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    pub observed_at: String,
+}
+
+/// Replica-local KV residency within a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvReplicaResidencyStatus {
+    pub device_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_created_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Session-level KV ownership and checkpoint state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvResidencySummary {
+    pub session_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_checkpoint_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_checkpoint_created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(default)]
+    pub replicas: Vec<KvReplicaResidencyStatus>,
+    pub updated_at: String,
+}
+
+/// Lightweight job summary for network-level scheduler status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerJobSummary {
+    pub job_id: String,
+    pub model_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    pub completion_tokens: u32,
+    pub updated_at: String,
+}
+
+/// Network-wide scheduler/operator status view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSchedulerStatusResponse {
+    pub success: bool,
+    pub network_id: String,
+    pub jobs: Vec<SchedulerJobSummary>,
+    pub decode_queue: Vec<DecodeQueueEntryStatus>,
+    pub serving_groups: Vec<ServingGroupStatus>,
+    pub kv_residency: Vec<KvResidencySummary>,
+    pub regroup_events: Vec<RegroupEventStatus>,
+}
+
+/// Detailed scheduler/operator status for a single job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSchedulerStatusResponse {
+    pub success: bool,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    pub completion_tokens: u32,
+    pub updated_at: String,
+    pub decode_queue: Vec<DecodeQueueEntryStatus>,
+    pub serving_groups: Vec<ServingGroupStatus>,
+    pub kv_residency: Vec<KvResidencySummary>,
+    pub regroup_events: Vec<RegroupEventStatus>,
+}

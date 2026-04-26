@@ -8,7 +8,7 @@
 
 use crate::errors::{AgentError, Result};
 use crate::inference::job::InferenceJob;
-use crate::inference::kv_cache::KVCache;
+use crate::inference::kv_cache::{KVCache, KVCacheSnapshot};
 use std::path::Path;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use super::types::{
     Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointedConfig, CheckpointedRequest,
+    KVCacheHandoff,
 };
 
 /// Manages checkpoint creation, storage, and retrieval
@@ -57,8 +58,7 @@ impl CheckpointManager {
     pub async fn save_checkpoint(
         &self,
         job: &InferenceJob,
-        kv_cache: Option<&KVCache>,
-        sequence_position: Option<u32>,
+        kv_snapshot: Option<&KVCacheSnapshot>,
     ) -> Result<CheckpointMetadata> {
         debug!(
             job_id = %job.request.job_id,
@@ -67,7 +67,7 @@ impl CheckpointManager {
         );
 
         // Create checkpoint from job state
-        let checkpoint = self.create_checkpoint(job, kv_cache, sequence_position)?;
+        let checkpoint = self.create_checkpoint(job, kv_snapshot)?;
 
         // Serialize to CBOR
         let data = checkpoint
@@ -127,39 +127,77 @@ impl CheckpointManager {
 
     pub async fn load_checkpoint_kv_cache(&self, job_id: Uuid) -> Result<Option<KVCache>> {
         Ok(self
-            .load_latest_checkpoint(job_id)
+            .load_checkpoint_kv_handoff(job_id)
             .await?
-            .and_then(|checkpoint| checkpoint.kv_cache_state)
-            .map(|bytes| KVCache::from_bytes(&bytes))
+            .map(|handoff| handoff.materialize_snapshot())
+            .transpose()
+            .map_err(AgentError::Execution)?
+            .flatten()
+            .map(|snapshot| snapshot.decode_cache())
             .transpose()?)
     }
 
     pub async fn load_checkpoint_sequence_position(&self, job_id: Uuid) -> Result<Option<u32>> {
         Ok(self
-            .load_latest_checkpoint(job_id)
+            .load_checkpoint_kv_handoff(job_id)
             .await?
-            .and_then(|checkpoint| checkpoint.sequence_position))
+            .map(|handoff| handoff.sequence.next_position))
     }
 
-    pub async fn export_latest_checkpoint_bytes(&self, job_id: Uuid) -> Result<Option<Vec<u8>>> {
+    pub async fn load_checkpoint_kv_handoff(&self, job_id: Uuid) -> Result<Option<KVCacheHandoff>> {
         Ok(self
             .load_latest_checkpoint(job_id)
             .await?
-            .map(|checkpoint| checkpoint.to_cbor())
-            .transpose()
-            .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?)
+            .map(|checkpoint| {
+                checkpoint.kv_handoff().map_err(|e| {
+                    AgentError::Execution(format!(
+                        "Invalid KV handoff in checkpoint {}: {}",
+                        checkpoint.metadata.checkpoint_id, e
+                    ))
+                })
+            })
+            .transpose()?
+            .flatten())
+    }
+
+    pub async fn export_latest_checkpoint_bytes(&self, job_id: Uuid) -> Result<Option<Vec<u8>>> {
+        let Some(mut checkpoint) = self.load_latest_checkpoint(job_id).await? else {
+            return Ok(None);
+        };
+        checkpoint.kv_handoff = checkpoint
+            .kv_handoff()
+            .map_err(AgentError::Execution)?
+            .map(|handoff| handoff.transfer_bundle());
+        checkpoint.kv_cache_state = None;
+        checkpoint.sequence_position = None;
+        let bytes = checkpoint
+            .to_cbor()
+            .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?;
+        Ok(Some(bytes))
     }
 
     pub async fn import_checkpoint_bytes(&self, bytes: &[u8]) -> Result<CheckpointMetadata> {
-        let checkpoint = Checkpoint::from_cbor(bytes)
+        let mut checkpoint = Checkpoint::from_cbor(bytes)
             .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
+        checkpoint
+            .validate()
+            .map_err(|e| AgentError::Execution(format!("Invalid imported checkpoint: {}", e)))?;
+        checkpoint.kv_handoff = checkpoint
+            .kv_handoff()
+            .map_err(AgentError::Execution)?
+            .map(|handoff| handoff.imported_for(self.worker_id.clone()));
+        checkpoint.kv_cache_state = None;
+        checkpoint.sequence_position = None;
+        let bytes = checkpoint
+            .to_cbor()
+            .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?;
         let job_dir = self
             .config
             .checkpoint_dir
             .join(checkpoint.metadata.job_id.to_string());
         std::fs::create_dir_all(&job_dir)?;
         let file_path = checkpoint.file_path(&self.config.checkpoint_dir);
-        std::fs::write(&file_path, bytes)?;
+        std::fs::write(&file_path, &bytes)?;
 
         let mut metadata = checkpoint.metadata.clone();
         metadata.size_bytes = bytes.len() as u64;
@@ -306,8 +344,7 @@ impl CheckpointManager {
     fn create_checkpoint(
         &self,
         job: &InferenceJob,
-        kv_cache: Option<&KVCache>,
-        sequence_position: Option<u32>,
+        kv_snapshot: Option<&KVCacheSnapshot>,
     ) -> Result<Checkpoint> {
         let metadata = CheckpointMetadata::new(
             job.request.job_id,
@@ -340,14 +377,18 @@ impl CheckpointManager {
         };
 
         let rng_state = Some(job.request.job_id.as_u128().to_le_bytes().to_vec());
+        let kv_handoff = kv_snapshot
+            .cloned()
+            .map(|snapshot| KVCacheHandoff::checkpoint_resident(snapshot, self.worker_id.clone()));
 
         let checkpoint = Checkpoint {
             metadata,
             request,
             generated_tokens: job.generated_tokens.clone(),
             config,
-            kv_cache_state: kv_cache.map(KVCache::to_bytes).transpose()?,
-            sequence_position,
+            kv_handoff,
+            kv_cache_state: None,
+            sequence_position: None,
             rng_state,
         };
 
@@ -359,6 +400,9 @@ impl CheckpointManager {
         let data = std::fs::read(path)?;
         let checkpoint = Checkpoint::from_cbor(&data)
             .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
+        checkpoint.validate().map_err(|e| {
+            AgentError::Execution(format!("Invalid checkpoint {}: {}", path.display(), e))
+        })?;
         Ok(checkpoint)
     }
 
@@ -459,8 +503,9 @@ impl CheckpointManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::types::{KVCacheResidency, KVPayloadRef};
     use crate::inference::job::{GenerationConfig, InferenceRequest};
-    use crate::inference::kv_cache::{KVCache, KVCacheConfig};
+    use crate::inference::kv_cache::{KVCache, KVCacheConfig, KVCacheEncoding, KVCacheSnapshot};
     use crate::inference::tensor_ops::Tensor2D;
     use tempfile::TempDir;
 
@@ -483,6 +528,25 @@ mod tests {
         job.add_token(101);
         job.add_token(102);
         job
+    }
+
+    fn create_test_snapshot() -> KVCacheSnapshot {
+        let mut kv_cache = KVCache::new(KVCacheConfig {
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 2,
+            max_seq_len: 16,
+        });
+        for layer_idx in 0..2 {
+            kv_cache
+                .update_layer(
+                    layer_idx,
+                    Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4).unwrap(),
+                    Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 1, 4).unwrap(),
+                )
+                .unwrap();
+        }
+        KVCacheSnapshot::from_cache(&kv_cache, 1).unwrap()
     }
 
     #[tokio::test]
@@ -510,7 +574,7 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save checkpoint
-        let metadata = manager.save_checkpoint(&job, None, None).await.unwrap();
+        let metadata = manager.save_checkpoint(&job, None).await.unwrap();
         assert_eq!(metadata.job_id, job_id);
         assert_eq!(metadata.token_index, 3);
 
@@ -538,10 +602,7 @@ mod tests {
         let job = create_test_job();
         let job_id = job.request.job_id;
 
-        source_manager
-            .save_checkpoint(&job, None, Some(3))
-            .await
-            .unwrap();
+        source_manager.save_checkpoint(&job, None).await.unwrap();
         let bytes = source_manager
             .export_latest_checkpoint_bytes(job_id)
             .await
@@ -576,7 +637,7 @@ mod tests {
                 .load_checkpoint_sequence_position(job_id)
                 .await
                 .unwrap(),
-            Some(3)
+            None
         );
     }
 
@@ -591,24 +652,10 @@ mod tests {
         let manager = CheckpointManager::new(config, "worker-1".to_string()).unwrap();
         let job = create_test_job();
 
-        let mut kv_cache = KVCache::new(KVCacheConfig {
-            num_layers: 2,
-            num_heads: 2,
-            head_dim: 2,
-            max_seq_len: 16,
-        });
-        for layer_idx in 0..2 {
-            kv_cache
-                .update_layer(
-                    layer_idx,
-                    Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4).unwrap(),
-                    Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 1, 4).unwrap(),
-                )
-                .unwrap();
-        }
+        let kv_snapshot = create_test_snapshot();
 
         manager
-            .save_checkpoint(&job, Some(&kv_cache), Some(1))
+            .save_checkpoint(&job, Some(&kv_snapshot))
             .await
             .unwrap();
         let restored = manager
@@ -632,6 +679,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_and_import_checkpoint_transitions_kv_ownership() {
+        let source_dir = TempDir::new().unwrap();
+        let source_manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: source_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            "worker-source".to_string(),
+        )
+        .unwrap();
+        let job = create_test_job();
+        let snapshot = create_test_snapshot();
+
+        source_manager
+            .save_checkpoint(&job, Some(&snapshot))
+            .await
+            .unwrap();
+        let bytes = source_manager
+            .export_latest_checkpoint_bytes(job.request.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let exported = Checkpoint::from_cbor(&bytes).unwrap();
+        let exported_handoff = exported.kv_handoff().unwrap().unwrap();
+        assert_eq!(exported_handoff.residency, KVCacheResidency::TransferBundle);
+        assert_eq!(exported_handoff.owner_worker_id, "worker-source");
+        assert_eq!(exported_handoff.source_worker_id, "worker-source");
+
+        let target_dir = TempDir::new().unwrap();
+        let target_manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: target_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            "worker-target".to_string(),
+        )
+        .unwrap();
+        target_manager
+            .import_checkpoint_bytes(&bytes)
+            .await
+            .unwrap();
+
+        let imported_handoff = target_manager
+            .load_checkpoint_kv_handoff(job.request.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            imported_handoff.residency,
+            KVCacheResidency::CheckpointStore
+        );
+        assert_eq!(imported_handoff.owner_worker_id, "worker-target");
+        assert_eq!(imported_handoff.source_worker_id, "worker-source");
+        assert_eq!(imported_handoff.sequence.next_position, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rejects_inline_handoff_without_materialized_payload() {
+        let source_dir = TempDir::new().unwrap();
+        let source_manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: source_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            "worker-source".to_string(),
+        )
+        .unwrap();
+        let job = create_test_job();
+        let snapshot = create_test_snapshot();
+
+        source_manager
+            .save_checkpoint(&job, Some(&snapshot))
+            .await
+            .unwrap();
+        let bytes = source_manager
+            .export_latest_checkpoint_bytes(job.request.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut checkpoint = Checkpoint::from_cbor(&bytes).unwrap();
+        if let Some(handoff) = checkpoint.kv_handoff.as_mut() {
+            handoff.payload = None;
+            handoff.payload_ref = KVPayloadRef::Inline {
+                encoding: KVCacheEncoding::FullSnapshotCbor,
+                size_bytes: 4,
+            };
+        }
+        let invalid_bytes = checkpoint.to_cbor().unwrap();
+
+        let target_dir = TempDir::new().unwrap();
+        let target_manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: target_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            "worker-target".to_string(),
+        )
+        .unwrap();
+
+        let error = target_manager
+            .import_checkpoint_bytes(&invalid_bytes)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing inline payload bytes"));
+    }
+
+    #[tokio::test]
     async fn test_list_checkpoints() {
         let temp_dir = TempDir::new().unwrap();
         let config = CheckpointConfig {
@@ -645,11 +801,11 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save multiple checkpoints
-        manager.save_checkpoint(&job, None, None).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
         job.add_token(103);
-        manager.save_checkpoint(&job, None, None).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
         job.add_token(104);
-        manager.save_checkpoint(&job, None, None).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
 
         // List checkpoints
         let checkpoints = manager.list_checkpoints(job_id).await.unwrap();
@@ -674,7 +830,7 @@ mod tests {
         let job_id = job.request.job_id;
 
         // Save and then delete
-        let metadata = manager.save_checkpoint(&job, None, None).await.unwrap();
+        let metadata = manager.save_checkpoint(&job, None).await.unwrap();
         manager
             .delete_checkpoint(job_id, metadata.checkpoint_id)
             .await
@@ -701,7 +857,7 @@ mod tests {
         // Save 4 checkpoints (should keep only 2)
         for i in 0..4 {
             job.add_token(200 + i);
-            manager.save_checkpoint(&job, None, None).await.unwrap();
+            manager.save_checkpoint(&job, None).await.unwrap();
         }
 
         // Should only have 2 checkpoints
@@ -729,7 +885,7 @@ mod tests {
 
         // Save a checkpoint
         let job = create_test_job();
-        manager.save_checkpoint(&job, None, None).await.unwrap();
+        manager.save_checkpoint(&job, None).await.unwrap();
 
         // Should have some usage now
         let usage = manager.storage_usage().await.unwrap();

@@ -7,6 +7,7 @@ use sha2::Digest;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::inference::kv_cache::{KVCacheBlob, KVCacheEncoding, KVCacheSnapshot, KVSequenceState};
 use crate::inference::ExecutionPhase;
 
 /// Configuration for checkpoint management
@@ -115,6 +116,131 @@ impl CheckpointMetadata {
     }
 }
 
+/// Where the authoritative KV state currently resides.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KVCacheResidency {
+    /// Inline with a durable checkpoint on local disk.
+    CheckpointStore,
+    /// Bundled for transfer between workers.
+    TransferBundle,
+    /// Described by a remote reference and fetched on demand.
+    RemoteReference,
+}
+
+/// Future-facing payload location for KV handoff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KVPayloadRef {
+    /// Full inline payload materialized with the checkpoint bytes.
+    Inline {
+        encoding: KVCacheEncoding,
+        size_bytes: u64,
+    },
+    /// Externalized payload to be fetched through another transport later.
+    External {
+        encoding: KVCacheEncoding,
+        location: String,
+        size_bytes: Option<u64>,
+    },
+}
+
+/// Metadata describing a KV handoff without forcing local materialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KVCacheHandoff {
+    /// Current durable or transferable residency of the KV state.
+    pub residency: KVCacheResidency,
+    /// Worker that should be treated as the owner after restore/import.
+    pub owner_worker_id: String,
+    /// Worker that originally exported the current snapshot lineage.
+    pub source_worker_id: String,
+    /// Sequence coverage represented by this handoff.
+    pub sequence: KVSequenceState,
+    /// Payload reference for the cache state.
+    pub payload_ref: KVPayloadRef,
+    /// Inline payload materialization when available locally.
+    pub payload: Option<KVCacheBlob>,
+}
+
+impl KVCacheHandoff {
+    pub fn checkpoint_resident(snapshot: KVCacheSnapshot, owner_worker_id: String) -> Self {
+        let payload_ref = KVPayloadRef::Inline {
+            encoding: snapshot.blob.encoding,
+            size_bytes: snapshot.blob.size_bytes(),
+        };
+        Self {
+            residency: KVCacheResidency::CheckpointStore,
+            owner_worker_id: owner_worker_id.clone(),
+            source_worker_id: owner_worker_id,
+            sequence: snapshot.sequence,
+            payload_ref,
+            payload: Some(snapshot.blob),
+        }
+    }
+
+    pub fn transfer_bundle(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.residency = KVCacheResidency::TransferBundle;
+        cloned
+    }
+
+    pub fn imported_for(&self, owner_worker_id: String) -> Self {
+        let mut cloned = self.clone();
+        cloned.residency = KVCacheResidency::CheckpointStore;
+        cloned.owner_worker_id = owner_worker_id;
+        cloned
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.sequence.validate().map_err(|e| e.to_string())?;
+        match (&self.payload_ref, &self.payload) {
+            (
+                KVPayloadRef::Inline {
+                    encoding,
+                    size_bytes,
+                },
+                Some(blob),
+            ) => {
+                if blob.encoding != *encoding {
+                    return Err(format!(
+                        "KV handoff encoding mismatch: payload_ref {:?} vs payload {:?}",
+                        encoding, blob.encoding
+                    ));
+                }
+                if blob.size_bytes() != *size_bytes {
+                    return Err(format!(
+                        "KV handoff payload size mismatch: payload_ref {} vs payload {}",
+                        size_bytes,
+                        blob.size_bytes()
+                    ));
+                }
+                let snapshot = KVCacheSnapshot {
+                    sequence: self.sequence,
+                    blob: blob.clone(),
+                };
+                snapshot.validate().map_err(|e| e.to_string())?;
+            }
+            (KVPayloadRef::Inline { .. }, None) => {
+                return Err("KV handoff is missing inline payload bytes".to_string());
+            }
+            (KVPayloadRef::External { .. }, _) => {}
+        }
+        Ok(())
+    }
+
+    pub fn materialize_snapshot(&self) -> Result<Option<KVCacheSnapshot>, String> {
+        self.validate()?;
+        match (&self.payload_ref, &self.payload) {
+            (KVPayloadRef::Inline { .. }, Some(blob)) => Ok(Some(KVCacheSnapshot {
+                sequence: self.sequence,
+                blob: blob.clone(),
+            })),
+            (KVPayloadRef::External { .. }, _) => Ok(None),
+            (KVPayloadRef::Inline { .. }, None) => {
+                Err("KV handoff is missing inline payload bytes".to_string())
+            }
+        }
+    }
+}
+
 /// A checkpoint containing inference state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -130,11 +256,16 @@ pub struct Checkpoint {
     /// Generation config (for resumption)
     pub config: CheckpointedConfig,
 
-    /// KV cache state persisted for inference recovery.
-    /// In production, this would be serialized tensor data
+    /// KV cache handoff for inference recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_handoff: Option<KVCacheHandoff>,
+
+    /// Legacy inline KV payload for backwards-compatible deserialization only.
+    #[serde(default, skip_serializing)]
     pub kv_cache_state: Option<Vec<u8>>,
 
-    /// Absolute sequence position represented by the persisted forward pass.
+    /// Legacy sequence position for backwards-compatible deserialization only.
+    #[serde(default, skip_serializing)]
     pub sequence_position: Option<u32>,
 
     /// RNG state for reproducibility
@@ -214,6 +345,52 @@ impl Checkpoint {
         ciborium::from_reader(bytes)
     }
 
+    pub fn kv_handoff(&self) -> Result<Option<KVCacheHandoff>, String> {
+        if let Some(kv_handoff) = &self.kv_handoff {
+            kv_handoff.validate()?;
+            return Ok(Some(kv_handoff.clone()));
+        }
+
+        match (&self.kv_cache_state, self.sequence_position) {
+            (Some(bytes), Some(sequence_position)) => {
+                let blob = KVCacheBlob {
+                    encoding: KVCacheEncoding::FullSnapshotCbor,
+                    bytes: bytes.clone(),
+                };
+                let sequence = KVSequenceState::new(sequence_position, sequence_position)
+                    .map_err(|err| err.to_string())?;
+                let handoff = KVCacheHandoff {
+                    residency: KVCacheResidency::CheckpointStore,
+                    owner_worker_id: self.metadata.worker_id.clone(),
+                    source_worker_id: self.metadata.worker_id.clone(),
+                    sequence,
+                    payload_ref: KVPayloadRef::Inline {
+                        encoding: KVCacheEncoding::FullSnapshotCbor,
+                        size_bytes: bytes.len() as u64,
+                    },
+                    payload: Some(blob),
+                };
+                handoff.validate()?;
+                Ok(Some(handoff))
+            }
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(
+                "Checkpoint contains legacy KV payload bytes without a sequence position"
+                    .to_string(),
+            ),
+            (None, Some(_)) => Err(
+                "Checkpoint contains legacy sequence position without KV payload bytes".to_string(),
+            ),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(kv_handoff) = self.kv_handoff()? {
+            kv_handoff.validate()?;
+        }
+        Ok(())
+    }
+
     /// Get file path for this checkpoint
     pub fn file_path(&self, base_dir: &std::path::Path) -> std::path::PathBuf {
         base_dir
@@ -225,6 +402,8 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::kv_cache::{KVCache, KVCacheSnapshot};
+    use crate::inference::tensor_ops::Tensor2D;
 
     #[test]
     fn test_checkpoint_config_default() {
@@ -299,6 +478,7 @@ mod tests {
                 checkpoint_interval: 50,
                 total_layers: 70,
             },
+            kv_handoff: None,
             kv_cache_state: None,
             sequence_position: None,
             rng_state: None,
@@ -346,6 +526,7 @@ mod tests {
                 checkpoint_interval: 50,
                 total_layers: 70,
             },
+            kv_handoff: None,
             kv_cache_state: None,
             sequence_position: None,
             rng_state: None,
@@ -395,6 +576,7 @@ mod tests {
                 checkpoint_interval: 50,
                 total_layers: 70,
             },
+            kv_handoff: None,
             kv_cache_state: None,
             sequence_position: None,
             rng_state: None,
@@ -403,5 +585,115 @@ mod tests {
         let path = checkpoint.file_path(std::path::Path::new("/tmp/checkpoints"));
         assert!(path.to_string_lossy().contains(&job_id.to_string()));
         assert!(path.to_string_lossy().ends_with(".ckpt"));
+    }
+
+    #[test]
+    fn test_checkpoint_exposes_handoff_sequence_state() {
+        let mut cache = KVCache::new(crate::inference::kv_cache::KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 8,
+        });
+        cache
+            .update_layer(
+                0,
+                Tensor2D::new(vec![1.0; 8], 1, 8).unwrap(),
+                Tensor2D::new(vec![2.0; 8], 1, 8).unwrap(),
+            )
+            .unwrap();
+        let snapshot = KVCacheSnapshot::from_cache(&cache, 1).unwrap();
+
+        let checkpoint = Checkpoint {
+            metadata: CheckpointMetadata::new(
+                Uuid::new_v4(),
+                10,
+                5,
+                "model".to_string(),
+                "worker".to_string(),
+                0,
+                "".to_string(),
+            ),
+            request: CheckpointedRequest {
+                job_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                network_id: "net".to_string(),
+                model_id: "model".to_string(),
+                prompt_tokens: vec![1, 2, 3],
+                executor_id: "exec".to_string(),
+                phase: ExecutionPhase::Decode,
+            },
+            generated_tokens: vec![100],
+            config: CheckpointedConfig {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_p: 0.9,
+                stop_sequences: vec![],
+                stream: false,
+                checkpoint_interval: 50,
+                total_layers: 70,
+            },
+            kv_handoff: Some(KVCacheHandoff::checkpoint_resident(
+                snapshot,
+                "worker".to_string(),
+            )),
+            kv_cache_state: None,
+            sequence_position: None,
+            rng_state: None,
+        };
+
+        let handoff = checkpoint.kv_handoff().unwrap().unwrap();
+        assert_eq!(handoff.sequence.next_position, 1);
+        assert_eq!(handoff.sequence.cached_tokens, 1);
+    }
+
+    #[test]
+    fn test_checkpoint_upgrades_legacy_kv_fields() {
+        let cache = KVCache::new(crate::inference::kv_cache::KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 8,
+        });
+        let bytes = cache.to_bytes().unwrap();
+        let checkpoint = Checkpoint {
+            metadata: CheckpointMetadata::new(
+                Uuid::new_v4(),
+                10,
+                5,
+                "model".to_string(),
+                "worker".to_string(),
+                0,
+                "".to_string(),
+            ),
+            request: CheckpointedRequest {
+                job_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                network_id: "net".to_string(),
+                model_id: "model".to_string(),
+                prompt_tokens: vec![1, 2, 3],
+                executor_id: "exec".to_string(),
+                phase: ExecutionPhase::Decode,
+            },
+            generated_tokens: vec![],
+            config: CheckpointedConfig {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_p: 0.9,
+                stop_sequences: vec![],
+                stream: false,
+                checkpoint_interval: 50,
+                total_layers: 70,
+            },
+            kv_handoff: None,
+            kv_cache_state: Some(bytes),
+            sequence_position: Some(0),
+            rng_state: None,
+        };
+
+        let handoff = checkpoint.kv_handoff().unwrap().unwrap();
+        assert_eq!(handoff.owner_worker_id, "worker");
+        assert_eq!(handoff.sequence.next_position, 0);
+        assert_eq!(handoff.sequence.cached_tokens, 0);
     }
 }

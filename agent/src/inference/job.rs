@@ -274,6 +274,14 @@ impl InferenceJob {
         self.current_token_idx += 1;
     }
 
+    pub fn has_decode_context(&self) -> bool {
+        !self.generated_tokens.is_empty()
+    }
+
+    pub fn last_generated_token(&self) -> Option<u32> {
+        self.generated_tokens.last().copied()
+    }
+
     /// Check if generation is complete
     pub fn is_complete(&self) -> bool {
         self.current_token_idx >= self.request.config.max_tokens

@@ -386,10 +386,15 @@ impl<'a> WorkerRing<'a> {
     ) -> Result<(TensorMessage, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
+        let traffic_class = message.traffic_class();
         let send_started = std::time::Instant::now();
         let recv_started = std::time::Instant::now();
         let (send_result, inbound) = tokio::join!(
-            self.tensor_plane.send(self.right_tensor_addr, &message),
+            self.tensor_plane.send_with_traffic_class(
+                self.right_tensor_addr,
+                &message,
+                traffic_class,
+            ),
             self.tensor_plane.recv_matching(|inbound| {
                 let tensor = &inbound.tensor;
                 tensor.sender_position == expected_sender_position
@@ -402,8 +407,8 @@ impl<'a> WorkerRing<'a> {
         send_result?;
 
         debug!(
-            "Sent tensor to right neighbor {}, waiting for tensor from left neighbor {}",
-            self.right_neighbor, self.left_neighbor
+            "Sent {:?} tensor to right neighbor {}, waiting for tensor from left neighbor {}",
+            traffic_class, self.right_neighbor, self.left_neighbor
         );
 
         let inbound = inbound.ok_or_else(|| {

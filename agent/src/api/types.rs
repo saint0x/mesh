@@ -133,6 +133,20 @@ pub enum ProgressEventKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum WorkClaimMode {
+    Any,
+    Prefill,
+    Decode,
+}
+
+impl Default for WorkClaimMode {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum KvTransferPolicy {
     CoLocated,
     ExportOnHandoff,
@@ -207,6 +221,12 @@ pub struct InferenceExecutionPlan {
 pub struct ClaimInferenceAssignmentRequest {
     pub device_id: String,
     pub network_id: String,
+    #[serde(default)]
+    pub claim_mode: WorkClaimMode,
+    #[serde(default)]
+    pub include_queue_state: bool,
+    #[serde(default)]
+    pub include_serving_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,9 +246,103 @@ pub struct InferenceExecutionLease {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSchedulerQueueState {
+    pub network_id: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub queued_sessions: Option<u32>,
+    #[serde(default)]
+    pub ready_sessions: Option<u32>,
+    #[serde(default)]
+    pub blocked_sessions: Option<u32>,
+    #[serde(default)]
+    pub leased_sessions: Option<u32>,
+    #[serde(default)]
+    pub active_sessions: Option<u32>,
+    #[serde(default)]
+    pub local_queued_sessions: Option<u32>,
+    #[serde(default)]
+    pub local_ready_sessions: Option<u32>,
+    #[serde(default)]
+    pub local_blocked_sessions: Option<u32>,
+    #[serde(default)]
+    pub local_leased_sessions: Option<u32>,
+    #[serde(default)]
+    pub local_active_sessions: Option<u32>,
+    #[serde(default)]
+    pub active_session_id: Option<String>,
+    #[serde(default)]
+    pub active_segment_id: Option<String>,
+    #[serde(default)]
+    pub queue_depth: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodeLeaseStatus {
+    pub lease_id: String,
+    pub job_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub acknowledged_at: Option<String>,
+    #[serde(default)]
+    pub ready_at: Option<String>,
+    #[serde(default)]
+    pub lease_owner_device_id: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    #[serde(default)]
+    pub last_renewed_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServingSessionMetadata {
+    pub session_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub active_segment_id: Option<String>,
+    #[serde(default)]
+    pub current_phase: Option<ExecutionPhase>,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    #[serde(default)]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(default)]
+    pub queue_status: Option<String>,
+    #[serde(default)]
+    pub ready_at: Option<String>,
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(default)]
+    pub local_replica: Option<InferenceSessionReplicaStatus>,
+    #[serde(default)]
+    pub replicas: Vec<InferenceSessionReplicaStatus>,
+    #[serde(default)]
+    pub decode_lease: Option<DecodeLeaseStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimInferenceAssignmentResponse {
     pub success: bool,
     pub assignment: Option<InferenceExecutionLease>,
+    #[serde(default)]
+    pub queue_state: Option<InferenceSchedulerQueueState>,
+    #[serde(default)]
+    pub decode_lease: Option<DecodeLeaseStatus>,
+    #[serde(default)]
+    pub serving_session: Option<ServingSessionMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +373,62 @@ pub struct ReportInferenceAssignmentProgressRequest {
     pub execution_time_ms: u64,
     pub time_to_first_token_ms: Option<u64>,
     pub kv_cache_seq_len: Option<u32>,
+    #[serde(default)]
+    pub batch_size: Option<u32>,
+    #[serde(default)]
+    pub active_decode_sessions: Option<u32>,
+    #[serde(default)]
+    pub scheduler_queue: Option<InferenceSchedulerQueueState>,
+    #[serde(default)]
+    pub serving_session: Option<ServingSessionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveDecodeQueueStateResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub queue_state: Option<InferenceSchedulerQueueState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewDecodeLeaseRequest {
+    pub device_id: String,
+    pub network_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    #[serde(default)]
+    pub scheduler_queue: Option<InferenceSchedulerQueueState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewDecodeLeaseResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub decode_lease: Option<DecodeLeaseStatus>,
+    #[serde(default)]
+    pub queue_state: Option<InferenceSchedulerQueueState>,
+    #[serde(default)]
+    pub serving_session: Option<ServingSessionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseDecodeLeaseRequest {
+    pub device_id: String,
+    pub network_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseDecodeLeaseResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub queue_state: Option<InferenceSchedulerQueueState>,
+    #[serde(default)]
+    pub serving_session: Option<ServingSessionMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,4 +489,57 @@ pub struct DownloadInferenceSessionCheckpointResponse {
 pub struct InferenceSessionCheckpointPayload {
     pub metadata: InferenceSessionCheckpointStatus,
     pub checkpoint_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceJobAssignmentStatus {
+    pub device_id: String,
+    pub ring_position: u32,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub shard_column_start: u32,
+    pub shard_column_end: u32,
+    pub assigned_capacity_units: u32,
+    pub execution_provider: Option<String>,
+    pub execution_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSessionStatus {
+    pub session_id: String,
+    pub status: String,
+    pub active_segment_id: Option<String>,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    pub kv_sequence_position: Option<u32>,
+    pub kv_checkpoint_device_id: Option<String>,
+    pub kv_checkpoint_created_at: Option<String>,
+    pub updated_at: String,
+    pub last_error: Option<String>,
+    pub checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(default)]
+    pub replicas: Vec<InferenceSessionReplicaStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceJobStatusResponse {
+    pub success: bool,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub status: String,
+    pub completion: Option<String>,
+    pub completion_tokens: u32,
+    pub execution_time_ms: u64,
+    pub time_to_first_token_ms: Option<u64>,
+    pub active_segment_id: Option<String>,
+    pub reserved_credits: f64,
+    pub settled_credits: f64,
+    pub released_credits: f64,
+    pub available_completion_tokens: u32,
+    pub model_size_factor: f64,
+    pub error: Option<String>,
+    pub assignments: Vec<InferenceJobAssignmentStatus>,
+    pub execution_plan: Option<InferenceExecutionPlan>,
+    pub session: Option<InferenceSessionStatus>,
 }

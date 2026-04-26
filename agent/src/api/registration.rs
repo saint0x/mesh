@@ -1,9 +1,11 @@
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DownloadInferenceSessionCheckpointResponse, HeartbeatRequest,
-    HeartbeatResponse, InferenceExecutionLease, RegisterDeviceRequest, RegisterDeviceResponse,
+    HeartbeatResponse, InferenceExecutionLease, ObserveDecodeQueueStateResponse,
+    RegisterDeviceRequest, RegisterDeviceResponse, ReleaseDecodeLeaseRequest,
+    ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest, RenewDecodeLeaseResponse,
     ReportInferenceAssignmentProgressRequest, ReportInferenceAssignmentRequest,
-    UploadInferenceSessionCheckpointRequest,
+    UploadInferenceSessionCheckpointRequest, WorkClaimMode,
 };
 use crate::connectivity::{
     build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
@@ -12,6 +14,7 @@ use crate::connectivity::{
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, sleep};
@@ -254,14 +257,27 @@ impl RegistrationClient {
         device_id: Uuid,
         network_id: &str,
     ) -> Result<Option<InferenceExecutionLease>> {
+        Ok(self
+            .claim_inference_work(ClaimInferenceAssignmentRequest {
+                device_id: device_id.to_string(),
+                network_id: network_id.to_string(),
+                claim_mode: WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            })
+            .await?
+            .assignment)
+    }
+
+    pub async fn claim_inference_work(
+        &self,
+        request: ClaimInferenceAssignmentRequest,
+    ) -> Result<ClaimInferenceAssignmentResponse> {
         let url = format!("{}/api/inference/assignments/claim", self.control_plane_url);
         let response = self
             .client
             .post(&url)
-            .json(&ClaimInferenceAssignmentRequest {
-                device_id: device_id.to_string(),
-                network_id: network_id.to_string(),
-            })
+            .json(&request)
             .send()
             .await
             .map_err(|e| AgentError::Http(format!("Assignment claim failed: {}", e)))?;
@@ -282,7 +298,78 @@ impl RegistrationClient {
             AgentError::Serialization(format!("Failed to parse assignment claim: {}", e))
         })?;
 
-        Ok(body.assignment)
+        Ok(body)
+    }
+
+    pub async fn claim_decode_work(
+        &self,
+        device_id: Uuid,
+        network_id: &str,
+    ) -> Result<Option<ClaimInferenceAssignmentResponse>> {
+        let explicit_url = format!("{}/api/inference/decode/claim", self.control_plane_url);
+        let request = ClaimInferenceAssignmentRequest {
+            device_id: device_id.to_string(),
+            network_id: network_id.to_string(),
+            claim_mode: WorkClaimMode::Decode,
+            include_queue_state: true,
+            include_serving_session: true,
+        };
+
+        if let Some(response) = self
+            .post_optional_json::<_, ClaimInferenceAssignmentResponse>(
+                &explicit_url,
+                &request,
+                "Explicit decode claim failed",
+            )
+            .await?
+        {
+            return Ok(Some(response));
+        }
+
+        Ok(Some(self.claim_inference_work(request).await?))
+    }
+
+    pub async fn observe_decode_queue_state(
+        &self,
+        device_id: Uuid,
+        network_id: &str,
+    ) -> Result<Option<ObserveDecodeQueueStateResponse>> {
+        let url = format!("{}/api/inference/decode/queue", self.control_plane_url);
+        self.get_optional_json(
+            &url,
+            &[
+                ("device_id", device_id.to_string()),
+                ("network_id", network_id.to_string()),
+            ],
+            "Decode queue observation failed",
+        )
+        .await
+    }
+
+    pub async fn renew_decode_lease(
+        &self,
+        lease_id: &str,
+        request: RenewDecodeLeaseRequest,
+    ) -> Result<Option<RenewDecodeLeaseResponse>> {
+        let url = format!(
+            "{}/api/inference/decode/leases/{}/renew",
+            self.control_plane_url, lease_id
+        );
+        self.post_optional_json(&url, &request, "Decode lease renew failed")
+            .await
+    }
+
+    pub async fn release_decode_lease(
+        &self,
+        lease_id: &str,
+        request: ReleaseDecodeLeaseRequest,
+    ) -> Result<Option<ReleaseDecodeLeaseResponse>> {
+        let url = format!(
+            "{}/api/inference/decode/leases/{}/release",
+            self.control_plane_url, lease_id
+        );
+        self.post_optional_json(&url, &request, "Decode lease release failed")
+            .await
     }
 
     pub async fn acknowledge_inference_assignment(
@@ -460,6 +547,68 @@ impl RegistrationClient {
             })
             .transpose()
     }
+}
+
+impl RegistrationClient {
+    async fn post_optional_json<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        error_context: &str,
+    ) -> Result<Option<T>> {
+        let response = self
+            .client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("{}: {}", error_context, e)))?;
+        parse_optional_json_response(response, error_context).await
+    }
+
+    async fn get_optional_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        query: &[(&str, String)],
+        error_context: &str,
+    ) -> Result<Option<T>> {
+        let response = self
+            .client
+            .get(url)
+            .query(query)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("{}: {}", error_context, e)))?;
+        parse_optional_json_response(response, error_context).await
+    }
+}
+
+async fn parse_optional_json_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    error_context: &str,
+) -> Result<Option<T>> {
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    {
+        return Ok(None);
+    }
+
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(AgentError::Network(format!(
+            "{}: HTTP {}: {}",
+            error_context, status, error_text
+        )));
+    }
+
+    response
+        .json::<T>()
+        .await
+        .map(Some)
+        .map_err(|e| AgentError::Serialization(format!("{}: {}", error_context, e)))
 }
 
 fn current_epoch_ms() -> u64 {

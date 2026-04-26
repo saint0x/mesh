@@ -8,6 +8,124 @@ use super::tensor_ops::Tensor2D;
 use crate::errors::{AgentError, Result};
 use serde::{Deserialize, Serialize};
 
+/// How a KV cache snapshot is encoded for transfer or persistence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KVCacheEncoding {
+    /// Full cache snapshot serialized as CBOR.
+    FullSnapshotCbor,
+}
+
+/// Logical sequence state associated with a KV cache materialization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KVSequenceState {
+    /// Absolute sequence position of the next token to process.
+    pub next_position: u32,
+    /// Number of tokens currently represented in the cache materialization.
+    pub cached_tokens: u32,
+}
+
+impl KVSequenceState {
+    pub fn new(next_position: u32, cached_tokens: u32) -> Result<Self> {
+        let state = Self {
+            next_position,
+            cached_tokens,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn from_cache(cache: &KVCache, next_position: u32) -> Result<Self> {
+        Self::new(next_position, cache.seq_len() as u32)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.cached_tokens > self.next_position {
+            return Err(AgentError::Execution(format!(
+                "KV sequence state is invalid: cached_tokens {} exceeds next_position {}",
+                self.cached_tokens, self.next_position
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cached_tokens == 0
+    }
+
+    pub fn first_cached_position(&self) -> u32 {
+        self.next_position.saturating_sub(self.cached_tokens)
+    }
+}
+
+/// Serialized KV payload that can later be replaced by remote or partial access.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KVCacheBlob {
+    /// Encoding of the payload bytes.
+    pub encoding: KVCacheEncoding,
+    /// Serialized payload bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl KVCacheBlob {
+    pub fn from_cache(cache: &KVCache) -> Result<Self> {
+        Ok(Self {
+            encoding: KVCacheEncoding::FullSnapshotCbor,
+            bytes: cache.to_bytes()?,
+        })
+    }
+
+    pub fn decode(&self) -> Result<KVCache> {
+        match self.encoding {
+            KVCacheEncoding::FullSnapshotCbor => KVCache::from_bytes(&self.bytes),
+        }
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
+/// Materialized KV cache snapshot paired with its logical sequence state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KVCacheSnapshot {
+    /// Sequence state represented by this cache view.
+    pub sequence: KVSequenceState,
+    /// Serialized cache payload.
+    pub blob: KVCacheBlob,
+}
+
+impl KVCacheSnapshot {
+    pub fn from_cache(cache: &KVCache, next_position: u32) -> Result<Self> {
+        let sequence = KVSequenceState::from_cache(cache, next_position)?;
+        let blob = KVCacheBlob::from_cache(cache)?;
+        Ok(Self { sequence, blob })
+    }
+
+    pub fn decode_cache(&self) -> Result<KVCache> {
+        let cache = self.blob.decode()?;
+        self.validate_with_cache(&cache)?;
+        Ok(cache)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.sequence.validate()?;
+        let cache = self.blob.decode()?;
+        self.validate_with_cache(&cache)
+    }
+
+    pub fn validate_with_cache(&self, cache: &KVCache) -> Result<()> {
+        self.sequence.validate()?;
+        if cache.seq_len() as u32 != self.sequence.cached_tokens {
+            return Err(AgentError::Execution(format!(
+                "KV snapshot cached token mismatch: payload has {} tokens, sequence metadata says {}",
+                cache.seq_len(),
+                self.sequence.cached_tokens
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for KV cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KVCacheConfig {
@@ -506,6 +624,37 @@ mod tests {
 
         assert_eq!(restored.seq_len(), cache.seq_len());
         assert_eq!(restored.layers.len(), cache.layers.len());
+    }
+
+    #[test]
+    fn test_kv_snapshot_tracks_sequence_state() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 10,
+        };
+        let mut cache = KVCache::new(config);
+        cache
+            .update_layer(
+                0,
+                Tensor2D::new(vec![1.0; 2 * 8], 2, 8).unwrap(),
+                Tensor2D::new(vec![2.0; 2 * 8], 2, 8).unwrap(),
+            )
+            .unwrap();
+
+        let snapshot = KVCacheSnapshot::from_cache(&cache, 2).unwrap();
+        assert_eq!(snapshot.sequence.next_position, 2);
+        assert_eq!(snapshot.sequence.cached_tokens, 2);
+        assert_eq!(snapshot.decode_cache().unwrap().seq_len(), 2);
+    }
+
+    #[test]
+    fn test_kv_sequence_rejects_invalid_window() {
+        let err = KVSequenceState::new(1, 2).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cached_tokens 2 exceeds next_position 1"));
     }
 
     #[test]

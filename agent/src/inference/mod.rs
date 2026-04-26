@@ -52,10 +52,14 @@ pub mod stats;
 pub mod tensor_ops;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
-pub use backend::{CandleExecutionBackend, ExecutionBackend};
+pub use backend::{
+    BackendMicrobatchExecutor, CandleExecutionBackend, DecodeMicrobatchOutput,
+    DecodeMicrobatchRequest, ExecutionBackend,
+};
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{
-    BackendInstanceSpec, EngineSessionState, ExecutionPhase, KvTransferPolicy, SessionAssignment,
+    BackendInstanceSpec, DecodeBatchPlan, DecodeBatchPolicy, DecodeBatchSlot, DecodeTask,
+    EngineSessionState, ExecutionPhase, KvTransferPolicy, SessionAssignment,
     TransportCapabilityTier,
 };
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};

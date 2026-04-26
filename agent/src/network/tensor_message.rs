@@ -9,6 +9,22 @@ pub enum AllReducePhase {
     Barrier,
 }
 
+/// Transport class used by the tensor plane to prioritize latency-sensitive
+/// traffic ahead of bulk transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TensorTrafficClass {
+    LatencyCritical,
+    Interactive,
+    Bulk,
+}
+
+impl TensorTrafficClass {
+    pub fn is_bulk(self) -> bool {
+        matches!(self, Self::Bulk)
+    }
+}
+
 /// Tensor payload exchanged on the dedicated tensor data plane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TensorMessage {
@@ -60,6 +76,18 @@ impl TensorMessage {
 
     pub fn is_barrier(&self) -> bool {
         self.step == Self::BARRIER_STEP
+    }
+
+    pub fn traffic_class(&self) -> TensorTrafficClass {
+        if self.is_barrier() {
+            return TensorTrafficClass::LatencyCritical;
+        }
+
+        match self.phase {
+            AllReducePhase::Barrier => TensorTrafficClass::LatencyCritical,
+            AllReducePhase::AllGather => TensorTrafficClass::Interactive,
+            AllReducePhase::ReduceScatter => TensorTrafficClass::Bulk,
+        }
     }
 
     pub fn size_bytes(&self) -> usize {

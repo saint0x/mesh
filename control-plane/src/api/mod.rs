@@ -3,6 +3,7 @@ pub mod inference;
 pub mod ledger;
 pub mod ring;
 pub mod routes;
+pub mod status;
 pub mod types;
 
 use axum::{
@@ -22,6 +23,14 @@ pub fn create_router(state: AppState) -> Router {
         // Network management endpoints
         .route("/api/networks", post(routes::create_network))
         .route("/api/networks", get(routes::list_networks))
+        .route(
+            "/api/status/networks/:network_id/scheduler",
+            get(status::get_network_scheduler_status),
+        )
+        .route(
+            "/api/status/jobs/:job_id/scheduler",
+            get(status::get_job_scheduler_status),
+        )
         // Device management endpoints
         .route("/api/devices/register", post(routes::register_device))
         .route("/api/devices/:id/heartbeat", post(routes::heartbeat))

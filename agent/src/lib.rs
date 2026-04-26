@@ -16,7 +16,10 @@ pub mod resource_manager;
 pub mod telemetry;
 
 pub use api::RegistrationClient;
-pub use checkpoint::{Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata};
+pub use checkpoint::{
+    Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, KVCacheHandoff,
+    KVCacheResidency, KVPayloadRef,
+};
 pub use connectivity::{
     build_direct_peer_candidates, build_direct_peer_candidates_from_records,
     load_direct_candidate_seed_addrs, load_direct_candidate_seed_records,
@@ -39,7 +42,8 @@ pub use network::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
     parse_tensor_plane_bind_addr_env, AllReducePhase, ConnectionInfo, ConnectionType, MeshEvent,
     MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections, TensorMessage, TensorPlane,
-    TensorPlaneConfig, TensorPlaneMetricsSnapshot, TensorPlaneProfile,
+    TensorPlaneCapabilitiesSnapshot, TensorPlaneConfig, TensorPlaneMetricsSnapshot,
+    TensorPlaneProfile, TensorTrafficClass,
 };
 pub use observability::{init_production_logging, init_simple_logging};
 pub use provider::{

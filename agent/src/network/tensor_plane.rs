@@ -7,18 +7,20 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::errors::{AgentError, Result};
 
-use super::tensor_message::{AllReducePhase, TensorMessage};
+use super::tensor_message::{AllReducePhase, TensorMessage, TensorTrafficClass};
 
 pub const DATA_PLANE_ENDPOINT_PREFIX: &str = "dataplane://";
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_INBOUND_MESSAGES: usize = 64;
 pub const DEFAULT_MAX_INBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_BULK_BANDWIDTH_SHARE_NUMERATOR: u64 = 3;
+const DEFAULT_BULK_BANDWIDTH_SHARE_DENOMINATOR: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +112,23 @@ pub struct TensorPlaneMetricsSnapshot {
     pub current_outbound_inflight_bytes: u64,
     pub peak_outbound_inflight_bytes: u64,
     pub current_outbound_connections: u64,
+    pub latency_critical_send_count: u64,
+    pub interactive_send_count: u64,
+    pub bulk_send_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorPlaneCapabilitiesSnapshot {
+    pub profile: TensorPlaneProfile,
+    pub max_message_bytes: usize,
+    pub inbound_queue_byte_capacity: usize,
+    pub outbound_inflight_byte_capacity: usize,
+    pub reserved_priority_outbound_inflight_bytes: usize,
+    pub bulk_outbound_inflight_byte_capacity: usize,
+    pub max_send_bandwidth_bytes_per_sec: u64,
+    pub bulk_send_bandwidth_bytes_per_sec: u64,
+    pub concurrent_receive_waiters: bool,
+    pub prioritized_traffic_classes: bool,
 }
 
 #[derive(Debug)]
@@ -139,6 +158,9 @@ struct TensorPlaneMetrics {
     peak_inbound_queued_bytes: AtomicU64,
     peak_outbound_inflight_bytes: AtomicU64,
     current_outbound_connections: AtomicU64,
+    latency_critical_send_count: AtomicU64,
+    interactive_send_count: AtomicU64,
+    bulk_send_count: AtomicU64,
 }
 
 impl TensorPlaneMetrics {
@@ -169,18 +191,22 @@ impl TensorPlaneMetrics {
             peak_inbound_queued_bytes: AtomicU64::new(0),
             peak_outbound_inflight_bytes: AtomicU64::new(0),
             current_outbound_connections: AtomicU64::new(0),
+            latency_critical_send_count: AtomicU64::new(0),
+            interactive_send_count: AtomicU64::new(0),
+            bulk_send_count: AtomicU64::new(0),
         }
     }
 }
 
 #[derive(Debug)]
 struct InboundState {
-    inbound_rx: mpsc::Receiver<InboundTensorMessage>,
     pending_inbound: VecDeque<InboundTensorMessage>,
+    closed: bool,
 }
 
 #[derive(Debug)]
 struct TensorPlaneState {
+    profile: TensorPlaneProfile,
     local_addr: SocketAddr,
     advertised_addr: SocketAddr,
     connect_timeout: Duration,
@@ -188,9 +214,14 @@ struct TensorPlaneState {
     max_message_bytes: usize,
     inbound_queue_byte_capacity: usize,
     outbound_inflight_byte_capacity: usize,
+    reserved_priority_outbound_inflight_bytes: usize,
+    bulk_outbound_inflight_byte_capacity: usize,
+    max_send_bandwidth_bytes_per_sec: u64,
+    bulk_send_bandwidth_bytes_per_sec: u64,
     inbound_queue_bytes: Arc<Semaphore>,
     outbound_inflight_bytes: Arc<Semaphore>,
-    outbound_bandwidth_limiter: Mutex<BandwidthLimiter>,
+    bulk_outbound_inflight_bytes: Arc<Semaphore>,
+    bulk_outbound_bandwidth_limiter: Mutex<BandwidthLimiter>,
     outbound_connections: Mutex<HashMap<SocketAddr, Arc<Mutex<TcpStream>>>>,
     metrics: TensorPlaneMetrics,
 }
@@ -239,7 +270,9 @@ impl BandwidthLimiter {
 pub struct TensorPlane {
     state: Arc<TensorPlaneState>,
     inbound: Arc<Mutex<InboundState>>,
+    inbound_notify: Arc<Notify>,
     _accept_task: tokio::task::JoinHandle<()>,
+    _inbound_dispatch_task: tokio::task::JoinHandle<()>,
 }
 
 impl TensorPlane {
@@ -263,11 +296,37 @@ impl TensorPlane {
                 AgentError::Config("tensor outbound byte budget exceeds u32".to_string())
             })?,
         ));
+        let reserved_priority_outbound_inflight_bytes =
+            compute_reserved_priority_outbound_inflight_bytes(
+                config.max_outbound_inflight_bytes,
+                config.max_message_bytes,
+            );
+        let bulk_outbound_inflight_byte_capacity = config
+            .max_outbound_inflight_bytes
+            .saturating_sub(reserved_priority_outbound_inflight_bytes)
+            .max(config.max_message_bytes);
+        let bulk_outbound_inflight_bytes = Arc::new(Semaphore::new(
+            bulk_outbound_inflight_byte_capacity
+                .try_into()
+                .map_err(|_| {
+                    AgentError::Config("tensor bulk byte budget exceeds u32".to_string())
+                })?,
+        ));
+        let bulk_send_bandwidth_bytes_per_sec = compute_bulk_bandwidth_bytes_per_sec(
+            config.max_send_bandwidth_bytes_per_sec,
+            config.max_message_bytes,
+        );
         let metrics = TensorPlaneMetrics::new();
         let (inbound_tx, inbound_rx) = mpsc::channel(config.max_inbound_messages);
         let io_timeout = config.io_timeout;
         let max_message_bytes = config.max_message_bytes;
+        let inbound = Arc::new(Mutex::new(InboundState {
+            pending_inbound: VecDeque::new(),
+            closed: false,
+        }));
+        let inbound_notify = Arc::new(Notify::new());
         let metrics_state = Arc::new(TensorPlaneState {
+            profile: config.profile,
             local_addr,
             advertised_addr,
             connect_timeout: config.connect_timeout,
@@ -275,14 +334,35 @@ impl TensorPlane {
             max_message_bytes,
             inbound_queue_byte_capacity: config.max_inbound_queued_bytes,
             outbound_inflight_byte_capacity: config.max_outbound_inflight_bytes,
+            reserved_priority_outbound_inflight_bytes,
+            bulk_outbound_inflight_byte_capacity,
+            max_send_bandwidth_bytes_per_sec: config.max_send_bandwidth_bytes_per_sec,
+            bulk_send_bandwidth_bytes_per_sec,
             inbound_queue_bytes,
             outbound_inflight_bytes,
-            outbound_bandwidth_limiter: Mutex::new(BandwidthLimiter::new(
-                config.max_send_bandwidth_bytes_per_sec,
+            bulk_outbound_inflight_bytes,
+            bulk_outbound_bandwidth_limiter: Mutex::new(BandwidthLimiter::new(
+                bulk_send_bandwidth_bytes_per_sec,
                 config.max_message_bytes,
             )),
             outbound_connections: Mutex::new(HashMap::new()),
             metrics,
+        });
+        let inbound_state = Arc::clone(&inbound);
+        let inbound_notify_state = Arc::clone(&inbound_notify);
+        let inbound_dispatch_task = tokio::spawn(async move {
+            let mut inbound_rx = inbound_rx;
+            while let Some(message) = inbound_rx.recv().await {
+                let mut state = inbound_state.lock().await;
+                state.pending_inbound.push_back(message);
+                drop(state);
+                inbound_notify_state.notify_waiters();
+            }
+
+            let mut state = inbound_state.lock().await;
+            state.closed = true;
+            drop(state);
+            inbound_notify_state.notify_waiters();
         });
         let accept_state = Arc::clone(&metrics_state);
         let accept_task = tokio::spawn(async move {
@@ -405,11 +485,10 @@ impl TensorPlane {
 
         Ok(Self {
             state: metrics_state,
-            inbound: Arc::new(Mutex::new(InboundState {
-                inbound_rx,
-                pending_inbound: VecDeque::new(),
-            })),
+            inbound,
+            inbound_notify,
             _accept_task: accept_task,
+            _inbound_dispatch_task: inbound_dispatch_task,
         })
     }
 
@@ -426,6 +505,23 @@ impl TensorPlane {
             "{}{}",
             DATA_PLANE_ENDPOINT_PREFIX, self.state.advertised_addr
         )
+    }
+
+    pub fn capabilities_snapshot(&self) -> TensorPlaneCapabilitiesSnapshot {
+        TensorPlaneCapabilitiesSnapshot {
+            profile: self.state.profile,
+            max_message_bytes: self.state.max_message_bytes,
+            inbound_queue_byte_capacity: self.state.inbound_queue_byte_capacity,
+            outbound_inflight_byte_capacity: self.state.outbound_inflight_byte_capacity,
+            reserved_priority_outbound_inflight_bytes: self
+                .state
+                .reserved_priority_outbound_inflight_bytes,
+            bulk_outbound_inflight_byte_capacity: self.state.bulk_outbound_inflight_byte_capacity,
+            max_send_bandwidth_bytes_per_sec: self.state.max_send_bandwidth_bytes_per_sec,
+            bulk_send_bandwidth_bytes_per_sec: self.state.bulk_send_bandwidth_bytes_per_sec,
+            concurrent_receive_waiters: true,
+            prioritized_traffic_classes: true,
+        }
     }
 
     pub fn metrics_snapshot(&self) -> TensorPlaneMetricsSnapshot {
@@ -541,10 +637,31 @@ impl TensorPlane {
                 .metrics
                 .current_outbound_connections
                 .load(Ordering::Relaxed),
+            latency_critical_send_count: self
+                .state
+                .metrics
+                .latency_critical_send_count
+                .load(Ordering::Relaxed),
+            interactive_send_count: self
+                .state
+                .metrics
+                .interactive_send_count
+                .load(Ordering::Relaxed),
+            bulk_send_count: self.state.metrics.bulk_send_count.load(Ordering::Relaxed),
         }
     }
 
     pub async fn send(&self, target: SocketAddr, message: &TensorMessage) -> Result<()> {
+        self.send_with_traffic_class(target, message, message.traffic_class())
+            .await
+    }
+
+    pub async fn send_with_traffic_class(
+        &self,
+        target: SocketAddr,
+        message: &TensorMessage,
+        traffic_class: TensorTrafficClass,
+    ) -> Result<()> {
         let send_started = Instant::now();
         let message_bytes = message.size_bytes().max(1);
         if message_bytes > self.state.max_message_bytes {
@@ -557,11 +674,17 @@ impl TensorPlane {
                 message_bytes, self.state.max_message_bytes
             )));
         }
+        if message_bytes > self.state.outbound_inflight_byte_capacity {
+            return Err(AgentError::Network(format!(
+                "Tensor message size {} exceeds outbound byte budget {}",
+                message_bytes, self.state.outbound_inflight_byte_capacity
+            )));
+        }
 
         let message_bytes_u32: u32 = message_bytes.try_into().map_err(|_| {
             AgentError::Network("Tensor message too large for byte accounting".to_string())
         })?;
-        let wait_started = std::time::Instant::now();
+        let wait_started = Instant::now();
         let outbound_permit = match self
             .state
             .outbound_inflight_bytes
@@ -592,15 +715,55 @@ impl TensorPlane {
                 permit
             }
         };
+        let bulk_outbound_permit = if traffic_class.is_bulk() {
+            let wait_started = Instant::now();
+            Some(
+                match self
+                    .state
+                    .bulk_outbound_inflight_bytes
+                    .clone()
+                    .try_acquire_many_owned(message_bytes_u32)
+                {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        self.state
+                            .metrics
+                            .outbound_backpressure_wait_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        let permit = self
+                            .state
+                            .bulk_outbound_inflight_bytes
+                            .clone()
+                            .acquire_many_owned(message_bytes_u32)
+                            .await
+                            .map_err(|_| {
+                                AgentError::Network(
+                                    "Tensor plane bulk outbound byte budget unexpectedly closed"
+                                        .to_string(),
+                                )
+                            })?;
+                        self.state.metrics.outbound_backpressure_wait_ms.fetch_add(
+                            wait_started.elapsed().as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
+                        permit
+                    }
+                },
+            )
+        } else {
+            None
+        };
         update_peak(
             &self.state.metrics.peak_outbound_inflight_bytes,
             (self.state.outbound_inflight_byte_capacity
                 - self.state.outbound_inflight_bytes.available_permits() as usize)
                 as u64,
         );
-        let bandwidth_wait = {
-            let mut limiter = self.state.outbound_bandwidth_limiter.lock().await;
+        let bandwidth_wait = if traffic_class.is_bulk() {
+            let mut limiter = self.state.bulk_outbound_bandwidth_limiter.lock().await;
             limiter.reserve_wait(message_bytes)
+        } else {
+            Duration::ZERO
         };
         if !bandwidth_wait.is_zero() {
             self.state
@@ -663,7 +826,9 @@ impl TensorPlane {
             .metrics
             .send_latency_ms
             .fetch_add(send_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        record_traffic_class_send(&self.state.metrics, traffic_class);
         drop(outbound_permit);
+        drop(bulk_outbound_permit);
 
         Ok(())
     }
@@ -721,34 +886,40 @@ impl TensorPlane {
     }
 
     pub async fn recv(&self) -> Option<InboundTensorMessage> {
-        let mut inbound = self.inbound.lock().await;
-        if let Some(message) = inbound.pending_inbound.pop_front() {
-            self.record_receive_metrics(&message);
-            return Some(message);
+        loop {
+            let notified = self.inbound_notify.notified();
+            {
+                let mut inbound = self.inbound.lock().await;
+                if let Some(message) = inbound.pending_inbound.pop_front() {
+                    self.record_receive_metrics(&message);
+                    return Some(message);
+                }
+                if inbound.closed {
+                    return None;
+                }
+            }
+            notified.await;
         }
-        let message = inbound.inbound_rx.recv().await?;
-        self.record_receive_metrics(&message);
-        Some(message)
     }
 
     pub async fn recv_matching<F>(&self, mut predicate: F) -> Option<InboundTensorMessage>
     where
         F: FnMut(&InboundTensorMessage) -> bool,
     {
-        let mut inbound = self.inbound.lock().await;
-        if let Some(index) = inbound.pending_inbound.iter().position(&mut predicate) {
-            let message = inbound.pending_inbound.remove(index)?;
-            self.record_receive_metrics(&message);
-            return Some(message);
-        }
-
         loop {
-            let message = inbound.inbound_rx.recv().await?;
-            if predicate(&message) {
-                self.record_receive_metrics(&message);
-                return Some(message);
+            let notified = self.inbound_notify.notified();
+            {
+                let mut inbound = self.inbound.lock().await;
+                if let Some(index) = inbound.pending_inbound.iter().position(&mut predicate) {
+                    let message = inbound.pending_inbound.remove(index)?;
+                    self.record_receive_metrics(&message);
+                    return Some(message);
+                }
+                if inbound.closed {
+                    return None;
+                }
             }
-            inbound.pending_inbound.push_back(message);
+            notified.await;
         }
     }
 
@@ -820,6 +991,7 @@ pub fn parse_tensor_plane_advertised_addr_env() -> Option<SocketAddr> {
 
 fn sanitized_config(config: TensorPlaneConfig) -> Result<TensorPlaneConfig> {
     let max_message_bytes = config.max_message_bytes.max(1);
+    let max_outbound_inflight_bytes = config.max_outbound_inflight_bytes.max(max_message_bytes);
     let max_send_bandwidth_bytes_per_sec = if config.max_send_bandwidth_bytes_per_sec == 0 {
         config
             .profile
@@ -832,7 +1004,7 @@ fn sanitized_config(config: TensorPlaneConfig) -> Result<TensorPlaneConfig> {
         max_message_bytes,
         max_inbound_messages: config.max_inbound_messages.max(1),
         max_inbound_queued_bytes: config.max_inbound_queued_bytes.max(1),
-        max_outbound_inflight_bytes: config.max_outbound_inflight_bytes.max(1),
+        max_outbound_inflight_bytes,
         max_send_bandwidth_bytes_per_sec,
         ..config
     })
@@ -846,6 +1018,36 @@ fn update_peak(metric: &AtomicU64, value: u64) {
             Err(observed) => current = observed,
         }
     }
+}
+
+fn compute_reserved_priority_outbound_inflight_bytes(
+    outbound_inflight_byte_capacity: usize,
+    max_message_bytes: usize,
+) -> usize {
+    if outbound_inflight_byte_capacity <= max_message_bytes {
+        return 0;
+    }
+
+    let target_reserve = (outbound_inflight_byte_capacity / 4).max(max_message_bytes);
+    let max_reserve = outbound_inflight_byte_capacity.saturating_sub(max_message_bytes);
+    target_reserve.min(max_reserve)
+}
+
+fn compute_bulk_bandwidth_bytes_per_sec(
+    max_send_bandwidth_bytes_per_sec: u64,
+    max_message_bytes: usize,
+) -> u64 {
+    if max_send_bandwidth_bytes_per_sec <= max_message_bytes as u64 {
+        return max_send_bandwidth_bytes_per_sec.max(1);
+    }
+
+    let scaled = max_send_bandwidth_bytes_per_sec
+        .saturating_mul(DEFAULT_BULK_BANDWIDTH_SHARE_NUMERATOR)
+        / DEFAULT_BULK_BANDWIDTH_SHARE_DENOMINATOR;
+    scaled
+        .max(max_message_bytes as u64)
+        .min(max_send_bandwidth_bytes_per_sec)
+        .max(1)
 }
 
 fn record_phase_bytes(
@@ -863,6 +1065,18 @@ fn record_phase_bytes(
         (AllReducePhase::Barrier, false) => &metrics.barrier_bytes_received,
     };
     target.fetch_add(bytes, Ordering::Relaxed);
+}
+
+fn record_traffic_class_send(metrics: &TensorPlaneMetrics, traffic_class: TensorTrafficClass) {
+    match traffic_class {
+        TensorTrafficClass::LatencyCritical => metrics
+            .latency_critical_send_count
+            .fetch_add(1, Ordering::Relaxed),
+        TensorTrafficClass::Interactive => metrics
+            .interactive_send_count
+            .fetch_add(1, Ordering::Relaxed),
+        TensorTrafficClass::Bulk => metrics.bulk_send_count.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 async fn read_tensor_message<T>(
@@ -919,6 +1133,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, timeout};
 
@@ -990,6 +1205,7 @@ mod tests {
         assert_eq!(plane.state.max_message_bytes, 1);
         assert_eq!(plane.state.inbound_queue_byte_capacity, 1);
         assert_eq!(plane.state.outbound_inflight_byte_capacity, 1);
+        assert_eq!(plane.state.bulk_outbound_inflight_byte_capacity, 1);
     }
 
     #[tokio::test]
@@ -1078,6 +1294,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recv_matching_supports_multiple_concurrent_waiters() {
+        let plane = Arc::new(
+            TensorPlane::bind(TensorPlaneConfig::default())
+                .await
+                .unwrap(),
+        );
+        let addr = plane.local_addr();
+
+        let waiter_for_two = {
+            let plane = Arc::clone(&plane);
+            tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(1),
+                    plane.recv_matching(|inbound| inbound.tensor.step == 2),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .tensor
+                .step
+            })
+        };
+        sleep(Duration::from_millis(25)).await;
+        let waiter_for_one = {
+            let plane = Arc::clone(&plane);
+            tokio::spawn(async move {
+                timeout(
+                    Duration::from_millis(250),
+                    plane.recv_matching(|inbound| inbound.tensor.step == 1),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .tensor
+                .step
+            })
+        };
+
+        let mut first = test_message(4);
+        first.step = 1;
+        plane.send(addr, &first).await.unwrap();
+        assert_eq!(waiter_for_one.await.unwrap(), 1);
+
+        let mut second = test_message(4);
+        second.step = 2;
+        plane.send(addr, &second).await.unwrap();
+        assert_eq!(waiter_for_two.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn test_tensor_plane_reuses_outbound_connection_for_multiple_messages() {
         let plane = TensorPlane::bind(TensorPlaneConfig::default())
             .await
@@ -1110,6 +1376,62 @@ mod tests {
         assert_eq!(first_received.tensor.step, 1);
         assert_eq!(second_received.tensor.step, 2);
         assert_eq!(plane.metrics_snapshot().current_outbound_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn test_latency_critical_send_skips_bulk_bandwidth_throttle() {
+        let plane = Arc::new(
+            TensorPlane::bind(TensorPlaneConfig {
+                // Keep the hard message limit above the test payload size so this
+                // exercises bandwidth throttling rather than size rejection.
+                max_message_bytes: 512,
+                max_outbound_inflight_bytes: 1024,
+                max_send_bandwidth_bytes_per_sec: 256,
+                ..TensorPlaneConfig::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let addr = plane.local_addr();
+
+        let first_bulk = test_message(64);
+        plane.send(addr, &first_bulk).await.unwrap();
+
+        let bulk_plane = Arc::clone(&plane);
+        let throttled_bulk_send = tokio::spawn(async move {
+            let bulk = test_message(48);
+            bulk_plane.send(addr, &bulk).await.unwrap();
+        });
+
+        sleep(Duration::from_millis(25)).await;
+
+        let priority_plane = Arc::clone(&plane);
+        let priority_send = tokio::spawn(async move {
+            let mut barrier = test_message(1);
+            barrier.phase = AllReducePhase::Barrier;
+            barrier.step = TensorMessage::BARRIER_STEP;
+            let started = Instant::now();
+            priority_plane.send(addr, &barrier).await.unwrap();
+            started.elapsed()
+        });
+
+        let priority_elapsed = priority_send.await.unwrap();
+        assert!(priority_elapsed < Duration::from_millis(200));
+        throttled_bulk_send.await.unwrap();
+
+        let snapshot = plane.metrics_snapshot();
+        assert_eq!(snapshot.latency_critical_send_count, 1);
+        assert_eq!(snapshot.bulk_send_count, 2);
+        assert!(snapshot.outbound_bandwidth_wait_count >= 1);
+    }
+
+    #[test]
+    fn test_tensor_plane_capabilities_report_priority_headroom() {
+        let reserved = compute_reserved_priority_outbound_inflight_bytes(4096, 512);
+        assert_eq!(reserved, 1024);
+
+        let bulk_rate = compute_bulk_bandwidth_bytes_per_sec(4096, 512);
+        assert_eq!(bulk_rate, 3072);
     }
 
     #[test]

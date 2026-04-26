@@ -1,10 +1,18 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OptionalExtension;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod models;
+
+use crate::api::types::{
+    DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
+    JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencySummary, KvTransferPolicy,
+    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerJobSummary,
+    ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
+};
 
 /// Database-related errors
 #[derive(Error, Debug)]
@@ -20,6 +28,9 @@ pub enum DbError {
 
     #[error("Database configuration error: {0}")]
     Config(String),
+
+    #[error("Database data error: {0}")]
+    Data(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -292,6 +303,16 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
             table_exists(conn, "inference_serving_groups")?
         }
         "022_create_inference_decode_queue.sql" => table_exists(conn, "inference_decode_queue")?,
+        "023_add_scheduler_visibility_metadata.sql" => {
+            column_exists(conn, "inference_decode_queue", "blocked_reason")?
+                && column_exists(conn, "inference_decode_queue", "blocked_since")?
+                && column_exists(conn, "inference_decode_queue", "block_detail")?
+                && column_exists(conn, "inference_serving_groups", "lease_owner_device_id")?
+                && column_exists(conn, "inference_serving_groups", "lease_expires_at")?
+        }
+        "024_create_inference_regroup_events.sql" => {
+            table_exists(conn, "inference_regroup_events")?
+        }
         _ => false,
     })
 }
@@ -320,6 +341,642 @@ fn column_exists(conn: &rusqlite::Connection, table_name: &str, column_name: &st
     Ok(false)
 }
 
+#[derive(Clone)]
+struct ServingGroupRow {
+    group_id: String,
+    session_id: String,
+    job_id: String,
+    network_id: String,
+    model_id: String,
+    phase: ExecutionPhase,
+    lease_owner_device_id: Option<String>,
+    lease_expires_at: Option<String>,
+    member: ServingGroupMemberStatus,
+}
+
+#[derive(Clone)]
+struct KvSessionRow {
+    session_id: String,
+    job_id: String,
+    network_id: String,
+    model_id: String,
+    status: String,
+    active_segment_id: Option<String>,
+    kv_owner_device_id: String,
+    kv_transfer_policy: KvTransferPolicy,
+    kv_sequence_position: Option<u32>,
+    kv_checkpoint_device_id: Option<String>,
+    kv_checkpoint_created_at: Option<String>,
+    updated_at: String,
+    latest_checkpoint: Option<InferenceSessionCheckpointStatus>,
+}
+
+impl Database {
+    pub fn load_network_scheduler_status(
+        &self,
+        network_id: &str,
+    ) -> Result<NetworkSchedulerStatusResponse> {
+        let conn = self.get_conn()?;
+        require_network_exists(&conn, network_id)?;
+
+        Ok(NetworkSchedulerStatusResponse {
+            success: true,
+            network_id: network_id.to_string(),
+            jobs: load_scheduler_job_summaries(&conn, network_id, None)?,
+            decode_queue: load_decode_queue_entries(&conn, network_id, None)?,
+            serving_groups: load_serving_group_snapshots(&conn, network_id, None)?,
+            kv_residency: load_kv_residency_summaries(&conn, network_id, None)?,
+            regroup_events: load_regroup_events(&conn, network_id, None)?,
+        })
+    }
+
+    pub fn load_job_scheduler_status(&self, job_id: &str) -> Result<JobSchedulerStatusResponse> {
+        let conn = self.get_conn()?;
+        let (network_id, model_id, status, active_segment_id, completion_tokens, updated_at) =
+            conn.query_row(
+                r#"
+                SELECT network_id, model_id, status, active_segment_id, completion_tokens, updated_at
+                FROM inference_jobs
+                WHERE job_id = ?
+                "#,
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)? as u32,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| DbError::NotFound(format!("Inference job not found: {}", job_id)))?;
+
+        Ok(JobSchedulerStatusResponse {
+            success: true,
+            job_id: job_id.to_string(),
+            network_id: network_id.clone(),
+            model_id,
+            status,
+            active_segment_id,
+            completion_tokens,
+            updated_at,
+            decode_queue: load_decode_queue_entries(&conn, &network_id, Some(job_id))?,
+            serving_groups: load_serving_group_snapshots(&conn, &network_id, Some(job_id))?,
+            kv_residency: load_kv_residency_summaries(&conn, &network_id, Some(job_id))?,
+            regroup_events: load_regroup_events(&conn, &network_id, Some(job_id))?,
+        })
+    }
+}
+
+fn require_network_exists(conn: &rusqlite::Connection, network_id: &str) -> Result<()> {
+    let exists = conn
+        .query_row(
+            "SELECT network_id FROM networks WHERE network_id = ?",
+            [network_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(DbError::NotFound(format!(
+            "Network not found: {}",
+            network_id
+        )))
+    }
+}
+
+fn load_scheduler_job_summaries(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<SchedulerJobSummary>> {
+    if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT job_id, model_id, status, active_segment_id, completion_tokens, updated_at
+            FROM inference_jobs
+            WHERE network_id = ?1 AND job_id = ?2
+            ORDER BY updated_at DESC, job_id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(SchedulerJobSummary {
+                job_id: row.get(0)?,
+                model_id: row.get(1)?,
+                status: row.get(2)?,
+                active_segment_id: row.get(3)?,
+                completion_tokens: row.get::<_, i64>(4)? as u32,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        collect_rows(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT job_id, model_id, status, active_segment_id, completion_tokens, updated_at
+            FROM inference_jobs
+            WHERE network_id = ?1
+            ORDER BY updated_at DESC, job_id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(SchedulerJobSummary {
+                job_id: row.get(0)?,
+                model_id: row.get(1)?,
+                status: row.get(2)?,
+                active_segment_id: row.get(3)?,
+                completion_tokens: row.get::<_, i64>(4)? as u32,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
+fn load_decode_queue_entries(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<DecodeQueueEntryStatus>> {
+    if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT session_id, job_id, network_id, segment_id, group_id, status,
+                   blocked_reason, blocked_since, block_detail, ready_at,
+                   lease_owner_device_id, lease_expires_at, last_error, updated_at
+            FROM inference_decode_queue
+            WHERE network_id = ?1 AND job_id = ?2
+            ORDER BY updated_at ASC, session_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(DecodeQueueEntryStatus {
+                session_id: row.get(0)?,
+                job_id: row.get(1)?,
+                network_id: row.get(2)?,
+                segment_id: row.get(3)?,
+                group_id: row.get(4)?,
+                status: row.get(5)?,
+                blocked_reason: row.get(6)?,
+                blocked_since: row.get(7)?,
+                block_detail: row.get(8)?,
+                ready_at: row.get(9)?,
+                lease_owner_device_id: row.get(10)?,
+                lease_expires_at: row.get(11)?,
+                last_error: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        })?;
+        collect_rows(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT session_id, job_id, network_id, segment_id, group_id, status,
+                   blocked_reason, blocked_since, block_detail, ready_at,
+                   lease_owner_device_id, lease_expires_at, last_error, updated_at
+            FROM inference_decode_queue
+            WHERE network_id = ?1
+            ORDER BY updated_at ASC, session_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(DecodeQueueEntryStatus {
+                session_id: row.get(0)?,
+                job_id: row.get(1)?,
+                network_id: row.get(2)?,
+                segment_id: row.get(3)?,
+                group_id: row.get(4)?,
+                status: row.get(5)?,
+                blocked_reason: row.get(6)?,
+                blocked_since: row.get(7)?,
+                block_detail: row.get(8)?,
+                ready_at: row.get(9)?,
+                lease_owner_device_id: row.get(10)?,
+                lease_expires_at: row.get(11)?,
+                last_error: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
+fn load_serving_group_snapshots(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<ServingGroupStatus>> {
+    let rows = if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT sg.group_id, sg.session_id, sg.job_id, sg.network_id, sg.model_id, sg.phase,
+                   sg.lease_owner_device_id, sg.lease_expires_at, sg.device_id, sg.ring_position,
+                   sg.shard_column_start, sg.shard_column_end, sg.assigned_capacity_units,
+                   sg.execution_provider, sg.status, a.status, a.lease_expires_at,
+                   a.active_segment_id, sg.last_error
+            FROM inference_serving_groups sg
+            LEFT JOIN inference_job_assignments a
+              ON a.job_id = sg.job_id
+             AND a.device_id = sg.device_id
+            WHERE sg.network_id = ?1 AND sg.job_id = ?2
+            ORDER BY sg.session_id ASC, sg.phase ASC, sg.group_id ASC, sg.ring_position ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(ServingGroupRow {
+                group_id: row.get(0)?,
+                session_id: row.get(1)?,
+                job_id: row.get(2)?,
+                network_id: row.get(3)?,
+                model_id: row.get(4)?,
+                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                    .map_err(to_sql_err)?,
+                lease_owner_device_id: row.get(6)?,
+                lease_expires_at: row.get(7)?,
+                member: ServingGroupMemberStatus {
+                    device_id: row.get(8)?,
+                    ring_position: row.get::<_, i64>(9)? as u32,
+                    shard_column_start: row.get::<_, i64>(10)? as u32,
+                    shard_column_end: row.get::<_, i64>(11)? as u32,
+                    assigned_capacity_units: row.get::<_, i64>(12)? as u32,
+                    execution_provider: row.get(13)?,
+                    status: row.get(14)?,
+                    assignment_status: row.get(15)?,
+                    assignment_lease_expires_at: row.get(16)?,
+                    active_segment_id: row.get(17)?,
+                    last_error: row.get(18)?,
+                },
+            })
+        })?;
+        collect_rows(rows)?
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT sg.group_id, sg.session_id, sg.job_id, sg.network_id, sg.model_id, sg.phase,
+                   sg.lease_owner_device_id, sg.lease_expires_at, sg.device_id, sg.ring_position,
+                   sg.shard_column_start, sg.shard_column_end, sg.assigned_capacity_units,
+                   sg.execution_provider, sg.status, a.status, a.lease_expires_at,
+                   a.active_segment_id, sg.last_error
+            FROM inference_serving_groups sg
+            LEFT JOIN inference_job_assignments a
+              ON a.job_id = sg.job_id
+             AND a.device_id = sg.device_id
+            WHERE sg.network_id = ?1
+            ORDER BY sg.session_id ASC, sg.phase ASC, sg.group_id ASC, sg.ring_position ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(ServingGroupRow {
+                group_id: row.get(0)?,
+                session_id: row.get(1)?,
+                job_id: row.get(2)?,
+                network_id: row.get(3)?,
+                model_id: row.get(4)?,
+                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                    .map_err(to_sql_err)?,
+                lease_owner_device_id: row.get(6)?,
+                lease_expires_at: row.get(7)?,
+                member: ServingGroupMemberStatus {
+                    device_id: row.get(8)?,
+                    ring_position: row.get::<_, i64>(9)? as u32,
+                    shard_column_start: row.get::<_, i64>(10)? as u32,
+                    shard_column_end: row.get::<_, i64>(11)? as u32,
+                    assigned_capacity_units: row.get::<_, i64>(12)? as u32,
+                    execution_provider: row.get(13)?,
+                    status: row.get(14)?,
+                    assignment_status: row.get(15)?,
+                    assignment_lease_expires_at: row.get(16)?,
+                    active_segment_id: row.get(17)?,
+                    last_error: row.get(18)?,
+                },
+            })
+        })?;
+        collect_rows(rows)?
+    };
+    let mut groups = BTreeMap::<(String, String), ServingGroupStatus>::new();
+    for row in rows {
+        let key = (row.session_id.clone(), row.group_id.clone());
+        let entry = groups.entry(key).or_insert_with(|| ServingGroupStatus {
+            group_id: row.group_id.clone(),
+            session_id: row.session_id.clone(),
+            job_id: row.job_id.clone(),
+            network_id: row.network_id.clone(),
+            model_id: row.model_id.clone(),
+            phase: row.phase,
+            member_count: 0,
+            lease: row
+                .lease_owner_device_id
+                .as_ref()
+                .or(row.lease_expires_at.as_ref())
+                .map(|_| ServingGroupLeaseStatus {
+                    lease_kind: if matches!(row.phase, ExecutionPhase::Decode) {
+                        "decode_queue".to_string()
+                    } else {
+                        "group".to_string()
+                    },
+                    owner_device_id: row.lease_owner_device_id.clone(),
+                    lease_expires_at: row.lease_expires_at.clone(),
+                    status: if row.lease_owner_device_id.is_some() {
+                        "leased".to_string()
+                    } else {
+                        "pending".to_string()
+                    },
+                }),
+            members: Vec::new(),
+        });
+        entry.member_count += 1;
+        if entry.lease.is_none() {
+            entry.lease = row
+                .lease_owner_device_id
+                .as_ref()
+                .or(row.lease_expires_at.as_ref())
+                .map(|_| ServingGroupLeaseStatus {
+                    lease_kind: if matches!(row.phase, ExecutionPhase::Decode) {
+                        "decode_queue".to_string()
+                    } else {
+                        "group".to_string()
+                    },
+                    owner_device_id: row.lease_owner_device_id.clone(),
+                    lease_expires_at: row.lease_expires_at.clone(),
+                    status: if row.lease_owner_device_id.is_some() {
+                        "leased".to_string()
+                    } else {
+                        "pending".to_string()
+                    },
+                });
+        }
+        entry.members.push(row.member);
+    }
+
+    Ok(groups.into_values().collect())
+}
+
+fn load_kv_residency_summaries(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<KvResidencySummary>> {
+    let rows = if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT session_id, job_id, network_id, model_id, status, active_segment_id,
+                   kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
+                   kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at
+            FROM inference_sessions
+            WHERE network_id = ?1 AND job_id = ?2
+            ORDER BY updated_at DESC, session_id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(KvSessionRow {
+                session_id: row.get(0)?,
+                job_id: row.get(1)?,
+                network_id: row.get(2)?,
+                model_id: row.get(3)?,
+                status: row.get(4)?,
+                active_segment_id: row.get(5)?,
+                kv_owner_device_id: row.get(6)?,
+                kv_transfer_policy: parse_kv_transfer_policy(row.get::<_, String>(7)?.as_str())
+                    .map_err(to_sql_err)?,
+                kv_sequence_position: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+                kv_checkpoint_device_id: row.get(9)?,
+                kv_checkpoint_created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                latest_checkpoint: None,
+            })
+        })?;
+        collect_rows(rows)?
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT session_id, job_id, network_id, model_id, status, active_segment_id,
+                   kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
+                   kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at
+            FROM inference_sessions
+            WHERE network_id = ?1
+            ORDER BY updated_at DESC, session_id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(KvSessionRow {
+                session_id: row.get(0)?,
+                job_id: row.get(1)?,
+                network_id: row.get(2)?,
+                model_id: row.get(3)?,
+                status: row.get(4)?,
+                active_segment_id: row.get(5)?,
+                kv_owner_device_id: row.get(6)?,
+                kv_transfer_policy: parse_kv_transfer_policy(row.get::<_, String>(7)?.as_str())
+                    .map_err(to_sql_err)?,
+                kv_sequence_position: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+                kv_checkpoint_device_id: row.get(9)?,
+                kv_checkpoint_created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                latest_checkpoint: None,
+            })
+        })?;
+        collect_rows(rows)?
+    };
+    let mut sessions = rows;
+    for session in &mut sessions {
+        session.latest_checkpoint = load_latest_checkpoint_for_session(conn, &session.session_id)?;
+    }
+
+    let mut output = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        output.push(KvResidencySummary {
+            session_id: session.session_id.clone(),
+            job_id: session.job_id.clone(),
+            network_id: session.network_id.clone(),
+            model_id: session.model_id.clone(),
+            status: session.status.clone(),
+            active_segment_id: session.active_segment_id.clone(),
+            kv_owner_device_id: session.kv_owner_device_id.clone(),
+            kv_transfer_policy: session.kv_transfer_policy,
+            kv_sequence_position: session.kv_sequence_position,
+            kv_checkpoint_device_id: session.kv_checkpoint_device_id.clone(),
+            kv_checkpoint_created_at: session.kv_checkpoint_created_at.clone(),
+            latest_checkpoint: session.latest_checkpoint.clone(),
+            replicas: load_kv_replica_rows(conn, &session.session_id)?,
+            updated_at: session.updated_at.clone(),
+        });
+    }
+
+    Ok(output)
+}
+
+fn load_kv_replica_rows(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<KvReplicaResidencyStatus>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT device_id, status, kv_sequence_position, checkpoint_created_at, updated_at, last_error
+        FROM inference_session_replicas
+        WHERE session_id = ?
+        ORDER BY device_id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok(KvReplicaResidencyStatus {
+            device_id: row.get(0)?,
+            status: row.get(1)?,
+            kv_sequence_position: row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
+            checkpoint_created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+            last_error: row.get(5)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn load_latest_checkpoint_for_session(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<InferenceSessionCheckpointStatus>> {
+    conn.query_row(
+        r#"
+        SELECT checkpoint_id, source_device_id, source_segment_id, phase,
+               kv_sequence_position, size_bytes, checkpoint_sha256, created_at
+        FROM inference_session_checkpoints
+        WHERE session_id = ?
+        ORDER BY created_at DESC, checkpoint_id DESC
+        LIMIT 1
+        "#,
+        [session_id],
+        |row| {
+            Ok(InferenceSessionCheckpointStatus {
+                checkpoint_id: row.get(0)?,
+                source_device_id: row.get(1)?,
+                source_segment_id: row.get(2)?,
+                phase: parse_execution_phase(row.get::<_, String>(3)?.as_str())
+                    .map_err(to_sql_err)?,
+                kv_sequence_position: row.get::<_, i64>(4)? as u32,
+                size_bytes: row.get::<_, i64>(5)? as u64,
+                sha256: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+fn load_regroup_events(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<RegroupEventStatus>> {
+    let rows = if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT event_id, session_id, job_id, network_id, model_id, phase, group_id, device_id,
+                   event_kind, reason, previous_status, new_status, segment_id, observed_at
+            FROM inference_regroup_events
+            WHERE network_id = ?1 AND job_id = ?2
+            ORDER BY observed_at DESC, event_id DESC
+            LIMIT 100
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(RegroupEventStatus {
+                event_id: row.get(0)?,
+                session_id: row.get(1)?,
+                job_id: row.get(2)?,
+                network_id: row.get(3)?,
+                model_id: row.get(4)?,
+                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                    .map_err(to_sql_err)?,
+                group_id: row.get(6)?,
+                device_id: row.get(7)?,
+                event_kind: row.get(8)?,
+                reason: row.get(9)?,
+                previous_status: row.get(10)?,
+                new_status: row.get(11)?,
+                segment_id: row.get(12)?,
+                observed_at: row.get(13)?,
+            })
+        })?;
+        collect_rows(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT event_id, session_id, job_id, network_id, model_id, phase, group_id, device_id,
+                   event_kind, reason, previous_status, new_status, segment_id, observed_at
+            FROM inference_regroup_events
+            WHERE network_id = ?1
+            ORDER BY observed_at DESC, event_id DESC
+            LIMIT 100
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(RegroupEventStatus {
+                event_id: row.get(0)?,
+                session_id: row.get(1)?,
+                job_id: row.get(2)?,
+                network_id: row.get(3)?,
+                model_id: row.get(4)?,
+                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                    .map_err(to_sql_err)?,
+                group_id: row.get(6)?,
+                device_id: row.get(7)?,
+                event_kind: row.get(8)?,
+                reason: row.get(9)?,
+                previous_status: row.get(10)?,
+                new_status: row.get(11)?,
+                segment_id: row.get(12)?,
+                observed_at: row.get(13)?,
+            })
+        })?;
+        collect_rows(rows)
+    };
+    rows
+}
+
+fn collect_rows<T>(
+    rows: impl Iterator<Item = std::result::Result<T, rusqlite::Error>>,
+) -> Result<Vec<T>> {
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(DbError::from)
+}
+
+fn parse_execution_phase(value: &str) -> Result<ExecutionPhase> {
+    match value {
+        "prefill" => Ok(ExecutionPhase::Prefill),
+        "decode" => Ok(ExecutionPhase::Decode),
+        other => Err(DbError::Data(format!(
+            "Invalid execution phase in persisted state: {}",
+            other
+        ))),
+    }
+}
+
+fn parse_kv_transfer_policy(value: &str) -> Result<KvTransferPolicy> {
+    let normalized = if value.starts_with('"') {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value)
+    };
+    serde_json::from_str(&normalized).map_err(|e| {
+        DbError::Data(format!(
+            "Invalid KV transfer policy in persisted state ({}): {}",
+            value, e
+        ))
+    })
+}
+
+fn to_sql_err(err: DbError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::other(err.to_string())),
+    )
+}
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -341,6 +998,173 @@ pub(crate) fn create_test_db() -> Database {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    fn seed_scheduler_visibility_fixture(db: &Database) {
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute(
+            "INSERT INTO networks (network_id, name, owner_user_id, settings) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["net-1", "Test Network", "owner-1", "{}"],
+        )
+        .expect("Failed to insert network");
+
+        for (device_id, ring_position, key_seed) in
+            [("worker-a", 0_i64, 7_u8), ("worker-b", 1_i64, 8_u8)]
+        {
+            conn.execute(
+                r#"
+                INSERT INTO devices (
+                    device_id, network_id, name, public_key, peer_id, capabilities,
+                    status, ring_position, shard_model_id, shard_column_start, shard_column_end,
+                    contributed_memory
+                ) VALUES (?1, 'net-1', ?2, ?3, ?4, ?5, 'online', ?6, 'model-1', ?7, ?8, 4096)
+                "#,
+                rusqlite::params![
+                    device_id,
+                    format!("Device {}", device_id),
+                    vec![key_seed; 32],
+                    format!("peer-{}", device_id),
+                    "{}",
+                    ring_position,
+                    ring_position * 64,
+                    (ring_position + 1) * 64
+                ],
+            )
+            .expect("Failed to insert device");
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_jobs (
+                job_id, network_id, submitted_by_device_id, model_id, prompt, prompt_tokens,
+                max_tokens, temperature, top_p, status, ring_worker_count, completion_tokens,
+                available_completion_tokens, execution_plan_json, active_segment_id, updated_at
+            ) VALUES (
+                'job-1', 'net-1', 'worker-a', 'model-1', 'hello', '[1,2,3]',
+                32, 0.7, 0.9, 'running', 2, 3, 32, NULL, 'segment-decode', '2026-04-25T12:00:00Z'
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert job");
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_sessions (
+                session_id, job_id, network_id, model_id, status, active_segment_id,
+                kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
+                kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at
+            ) VALUES (
+                'session-1', 'job-1', 'net-1', 'model-1', 'decode_pending_transfer',
+                'segment-decode', 'worker-a', 'export_on_handoff', 3,
+                'worker-a', '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z'
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert session");
+
+        for (device_id, status, seq) in [
+            ("worker-a", "decode_active", Some(3_i64)),
+            ("worker-b", "decode_pending_transfer", Some(2_i64)),
+        ] {
+            conn.execute(
+                r#"
+                INSERT INTO inference_session_replicas (
+                    session_id, device_id, job_id, status, active_segment_id,
+                    kv_sequence_position, checkpoint_created_at, updated_at, last_error
+                ) VALUES (?1, ?2, 'job-1', ?3, 'segment-decode', ?4, '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z', NULL)
+                "#,
+                rusqlite::params!["session-1", device_id, status, seq],
+            )
+            .expect("Failed to insert session replica");
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_session_checkpoints (
+                checkpoint_id, session_id, job_id, source_device_id, source_segment_id, phase,
+                kv_sequence_position, size_bytes, checkpoint_sha256, checkpoint_bytes, created_at, updated_at
+            ) VALUES (
+                'ckpt-1', 'session-1', 'job-1', 'worker-a', 'segment-prefill', 'prefill',
+                3, 128, 'deadbeef', X'ABCD', '2026-04-25T12:00:05Z', '2026-04-25T12:00:05Z'
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert session checkpoint");
+
+        for (device_id, ring_position, start, end, assign_status, lease_expires_at) in [
+            (
+                "worker-a",
+                0_i64,
+                0_i64,
+                64_i64,
+                "acknowledged",
+                Some("2026-04-25T12:01:00Z"),
+            ),
+            ("worker-b", 1_i64, 64_i64, 128_i64, "waiting", None),
+        ] {
+            conn.execute(
+                r#"
+                INSERT INTO inference_job_assignments (
+                    assignment_id, job_id, network_id, device_id, ring_position, status, lease_expires_at,
+                    assigned_at, shard_column_start, shard_column_end, assigned_capacity_units,
+                    execution_provider, active_segment_id
+                ) VALUES (?1, 'job-1', 'net-1', ?2, ?3, ?4, ?5, '2026-04-25T12:00:00Z', ?6, ?7, 16, 'metal', 'segment-decode')
+                "#,
+                rusqlite::params![
+                    format!("assign-{}", device_id),
+                    device_id,
+                    ring_position,
+                    assign_status,
+                    lease_expires_at,
+                    start,
+                    end
+                ],
+            )
+            .expect("Failed to insert assignment");
+        }
+
+        for (device_id, ring_position, start, end, status) in [
+            ("worker-a", 0_i64, 0_i64, 64_i64, "decode_member"),
+            (
+                "worker-b",
+                1_i64,
+                64_i64,
+                128_i64,
+                "decode_pending_transfer",
+            ),
+        ] {
+            conn.execute(
+                r#"
+                INSERT INTO inference_serving_groups (
+                    group_id, session_id, job_id, network_id, model_id, phase, device_id,
+                    ring_position, shard_column_start, shard_column_end, assigned_capacity_units,
+                    execution_provider, status, last_error, updated_at
+                ) VALUES (
+                    'group-decode', 'session-1', 'job-1', 'net-1', 'model-1', 'decode', ?1,
+                    ?2, ?3, ?4, 16, 'metal', ?5, NULL, '2026-04-25T12:00:06Z'
+                )
+                "#,
+                rusqlite::params![device_id, ring_position, start, end, status],
+            )
+            .expect("Failed to insert serving group member");
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_decode_queue (
+                session_id, job_id, network_id, segment_id, group_id, status, ready_at,
+                lease_owner_device_id, lease_expires_at, last_error, updated_at
+            ) VALUES (
+                'session-1', 'job-1', 'net-1', 'segment-decode', 'group-decode', 'blocked_on_prefill',
+                NULL, NULL, NULL, NULL, '2026-04-25T12:00:06Z'
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert decode queue row");
+    }
 
     #[test]
     fn test_create_in_memory_db() {
@@ -535,5 +1359,83 @@ mod tests {
         let path = Database::default_path().expect("Failed to get default path");
         assert!(path.to_string_lossy().contains(".meshnet"));
         assert!(path.to_string_lossy().ends_with("control-plane.db"));
+    }
+
+    #[test]
+    fn test_network_scheduler_status_exposes_queue_groups_and_kv_residency() {
+        let db = create_test_db();
+        seed_scheduler_visibility_fixture(&db);
+
+        let status = db
+            .load_network_scheduler_status("net-1")
+            .expect("Failed to load network scheduler status");
+
+        assert_eq!(status.jobs.len(), 1);
+        assert_eq!(status.decode_queue.len(), 1);
+        assert_eq!(
+            status.decode_queue[0].blocked_reason.as_deref(),
+            Some("prefill_incomplete")
+        );
+        assert_eq!(status.serving_groups.len(), 1);
+        assert_eq!(status.serving_groups[0].member_count, 2);
+        assert_eq!(
+            status.serving_groups[0]
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.owner_device_id.as_deref()),
+            None
+        );
+        assert_eq!(status.kv_residency.len(), 1);
+        assert_eq!(status.kv_residency[0].replicas.len(), 2);
+        assert_eq!(
+            status.kv_residency[0]
+                .latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.kv_sequence_position),
+            Some(3)
+        );
+        assert!(!status.regroup_events.is_empty());
+    }
+
+    #[test]
+    fn test_job_scheduler_status_tracks_regroup_and_leases() {
+        let db = create_test_db();
+        seed_scheduler_visibility_fixture(&db);
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute(
+            r#"
+            UPDATE inference_decode_queue
+            SET status = 'leased',
+                lease_owner_device_id = 'worker-a',
+                lease_expires_at = '2026-04-25T12:02:00Z',
+                updated_at = '2026-04-25T12:01:30Z'
+            WHERE session_id = 'session-1'
+            "#,
+            [],
+        )
+        .expect("Failed to update decode queue lease");
+        drop(conn);
+
+        let status = db
+            .load_job_scheduler_status("job-1")
+            .expect("Failed to load job scheduler status");
+
+        assert_eq!(status.decode_queue[0].status, "leased");
+        assert_eq!(
+            status.decode_queue[0].lease_owner_device_id.as_deref(),
+            Some("worker-a")
+        );
+        assert_eq!(
+            status.serving_groups[0]
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.owner_device_id.as_deref()),
+            Some("worker-a")
+        );
+        assert!(status
+            .regroup_events
+            .iter()
+            .any(|event| event.event_kind == "queue_lease_changed"));
     }
 }

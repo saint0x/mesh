@@ -81,3 +81,44 @@ impl EngineSessionState {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeTask {
+    pub session_id: Uuid,
+    pub fairness_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeBatchPolicy {
+    pub max_batch_size: usize,
+    pub max_total_kv_tokens: usize,
+}
+
+impl Default for DecodeBatchPolicy {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 1,
+            max_total_kv_tokens: usize::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeBatchSlot {
+    pub session_id: Uuid,
+    pub fairness_epoch: u64,
+    pub kv_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeBatchPlan {
+    pub slots: Vec<DecodeBatchSlot>,
+    pub deferred: Vec<DecodeTask>,
+    pub total_kv_tokens: usize,
+}
+
+impl DecodeBatchPlan {
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}

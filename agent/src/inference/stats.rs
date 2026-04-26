@@ -945,6 +945,9 @@ mod tests {
             current_outbound_inflight_bytes: 17,
             peak_outbound_inflight_bytes: 23,
             current_outbound_connections: 2,
+            latency_critical_send_count: 1,
+            interactive_send_count: 2,
+            bulk_send_count: 3,
         });
 
         assert_eq!(stats.tensor_bytes_sent.load(Ordering::Relaxed), 128);

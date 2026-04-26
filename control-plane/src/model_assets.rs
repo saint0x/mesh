@@ -1,10 +1,57 @@
 use crate::api::error::ApiError;
+use crate::api::types::{ExecutionGroupMember, ExecutionPhase};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use tokenizers::Tokenizer;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingLayoutKind {
+    TensorParallel,
+    FullReplica,
+    Pipeline,
+    TensorPipelineHybrid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProviderConstraints {
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    #[serde(default)]
+    pub requires_homogeneous: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServingLayoutRule {
+    pub layout: ServingLayoutKind,
+    #[serde(default)]
+    pub min_members: Option<u32>,
+    #[serde(default)]
+    pub max_members: Option<u32>,
+    #[serde(default)]
+    pub tensor_parallel_degree: Option<u32>,
+    #[serde(default)]
+    pub pipeline_parallel_degree: Option<u32>,
+    #[serde(default)]
+    pub provider_constraints: ProviderConstraints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ModelExecutionLayout {
+    #[serde(default)]
+    pub prefill: Vec<ServingLayoutRule>,
+    #[serde(default)]
+    pub decode: Vec<ServingLayoutRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedServingLayout {
+    pub layout: ServingLayoutKind,
+    pub member_count: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelManifest {
@@ -15,6 +62,8 @@ pub struct ModelManifest {
     pub tokenizer_file: String,
     #[serde(default = "default_tokenizer_config_file")]
     pub tokenizer_config_file: String,
+    #[serde(default)]
+    pub execution_layout: ModelExecutionLayout,
 }
 
 fn default_tokenizer_file() -> String {
@@ -23,6 +72,38 @@ fn default_tokenizer_file() -> String {
 
 fn default_tokenizer_config_file() -> String {
     "tokenizer_config.json".to_string()
+}
+
+fn default_prefill_layout_rules() -> Vec<ServingLayoutRule> {
+    vec![ServingLayoutRule {
+        layout: ServingLayoutKind::TensorParallel,
+        min_members: None,
+        max_members: None,
+        tensor_parallel_degree: None,
+        pipeline_parallel_degree: None,
+        provider_constraints: ProviderConstraints::default(),
+    }]
+}
+
+fn default_decode_layout_rules() -> Vec<ServingLayoutRule> {
+    vec![
+        ServingLayoutRule {
+            layout: ServingLayoutKind::FullReplica,
+            min_members: None,
+            max_members: None,
+            tensor_parallel_degree: None,
+            pipeline_parallel_degree: None,
+            provider_constraints: ProviderConstraints::default(),
+        },
+        ServingLayoutRule {
+            layout: ServingLayoutKind::TensorParallel,
+            min_members: None,
+            max_members: None,
+            tensor_parallel_degree: None,
+            pipeline_parallel_degree: None,
+            provider_constraints: ProviderConstraints::default(),
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,8 +166,69 @@ fn validate_manifest(
             path.display()
         )));
     }
+    validate_layout_rules(
+        path,
+        manifest.tensor_parallelism_dim,
+        &manifest.execution_layout,
+    )?;
 
     Ok(manifest)
+}
+
+fn validate_layout_rules(
+    path: &Path,
+    tensor_parallelism_dim: u32,
+    layout: &ModelExecutionLayout,
+) -> Result<(), ApiError> {
+    for (phase_name, rules) in [("prefill", &layout.prefill), ("decode", &layout.decode)] {
+        for (index, rule) in rules.iter().enumerate() {
+            if let Some(min_members) = rule.min_members {
+                if min_members == 0 {
+                    return Err(ApiError::BadRequest(format!(
+                        "Model manifest {} declares {} layout rule {} with min_members=0",
+                        path.display(),
+                        phase_name,
+                        index
+                    )));
+                }
+            }
+            if let (Some(min_members), Some(max_members)) = (rule.min_members, rule.max_members) {
+                if max_members < min_members {
+                    return Err(ApiError::BadRequest(format!(
+                        "Model manifest {} declares {} layout rule {} with max_members < min_members",
+                        path.display(),
+                        phase_name,
+                        index
+                    )));
+                }
+            }
+            if let Some(degree) = rule.tensor_parallel_degree {
+                if degree == 0 || degree > tensor_parallelism_dim {
+                    return Err(ApiError::BadRequest(format!(
+                        "Model manifest {} declares {} layout rule {} with invalid tensor_parallel_degree {}",
+                        path.display(),
+                        phase_name,
+                        index,
+                        degree
+                    )));
+                }
+            }
+            if matches!(
+                rule.layout,
+                ServingLayoutKind::Pipeline | ServingLayoutKind::TensorPipelineHybrid
+            ) && rule.pipeline_parallel_degree == Some(0)
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "Model manifest {} declares {} layout rule {} with pipeline_parallel_degree=0",
+                    path.display(),
+                    phase_name,
+                    index
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn load_model_manifest_uncached(model_id: &str) -> Result<ModelManifest, ApiError> {
@@ -169,6 +311,253 @@ pub fn load_model_manifest(model_id: &str) -> Result<ModelManifest, ApiError> {
     Ok(get_model_assets(model_id)?.manifest)
 }
 
+impl ModelManifest {
+    pub fn layout_rules_for_phase(&self, phase: ExecutionPhase) -> Vec<ServingLayoutRule> {
+        let configured = match phase {
+            ExecutionPhase::Prefill => &self.execution_layout.prefill,
+            ExecutionPhase::Decode => &self.execution_layout.decode,
+        };
+        if configured.is_empty() {
+            match phase {
+                ExecutionPhase::Prefill => default_prefill_layout_rules(),
+                ExecutionPhase::Decode => default_decode_layout_rules(),
+            }
+        } else {
+            configured.clone()
+        }
+    }
+}
+
+pub fn validate_execution_group_members(
+    manifest: &ModelManifest,
+    phase: ExecutionPhase,
+    members: &[ExecutionGroupMember],
+) -> Result<ResolvedServingLayout, String> {
+    if members.is_empty() {
+        return Err("execution group has no members".to_string());
+    }
+
+    let rules = manifest.layout_rules_for_phase(phase);
+    let mut errors = Vec::with_capacity(rules.len());
+    for rule in rules {
+        match validate_against_rule(manifest, members, &rule) {
+            Ok(()) => {
+                return Ok(ResolvedServingLayout {
+                    layout: rule.layout,
+                    member_count: members.len(),
+                });
+            }
+            Err(err) => errors.push(format!("{:?}: {}", rule.layout, err)),
+        }
+    }
+
+    Err(if errors.is_empty() {
+        "no execution layout rules are available".to_string()
+    } else {
+        format!("no legal {:?} layout matched: {}", phase, errors.join("; "))
+    })
+}
+
+pub fn validate_execution_group(
+    model_id: &str,
+    phase: ExecutionPhase,
+    members: &[ExecutionGroupMember],
+) -> Result<ResolvedServingLayout, ApiError> {
+    let manifest = load_model_manifest(model_id)?;
+    validate_execution_group_members(&manifest, phase, members).map_err(ApiError::Conflict)
+}
+
+fn validate_against_rule(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    rule: &ServingLayoutRule,
+) -> Result<(), String> {
+    validate_member_count(members, rule)?;
+    validate_member_shards(manifest, members)?;
+    validate_provider_constraints(members, &rule.provider_constraints)?;
+
+    match rule.layout {
+        ServingLayoutKind::TensorParallel => {
+            validate_tensor_parallel_layout(manifest, members, rule.tensor_parallel_degree)
+        }
+        ServingLayoutKind::FullReplica => validate_full_replica_layout(manifest, members),
+        ServingLayoutKind::Pipeline => Err(
+            "pipeline layouts are declared but not yet supported by planner legality checks"
+                .to_string(),
+        ),
+        ServingLayoutKind::TensorPipelineHybrid => Err(
+            "tensor/pipeline hybrid layouts are declared but not yet supported by planner legality checks"
+                .to_string(),
+        ),
+    }
+}
+
+fn validate_member_count(
+    members: &[ExecutionGroupMember],
+    rule: &ServingLayoutRule,
+) -> Result<(), String> {
+    let member_count = members.len() as u32;
+    if let Some(min_members) = rule.min_members {
+        if member_count < min_members {
+            return Err(format!(
+                "requires at least {} members, found {}",
+                min_members, member_count
+            ));
+        }
+    }
+    if let Some(max_members) = rule.max_members {
+        if member_count > max_members {
+            return Err(format!(
+                "allows at most {} members, found {}",
+                max_members, member_count
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_member_shards(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+) -> Result<(), String> {
+    for member in members {
+        if member.shard.column_start >= member.shard.column_end {
+            return Err(format!(
+                "member {} has an empty shard span {}..{}",
+                member.device_id, member.shard.column_start, member.shard.column_end
+            ));
+        }
+        if member.shard.column_end > manifest.tensor_parallelism_dim {
+            return Err(format!(
+                "member {} shard span {}..{} exceeds tensor parallel dimension {}",
+                member.device_id,
+                member.shard.column_start,
+                member.shard.column_end,
+                manifest.tensor_parallelism_dim
+            ));
+        }
+        if member.shard.column_start >= manifest.tensor_parallelism_dim {
+            return Err(format!(
+                "member {} shard span {}..{} starts outside tensor parallel dimension {}",
+                member.device_id,
+                member.shard.column_start,
+                member.shard.column_end,
+                manifest.tensor_parallelism_dim
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_constraints(
+    members: &[ExecutionGroupMember],
+    constraints: &ProviderConstraints,
+) -> Result<(), String> {
+    if !constraints.allowed_providers.is_empty() {
+        for member in members {
+            if !constraints
+                .allowed_providers
+                .iter()
+                .any(|allowed| allowed == &member.execution_provider)
+            {
+                return Err(format!(
+                    "member {} uses provider {}, allowed providers are {}",
+                    member.device_id,
+                    member.execution_provider,
+                    constraints.allowed_providers.join(", ")
+                ));
+            }
+        }
+    }
+    if constraints.requires_homogeneous {
+        let first = members
+            .first()
+            .map(|member| member.execution_provider.as_str())
+            .unwrap_or_default();
+        if members
+            .iter()
+            .any(|member| member.execution_provider.as_str() != first)
+        {
+            return Err("providers must be homogeneous across the group".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_tensor_parallel_layout(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+    exact_degree: Option<u32>,
+) -> Result<(), String> {
+    if let Some(exact_degree) = exact_degree {
+        if members.len() as u32 != exact_degree {
+            return Err(format!(
+                "requires tensor_parallel_degree={}, found {} members",
+                exact_degree,
+                members.len()
+            ));
+        }
+    }
+
+    let mut intervals = members
+        .iter()
+        .map(|member| {
+            (
+                member.device_id.as_str(),
+                member.shard.column_start,
+                member.shard.column_end,
+            )
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_unstable_by_key(|(_, start, end)| (*start, *end));
+
+    let mut cursor = 0;
+    for (device_id, start, end) in intervals {
+        if start != cursor {
+            if start < cursor {
+                return Err(format!(
+                    "member {} overlaps the existing tensor-parallel span at {}..{}",
+                    device_id, start, end
+                ));
+            }
+            return Err(format!(
+                "tensor-parallel layout leaves a gap before {}..{}",
+                start, end
+            ));
+        }
+        cursor = end;
+    }
+
+    if cursor != manifest.tensor_parallelism_dim {
+        return Err(format!(
+            "tensor-parallel layout ends at {}, expected {}",
+            cursor, manifest.tensor_parallelism_dim
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_full_replica_layout(
+    manifest: &ModelManifest,
+    members: &[ExecutionGroupMember],
+) -> Result<(), String> {
+    for member in members {
+        if member.shard.column_start != 0
+            || member.shard.column_end != manifest.tensor_parallelism_dim
+        {
+            return Err(format!(
+                "member {} is not a full replica because it serves {}..{} instead of 0..{}",
+                member.device_id,
+                member.shard.column_start,
+                member.shard.column_end,
+                manifest.tensor_parallelism_dim
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn clear_model_asset_cache() {
     if let Ok(mut cache) = model_asset_cache().write() {
@@ -238,6 +627,17 @@ pub mod testsupport {
     }
 
     pub fn ensure_test_model(model_id: &str, tensor_parallelism_dim: u32) -> PathBuf {
+        ensure_test_model_with_manifest(ModelManifest {
+            model_id: model_id.to_string(),
+            tensor_parallelism_dim,
+            total_model_bytes: 1024 * 1024,
+            tokenizer_file: "tokenizer.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
+            execution_layout: ModelExecutionLayout::default(),
+        })
+    }
+
+    pub fn ensure_test_model_with_manifest(manifest: ModelManifest) -> PathBuf {
         let _guard = TEST_MODEL_WRITE_LOCK.lock().unwrap();
         let root = TEST_MODEL_STORE
             .get_or_init(|| {
@@ -248,16 +648,8 @@ pub mod testsupport {
             })
             .clone();
 
-        let model_dir = root.join(model_id);
+        let model_dir = root.join(&manifest.model_id);
         fs::create_dir_all(&model_dir).unwrap();
-
-        let manifest = ModelManifest {
-            model_id: model_id.to_string(),
-            tensor_parallelism_dim,
-            total_model_bytes: 1024 * 1024,
-            tokenizer_file: "tokenizer.json".to_string(),
-            tokenizer_config_file: "tokenizer_config.json".to_string(),
-        };
         atomic_write(
             &model_dir.join("model.json"),
             &serde_json::to_vec_pretty(&manifest).unwrap(),

@@ -1411,6 +1411,24 @@ fn claim_assignment(
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         let execution_plan = load_execution_plan_json(&assignment.execution_plan_json)?;
         let active = active_segment(&execution_plan, &assignment.active_segment_id)?;
+        tx.execute(
+            r#"
+            UPDATE inference_serving_groups
+            SET status = ?, updated_at = ?, last_error = NULL
+            WHERE job_id = ? AND group_id = ? AND device_id = ?
+            "#,
+            params![
+                match active.phase {
+                    crate::api::types::ExecutionPhase::Prefill => "prefill_leased",
+                    crate::api::types::ExecutionPhase::Decode => "decode_leased",
+                },
+                &now_str,
+                &assignment.job_id,
+                &active.execution_group_id,
+                &assignment.device_id
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         if matches!(active.phase, crate::api::types::ExecutionPhase::Decode) {
             upsert_decode_queue(
                 &tx,

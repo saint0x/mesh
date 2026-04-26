@@ -40,8 +40,11 @@ use agent::pki::{
 };
 use agent::{
     api::types::{
-        ExecutionGroupMember, InferenceExecutionLease, PeerPunchPlan, ProgressEventKind,
-        ReportInferenceAssignmentProgressRequest, RingTopologyResponse, WorkerInfo,
+        ClaimInferenceAssignmentRequest, DecodeLeaseStatus, ExecutionGroupMember,
+        ExecutionPhase as ApiExecutionPhase, InferenceExecutionLease, InferenceJobStatusResponse,
+        InferenceSchedulerQueueState, PeerPunchPlan, ProgressEventKind, ReleaseDecodeLeaseRequest,
+        RenewDecodeLeaseRequest, ReportInferenceAssignmentProgressRequest, RingTopologyResponse,
+        ServingSessionMetadata, WorkClaimMode, WorkerInfo,
     },
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
@@ -748,6 +751,73 @@ fn topology_from_execution_lease(lease: &InferenceExecutionLease) -> RingTopolog
     }
 }
 
+fn api_phase(phase: agent::inference::ExecutionPhase) -> ApiExecutionPhase {
+    match phase {
+        agent::inference::ExecutionPhase::Prefill => ApiExecutionPhase::Prefill,
+        agent::inference::ExecutionPhase::Decode => ApiExecutionPhase::Decode,
+    }
+}
+
+fn log_scheduler_queue_state(
+    queue_state: Option<&InferenceSchedulerQueueState>,
+    serving_session: Option<&ServingSessionMetadata>,
+    decode_lease: Option<&DecodeLeaseStatus>,
+) {
+    if queue_state.is_none() && serving_session.is_none() && decode_lease.is_none() {
+        return;
+    }
+
+    info!(
+        queue_status = queue_state.and_then(|state| state.status.as_deref()),
+        queue_depth = queue_state.and_then(|state| state.queue_depth),
+        ready_sessions = queue_state.and_then(|state| state.ready_sessions),
+        blocked_sessions = queue_state.and_then(|state| state.blocked_sessions),
+        local_ready_sessions = queue_state.and_then(|state| state.local_ready_sessions),
+        local_active_sessions = queue_state.and_then(|state| state.local_active_sessions),
+        serving_session_id = serving_session.map(|session| session.session_id.as_str()),
+        serving_status = serving_session.map(|session| session.status.as_str()),
+        serving_queue_status = serving_session.and_then(|session| session.queue_status.as_deref()),
+        serving_kv_seq = serving_session.and_then(|session| session.kv_sequence_position),
+        decode_lease_id = decode_lease.map(|lease| lease.lease_id.as_str()),
+        decode_lease_status = decode_lease.and_then(|lease| lease.status.as_deref()),
+        decode_lease_expires_at = decode_lease.and_then(|lease| lease.lease_expires_at.as_deref()),
+        "Observed scheduler queue and serving session state"
+    );
+}
+
+async fn release_decode_lease_if_needed(
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    reason: &str,
+    error: Option<String>,
+) {
+    if !matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+        return;
+    }
+
+    if let Err(release_error) = registration_client
+        .release_decode_lease(
+            &assignment.lease_id,
+            ReleaseDecodeLeaseRequest {
+                device_id: assignment.device_id.clone(),
+                network_id: assignment.network_id.clone(),
+                session_id: assignment.active_segment.session_id.clone(),
+                segment_id: assignment.active_segment.segment_id.clone(),
+                reason: reason.to_string(),
+                error,
+            },
+        )
+        .await
+    {
+        warn!(
+            lease_id = %assignment.lease_id,
+            job_id = %assignment.job_id,
+            error = %release_error,
+            "Failed to release decode lease"
+        );
+    }
+}
+
 fn find_peer_punch_plan(
     topology: &RingTopologyResponse,
     source_device_id: &Uuid,
@@ -839,39 +909,6 @@ fn apply_runtime_rlimits(memory_limit_bytes: u64) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn apply_runtime_rlimits(_memory_limit_bytes: u64) -> Result<()> {
     Ok(())
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct InferenceJobStatusResponse {
-    success: bool,
-    job_id: String,
-    network_id: String,
-    model_id: String,
-    status: String,
-    completion: Option<String>,
-    completion_tokens: u32,
-    execution_time_ms: u64,
-    time_to_first_token_ms: Option<u64>,
-    reserved_credits: f64,
-    settled_credits: f64,
-    released_credits: f64,
-    available_completion_tokens: u32,
-    model_size_factor: f64,
-    error: Option<String>,
-    assignments: Vec<InferenceJobAssignmentStatus>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct InferenceJobAssignmentStatus {
-    device_id: String,
-    ring_position: u32,
-    status: String,
-    failure_reason: Option<String>,
-    shard_column_start: u32,
-    shard_column_end: u32,
-    assigned_capacity_units: u32,
-    execution_provider: String,
-    execution_time_ms: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1494,18 +1531,104 @@ async fn cmd_runtime() -> Result<()> {
         }
 
         // Claim and execute inference assignments
+        let mut explicit_decode_claim_supported = true;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            let assignment = match registration_client
-                .claim_inference_assignment(device_id, &network_id)
-                .await
-            {
-                Ok(Some(assignment)) => assignment,
-                Ok(None) => continue,
-                Err(e) => {
-                    debug!(error = %e, "Inference assignment claim failed");
-                    continue;
+            let mut claim_response = None;
+
+            if explicit_decode_claim_supported {
+                match registration_client
+                    .claim_decode_work(device_id, &network_id)
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        if let Some(assignment) = response.assignment.as_ref() {
+                            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
+                            {
+                                claim_response = Some(response);
+                            } else {
+                                warn!(
+                                    job_id = %assignment.job_id,
+                                    lease_id = %assignment.lease_id,
+                                    phase = ?assignment.active_segment.phase,
+                                    "Explicit decode claim returned non-decode work; disabling decode-only claim path until control plane is upgraded"
+                                );
+                                explicit_decode_claim_supported = false;
+                            }
+                        } else {
+                            if let Some(queue_state) = response.queue_state.as_ref() {
+                                debug!(
+                                    queue_status = queue_state.status.as_deref(),
+                                    ready_sessions = queue_state.ready_sessions,
+                                    blocked_sessions = queue_state.blocked_sessions,
+                                    local_ready_sessions = queue_state.local_ready_sessions,
+                                    "No decode work claimed; scheduler queue state observed"
+                                );
+                            }
+                            claim_response = Some(response);
+                        }
+                    }
+                    Ok(None) => {
+                        match registration_client
+                            .observe_decode_queue_state(device_id, &network_id)
+                            .await
+                        {
+                            Ok(Some(observed)) => {
+                                if let Some(queue_state) = observed.queue_state.as_ref() {
+                                    debug!(
+                                        queue_status = queue_state.status.as_deref(),
+                                        ready_sessions = queue_state.ready_sessions,
+                                        blocked_sessions = queue_state.blocked_sessions,
+                                        local_ready_sessions = queue_state.local_ready_sessions,
+                                        "Observed decode queue state without claiming work"
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug!(error = %e, "Decode queue observation failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Explicit decode claim failed");
+                    }
                 }
+            }
+
+            let claim_response = match claim_response {
+                Some(response) if response.assignment.is_some() => response,
+                _ => match registration_client
+                    .claim_inference_work(ClaimInferenceAssignmentRequest {
+                        device_id: device_id.to_string(),
+                        network_id: network_id.clone(),
+                        claim_mode: WorkClaimMode::Any,
+                        include_queue_state: true,
+                        include_serving_session: true,
+                    })
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(e) => {
+                        debug!(error = %e, "Inference assignment claim failed");
+                        continue;
+                    }
+                },
+            };
+
+            let queue_state = claim_response.queue_state.clone();
+            let serving_session = claim_response.serving_session.clone();
+            let decode_lease = claim_response.decode_lease.clone();
+
+            log_scheduler_queue_state(
+                queue_state.as_ref(),
+                serving_session.as_ref(),
+                decode_lease.as_ref(),
+            );
+
+            let assignment = match claim_response.assignment {
+                Some(assignment) => assignment,
+                None => continue,
             };
 
             let job_id = match Uuid::parse_str(&assignment.job_id) {
@@ -1533,6 +1656,8 @@ async fn cmd_runtime() -> Result<()> {
                 session_status = %assignment.session.status,
                 session_kv_owner = %assignment.session.kv_owner_device_id,
                 session_kv_seq = ?assignment.session.kv_sequence_position,
+                queue_status = queue_state.as_ref().and_then(|state| state.status.as_deref()),
+                decode_lease_status = decode_lease.as_ref().and_then(|lease| lease.status.as_deref()),
                 prompt_len = assignment.active_segment.prompt_tokens.len(),
                 requested_max_tokens = assignment.active_segment.max_tokens,
                 allowed_completion_tokens = assignment.available_completion_tokens,
@@ -1556,6 +1681,13 @@ async fn cmd_runtime() -> Result<()> {
 
             if ring_position.is_none() {
                 warn!(job_id = %job_id, "Cannot process assignment while not in ring");
+                release_decode_lease_if_needed(
+                    &registration_client,
+                    &assignment,
+                    "worker_not_in_ring",
+                    Some("worker not in ring topology".to_string()),
+                )
+                .await;
                 let _ = registration_client
                     .report_inference_result(
                         job_id,
@@ -1580,6 +1712,13 @@ async fn cmd_runtime() -> Result<()> {
                 .await
             {
                 error!(job_id = %job_id, error = %e, "Failed to acknowledge assignment");
+                release_decode_lease_if_needed(
+                    &registration_client,
+                    &assignment,
+                    "acknowledge_failed",
+                    Some(e.to_string()),
+                )
+                .await;
                 continue;
             }
 
@@ -1599,12 +1738,8 @@ async fn cmd_runtime() -> Result<()> {
                 session_id: Uuid::parse_str(&assignment.active_segment.session_id)
                     .unwrap_or(job_id),
                 phase: match assignment.active_segment.phase {
-                    agent::api::types::ExecutionPhase::Prefill => {
-                        agent::inference::ExecutionPhase::Prefill
-                    }
-                    agent::api::types::ExecutionPhase::Decode => {
-                        agent::inference::ExecutionPhase::Decode
-                    }
+                    ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
+                    ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
                 },
                 executor_id: device_id.to_string(),
                 created_at: std::time::SystemTime::now()
@@ -1616,10 +1751,7 @@ async fn cmd_runtime() -> Result<()> {
             let local_replica = assignment.session.local_replica.clone();
             let session_checkpoint = assignment.session.checkpoint.clone();
 
-            if matches!(
-                assignment.active_segment.phase,
-                agent::api::types::ExecutionPhase::Decode
-            ) {
+            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
                 let decode_ready = local_replica
                     .as_ref()
                     .map(|replica| {
@@ -1635,6 +1767,13 @@ async fn cmd_runtime() -> Result<()> {
                         replica_kv_seq = ?local_replica.as_ref().and_then(|r| r.kv_sequence_position),
                         "Decode lease rejected because local replica is not resume-ready"
                     );
+                    release_decode_lease_if_needed(
+                        &registration_client,
+                        &assignment,
+                        "local_replica_not_ready",
+                        Some("decode lease missing local resume-ready KV replica".to_string()),
+                    )
+                    .await;
                     let _ = registration_client
                         .report_inference_result(
                             job_id,
@@ -1658,10 +1797,8 @@ async fn cmd_runtime() -> Result<()> {
                 }
             }
 
-            if matches!(
-                assignment.active_segment.phase,
-                agent::api::types::ExecutionPhase::Decode
-            ) && !coordinator.has_session(request.session_id)
+            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
+                && !coordinator.has_session(request.session_id)
             {
                 if let Some(checkpoint) = session_checkpoint.as_ref() {
                     if checkpoint.source_device_id != device_id.to_string() {
@@ -1715,27 +1852,77 @@ async fn cmd_runtime() -> Result<()> {
                 }
             }
 
-            match coordinator
+            let lease_renew_handle = if matches!(
+                assignment.active_segment.phase,
+                ApiExecutionPhase::Decode
+            ) {
+                let registration_client = registration_client.clone();
+                let lease_id = assignment.lease_id.clone();
+                let device_id = device_id.to_string();
+                let network_id = assignment.network_id.clone();
+                let session_id = assignment.active_segment.session_id.clone();
+                let segment_id = active_segment_id.clone();
+                let queue_snapshot = queue_state.clone();
+                Some(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(20));
+                    loop {
+                        tick.tick().await;
+                        match registration_client
+                            .renew_decode_lease(
+                                &lease_id,
+                                RenewDecodeLeaseRequest {
+                                    device_id: device_id.clone(),
+                                    network_id: network_id.clone(),
+                                    session_id: session_id.clone(),
+                                    segment_id: segment_id.clone(),
+                                    scheduler_queue: queue_snapshot.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(Some(response)) => {
+                                debug!(
+                                    lease_id = %lease_id,
+                                    lease_expires_at = response
+                                        .decode_lease
+                                        .as_ref()
+                                        .and_then(|lease| lease.lease_expires_at.as_deref()),
+                                    queue_status = response
+                                        .queue_state
+                                        .as_ref()
+                                        .and_then(|state| state.status.as_deref()),
+                                    "Renewed decode lease"
+                                );
+                            }
+                            Ok(None) => {
+                                debug!(lease_id = %lease_id, "Decode lease renew endpoint unavailable");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(lease_id = %lease_id, error = %e, "Decode lease renew failed");
+                            }
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
+
+            let execution_result = coordinator
                 .process_segment_with_progress(request, |progress| {
                     let registration_client = registration_client.clone();
                     let device_id = device_id;
                     let segment_id = active_segment_id.clone();
-                    let segment_id_for_request = segment_id.clone();
+                    let scheduler_queue = queue_state.clone();
+                    let serving_session = serving_session.clone();
                     async move {
                         registration_client
                             .report_inference_progress(
                                 job_id,
                                 ReportInferenceAssignmentProgressRequest {
                                     device_id: device_id.to_string(),
-                                    segment_id: segment_id_for_request,
-                                    phase: match progress.phase {
-                                        agent::inference::ExecutionPhase::Prefill => {
-                                            agent::api::types::ExecutionPhase::Prefill
-                                        }
-                                        agent::inference::ExecutionPhase::Decode => {
-                                            agent::api::types::ExecutionPhase::Decode
-                                        }
-                                    },
+                                    segment_id: segment_id.clone(),
+                                    phase: api_phase(progress.phase),
                                     event: if progress.phase
                                         == agent::inference::ExecutionPhase::Prefill
                                     {
@@ -1747,13 +1934,22 @@ async fn cmd_runtime() -> Result<()> {
                                     execution_time_ms: progress.execution_time_ms,
                                     time_to_first_token_ms: progress.time_to_first_token_ms,
                                     kv_cache_seq_len: progress.kv_cache_seq_len,
+                                    batch_size: Some(1),
+                                    active_decode_sessions: Some(1),
+                                    scheduler_queue: scheduler_queue.clone(),
+                                    serving_session: serving_session.clone(),
                                 },
                             )
                             .await
                     }
                 })
-                .await
-            {
+                .await;
+
+            if let Some(handle) = lease_renew_handle {
+                handle.abort();
+            }
+
+            match execution_result {
                 Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
                     kv_cache_seq_len,
                     ..
@@ -1777,7 +1973,7 @@ async fn cmd_runtime() -> Result<()> {
                                             device_id: device_id.to_string(),
                                             session_id: assignment.active_segment.session_id.clone(),
                                             segment_id: active_segment_id.clone(),
-                                            phase: agent::api::types::ExecutionPhase::Prefill,
+                                            phase: ApiExecutionPhase::Prefill,
                                             kv_sequence_position: kv_cache_seq_len,
                                             checkpoint_hex: hex::encode(bytes),
                                         },
@@ -1846,6 +2042,13 @@ async fn cmd_runtime() -> Result<()> {
                 }
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "Inference job failed");
+                    release_decode_lease_if_needed(
+                        &registration_client,
+                        &assignment,
+                        "segment_execution_failed",
+                        Some(e.to_string()),
+                    )
+                    .await;
                     let _ = registration_client
                         .report_inference_result(
                             job_id,
@@ -2627,7 +2830,10 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
             assignment.ring_position,
             assignment.device_id,
             assignment.status,
-            assignment.execution_provider,
+            assignment
+                .execution_provider
+                .as_deref()
+                .unwrap_or("unknown"),
             assignment.shard_column_start,
             assignment.shard_column_end,
             assignment.assigned_capacity_units,
@@ -2635,6 +2841,39 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
         );
         if let Some(reason) = &assignment.failure_reason {
             println!("    failure: {}", reason);
+        }
+    }
+
+    if let Some(session) = &status.session {
+        println!("\n{}", "Session:".bold());
+        println!(
+            "  id={} status={} kv_owner={} kv_policy={:?} kv_seq={:?}",
+            session.session_id,
+            session.status,
+            session.kv_owner_device_id,
+            session.kv_transfer_policy,
+            session.kv_sequence_position
+        );
+        if let Some(segment_id) = &session.active_segment_id {
+            println!("  active_segment={}", segment_id);
+        }
+        if let Some(checkpoint) = &session.checkpoint {
+            println!(
+                "  checkpoint={} source={} phase={:?} kv_seq={}",
+                checkpoint.checkpoint_id,
+                checkpoint.source_device_id,
+                checkpoint.phase,
+                checkpoint.kv_sequence_position
+            );
+        }
+        for replica in &session.replicas {
+            println!(
+                "  replica device={} status={} kv_seq={:?} updated_at={}",
+                replica.device_id, replica.status, replica.kv_sequence_position, replica.updated_at
+            );
+            if let Some(error) = &replica.last_error {
+                println!("    replica_error: {}", error);
+            }
         }
     }
 
