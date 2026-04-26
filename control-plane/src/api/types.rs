@@ -1172,6 +1172,34 @@ pub struct SchedulerBatchMetrics {
     pub deferred_decode_sessions: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerEventStatus {
+    pub event_id: i64,
+    pub network_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_group_key: Option<String>,
+    pub event_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_session_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_target_batch_size: Option<u32>,
+    pub created_at: String,
+}
+
 /// Network-wide scheduler/operator status view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSchedulerStatusResponse {
@@ -1183,6 +1211,7 @@ pub struct NetworkSchedulerStatusResponse {
     pub serving_groups: Vec<ServingGroupStatus>,
     pub kv_residency: Vec<KvResidencySummary>,
     pub regroup_events: Vec<RegroupEventStatus>,
+    pub scheduler_events: Vec<SchedulerEventStatus>,
 }
 
 /// Detailed scheduler/operator status for a single job.
@@ -1202,4 +1231,5 @@ pub struct JobSchedulerStatusResponse {
     pub serving_groups: Vec<ServingGroupStatus>,
     pub kv_residency: Vec<KvResidencySummary>,
     pub regroup_events: Vec<RegroupEventStatus>,
+    pub scheduler_events: Vec<SchedulerEventStatus>,
 }

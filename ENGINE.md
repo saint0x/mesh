@@ -108,7 +108,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add metrics for scheduler backlog, runnable sessions, blocked sessions, and batch size
 - Planned: Add metrics for KV residency, transfer volume, and checkpoint fallback rate
 - Planned: Add metrics for regroup frequency and recovery latency
-- In progress: Add structured event log for scheduler decisions
+- ✅ Add structured event log for scheduler decisions
 - ✅ Add operator views in UI/API for session placement and queue state
 - Planned: Add production-readiness runbooks for scheduler stalls, KV pressure, and failover
 

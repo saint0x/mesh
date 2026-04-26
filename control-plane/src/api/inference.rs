@@ -200,6 +200,22 @@ struct DecodeLeaseCohortStatus {
     pooled_active_sessions: Option<u32>,
 }
 
+struct SchedulerEventRecord<'a> {
+    network_id: &'a str,
+    job_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+    device_id: Option<&'a str>,
+    segment_id: Option<&'a str>,
+    group_id: Option<&'a str>,
+    batch_group_key: Option<&'a str>,
+    event_kind: &'a str,
+    queue_status: Option<&'a str>,
+    detail: Option<&'a str>,
+    lease_target_session_count: Option<u32>,
+    lease_target_batch_size: Option<u32>,
+    created_at: &'a str,
+}
+
 #[derive(Clone)]
 struct PersistedDecodeBatchEvent {
     event_id: i64,
@@ -1226,7 +1242,7 @@ fn renew_decode_lease_state(
         .optional()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    let Some((_, group_id, batch_group_key)) = matched else {
+    let Some((job_id, group_id, batch_group_key)) = matched else {
         return Err(ApiError::NotFound(format!(
             "Decode lease {} not found for session {}",
             lease_id, req.session_id
@@ -1277,6 +1293,24 @@ fn renew_decode_lease_state(
         batch_group_key.as_deref().unwrap_or(""),
         &group_id,
     )?;
+    record_scheduler_event(
+        &tx,
+        SchedulerEventRecord {
+            network_id: &req.network_id,
+            job_id: Some(job_id.as_str()),
+            session_id: Some(&req.session_id),
+            device_id: Some(&req.device_id),
+            segment_id: Some(&req.segment_id),
+            group_id: Some(&group_id),
+            batch_group_key: batch_group_key.as_deref(),
+            event_kind: "decode_lease_renewed",
+            queue_status: Some("leased"),
+            detail: Some("decode lease renewed"),
+            lease_target_session_count: None,
+            lease_target_batch_size: None,
+            created_at: &now,
+        },
+    )?;
 
     tx.commit()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -1303,7 +1337,7 @@ fn release_decode_lease_state(
     let queue_status = tx
         .query_row(
             r#"
-            SELECT dq.status, dq.group_id, dq.batch_group_key
+            SELECT dq.status, dq.group_id, dq.batch_group_key, dq.job_id
             FROM inference_job_assignments a
             INNER JOIN inference_decode_queue dq
               ON dq.job_id = a.job_id
@@ -1326,13 +1360,14 @@ fn release_decode_lease_state(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    let Some((previous_status, group_id, batch_group_key)) = queue_status else {
+    let Some((previous_status, group_id, batch_group_key, job_id)) = queue_status else {
         return Err(ApiError::NotFound(format!(
             "Decode lease {} not found for session {}",
             lease_id, req.session_id
@@ -1415,6 +1450,24 @@ fn release_decode_lease_state(
         &req.network_id,
         batch_group_key.as_deref().unwrap_or(""),
         &group_id,
+    )?;
+    record_scheduler_event(
+        &tx,
+        SchedulerEventRecord {
+            network_id: &req.network_id,
+            job_id: Some(job_id.as_str()),
+            session_id: Some(&req.session_id),
+            device_id: Some(&req.device_id),
+            segment_id: Some(&req.segment_id),
+            group_id: Some(&group_id),
+            batch_group_key: batch_group_key.as_deref(),
+            event_kind: "decode_lease_released",
+            queue_status: Some("ready"),
+            detail: Some(&req.reason),
+            lease_target_session_count: None,
+            lease_target_batch_size: None,
+            created_at: &now,
+        },
     )?;
 
     tx.commit()
@@ -1873,6 +1926,38 @@ fn load_decode_lease_cohort_status(
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(cohort)
+}
+
+fn record_scheduler_event(
+    conn: &rusqlite::Connection,
+    event: SchedulerEventRecord<'_>,
+) -> ApiResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO inference_scheduler_events (
+            network_id, job_id, session_id, device_id, segment_id, group_id, batch_group_key,
+            event_kind, queue_status, detail, lease_target_session_count,
+            lease_target_batch_size, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            event.network_id,
+            event.job_id,
+            event.session_id,
+            event.device_id,
+            event.segment_id,
+            event.group_id,
+            event.batch_group_key,
+            event.event_kind,
+            event.queue_status,
+            event.detail,
+            event.lease_target_session_count.map(i64::from),
+            event.lease_target_batch_size.map(i64::from),
+            event.created_at,
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
 }
 
 fn decode_batch_group_key(
@@ -2611,6 +2696,24 @@ fn claim_assignment(
             assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
             assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
             assignment.pooled_active_sessions = cohort.pooled_active_sessions;
+            record_scheduler_event(
+                &tx,
+                SchedulerEventRecord {
+                    network_id: &assignment.network_id,
+                    job_id: Some(&assignment.job_id),
+                    session_id: Some(&assignment.session_id),
+                    device_id: Some(&assignment.device_id),
+                    segment_id: Some(&active.segment_id),
+                    group_id: Some(&active.execution_group_id),
+                    batch_group_key: Some(&batch_group_key),
+                    event_kind: "decode_claimed",
+                    queue_status: Some("leased"),
+                    detail: Some("decode assignment claimed"),
+                    lease_target_session_count: Some(lease_target_session_count),
+                    lease_target_batch_size: Some(lease_target_batch_size),
+                    created_at: &now_str,
+                },
+            )?;
         }
     }
 
@@ -3439,6 +3542,28 @@ fn report_assignment_progress(
                         &next_group.group_id,
                     )?;
                 }
+                record_scheduler_event(
+                    &tx,
+                    SchedulerEventRecord {
+                        network_id: &job_context.network_id,
+                        job_id: Some(job_id),
+                        session_id: Some(&next_segment.session_id),
+                        device_id: Some(&req.device_id),
+                        segment_id: Some(&next_segment_id),
+                        group_id: Some(&next_group.group_id),
+                        batch_group_key: Some(&batch_group_key),
+                        event_kind: if decode_queue_status == "ready" {
+                            "decode_queue_ready"
+                        } else {
+                            "decode_queue_blocked_transfer"
+                        },
+                        queue_status: Some(decode_queue_status),
+                        detail: Some("prefill completed and decode queue advanced"),
+                        lease_target_session_count: None,
+                        lease_target_batch_size: None,
+                        created_at: &now,
+                    },
+                )?;
                 for device_id in &next_participants {
                     let group_member = next_group
                         .members
@@ -4171,6 +4296,24 @@ fn store_session_checkpoint(
             &network_id,
             batch_group_key.as_deref().unwrap_or(""),
             &group_id,
+        )?;
+        record_scheduler_event(
+            &tx,
+            SchedulerEventRecord {
+                network_id: &network_id,
+                job_id: Some(job_id),
+                session_id: Some(&req.session_id),
+                device_id: Some(&req.device_id),
+                segment_id: Some(&req.segment_id),
+                group_id: Some(&group_id),
+                batch_group_key: batch_group_key.as_deref(),
+                event_kind: "decode_queue_unblocked",
+                queue_status: Some("ready"),
+                detail: Some("checkpoint upload unblocked decode queue"),
+                lease_target_session_count: None,
+                lease_target_batch_size: None,
+                created_at: &now,
+            },
         )?;
     }
 
@@ -6723,6 +6866,19 @@ mod tests {
                 .and_then(|session| session.queue_status.as_deref()),
             Some("ready")
         );
+
+        let job_scheduler = state
+            .db
+            .load_job_scheduler_status(&submit.job_id)
+            .expect("expected job scheduler status");
+        let event_kinds = job_scheduler
+            .scheduler_events
+            .iter()
+            .map(|event| event.event_kind.as_str())
+            .collect::<Vec<_>>();
+        assert!(event_kinds.contains(&"decode_claimed"));
+        assert!(event_kinds.contains(&"decode_lease_renewed"));
+        assert!(event_kinds.contains(&"decode_lease_released"));
     }
 
     #[tokio::test]

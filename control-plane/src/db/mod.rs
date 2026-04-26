@@ -10,7 +10,8 @@ pub mod models;
 use crate::api::types::{
     DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
     JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencySummary, KvTransferPolicy,
-    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics, SchedulerJobSummary,
+    NetworkSchedulerStatusResponse, RegroupEventStatus, SchedulerBatchMetrics, SchedulerEventStatus,
+    SchedulerJobSummary,
     ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
     ServingGroupWorkloadStatus,
 };
@@ -340,6 +341,9 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
             column_exists(conn, "inference_decode_batch_events", "target_session_count")?
                 && column_exists(conn, "inference_decode_batch_events", "target_batch_size")?
         }
+        "031_create_inference_scheduler_events.sql" => {
+            table_exists(conn, "inference_scheduler_events")?
+        }
         _ => false,
     })
 }
@@ -430,6 +434,7 @@ impl Database {
             serving_groups: load_serving_group_snapshots(&conn, network_id, None)?,
             kv_residency: load_kv_residency_summaries(&conn, network_id, None)?,
             regroup_events: load_regroup_events(&conn, network_id, None)?,
+            scheduler_events: load_scheduler_events(&conn, network_id, None)?,
         })
     }
 
@@ -474,6 +479,7 @@ impl Database {
             serving_groups: load_serving_group_snapshots(&conn, &network_id, Some(job_id))?,
             kv_residency: load_kv_residency_summaries(&conn, &network_id, Some(job_id))?,
             regroup_events: load_regroup_events(&conn, &network_id, Some(job_id))?,
+            scheduler_events: load_scheduler_events(&conn, &network_id, Some(job_id))?,
         })
     }
 }
@@ -616,6 +622,76 @@ fn load_decode_queue_entries(
                 lease_target_batch_size: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
                 last_error: row.get(15)?,
                 updated_at: row.get(16)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
+fn load_scheduler_events(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<SchedulerEventStatus>> {
+    let sql = if job_id.is_some() {
+        r#"
+        SELECT event_id, network_id, job_id, session_id, device_id, segment_id, group_id,
+               batch_group_key, event_kind, queue_status, detail,
+               lease_target_session_count, lease_target_batch_size, created_at
+        FROM inference_scheduler_events
+        WHERE network_id = ?1 AND job_id = ?2
+        ORDER BY created_at DESC, event_id DESC
+        LIMIT 50
+        "#
+    } else {
+        r#"
+        SELECT event_id, network_id, job_id, session_id, device_id, segment_id, group_id,
+               batch_group_key, event_kind, queue_status, detail,
+               lease_target_session_count, lease_target_batch_size, created_at
+        FROM inference_scheduler_events
+        WHERE network_id = ?1
+        ORDER BY created_at DESC, event_id DESC
+        LIMIT 50
+        "#
+    };
+    let mut stmt = conn.prepare(sql)?;
+    if let Some(job_id) = job_id {
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(SchedulerEventStatus {
+                event_id: row.get(0)?,
+                network_id: row.get(1)?,
+                job_id: row.get(2)?,
+                session_id: row.get(3)?,
+                device_id: row.get(4)?,
+                segment_id: row.get(5)?,
+                group_id: row.get(6)?,
+                batch_group_key: row.get(7)?,
+                event_kind: row.get(8)?,
+                queue_status: row.get(9)?,
+                detail: row.get(10)?,
+                lease_target_session_count: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                lease_target_batch_size: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                created_at: row.get(13)?,
+            })
+        })?;
+        collect_rows(rows)
+    } else {
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(SchedulerEventStatus {
+                event_id: row.get(0)?,
+                network_id: row.get(1)?,
+                job_id: row.get(2)?,
+                session_id: row.get(3)?,
+                device_id: row.get(4)?,
+                segment_id: row.get(5)?,
+                group_id: row.get(6)?,
+                batch_group_key: row.get(7)?,
+                event_kind: row.get(8)?,
+                queue_status: row.get(9)?,
+                detail: row.get(10)?,
+                lease_target_session_count: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                lease_target_batch_size: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                created_at: row.get(13)?,
             })
         })?;
         collect_rows(rows)
