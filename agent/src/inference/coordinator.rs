@@ -439,6 +439,13 @@ impl InferenceCoordinator {
         }
     }
 
+    fn active_decode_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.job.has_decode_context() && !session.job.is_complete())
+            .count()
+    }
+
     pub async fn export_session_checkpoint_bytes(&mut self, session_id: Uuid) -> Result<Vec<u8>> {
         let Some(manager) = self.checkpoint_manager.clone() else {
             return Err(AgentError::Execution(
@@ -974,6 +981,8 @@ impl InferenceCoordinator {
                 .time_to_first_token()
                 .map(|d| d.as_millis() as u64),
             kv_cache_seq_len: Some(kv_cache_seq_len),
+            batch_size: None,
+            active_decode_sessions: None,
         })
         .await?;
 
@@ -1183,8 +1192,11 @@ impl InferenceCoordinator {
                         .to_string(),
                 ));
             }
+            let batch_size = u32::try_from(batch.slots.len()).unwrap_or(u32::MAX);
 
             let outcomes = self.execute_decode_microbatch(batch, position).await?;
+            let active_decode_sessions =
+                u32::try_from(self.active_decode_session_count()).unwrap_or(u32::MAX);
 
             for outcome in outcomes {
                 if outcome.should_checkpoint {
@@ -1218,6 +1230,8 @@ impl InferenceCoordinator {
                         execution_time_ms: segment_start.elapsed().as_millis() as u64,
                         time_to_first_token_ms: outcome.time_to_first_token_ms,
                         kv_cache_seq_len: Some(outcome.kv_cache_seq_len),
+                        batch_size: Some(batch_size),
+                        active_decode_sessions: Some(active_decode_sessions),
                     })
                     .await?;
                     last_reported_completion_tokens = outcome.completion_tokens;
@@ -1241,6 +1255,8 @@ impl InferenceCoordinator {
                 execution_time_ms,
                 time_to_first_token_ms: None,
                 kv_cache_seq_len: None,
+                batch_size: None,
+                active_decode_sessions: None,
             })
             .await?;
         }

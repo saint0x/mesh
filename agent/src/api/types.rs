@@ -317,6 +317,10 @@ pub struct ServingSessionMetadata {
     #[serde(default)]
     pub kv_sequence_position: Option<u32>,
     #[serde(default)]
+    pub latest_batch_size: Option<u32>,
+    #[serde(default)]
+    pub latest_active_decode_sessions: Option<u32>,
+    #[serde(default)]
     pub queue_status: Option<String>,
     #[serde(default)]
     pub ready_at: Option<String>,
@@ -439,6 +443,8 @@ pub struct InferenceSessionLease {
     pub kv_owner_device_id: String,
     pub kv_transfer_policy: KvTransferPolicy,
     pub kv_sequence_position: Option<u32>,
+    pub latest_batch_size: Option<u32>,
+    pub latest_active_decode_sessions: Option<u32>,
     pub kv_checkpoint_device_id: Option<String>,
     pub kv_checkpoint_created_at: Option<String>,
     pub updated_at: String,
@@ -512,6 +518,8 @@ pub struct InferenceSessionStatus {
     pub kv_owner_device_id: String,
     pub kv_transfer_policy: KvTransferPolicy,
     pub kv_sequence_position: Option<u32>,
+    pub latest_batch_size: Option<u32>,
+    pub latest_active_decode_sessions: Option<u32>,
     pub kv_checkpoint_device_id: Option<String>,
     pub kv_checkpoint_created_at: Option<String>,
     pub updated_at: String,

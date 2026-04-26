@@ -115,6 +115,8 @@ pub struct InferenceProgressUpdate {
     pub execution_time_ms: u64,
     pub time_to_first_token_ms: Option<u64>,
     pub kv_cache_seq_len: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub active_decode_sessions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
