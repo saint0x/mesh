@@ -18,6 +18,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Prefer filling the most under-served owned decode cohort before shallower owned cohorts
 - ✅ Prefer opening larger fresh decode cohorts before smaller fresh cohorts
 - ✅ Prefer fresh decode cohorts with more immediate ready runway before equally sized but colder cohorts
+- ✅ Prefer fresh decode cohorts with less transfer debt when immediate ready runway ties
 - Planned: Add admission control across multiple concurrent jobs and models
 - Planned: Add topology-aware pool partitioning for prefill-heavy vs decode-heavy work
 - In progress: Add scheduler scoring that reasons about queue age, latency target, throughput target, and resiliency target

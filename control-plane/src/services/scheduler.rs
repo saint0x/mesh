@@ -71,6 +71,7 @@ struct SchedulerCandidate {
     group_lease_expires_at: Option<String>,
     decode_lease_target_session_count: Option<u32>,
     decode_cohort_ready_sessions: u32,
+    decode_cohort_blocked_sessions: u32,
     decode_cohort_leased_sessions: u32,
     decode_cohort_active_sessions: u32,
 }
@@ -458,15 +459,20 @@ fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
             .candidate
             .decode_cohort_ready_sessions
             .max(1)
-            .min(1_000);
+            .min(31);
+        let fresh_blocked = candidate
+            .candidate
+            .decode_cohort_blocked_sessions
+            .min(31);
         let fresh_target = candidate
             .candidate
             .decode_lease_target_session_count
-            .unwrap_or(1);
-        let fresh_rank = fresh_ready
-            .saturating_mul(1_000)
-            .saturating_add(fresh_target.min(999));
-        return 1_000_000u32.saturating_sub(fresh_rank);
+            .unwrap_or(1)
+            .min(31);
+        let fresh_score = (fresh_ready << 10)
+            .saturating_add((31u32.saturating_sub(fresh_blocked)) << 5)
+            .saturating_add(fresh_target);
+        return 1_999_999u32.saturating_sub(fresh_score);
     }
 
     let cohort_fill = candidate
@@ -515,6 +521,13 @@ fn load_scheduler_candidates(
                 dq.lease_target_session_count,
                 COALESCE((
                     SELECT SUM(CASE WHEN peer.status = 'ready' THEN 1 ELSE 0 END)
+                    FROM inference_decode_queue peer
+                    WHERE peer.network_id = a.network_id
+                      AND COALESCE(peer.batch_group_key, peer.group_id) =
+                          COALESCE(dq.batch_group_key, dq.group_id)
+                ), 0),
+                COALESCE((
+                    SELECT SUM(CASE WHEN peer.status = 'blocked_on_transfer' THEN 1 ELSE 0 END)
                     FROM inference_decode_queue peer
                     WHERE peer.network_id = a.network_id
                       AND COALESCE(peer.batch_group_key, peer.group_id) =
@@ -589,8 +602,9 @@ fn load_scheduler_candidates(
             group_lease_expires_at: row.get(18)?,
             decode_lease_target_session_count: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
             decode_cohort_ready_sessions: row.get::<_, i64>(20)? as u32,
-            decode_cohort_leased_sessions: row.get::<_, i64>(21)? as u32,
-            decode_cohort_active_sessions: row.get::<_, i64>(22)? as u32,
+            decode_cohort_blocked_sessions: row.get::<_, i64>(21)? as u32,
+            decode_cohort_leased_sessions: row.get::<_, i64>(22)? as u32,
+            decode_cohort_active_sessions: row.get::<_, i64>(23)? as u32,
         })
     });
     let candidates = rows
@@ -1062,6 +1076,7 @@ mod tests {
             group_lease_expires_at: None,
             decode_lease_target_session_count: None,
             decode_cohort_ready_sessions: 0,
+            decode_cohort_blocked_sessions: 0,
             decode_cohort_leased_sessions: 0,
             decode_cohort_active_sessions: 0,
         }
@@ -1453,6 +1468,7 @@ mod tests {
         larger.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
         larger.decode_lease_target_session_count = Some(4);
         larger.decode_cohort_ready_sessions = 1;
+        larger.decode_cohort_blocked_sessions = 0;
 
         let mut smaller = larger.clone();
         smaller.assignment_id = "smaller".into();
@@ -1505,6 +1521,7 @@ mod tests {
         more_ready.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
         more_ready.decode_lease_target_session_count = Some(4);
         more_ready.decode_cohort_ready_sessions = 3;
+        more_ready.decode_cohort_blocked_sessions = 0;
 
         let mut less_ready = more_ready.clone();
         less_ready.assignment_id = "less-ready".into();
@@ -1535,6 +1552,59 @@ mod tests {
         );
         let right = rank_candidate(
             &less_ready,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_fresh_decode_group_with_less_transfer_debt_when_ready_runway_ties() {
+        let mut less_blocked = base_candidate(SchedulerPhase::Decode);
+        less_blocked.assignment_id = "less-blocked".into();
+        less_blocked.group_status = "decode_ready".into();
+        less_blocked.decode_queue_status = Some("ready".into());
+        less_blocked.decode_ready_at = Some("2026-01-01T00:00:02Z".into());
+        less_blocked.decode_lease_target_session_count = Some(4);
+        less_blocked.decode_cohort_ready_sessions = 2;
+        less_blocked.decode_cohort_blocked_sessions = 1;
+
+        let mut more_blocked = less_blocked.clone();
+        more_blocked.assignment_id = "more-blocked".into();
+        more_blocked.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        more_blocked.decode_cohort_blocked_sessions = 3;
+
+        let less_blocked = RunnableCandidate {
+            ready_at: less_blocked.decode_ready_at.clone().unwrap(),
+            candidate: less_blocked,
+        };
+        let more_blocked = RunnableCandidate {
+            ready_at: more_blocked.decode_ready_at.clone().unwrap(),
+            candidate: more_blocked,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &less_blocked,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &more_blocked,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
