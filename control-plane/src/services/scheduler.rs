@@ -524,7 +524,9 @@ fn decode_group_fill_rank(candidate: &RunnableCandidate) -> u32 {
         .unwrap_or(cohort_fill.max(1));
     if cohort_fill < target {
         let remaining_capacity = target.saturating_sub(cohort_fill);
-        1_000u32.saturating_sub(remaining_capacity.min(1_000))
+        let remaining_rank = 1_023u32.saturating_sub(remaining_capacity.min(1_023));
+        let fill_density_rank = 1_023u32.saturating_sub(cohort_fill.min(1_023));
+        return (remaining_rank << 10).saturating_add(fill_density_rank);
     } else {
         2_000_000
     }
@@ -1821,6 +1823,64 @@ mod tests {
         );
         let right = rank_candidate(
             &ready,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(left < right);
+    }
+
+    #[test]
+    fn latency_prefers_denser_owned_decode_cohort_when_remaining_capacity_ties() {
+        let mut denser = base_candidate(SchedulerPhase::Decode);
+        denser.assignment_id = "denser".into();
+        denser.group_status = "decode_leased".into();
+        denser.decode_queue_status = Some("leased".into());
+        denser.decode_ready_at = Some("2026-01-01T00:00:03Z".into());
+        denser.group_lease_owner_device_id = Some("worker-1".into());
+        denser.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        denser.decode_lease_target_session_count = Some(5);
+        denser.decode_cohort_leased_sessions = 2;
+        denser.decode_cohort_active_sessions = 1;
+        denser.decode_cohort_oldest_ready_at = Some("2026-01-01T00:00:01Z".into());
+
+        let mut thinner = denser.clone();
+        thinner.assignment_id = "thinner".into();
+        thinner.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        thinner.decode_lease_target_session_count = Some(3);
+        thinner.decode_cohort_leased_sessions = 1;
+        thinner.decode_cohort_active_sessions = 0;
+
+        let denser = RunnableCandidate {
+            ready_at: denser.decode_ready_at.clone().unwrap(),
+            candidate: denser,
+        };
+        let thinner = RunnableCandidate {
+            ready_at: thinner.decode_ready_at.clone().unwrap(),
+            candidate: thinner,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let left = rank_candidate(
+            &denser,
+            SchedulerPolicyMode::LatencyFirst,
+            &policy,
+            8,
+            8,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let right = rank_candidate(
+            &thinner,
             SchedulerPolicyMode::LatencyFirst,
             &policy,
             8,
