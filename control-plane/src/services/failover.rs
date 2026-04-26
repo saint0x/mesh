@@ -21,8 +21,8 @@ pub struct InferenceSessionRecord {
     pub kv_owner_device_id: String,
     pub kv_transfer_policy: String,
     pub kv_sequence_position: Option<u32>,
-    pub kv_checkpoint_device_id: Option<String>,
-    pub kv_checkpoint_created_at: Option<String>,
+    pub latest_checkpoint_device_id: Option<String>,
+    pub latest_checkpoint_created_at: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -34,7 +34,6 @@ pub struct SessionReplicaRecord {
     pub status: String,
     pub active_segment_id: Option<String>,
     pub kv_sequence_position: Option<u32>,
-    pub checkpoint_created_at: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -717,8 +716,7 @@ fn load_session_context(
             SELECT j.execution_plan_json,
                    s.session_id, s.job_id, s.network_id, s.model_id, s.status,
                    s.active_segment_id, s.kv_owner_device_id, s.kv_transfer_policy,
-                   s.kv_sequence_position, s.kv_checkpoint_device_id,
-                   s.kv_checkpoint_created_at, s.last_error
+                   s.kv_sequence_position, s.last_error
             FROM inference_sessions s
             INNER JOIN inference_jobs j ON j.job_id = s.job_id
             WHERE s.session_id = ?
@@ -739,14 +737,18 @@ fn load_session_context(
                         kv_sequence_position: row
                             .get::<_, Option<i64>>(9)?
                             .map(|value| value as u32),
-                        kv_checkpoint_device_id: row.get(10)?,
-                        kv_checkpoint_created_at: row.get(11)?,
-                        last_error: row.get(12)?,
+                        latest_checkpoint_device_id: None,
+                        latest_checkpoint_created_at: None,
+                        last_error: row.get(10)?,
                     },
                 ))
             },
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let mut session = session;
+    let latest_checkpoint = load_latest_checkpoint_identity(conn, session_id)?;
+    session.latest_checkpoint_device_id = latest_checkpoint.as_ref().map(|item| item.0.clone());
+    session.latest_checkpoint_created_at = latest_checkpoint.as_ref().map(|item| item.1.clone());
     let plan = serde_json::from_str::<InferenceExecutionPlan>(&execution_plan_json)
         .map_err(|e| ApiError::Internal(format!("Invalid execution plan json: {}", e)))?;
 
@@ -755,7 +757,7 @@ fn load_session_context(
             .prepare(
                 r#"
                 SELECT session_id, device_id, job_id, status, active_segment_id,
-                       kv_sequence_position, checkpoint_created_at, last_error
+                       kv_sequence_position, last_error
                 FROM inference_session_replicas
                 WHERE session_id = ?
                 "#,
@@ -769,8 +771,7 @@ fn load_session_context(
                 status: row.get(3)?,
                 active_segment_id: row.get(4)?,
                 kv_sequence_position: row.get::<_, Option<i64>>(5)?.map(|value| value as u32),
-                checkpoint_created_at: row.get(6)?,
-                last_error: row.get(7)?,
+                last_error: row.get(6)?,
             })
         });
         let collected = rows
@@ -1238,8 +1239,8 @@ fn apply_replica_regroup_updates(
                 r#"
                 INSERT INTO inference_session_replicas (
                     session_id, device_id, job_id, status, active_segment_id,
-                    kv_sequence_position, checkpoint_created_at, updated_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    kv_sequence_position, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
                 "#,
                 params![
                     &context.session.session_id,
@@ -1633,19 +1634,29 @@ fn build_group_updates(
 
 fn checkpoint_available(
     session: &InferenceSessionRecord,
-    replicas: &[SessionReplicaRecord],
-    target_participants: &[String],
+    _replicas: &[SessionReplicaRecord],
+    _target_participants: &[String],
 ) -> bool {
-    if session.kv_checkpoint_device_id.is_some() && session.kv_checkpoint_created_at.is_some() {
-        return true;
-    }
+    session.latest_checkpoint_device_id.is_some() && session.latest_checkpoint_created_at.is_some()
+}
 
-    let target_set = target_participants.iter().collect::<HashSet<_>>();
-    replicas.iter().any(|replica| {
-        target_set.contains(&replica.device_id)
-            && replica.checkpoint_created_at.is_some()
-            && replica.kv_sequence_position.is_some()
-    })
+fn load_latest_checkpoint_identity(
+    conn: &Transaction<'_>,
+    session_id: &str,
+) -> ApiResult<Option<(String, String)>> {
+    conn.query_row(
+        r#"
+        SELECT source_device_id, created_at
+        FROM inference_session_checkpoints
+        WHERE session_id = ?
+        ORDER BY created_at DESC, checkpoint_id DESC
+        LIMIT 1
+        "#,
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
 fn select_next_kv_owner(
@@ -1667,11 +1678,7 @@ fn select_next_kv_owner(
                 replica
                     .and_then(|item| item.kv_sequence_position)
                     .unwrap_or(0),
-                u8::from(
-                    replica
-                        .and_then(|item| item.checkpoint_created_at.as_ref())
-                        .is_some(),
-                ),
+                u8::from(session.latest_checkpoint_created_at.is_some()),
                 member.map(|item| item.assigned_capacity_units).unwrap_or(0),
             )
         })
@@ -2310,8 +2317,8 @@ mod tests {
             kv_owner_device_id: "worker-1".into(),
             kv_transfer_policy: "co_located".into(),
             kv_sequence_position: None,
-            kv_checkpoint_device_id: None,
-            kv_checkpoint_created_at: None,
+            latest_checkpoint_device_id: None,
+            latest_checkpoint_created_at: None,
             last_error: None,
         };
         let replicas = vec![
@@ -2416,10 +2423,10 @@ mod tests {
             }
             .into(),
             kv_sequence_position: Some(32),
-            kv_checkpoint_device_id: checkpoint_created_at
+            latest_checkpoint_device_id: checkpoint_created_at
                 .as_ref()
                 .map(|_| kv_owner_device_id.to_string()),
-            kv_checkpoint_created_at: checkpoint_created_at.clone(),
+            latest_checkpoint_created_at: checkpoint_created_at.clone(),
             last_error: None,
         };
         let replicas = members
@@ -2503,7 +2510,7 @@ mod tests {
         device_id: &str,
         status: &str,
         kv_sequence_position: Option<u32>,
-        checkpoint_created_at: Option<&str>,
+        _checkpoint_created_at: Option<&str>,
     ) -> SessionReplicaRecord {
         SessionReplicaRecord {
             session_id: session_id.into(),
@@ -2512,7 +2519,6 @@ mod tests {
             status: status.into(),
             active_segment_id: Some("segment-decode".into()),
             kv_sequence_position,
-            checkpoint_created_at: checkpoint_created_at.map(str::to_string),
             last_error: None,
         }
     }
@@ -2581,10 +2587,9 @@ mod tests {
             r#"
             INSERT INTO inference_sessions (
                 session_id, job_id, network_id, model_id, status, active_segment_id,
-                kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
-                kv_checkpoint_device_id, kv_checkpoint_created_at, last_error,
+                kv_owner_device_id, kv_transfer_policy, kv_sequence_position, last_error,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-04-25T12:00:00Z', '2026-04-25T12:00:00Z')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-04-25T12:00:00Z', '2026-04-25T12:00:00Z')
             "#,
             params![
                 &session.session_id,
@@ -2596,12 +2601,39 @@ mod tests {
                 &session.kv_owner_device_id,
                 &session.kv_transfer_policy,
                 session.kv_sequence_position.map(i64::from),
-                session.kv_checkpoint_device_id.as_deref(),
-                session.kv_checkpoint_created_at.as_deref(),
                 session.last_error.as_deref()
             ],
         )
         .unwrap();
+
+        if let (Some(source_device_id), Some(created_at)) = (
+            session.latest_checkpoint_device_id.as_deref(),
+            session.latest_checkpoint_created_at.as_deref(),
+        ) {
+            conn.execute(
+                r#"
+                INSERT INTO inference_session_checkpoints (
+                    checkpoint_id, session_id, job_id, source_device_id, source_segment_id,
+                    phase, kv_sequence_position, size_bytes, checkpoint_sha256,
+                    checkpoint_bytes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'decode', ?, ?, ?, ?, ?, ?)
+                "#,
+                params![
+                    format!("checkpoint-{}", session.session_id),
+                    &session.session_id,
+                    &session.job_id,
+                    source_device_id,
+                    active_segment,
+                    session.kv_sequence_position.map(i64::from).unwrap_or(0),
+                    128_i64,
+                    format!("sha256-{}", session.session_id),
+                    vec![0_u8, 1_u8, 2_u8, 3_u8],
+                    created_at,
+                    created_at,
+                ],
+            )
+            .unwrap();
+        }
 
         let active_participants = plan
             .segments
@@ -2657,8 +2689,8 @@ mod tests {
                 r#"
                 INSERT INTO inference_session_replicas (
                     session_id, device_id, job_id, status, active_segment_id,
-                    kv_sequence_position, checkpoint_created_at, updated_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '2026-04-25T12:00:00Z', ?)
+                    kv_sequence_position, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, '2026-04-25T12:00:00Z', ?)
                 "#,
                 params![
                     &replica.session_id,
@@ -2667,7 +2699,6 @@ mod tests {
                     &replica.status,
                     replica.active_segment_id.as_deref(),
                     replica.kv_sequence_position.map(i64::from),
-                    replica.checkpoint_created_at.as_deref(),
                     replica.last_error.as_deref()
                 ],
             )

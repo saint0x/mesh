@@ -193,6 +193,40 @@ struct PersistedSessionReplicaStatus {
     last_error: Option<String>,
 }
 
+fn latest_checkpoint_legacy_fields(
+    checkpoint: Option<&PersistedSessionCheckpointStatus>,
+    kv_owner_device_id: &str,
+    kv_sequence_position: Option<u32>,
+    updated_at: &str,
+) -> (Option<String>, Option<String>) {
+    if let Some(checkpoint) = checkpoint {
+        return (
+            Some(checkpoint.source_device_id.clone()),
+            Some(checkpoint.created_at.clone()),
+        );
+    }
+
+    if kv_sequence_position.is_some() {
+        return (
+            Some(kv_owner_device_id.to_string()),
+            Some(updated_at.to_string()),
+        );
+    }
+
+    (None, None)
+}
+
+fn replica_checkpoint_created_at(
+    replica: &PersistedSessionReplicaStatus,
+    checkpoint: Option<&PersistedSessionCheckpointStatus>,
+) -> Option<String> {
+    if replica.kv_sequence_position.is_some() {
+        checkpoint.map(|item| item.created_at.clone())
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Default)]
 struct DecodeLeaseCohortStatus {
     pooled_batch_group_key: Option<String>,
@@ -432,9 +466,8 @@ pub async fn submit_inference(
                 session_id, job_id, network_id, model_id, status, active_segment_id,
                 kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
                 latest_batch_size, latest_active_decode_sessions,
-                latest_batch_kv_tokens, latest_deferred_decode_sessions,
-                kv_checkpoint_device_id, kv_checkpoint_created_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'prefill_pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+                latest_batch_kv_tokens, latest_deferred_decode_sessions, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'prefill_pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
             "#,
             params![
                 &initial_segment.session_id,
@@ -454,8 +487,8 @@ pub async fn submit_inference(
                 r#"
                 INSERT INTO inference_session_replicas (
                     session_id, device_id, job_id, status, active_segment_id, kv_sequence_position,
-                    checkpoint_created_at, updated_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL)
+                    updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
                 "#,
                 params![
                     &initial_segment.session_id,
@@ -993,7 +1026,7 @@ fn load_serving_session_metadata(
                    s.kv_sequence_position, s.latest_batch_size, s.latest_active_decode_sessions,
                    s.latest_batch_kv_tokens, s.latest_deferred_decode_sessions,
                    dq.lease_target_session_count, dq.lease_target_batch_size, dq.status, dq.ready_at,
-                   s.kv_checkpoint_device_id, s.kv_checkpoint_created_at, s.updated_at, s.last_error
+                   s.updated_at, s.last_error
             FROM inference_sessions s
             LEFT JOIN inference_decode_queue dq ON dq.session_id = s.session_id
             WHERE s.session_id = ?
@@ -1019,10 +1052,10 @@ fn load_serving_session_metadata(
                     pooled_blocked_sessions: None,
                     pooled_leased_sessions: None,
                     pooled_active_sessions: None,
-                    kv_checkpoint_device_id: row.get(14)?,
-                    kv_checkpoint_created_at: row.get(15)?,
-                    updated_at: row.get(16)?,
-                    last_error: row.get(17)?,
+                    kv_checkpoint_device_id: None,
+                    kv_checkpoint_created_at: None,
+                    updated_at: row.get(14)?,
+                    last_error: row.get(15)?,
                     checkpoint: None,
                     replicas: Vec::new(),
                     recent_decode_batches: Vec::new(),
@@ -1053,11 +1086,20 @@ fn load_serving_session_metadata(
     session.pooled_leased_sessions = cohort.pooled_leased_sessions;
     session.pooled_active_sessions = cohort.pooled_active_sessions;
     session.checkpoint = load_latest_session_checkpoint_status(conn, &session.session_id)?;
+    (
+        session.kv_checkpoint_device_id,
+        session.kv_checkpoint_created_at,
+    ) = latest_checkpoint_legacy_fields(
+        session.checkpoint.as_ref(),
+        &session.kv_owner_device_id,
+        session.kv_sequence_position,
+        &session.updated_at,
+    );
     let mut stmt = conn
         .prepare(
             r#"
             SELECT device_id, status, active_segment_id, kv_sequence_position,
-                   checkpoint_created_at, updated_at, last_error
+                   updated_at, last_error
             FROM inference_session_replicas
             WHERE session_id = ?
             ORDER BY device_id ASC
@@ -1071,14 +1113,18 @@ fn load_serving_session_metadata(
                 status: row.get(1)?,
                 active_segment_id: row.get(2)?,
                 kv_sequence_position: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
-                checkpoint_created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                last_error: row.get(6)?,
+                checkpoint_created_at: None,
+                updated_at: row.get(4)?,
+                last_error: row.get(5)?,
             })
         })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let checkpoint = session.checkpoint.clone();
+    for replica in &mut session.replicas {
+        replica.checkpoint_created_at = replica_checkpoint_created_at(replica, checkpoint.as_ref());
+    }
 
     let decode_lease = load_decode_lease_status(conn, &session.session_id)?;
     let queue_row = conn
@@ -3175,10 +3221,9 @@ fn claim_assignment(
                 s.kv_transfer_policy, s.kv_sequence_position, s.latest_batch_size,
                 s.latest_active_decode_sessions, s.latest_batch_kv_tokens,
                 s.latest_deferred_decode_sessions, dq.lease_target_session_count,
-                dq.lease_target_batch_size, s.kv_checkpoint_device_id,
-                s.kv_checkpoint_created_at, s.updated_at,
+                dq.lease_target_batch_size, s.updated_at,
                 r.status, r.active_segment_id, r.kv_sequence_position,
-                r.checkpoint_created_at, r.updated_at, r.last_error
+                r.updated_at, r.last_error
             FROM inference_job_assignments a
             INNER JOIN inference_jobs j ON j.job_id = a.job_id
             INNER JOIN inference_sessions s ON s.job_id = j.job_id
@@ -3221,15 +3266,15 @@ fn claim_assignment(
                     pooled_blocked_sessions: None,
                     pooled_leased_sessions: None,
                     pooled_active_sessions: None,
-                    kv_checkpoint_device_id: row.get(27)?,
-                    kv_checkpoint_created_at: row.get(28)?,
-                    session_updated_at: row.get(29)?,
-                    replica_status: row.get(30)?,
-                    replica_active_segment_id: row.get(31)?,
-                    replica_kv_sequence_position: row.get::<_, Option<i64>>(32)?.map(|v| v as u32),
-                    replica_checkpoint_created_at: row.get(33)?,
-                    replica_updated_at: row.get(34)?,
-                    replica_last_error: row.get(35)?,
+                    kv_checkpoint_device_id: None,
+                    kv_checkpoint_created_at: None,
+                    session_updated_at: row.get(27)?,
+                    replica_status: row.get(28)?,
+                    replica_active_segment_id: row.get(29)?,
+                    replica_kv_sequence_position: row.get::<_, Option<i64>>(30)?.map(|v| v as u32),
+                    replica_checkpoint_created_at: None,
+                    replica_updated_at: row.get(31)?,
+                    replica_last_error: row.get(32)?,
                 })
             },
         )
@@ -3240,6 +3285,21 @@ fn claim_assignment(
     };
 
     if let Some(assignment) = row.as_mut() {
+        let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
+        let (kv_checkpoint_device_id, kv_checkpoint_created_at) = latest_checkpoint_legacy_fields(
+            checkpoint.as_ref(),
+            &assignment.kv_owner_device_id,
+            assignment.kv_sequence_position,
+            &assignment.session_updated_at,
+        );
+        assignment.kv_checkpoint_device_id = kv_checkpoint_device_id;
+        assignment.kv_checkpoint_created_at = kv_checkpoint_created_at;
+        assignment.replica_checkpoint_created_at =
+            if assignment.replica_kv_sequence_position.is_some() {
+                checkpoint.as_ref().map(|item| item.created_at.clone())
+            } else {
+                None
+            };
         tx.execute(
             r#"
             UPDATE inference_job_assignments
@@ -3838,14 +3898,6 @@ fn report_assignment_result(
                 ELSE active_segment_id
             END,
             kv_sequence_position = COALESCE(?, kv_sequence_position),
-            kv_checkpoint_device_id = CASE
-                WHEN ? = 'completed' THEN NULL
-                ELSE kv_checkpoint_device_id
-            END,
-            kv_checkpoint_created_at = CASE
-                WHEN ? = 'completed' THEN NULL
-                ELSE kv_checkpoint_created_at
-            END,
             updated_at = ?,
             last_error = ?
         WHERE job_id = ?
@@ -3860,8 +3912,6 @@ fn report_assignment_result(
             },
             job_status,
             req.kv_cache_seq_len.map(i64::from),
-            job_status,
-            job_status,
             &now,
             error.as_deref().or(req.error.as_deref()),
             job_id
@@ -3874,10 +3924,6 @@ fn report_assignment_result(
         SET status = ?,
             active_segment_id = NULL,
             kv_sequence_position = COALESCE(?, kv_sequence_position),
-            checkpoint_created_at = CASE
-                WHEN ? = 'completed' THEN NULL
-                ELSE checkpoint_created_at
-            END,
             updated_at = ?,
             last_error = ?
         WHERE job_id = ? AND device_id = ?
@@ -3885,7 +3931,6 @@ fn report_assignment_result(
         params![
             if req.success { "completed" } else { "failed" },
             req.kv_cache_seq_len.map(i64::from),
-            job_status,
             &now,
             error.as_deref().or(req.error.as_deref()),
             job_id,
@@ -4173,8 +4218,6 @@ fn report_assignment_progress(
                 latest_active_decode_sessions = COALESCE(?, latest_active_decode_sessions),
                 latest_batch_kv_tokens = COALESCE(?, latest_batch_kv_tokens),
                 latest_deferred_decode_sessions = COALESCE(?, latest_deferred_decode_sessions),
-                kv_checkpoint_device_id = ?,
-                kv_checkpoint_created_at = ?,
                 updated_at = ?,
                 last_error = NULL
             WHERE job_id = ?
@@ -4188,8 +4231,6 @@ fn report_assignment_progress(
                 req.active_decode_sessions.map(i64::from),
                 req.batch_kv_tokens.map(i64::from),
                 req.deferred_decode_sessions.map(i64::from),
-                &req.device_id,
-                &now,
                 &now,
                 job_id
             ],
@@ -4201,14 +4242,12 @@ fn report_assignment_progress(
             SET status = 'prefill_complete',
                 active_segment_id = NULL,
                 kv_sequence_position = COALESCE(?, kv_sequence_position),
-                checkpoint_created_at = ?,
                 updated_at = ?,
                 last_error = NULL
             WHERE job_id = ? AND device_id = ?
             "#,
             params![
                 req.kv_cache_seq_len.map(i64::from),
-                &now,
                 &now,
                 job_id,
                 &req.device_id
@@ -4452,8 +4491,8 @@ fn report_assignment_progress(
                             r#"
                             INSERT INTO inference_session_replicas (
                                 session_id, device_id, job_id, status, active_segment_id,
-                                kv_sequence_position, checkpoint_created_at, updated_at, last_error
-                            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL)
+                                kv_sequence_position, updated_at, last_error
+                            ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
                             "#,
                             params![
                                 &next_segment.session_id,
@@ -4758,7 +4797,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                    s.kv_sequence_position, s.latest_batch_size, s.latest_active_decode_sessions,
                    s.latest_batch_kv_tokens, s.latest_deferred_decode_sessions,
                    dq.lease_target_session_count, dq.lease_target_batch_size,
-                   s.kv_checkpoint_device_id, s.kv_checkpoint_created_at, s.updated_at, s.last_error
+                   s.updated_at, s.last_error
             FROM inference_sessions s
             LEFT JOIN inference_decode_queue dq ON dq.session_id = s.session_id
             WHERE s.job_id = ?
@@ -4784,10 +4823,10 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     pooled_blocked_sessions: None,
                     pooled_leased_sessions: None,
                     pooled_active_sessions: None,
-                    kv_checkpoint_device_id: row.get(12)?,
-                    kv_checkpoint_created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                    last_error: row.get(15)?,
+                    kv_checkpoint_device_id: None,
+                    kv_checkpoint_created_at: None,
+                    updated_at: row.get(12)?,
+                    last_error: row.get(13)?,
                     checkpoint: None,
                     replicas: Vec::new(),
                     recent_decode_batches: Vec::new(),
@@ -4815,11 +4854,20 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
         session.pooled_leased_sessions = cohort.pooled_leased_sessions;
         session.pooled_active_sessions = cohort.pooled_active_sessions;
         session.checkpoint = load_latest_session_checkpoint_status(&conn, &session.session_id)?;
+        (
+            session.kv_checkpoint_device_id,
+            session.kv_checkpoint_created_at,
+        ) = latest_checkpoint_legacy_fields(
+            session.checkpoint.as_ref(),
+            &session.kv_owner_device_id,
+            session.kv_sequence_position,
+            &session.updated_at,
+        );
         let mut stmt = conn
             .prepare(
                 r#"
                 SELECT device_id, status, active_segment_id, kv_sequence_position,
-                       checkpoint_created_at, updated_at, last_error
+                       updated_at, last_error
                 FROM inference_session_replicas
                 WHERE session_id = ?
                 ORDER BY device_id ASC
@@ -4833,14 +4881,19 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     status: row.get(1)?,
                     active_segment_id: row.get(2)?,
                     kv_sequence_position: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
-                    checkpoint_created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    last_error: row.get(6)?,
+                    checkpoint_created_at: None,
+                    updated_at: row.get(4)?,
+                    last_error: row.get(5)?,
                 })
             })
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        let checkpoint = session.checkpoint.clone();
+        for replica in &mut session.replicas {
+            replica.checkpoint_created_at =
+                replica_checkpoint_created_at(replica, checkpoint.as_ref());
+        }
         session.recent_decode_batches =
             load_recent_decode_batch_events(&conn, &session.session_id, 8)?;
         Some(session)
@@ -5015,15 +5068,11 @@ fn store_session_checkpoint(
     tx.execute(
         r#"
         UPDATE inference_sessions
-        SET kv_checkpoint_device_id = ?,
-            kv_checkpoint_created_at = ?,
-            kv_sequence_position = MAX(COALESCE(kv_sequence_position, 0), ?),
+        SET kv_sequence_position = MAX(COALESCE(kv_sequence_position, 0), ?),
             updated_at = ?
         WHERE job_id = ? AND session_id = ?
         "#,
         params![
-            &req.device_id,
-            &now,
             i64::from(req.kv_sequence_position),
             &now,
             job_id,
@@ -5040,17 +5089,11 @@ fn store_session_checkpoint(
                 ELSE status
             END,
             kv_sequence_position = COALESCE(kv_sequence_position, ?),
-            checkpoint_created_at = COALESCE(checkpoint_created_at, ?),
             updated_at = ?,
             last_error = NULL
         WHERE session_id = ?
         "#,
-        params![
-            i64::from(req.kv_sequence_position),
-            &now,
-            &now,
-            &req.session_id
-        ],
+        params![i64::from(req.kv_sequence_position), &now, &req.session_id],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     tx.execute(

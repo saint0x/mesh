@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "name": "api-persistence-data-model",
+  "steps": [
+    {
+      "name": "cleanup migration removes superseded KV checkpoint columns while preserving session telemetry",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_run_migrations_cleanup_superseded_kv_checkpoint_fields",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "network scheduler status exposes normalized KV residency and queue state",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_network_scheduler_status_exposes_queue_groups_and_kv_residency",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "checkpoint upload remains visible through normalized status and download surfaces",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "api::inference::tests::test_uploaded_session_checkpoint_is_exposed_on_status_lease_and_download",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "decode queue observation and lease lifecycle still work with normalized session state",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "api::inference::tests::test_decode_queue_observation_and_lease_lifecycle_endpoints",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

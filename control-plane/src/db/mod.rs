@@ -356,6 +356,13 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         "034_create_inference_prompt_cache_entries.sql" => {
             table_exists(conn, "inference_prompt_cache_entries")?
         }
+        "035_cleanup_superseded_kv_checkpoint_fields.sql" => {
+            table_exists(conn, "inference_sessions")?
+                && table_exists(conn, "inference_session_replicas")?
+                && !column_exists(conn, "inference_sessions", "kv_checkpoint_device_id")?
+                && !column_exists(conn, "inference_sessions", "kv_checkpoint_created_at")?
+                && !column_exists(conn, "inference_session_replicas", "checkpoint_created_at")?
+        }
         _ => false,
     })
 }
@@ -421,8 +428,6 @@ struct KvSessionRow {
     kv_owner_device_id: String,
     kv_transfer_policy: KvTransferPolicy,
     kv_sequence_position: Option<u32>,
-    kv_checkpoint_device_id: Option<String>,
-    kv_checkpoint_created_at: Option<String>,
     updated_at: String,
     latest_checkpoint: Option<InferenceSessionCheckpointStatus>,
 }
@@ -1212,8 +1217,7 @@ fn load_kv_residency_summaries(
         let mut stmt = conn.prepare(
             r#"
             SELECT session_id, job_id, network_id, model_id, status, active_segment_id,
-                   kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
-                   kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at
+                   kv_owner_device_id, kv_transfer_policy, kv_sequence_position, updated_at
             FROM inference_sessions
             WHERE network_id = ?1 AND job_id = ?2
             ORDER BY updated_at DESC, session_id DESC
@@ -1231,9 +1235,7 @@ fn load_kv_residency_summaries(
                 kv_transfer_policy: parse_kv_transfer_policy(row.get::<_, String>(7)?.as_str())
                     .map_err(to_sql_err)?,
                 kv_sequence_position: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-                kv_checkpoint_device_id: row.get(9)?,
-                kv_checkpoint_created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                updated_at: row.get(9)?,
                 latest_checkpoint: None,
             })
         })?;
@@ -1242,8 +1244,7 @@ fn load_kv_residency_summaries(
         let mut stmt = conn.prepare(
             r#"
             SELECT session_id, job_id, network_id, model_id, status, active_segment_id,
-                   kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
-                   kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at
+                   kv_owner_device_id, kv_transfer_policy, kv_sequence_position, updated_at
             FROM inference_sessions
             WHERE network_id = ?1
             ORDER BY updated_at DESC, session_id DESC
@@ -1261,9 +1262,7 @@ fn load_kv_residency_summaries(
                 kv_transfer_policy: parse_kv_transfer_policy(row.get::<_, String>(7)?.as_str())
                     .map_err(to_sql_err)?,
                 kv_sequence_position: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-                kv_checkpoint_device_id: row.get(9)?,
-                kv_checkpoint_created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                updated_at: row.get(9)?,
                 latest_checkpoint: None,
             })
         })?;
@@ -1290,8 +1289,14 @@ fn load_kv_residency_summaries(
             kv_owner_device_id: session.kv_owner_device_id.clone(),
             kv_transfer_policy: session.kv_transfer_policy,
             kv_sequence_position: session.kv_sequence_position,
-            kv_checkpoint_device_id: session.kv_checkpoint_device_id.clone(),
-            kv_checkpoint_created_at: session.kv_checkpoint_created_at.clone(),
+            kv_checkpoint_device_id: session
+                .latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.source_device_id.clone()),
+            kv_checkpoint_created_at: session
+                .latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.created_at.clone()),
             latest_checkpoint: session.latest_checkpoint.clone(),
             replicas: load_kv_replica_rows(conn, &session.session_id)?,
             residency_slices,
@@ -1311,7 +1316,7 @@ fn load_kv_replica_rows(
 ) -> Result<Vec<KvReplicaResidencyStatus>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT device_id, status, kv_sequence_position, checkpoint_created_at, updated_at, last_error
+        SELECT device_id, status, kv_sequence_position, updated_at, last_error
         FROM inference_session_replicas
         WHERE session_id = ?
         ORDER BY device_id ASC
@@ -1322,9 +1327,9 @@ fn load_kv_replica_rows(
             device_id: row.get(0)?,
             status: row.get(1)?,
             kv_sequence_position: row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
-            checkpoint_created_at: row.get(3)?,
-            updated_at: row.get(4)?,
-            last_error: row.get(5)?,
+            checkpoint_created_at: None,
+            updated_at: row.get(3)?,
+            last_error: row.get(4)?,
         })
     })?;
     collect_rows(rows)
@@ -1788,12 +1793,11 @@ mod tests {
                 session_id, job_id, network_id, model_id, status, active_segment_id,
                 kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
                 latest_batch_size, latest_active_decode_sessions, latest_batch_kv_tokens,
-                latest_deferred_decode_sessions, kv_checkpoint_device_id,
-                kv_checkpoint_created_at, updated_at
+                latest_deferred_decode_sessions, updated_at
             ) VALUES (
                 'session-1', 'job-1', 'net-1', 'model-1', 'decode_pending_transfer',
                 'segment-decode', 'worker-a', 'export_on_handoff', 3,
-                2, 3, 11, 1, 'worker-a', '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z'
+                2, 3, 11, 1, '2026-04-25T12:00:06Z'
             )
             "#,
             [],
@@ -1808,8 +1812,8 @@ mod tests {
                 r#"
                 INSERT INTO inference_session_replicas (
                     session_id, device_id, job_id, status, active_segment_id,
-                    kv_sequence_position, checkpoint_created_at, updated_at, last_error
-                ) VALUES (?1, ?2, 'job-1', ?3, 'segment-decode', ?4, '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z', NULL)
+                    kv_sequence_position, updated_at, last_error
+                ) VALUES (?1, ?2, 'job-1', ?3, 'segment-decode', ?4, '2026-04-25T12:00:06Z', NULL)
                 "#,
                 rusqlite::params!["session-1", device_id, status, seq],
             )
@@ -2130,6 +2134,176 @@ mod tests {
             )
             .expect("Failed to count backfilled migrations");
         assert_eq!(recorded, 4);
+    }
+
+    #[test]
+    fn test_run_migrations_cleanup_superseded_kv_checkpoint_fields() {
+        let temp_db = NamedTempFile::new().expect("Failed to create temp database file");
+        let db = Database::new(
+            temp_db
+                .path()
+                .to_str()
+                .expect("Temp database path should be valid UTF-8"),
+        )
+        .expect("Failed to create database");
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+                filename TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE networks (
+                network_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY,
+                network_id TEXT NOT NULL
+            );
+            CREATE TABLE inference_jobs (
+                job_id TEXT PRIMARY KEY,
+                network_id TEXT NOT NULL
+            );
+            CREATE TABLE inference_sessions (
+                session_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL REFERENCES inference_jobs(job_id) ON DELETE CASCADE,
+                network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                active_segment_id TEXT,
+                kv_owner_device_id TEXT NOT NULL,
+                kv_transfer_policy TEXT NOT NULL,
+                kv_sequence_position INTEGER,
+                kv_checkpoint_device_id TEXT,
+                kv_checkpoint_created_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                latest_batch_size INTEGER,
+                latest_active_decode_sessions INTEGER,
+                latest_batch_kv_tokens INTEGER,
+                latest_deferred_decode_sessions INTEGER,
+                UNIQUE(job_id)
+            );
+            CREATE TABLE inference_session_replicas (
+                session_id TEXT NOT NULL REFERENCES inference_sessions(session_id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+                job_id TEXT NOT NULL REFERENCES inference_jobs(job_id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                active_segment_id TEXT,
+                kv_sequence_position INTEGER,
+                checkpoint_created_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_error TEXT,
+                PRIMARY KEY (session_id, device_id)
+            );
+            INSERT INTO networks (network_id) VALUES ('net-1');
+            INSERT INTO devices (device_id, network_id) VALUES ('worker-a', 'net-1');
+            INSERT INTO inference_jobs (job_id, network_id) VALUES ('job-1', 'net-1');
+            INSERT INTO inference_sessions (
+                session_id, job_id, network_id, model_id, status, active_segment_id,
+                kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
+                kv_checkpoint_device_id, kv_checkpoint_created_at, updated_at,
+                latest_batch_size, latest_active_decode_sessions, latest_batch_kv_tokens,
+                latest_deferred_decode_sessions
+            ) VALUES (
+                'session-1', 'job-1', 'net-1', 'model-1', 'decode_ready', 'segment-1',
+                'worker-a', 'export_on_handoff', 3, 'worker-a', '2026-04-25T12:00:05Z',
+                '2026-04-25T12:00:06Z', 2, 3, 11, 1
+            );
+            INSERT INTO inference_session_replicas (
+                session_id, device_id, job_id, status, active_segment_id,
+                kv_sequence_position, checkpoint_created_at, updated_at
+            ) VALUES (
+                'session-1', 'worker-a', 'job-1', 'decode_ready', 'segment-1',
+                3, '2026-04-25T12:00:05Z', '2026-04-25T12:00:06Z'
+            );
+            "#,
+        )
+        .expect("Failed to seed pre-cleanup schema");
+        let prior_migrations = [
+            "001_create_networks.sql",
+            "002_create_devices.sql",
+            "003_create_ledger_events.sql",
+            "004_add_ring_topology.sql",
+            "005_create_inference_dispatch.sql",
+            "006_add_device_connectivity_state.sql",
+            "007_add_device_peer_metadata.sql",
+            "008_add_device_direct_candidates.sql",
+            "009_add_inference_assignment_metrics.sql",
+            "010_add_ring_model_id.sql",
+            "011_add_assignment_capacity_and_shards.sql",
+            "012_add_credit_reservation_and_allowance.sql",
+            "013_add_realtime_accounting_progress.sql",
+            "014_add_execution_plan_to_inference_jobs.sql",
+            "015_add_phase_timing_to_inference_jobs.sql",
+            "016_add_active_segment_to_inference_jobs.sql",
+            "017_add_assignment_segment_lifecycle.sql",
+            "018_create_inference_sessions.sql",
+            "019_create_inference_session_replicas.sql",
+            "020_create_inference_session_checkpoints.sql",
+            "021_create_inference_serving_groups.sql",
+            "022_create_inference_decode_queue.sql",
+            "023_add_scheduler_visibility_metadata.sql",
+            "024_create_inference_regroup_events.sql",
+            "025_add_decode_batch_telemetry_to_inference_sessions.sql",
+            "026_add_decode_batch_pressure_to_inference_sessions.sql",
+            "027_create_inference_decode_batch_events.sql",
+            "028_add_decode_lease_batch_targets.sql",
+            "029_add_decode_batch_group_key.sql",
+            "030_add_target_fields_to_decode_batch_events.sql",
+            "031_create_inference_scheduler_events.sql",
+            "032_create_inference_session_kv_residency.sql",
+            "033_create_inference_session_kv_transfers.sql",
+            "034_create_inference_prompt_cache_entries.sql",
+        ];
+        for migration in prior_migrations {
+            conn.execute(
+                "INSERT INTO schema_migrations (filename) VALUES (?)",
+                [migration],
+            )
+            .expect("Failed to seed migration history");
+        }
+        drop(conn);
+
+        db.migrate()
+            .expect("Failed to apply cleanup migration for superseded KV checkpoint fields");
+
+        let conn = db.get_conn().expect("Failed to reload connection");
+        assert!(
+            !column_exists(&conn, "inference_sessions", "kv_checkpoint_device_id")
+                .expect("Failed to inspect session schema")
+        );
+        assert!(
+            !column_exists(&conn, "inference_sessions", "kv_checkpoint_created_at")
+                .expect("Failed to inspect session schema")
+        );
+        assert!(
+            !column_exists(&conn, "inference_session_replicas", "checkpoint_created_at")
+                .expect("Failed to inspect replica schema")
+        );
+        let telemetry: (i64, i64, i64, i64) = conn
+            .query_row(
+                r#"
+                SELECT latest_batch_size, latest_active_decode_sessions,
+                       latest_batch_kv_tokens, latest_deferred_decode_sessions
+                FROM inference_sessions
+                WHERE session_id = 'session-1'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("Failed to read migrated session telemetry");
+        assert_eq!(telemetry, (2, 3, 11, 1));
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE filename = '035_cleanup_superseded_kv_checkpoint_fields.sql'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to verify cleanup migration history");
+        assert_eq!(recorded, 1);
     }
 
     #[test]

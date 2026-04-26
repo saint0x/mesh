@@ -138,9 +138,9 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add scheduler-owned queue tables and serving-group tables
 - ✅ Add decode-step and batch accounting tables
 - ✅ Add worker-facing decode queue observation and decode lease renew/release APIs
-- In progress: Add KV residency and transfer tables
+- ✅ Add KV residency and transfer tables
 - ✅ Add failover/regroup event history tables
-- In progress: Add migration coverage and backward-incompatible cleanup for superseded fields
+- ✅ Add migration coverage and backward-incompatible cleanup for superseded fields
 - ✅ Add API surfaces for scheduler/debug/status inspection
 - ✅ Add API surfaces for grouped decode telemetry
 
@@ -171,7 +171,7 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Build real scheduler ownership over active decode planning and claim-time routing
 - ✅ Add explicit decode queue state and serving-group ownership records
 - In progress: Add continuous batching in the agent/runtime and scheduler
-- In progress: Expand KV management from checkpoint handoff to live residency management
+- ✅ Expand KV management from checkpoint handoff to live residency management
 - ✅ Add regroup/failover
 - ✅ Constrain planning with richer manifests
 - ✅ Deepen backend/provider optimization after engine control flow is stable
