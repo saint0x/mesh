@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "name": "serving-production-integrated",
+  "steps": [
+    {
+      "name": "transport serving dataplane reuses durable neighbor sessions",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_serving_transport_reuses_durable_neighbor_pair_session",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "transport serving dataplane carries checkpoint and bulk lanes",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_checkpoint_and_bulk_lanes_use_serving_transport",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "collective buffer cutover preserves forward-pass checkpoint round trips",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_forward_pass_kv_snapshot_round_trip",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "device stochastic sampling remains aligned with host semantics",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::tensor_ops::tests::test_device_sampling_matches_host_temperature_top_p",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "runtime guardrails defer mixed-provider throughput batches",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_throughput_batch_guardrail_defers_mixed_provider_sessions",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "segmented checkpoints preserve nonzero kv base positions",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "checkpoint::manager::tests::test_save_and_load_segmented_checkpoint_kv_cache",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "live decode retention slides the kv window under pressure",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_local_incremental_decode_slides_live_kv_window",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "continuous batching still admits multiple decode sessions",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_build_next_decode_batch_admits_multiple_sessions",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

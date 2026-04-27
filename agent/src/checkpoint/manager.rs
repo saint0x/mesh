@@ -682,6 +682,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_save_and_load_segmented_checkpoint_kv_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = CheckpointConfig {
+            checkpoint_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let manager = CheckpointManager::new(config, "worker-1".to_string()).unwrap();
+        let job = create_test_job();
+
+        let mut kv_cache = KVCache::new(KVCacheConfig {
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 2,
+            max_seq_len: 16,
+        });
+        for layer_idx in 0..2 {
+            kv_cache
+                .update_layer(
+                    layer_idx,
+                    Tensor2D::new(
+                        vec![
+                            1.0 + layer_idx as f32,
+                            2.0 + layer_idx as f32,
+                            3.0 + layer_idx as f32,
+                            4.0 + layer_idx as f32,
+                            5.0 + layer_idx as f32,
+                            6.0 + layer_idx as f32,
+                            7.0 + layer_idx as f32,
+                            8.0 + layer_idx as f32,
+                        ],
+                        2,
+                        4,
+                    )
+                    .unwrap(),
+                    Tensor2D::new(
+                        vec![
+                            9.0 + layer_idx as f32,
+                            10.0 + layer_idx as f32,
+                            11.0 + layer_idx as f32,
+                            12.0 + layer_idx as f32,
+                            13.0 + layer_idx as f32,
+                            14.0 + layer_idx as f32,
+                            15.0 + layer_idx as f32,
+                            16.0 + layer_idx as f32,
+                        ],
+                        2,
+                        4,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        kv_cache.retain_suffix(1);
+        let kv_snapshot =
+            KVCacheSnapshot::from_cache(&kv_cache, kv_cache.next_position() as u32).unwrap();
+
+        manager
+            .save_checkpoint(&job, Some(&kv_snapshot))
+            .await
+            .unwrap();
+        let restored = manager
+            .load_checkpoint_kv_cache(job.request.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(restored.base_position(), 1);
+        assert_eq!(restored.seq_len(), 1);
+        assert_eq!(
+            manager
+                .load_checkpoint_sequence_position(job.request.job_id)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
     async fn test_export_and_import_checkpoint_transitions_kv_ownership() {
         let source_dir = TempDir::new().unwrap();
         let source_manager = CheckpointManager::new(

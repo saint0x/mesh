@@ -348,6 +348,47 @@ impl DeviceLayerKVCache {
         self.seq_len = 0;
     }
 
+    fn retain_suffix(&mut self, keep_rows: usize, device: &candle_core::Device) -> Result<()> {
+        if self.seq_len <= keep_rows {
+            return Ok(());
+        }
+        if keep_rows == 0 {
+            self.seq_len = 0;
+            return Ok(());
+        }
+        let start_row = self.seq_len - keep_rows;
+        let cols = self.cols;
+        let new_keys = CandleTensor::zeros((self.capacity_rows, cols), DType::F32, device)
+            .map_err(device_error)?;
+        let new_values = CandleTensor::zeros((self.capacity_rows, cols), DType::F32, device)
+            .map_err(device_error)?;
+        let existing_keys = self.keys.as_ref().ok_or_else(|| {
+            AgentError::Execution("Device KV keys buffer was not allocated".to_string())
+        })?;
+        let existing_values = self.values.as_ref().ok_or_else(|| {
+            AgentError::Execution("Device KV values buffer was not allocated".to_string())
+        })?;
+        let kept_keys = existing_keys
+            .narrow(0, start_row, keep_rows)
+            .map_err(device_error)?;
+        let kept_values = existing_values
+            .narrow(0, start_row, keep_rows)
+            .map_err(device_error)?;
+        let row_ranges = &[0..keep_rows, 0..cols];
+        self.keys = Some(
+            new_keys
+                .slice_assign(row_ranges, &kept_keys)
+                .map_err(device_error)?,
+        );
+        self.values = Some(
+            new_values
+                .slice_assign(row_ranges, &kept_values)
+                .map_err(device_error)?,
+        );
+        self.seq_len = keep_rows;
+        Ok(())
+    }
+
     fn memory_usage(&self) -> usize {
         self.capacity_rows
             .saturating_mul(self.cols)
@@ -359,6 +400,7 @@ impl DeviceLayerKVCache {
 #[derive(Clone)]
 struct DeviceKVCache {
     layers: Vec<DeviceLayerKVCache>,
+    base_position: usize,
     config: KVCacheConfig,
 }
 
@@ -368,6 +410,7 @@ impl DeviceKVCache {
             layers: (0..config.num_layers)
                 .map(|_| DeviceLayerKVCache::new())
                 .collect(),
+            base_position: 0,
             config,
         }
     }
@@ -381,17 +424,34 @@ impl DeviceKVCache {
         let rows = keys.dims().first().copied().ok_or_else(|| {
             AgentError::Execution("Device KV append received an empty key shape".to_string())
         })?;
+        let max_seq_len = self.config.max_seq_len.max(1);
+        let (keys, values, rows) = if rows > max_seq_len {
+            let keep_rows = max_seq_len;
+            let start_row = rows - keep_rows;
+            (
+                keys.narrow(0, start_row, keep_rows).map_err(device_error)?,
+                values
+                    .narrow(0, start_row, keep_rows)
+                    .map_err(device_error)?,
+                keep_rows,
+            )
+        } else {
+            (keys.clone(), values.clone(), rows)
+        };
+        let target_layer_seq_len = self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?
+            .seq_len;
+        if target_layer_seq_len.saturating_add(rows) > max_seq_len {
+            let drop_rows = target_layer_seq_len.saturating_add(rows) - max_seq_len;
+            self.retain_suffix(target_layer_seq_len.saturating_sub(drop_rows))?;
+        }
         let layer = self
             .layers
             .get_mut(layer_idx)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
-        if layer.seq_len + rows > self.config.max_seq_len {
-            return Err(AgentError::Execution(format!(
-                "KV cache exceeded max_seq_len {} on layer {}: {} + {}",
-                self.config.max_seq_len, layer_idx, layer.seq_len, rows
-            )));
-        }
-        layer.append(keys, values)
+        layer.append(&keys, &values)
     }
 
     fn layer_seq_len(&self, layer_idx: usize) -> Result<usize> {
@@ -416,10 +476,32 @@ impl DeviceKVCache {
         self.layers.first().map(|layer| layer.seq_len).unwrap_or(0)
     }
 
+    fn base_position(&self) -> usize {
+        self.base_position
+    }
+
+    fn next_position(&self) -> usize {
+        self.base_position.saturating_add(self.seq_len())
+    }
+
     fn clear(&mut self) {
         for layer in &mut self.layers {
             layer.clear();
         }
+        self.base_position = 0;
+    }
+
+    fn retain_suffix(&mut self, keep_rows: usize) -> Result<()> {
+        let seq_len = self.seq_len();
+        if seq_len <= keep_rows {
+            return Ok(());
+        }
+        let device = execution_device()?;
+        for layer in &mut self.layers {
+            layer.retain_suffix(keep_rows, &device)?;
+        }
+        self.base_position = self.base_position.saturating_add(seq_len - keep_rows);
+        Ok(())
     }
 
     fn memory_usage(&self) -> usize {
@@ -429,11 +511,23 @@ impl DeviceKVCache {
             .sum()
     }
 
-    fn export_snapshot(&self, next_position: u32) -> Result<Option<KVCacheSnapshot>> {
+    fn export_snapshot(
+        &self,
+        next_position: u32,
+        max_cached_tokens: Option<usize>,
+    ) -> Result<Option<KVCacheSnapshot>> {
+        if self.next_position() as u32 != next_position {
+            return Err(AgentError::Execution(format!(
+                "Device KV export next_position {} does not match cache next position {}",
+                next_position,
+                self.next_position()
+            )));
+        }
         if self.seq_len() == 0 {
             return Ok(None);
         }
         let mut host_cache = KVCache::new(self.config.clone());
+        host_cache.set_base_position_for_restore(self.base_position);
         for layer_idx in 0..self.layers.len() {
             let layer_seq_len = self.layer_seq_len(layer_idx)?;
             if layer_seq_len == 0 {
@@ -441,6 +535,9 @@ impl DeviceKVCache {
             }
             let (keys, values, _) = self.get_layer_active_kv(layer_idx)?;
             host_cache.append_layer(layer_idx, from_candle_2d(&keys)?, from_candle_2d(&values)?)?;
+        }
+        if let Some(limit) = max_cached_tokens {
+            host_cache.retain_suffix(limit.max(1));
         }
         KVCacheSnapshot::from_cache(&host_cache, next_position).map(Some)
     }
@@ -450,6 +547,7 @@ impl DeviceKVCache {
         let host_cache = snapshot.decode_cache()?;
         let device = execution_device()?;
         self.clear();
+        self.base_position = host_cache.base_position();
         for (layer_idx, layer) in host_cache.layers.iter().enumerate() {
             match (&layer.keys, &layer.values) {
                 (Some(keys), Some(values)) if layer.seq_len > 0 => {
@@ -471,6 +569,13 @@ impl DeviceKVCache {
                 "Recovered device KV cache length {} does not match snapshot cached token count {}",
                 self.seq_len(),
                 snapshot.sequence.cached_tokens
+            )));
+        }
+        if self.base_position as u32 != snapshot.sequence.first_cached_position() {
+            return Err(AgentError::Execution(format!(
+                "Recovered device KV cache base position {} does not match snapshot first cached position {}",
+                self.base_position,
+                snapshot.sequence.first_cached_position()
             )));
         }
         let _ = device;
@@ -653,8 +758,25 @@ fn attention_output(
         partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
     let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
 
+    let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
+    let incoming_rows = absolute_positions.len();
+    let max_seq_len = kv_cache.config.max_seq_len.max(1);
+    if current_layer_seq_len.saturating_add(incoming_rows) > max_seq_len {
+        let drop_rows = current_layer_seq_len.saturating_add(incoming_rows) - max_seq_len;
+        kv_cache.retain_suffix(current_layer_seq_len.saturating_sub(drop_rows));
+    }
+    let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
+    let incoming_rows = absolute_positions.len();
+    let max_seq_len = kv_cache.config.max_seq_len.max(1);
+    if current_layer_seq_len.saturating_add(incoming_rows) > max_seq_len {
+        let drop_rows = current_layer_seq_len.saturating_add(incoming_rows) - max_seq_len;
+        kv_cache.retain_suffix(current_layer_seq_len.saturating_sub(drop_rows));
+    }
     let cache_prefix_len = kv_cache.layer_seq_len(layer_idx)?;
-    validate_positions(absolute_positions, cache_prefix_len)?;
+    validate_positions(
+        absolute_positions,
+        kv_cache.base_position().saturating_add(cache_prefix_len),
+    )?;
     let q_rope = apply_rope(&q_local, absolute_positions, head_dim, config.rope_base)?;
     let k_rope = apply_rope(&k_local, absolute_positions, head_dim, config.rope_base)?;
 
@@ -1078,8 +1200,14 @@ impl ForwardPass {
         }
 
         self.clear_cache();
-        let hidden = self.forward_tokens(tokens, 0, worker_ring, job_id).await?;
+        let window = self.device_kv_cache.config.max_seq_len.max(1);
+        let start = tokens.len().saturating_sub(window);
+        self.device_kv_cache.base_position = start;
+        let hidden = self
+            .forward_tokens(&tokens[start..], start, worker_ring, job_id)
+            .await?;
         self.position = tokens.len();
+        debug_assert_eq!(self.device_kv_cache.next_position(), self.position);
         self.compute_logits(&hidden)
     }
 
@@ -1094,11 +1222,11 @@ impl ForwardPass {
                 "Decode step requested before prompt prefill".to_string(),
             ));
         }
-        if self.device_kv_cache.seq_len() != self.position {
+        if self.device_kv_cache.next_position() != self.position {
             return Err(crate::errors::AgentError::Execution(format!(
-                "Forward pass position {} diverged from KV cache length {}",
+                "Forward pass position {} diverged from KV cache next position {}",
                 self.position,
-                self.device_kv_cache.seq_len()
+                self.device_kv_cache.next_position()
             )));
         }
 
@@ -1308,15 +1436,20 @@ impl ForwardPass {
     }
 
     pub fn logical_kv_tokens(&self) -> usize {
-        self.device_kv_cache.seq_len().max(self.position)
+        self.position
+            .saturating_sub(self.device_kv_cache.base_position())
     }
 
     pub fn cache_seq_len(&self) -> usize {
         self.device_kv_cache.seq_len()
     }
 
-    pub fn export_kv_cache_snapshot(&self) -> Result<Option<KVCacheSnapshot>> {
-        self.device_kv_cache.export_snapshot(self.position as u32)
+    pub fn export_kv_cache_snapshot(
+        &self,
+        max_cached_tokens: Option<usize>,
+    ) -> Result<Option<KVCacheSnapshot>> {
+        self.device_kv_cache
+            .export_snapshot(self.position as u32, max_cached_tokens)
     }
 
     pub fn import_kv_cache_snapshot(&mut self, snapshot: &KVCacheSnapshot) -> Result<()> {
@@ -1440,7 +1573,10 @@ fn attention_output_device(
     }
 
     let cache_prefix_len = kv_cache.layer_seq_len(layer_idx)?;
-    validate_positions(absolute_positions, cache_prefix_len)?;
+    validate_positions(
+        absolute_positions,
+        kv_cache.base_position().saturating_add(cache_prefix_len),
+    )?;
     let q_rope = apply_rope_candle(
         &q_local,
         q_rows,
@@ -1558,8 +1694,19 @@ fn attention_output_device_batch(
 
     let mut outputs = Vec::with_capacity(batch_size);
     for row_idx in 0..batch_size {
+        let current_layer_seq_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
+        let max_seq_len = kv_caches[row_idx].config.max_seq_len.max(1);
+        if current_layer_seq_len.saturating_add(1) > max_seq_len {
+            let drop_rows = current_layer_seq_len.saturating_add(1) - max_seq_len;
+            kv_caches[row_idx].retain_suffix(current_layer_seq_len.saturating_sub(drop_rows))?;
+        }
         let prefix_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
-        validate_positions(&[absolute_positions[row_idx]], prefix_len)?;
+        validate_positions(
+            &[absolute_positions[row_idx]],
+            kv_caches[row_idx]
+                .base_position()
+                .saturating_add(prefix_len),
+        )?;
         let q_row = q_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let k_row = k_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let v_row = v_local.narrow(0, row_idx, 1).map_err(device_error)?;
@@ -1758,8 +1905,12 @@ impl LocalForwardPass {
     /// Run forward pass without distribution (for testing)
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Tensor2D> {
         self.kv_cache.clear();
-        let hidden = self.forward_tokens(tokens, 0)?;
+        let window = self.kv_cache.config.max_seq_len.max(1);
+        let start = tokens.len().saturating_sub(window);
+        self.kv_cache.set_base_position_for_restore(start);
+        let hidden = self.forward_tokens(&tokens[start..], start)?;
         self.position = tokens.len();
+        debug_assert_eq!(self.kv_cache.next_position(), self.position);
         Ok(hidden)
     }
 
@@ -1771,8 +1922,12 @@ impl LocalForwardPass {
         }
 
         self.kv_cache.clear();
-        let hidden = self.forward_tokens(tokens, 0)?;
+        let window = self.kv_cache.config.max_seq_len.max(1);
+        let start = tokens.len().saturating_sub(window);
+        self.kv_cache.set_base_position_for_restore(start);
+        let hidden = self.forward_tokens(&tokens[start..], start)?;
         self.position = tokens.len();
+        debug_assert_eq!(self.kv_cache.next_position(), self.position);
         let last_row = hidden.row(hidden.rows - 1);
         let last_hidden = Tensor2D::new(last_row.to_vec(), 1, hidden.cols)?;
         let logits_2d = matmul(&last_hidden, &self.weights.lm_head)?;
@@ -1785,11 +1940,11 @@ impl LocalForwardPass {
                 "Decode step requested before prompt prefill".to_string(),
             ));
         }
-        if self.kv_cache.seq_len() != self.position {
+        if self.kv_cache.next_position() != self.position {
             return Err(crate::errors::AgentError::Execution(format!(
-                "Local forward pass position {} diverged from KV cache length {}",
+                "Local forward pass position {} diverged from KV cache next position {}",
                 self.position,
-                self.kv_cache.seq_len()
+                self.kv_cache.next_position()
             )));
         }
 
@@ -2017,6 +2172,24 @@ mod tests {
     }
 
     #[test]
+    fn test_local_incremental_decode_slides_live_kv_window() {
+        let config = create_test_config();
+        let weights = create_test_weights(&config, config.hidden_dim);
+        let mut incremental = LocalForwardPass::new(weights);
+        incremental.kv_cache.config.max_seq_len = 2;
+
+        let prompt = vec![1, 2, 3];
+        let first_logits = incremental.prefill(&prompt).unwrap();
+        let first_token = sample_greedy(&first_logits);
+        let _decode_logits = incremental.decode_step(first_token).unwrap();
+
+        assert_eq!(incremental.position, 4);
+        assert_eq!(incremental.kv_cache.seq_len(), 2);
+        assert_eq!(incremental.kv_cache.base_position(), 2);
+        assert_eq!(incremental.kv_cache.next_position(), 4);
+    }
+
+    #[test]
     fn test_forward_pass_creation() {
         let config = create_test_config();
         let weights = create_test_weights(&config, 16);
@@ -2069,7 +2242,7 @@ mod tests {
         assert_eq!(forward.logical_kv_tokens(), 2);
 
         let exported = forward
-            .export_kv_cache_snapshot()
+            .export_kv_cache_snapshot(None)
             .unwrap()
             .expect("snapshot should be present");
         assert_eq!(exported.sequence, snapshot.sequence);
@@ -2082,6 +2255,53 @@ mod tests {
             assert_eq!(actual_k.data, expected_k.data);
             assert_eq!(actual_v.data, expected_v.data);
         }
+    }
+
+    #[test]
+    fn test_forward_pass_exports_segmented_kv_snapshot_window() {
+        let config = create_test_config();
+        let weights = create_test_weights(&config, config.hidden_dim);
+        let mut forward = ForwardPass::new(
+            weights,
+            0,
+            0,
+            config.hidden_dim,
+            1,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let kv_cols = config.num_kv_heads * (config.hidden_dim / config.num_heads);
+        let mut host_cache = KVCache::new(KVCacheConfig {
+            num_layers: config.num_layers,
+            num_heads: config.num_kv_heads,
+            head_dim: config.hidden_dim / config.num_heads,
+            max_seq_len: 16,
+        });
+        for layer_idx in 0..config.num_layers {
+            host_cache
+                .append_layer(
+                    layer_idx,
+                    Tensor2D::filled(4, kv_cols, 0.2 + layer_idx as f32),
+                    Tensor2D::filled(4, kv_cols, 0.4 + layer_idx as f32),
+                )
+                .unwrap();
+        }
+
+        let snapshot = KVCacheSnapshot::from_cache(&host_cache, 4).unwrap();
+        forward.import_kv_cache_snapshot(&snapshot).unwrap();
+
+        let exported = forward
+            .export_kv_cache_snapshot(Some(2))
+            .unwrap()
+            .expect("segmented snapshot should be present");
+        assert_eq!(exported.sequence.next_position, 4);
+        assert_eq!(exported.sequence.cached_tokens, 2);
+        assert_eq!(exported.sequence.first_cached_position(), 2);
+
+        let restored = exported.decode_cache().unwrap();
+        assert_eq!(restored.base_position(), 2);
+        assert_eq!(restored.seq_len(), 2);
     }
 
     #[test]

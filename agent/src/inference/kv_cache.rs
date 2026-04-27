@@ -35,6 +35,13 @@ impl KVSequenceState {
     }
 
     pub fn from_cache(cache: &KVCache, next_position: u32) -> Result<Self> {
+        if cache.next_position() as u32 != next_position {
+            return Err(AgentError::Execution(format!(
+                "KV sequence state next_position {} does not match cache next position {}",
+                next_position,
+                cache.next_position()
+            )));
+        }
         Self::new(next_position, cache.seq_len() as u32)
     }
 
@@ -120,6 +127,13 @@ impl KVCacheSnapshot {
                 "KV snapshot cached token mismatch: payload has {} tokens, sequence metadata says {}",
                 cache.seq_len(),
                 self.sequence.cached_tokens
+            )));
+        }
+        if cache.base_position() as u32 != self.sequence.first_cached_position() {
+            return Err(AgentError::Execution(format!(
+                "KV snapshot base position mismatch: payload starts at {}, sequence metadata says {}",
+                cache.base_position(),
+                self.sequence.first_cached_position()
             )));
         }
         Ok(())
@@ -310,6 +324,9 @@ impl LayerKVCache {
 pub struct KVCache {
     /// Per-layer caches
     pub layers: Vec<LayerKVCache>,
+    /// Absolute token position represented by row 0 of the cache.
+    #[serde(default)]
+    pub base_position: usize,
     /// Configuration
     pub config: KVCacheConfig,
 }
@@ -319,7 +336,11 @@ impl KVCache {
     pub fn new(config: KVCacheConfig) -> Self {
         let layers = (0..config.num_layers).map(LayerKVCache::new).collect();
 
-        Self { layers, config }
+        Self {
+            layers,
+            base_position: 0,
+            config,
+        }
     }
 
     /// Create with default configuration
@@ -353,23 +374,50 @@ impl KVCache {
         keys: Tensor2D,
         values: Tensor2D,
     ) -> Result<()> {
+        let max_seq_len = self.config.max_seq_len.max(1);
         let incoming_rows = keys.rows;
+        let (keys, values, incoming_rows) = if incoming_rows > max_seq_len {
+            let keep_rows = max_seq_len;
+            let start_row = incoming_rows - keep_rows;
+            let start = start_row * keys.cols;
+            let end = incoming_rows * keys.cols;
+            (
+                Tensor2D::new(keys.data[start..end].to_vec(), keep_rows, keys.cols)?,
+                Tensor2D::new(values.data[start..end].to_vec(), keep_rows, values.cols)?,
+                keep_rows,
+            )
+        } else {
+            (keys, values, incoming_rows)
+        };
+
+        let target_layer_seq_len = self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?
+            .seq_len;
+        if target_layer_seq_len.saturating_add(incoming_rows) > max_seq_len {
+            let drop_rows = target_layer_seq_len.saturating_add(incoming_rows) - max_seq_len;
+            self.retain_suffix(target_layer_seq_len.saturating_sub(drop_rows));
+        }
+
         let layer = self
             .layers
             .get_mut(layer_idx)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
-        if layer.seq_len + incoming_rows > self.config.max_seq_len {
-            return Err(AgentError::Execution(format!(
-                "KV cache exceeded max_seq_len {} on layer {}: {} + {}",
-                self.config.max_seq_len, layer_idx, layer.seq_len, incoming_rows
-            )));
-        }
         layer.append(keys, values)
     }
 
     /// Get the current sequence length
     pub fn seq_len(&self) -> usize {
         self.layers.first().map(|l| l.seq_len).unwrap_or(0)
+    }
+
+    pub fn base_position(&self) -> usize {
+        self.base_position
+    }
+
+    pub fn next_position(&self) -> usize {
+        self.base_position.saturating_add(self.seq_len())
     }
 
     pub fn layer_seq_len(&self, layer_idx: usize) -> Result<usize> {
@@ -405,13 +453,33 @@ impl KVCache {
         for layer in &mut self.layers {
             layer.clear();
         }
+        self.base_position = 0;
     }
 
-    /// Truncate all caches to specific length
-    pub fn truncate(&mut self, max_len: usize) {
-        for layer in &mut self.layers {
-            layer.truncate(max_len);
+    /// Keep only the newest `max_len` tokens across all layers.
+    pub fn retain_suffix(&mut self, max_len: usize) {
+        let seq_len = self.seq_len();
+        if seq_len <= max_len {
+            return;
         }
+
+        let drop_rows = seq_len - max_len;
+        for layer in &mut self.layers {
+            if let (Some(keys), Some(values)) = (&mut layer.keys, &mut layer.values) {
+                let kv_dim = keys.cols;
+                let drop_values = drop_rows * kv_dim;
+                keys.data.drain(0..drop_values);
+                values.data.drain(0..drop_values);
+                keys.rows = max_len;
+                values.rows = max_len;
+                layer.seq_len = max_len;
+            }
+        }
+        self.base_position = self.base_position.saturating_add(drop_rows);
+    }
+
+    pub fn set_base_position_for_restore(&mut self, base_position: usize) {
+        self.base_position = base_position;
     }
 
     /// Get total memory usage in bytes
@@ -486,7 +554,7 @@ impl SlidingWindowCache {
 
         // Slide window if needed
         if self.inner.seq_len() > self.window_size {
-            self.inner.truncate(self.window_size);
+            self.inner.retain_suffix(self.window_size);
         }
 
         Ok(())
@@ -550,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kv_cache_truncate() {
+    fn test_kv_cache_retain_suffix() {
         let config = KVCacheConfig {
             num_layers: 1,
             num_heads: 2,
@@ -565,8 +633,9 @@ mod tests {
 
         assert_eq!(cache.seq_len(), 20);
 
-        cache.truncate(10);
+        cache.retain_suffix(10);
         assert_eq!(cache.seq_len(), 10);
+        assert_eq!(cache.base_position(), 10);
     }
 
     #[test]
@@ -590,6 +659,7 @@ mod tests {
         let values = Tensor2D::new(vec![2.0; 4 * 8], 4, 8).unwrap();
         cache.update_layer(0, keys, values).unwrap();
         assert_eq!(cache.cache().seq_len(), 5);
+        assert_eq!(cache.cache().base_position(), 2);
     }
 
     #[test]
@@ -614,6 +684,7 @@ mod tests {
 
         assert_eq!(restored.seq_len(), cache.seq_len());
         assert_eq!(restored.layers.len(), cache.layers.len());
+        assert_eq!(restored.base_position(), cache.base_position());
     }
 
     #[test]
@@ -636,7 +707,36 @@ mod tests {
         let snapshot = KVCacheSnapshot::from_cache(&cache, 2).unwrap();
         assert_eq!(snapshot.sequence.next_position, 2);
         assert_eq!(snapshot.sequence.cached_tokens, 2);
+        assert_eq!(snapshot.sequence.first_cached_position(), 0);
         assert_eq!(snapshot.decode_cache().unwrap().seq_len(), 2);
+    }
+
+    #[test]
+    fn test_kv_snapshot_tracks_nonzero_base_position() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 10,
+        };
+        let mut cache = KVCache::new(config);
+        cache
+            .update_layer(
+                0,
+                Tensor2D::new(vec![1.0; 4 * 8], 4, 8).unwrap(),
+                Tensor2D::new(vec![2.0; 4 * 8], 4, 8).unwrap(),
+            )
+            .unwrap();
+        cache.retain_suffix(2);
+
+        let snapshot = KVCacheSnapshot::from_cache(&cache, cache.next_position() as u32).unwrap();
+        assert_eq!(snapshot.sequence.next_position, 4);
+        assert_eq!(snapshot.sequence.cached_tokens, 2);
+        assert_eq!(snapshot.sequence.first_cached_position(), 2);
+
+        let restored = snapshot.decode_cache().unwrap();
+        assert_eq!(restored.base_position(), 2);
+        assert_eq!(restored.seq_len(), 2);
     }
 
     #[test]
@@ -664,13 +764,14 @@ mod tests {
             )
             .unwrap();
 
-        let err = cache
+        cache
             .append_layer(
                 0,
                 Tensor2D::new(vec![3.0; 8], 1, 8).unwrap(),
                 Tensor2D::new(vec![4.0; 8], 1, 8).unwrap(),
             )
-            .unwrap_err();
-        assert!(err.to_string().contains("max_seq_len"));
+            .unwrap();
+        assert_eq!(cache.seq_len(), 2);
+        assert_eq!(cache.base_position(), 1);
     }
 }

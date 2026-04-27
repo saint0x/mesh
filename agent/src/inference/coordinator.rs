@@ -72,6 +72,9 @@ pub struct InferenceConfig {
     /// Maximum checkpoint loads allowed across the node in a rolling minute.
     pub recovery_max_checkpoint_loads_per_minute: u32,
 
+    /// Maximum number of cached KV tokens to materialize into a checkpoint payload.
+    pub checkpoint_segment_max_tokens: usize,
+
     /// Maximum number of decode sessions admitted into a single microbatch.
     pub max_decode_batch_size: usize,
 
@@ -106,6 +109,7 @@ impl Default for InferenceConfig {
             recovery_max_attempts_per_job: 2,
             recovery_cooldown: Duration::from_secs(5),
             recovery_max_checkpoint_loads_per_minute: 8,
+            checkpoint_segment_max_tokens: 1024,
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 16_384,
             max_active_sessions: 8,
@@ -294,6 +298,10 @@ struct RuntimeMemorySnapshot {
 }
 
 impl InferenceCoordinator {
+    fn checkpoint_segment_max_tokens(&self) -> Option<usize> {
+        Some(self.config.checkpoint_segment_max_tokens.max(1))
+    }
+
     /// Create a new inference coordinator
     pub fn new(swarm: MeshSwarm, tensor_plane: TensorPlane, config: InferenceConfig) -> Self {
         // Initialize shard registry with default path
@@ -814,7 +822,11 @@ impl InferenceCoordinator {
         let kv_snapshot = self
             .sessions
             .get(&session_id)
-            .map(|session| session.backend.export_kv_cache())
+            .map(|session| {
+                session
+                    .backend
+                    .export_kv_cache(self.checkpoint_segment_max_tokens())
+            })
             .transpose()?
             .flatten();
         manager
@@ -1110,7 +1122,11 @@ impl InferenceCoordinator {
             let kv_snapshot = self
                 .sessions
                 .get(&job.request.session_id)
-                .map(|session| session.backend.export_kv_cache())
+                .map(|session| {
+                    session
+                        .backend
+                        .export_kv_cache(self.checkpoint_segment_max_tokens())
+                })
                 .transpose()?
                 .flatten();
             let manager = Arc::clone(manager);
@@ -1906,7 +1922,10 @@ mod tests {
             RingAllReduceMetrics::default()
         }
 
-        fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
+        fn export_kv_cache(
+            &self,
+            _max_cached_tokens: Option<usize>,
+        ) -> Result<Option<KVCacheSnapshot>> {
             Ok(None)
         }
 
@@ -2049,6 +2068,7 @@ mod tests {
         assert_eq!(config.recovery_max_attempts_per_job, 2);
         assert_eq!(config.recovery_cooldown, Duration::from_secs(5));
         assert_eq!(config.recovery_max_checkpoint_loads_per_minute, 8);
+        assert_eq!(config.checkpoint_segment_max_tokens, 1024);
         assert_eq!(config.max_decode_batch_size, 4);
         assert_eq!(config.max_decode_batch_kv_tokens, 16_384);
     }

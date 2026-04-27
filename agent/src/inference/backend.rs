@@ -55,7 +55,7 @@ pub trait ExecutionBackend: Send {
 
     fn last_allreduce_metrics(&self) -> RingAllReduceMetrics;
 
-    fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>>;
+    fn export_kv_cache(&self, max_cached_tokens: Option<usize>) -> Result<Option<KVCacheSnapshot>>;
 
     fn import_kv_cache(&mut self, snapshot: &KVCacheSnapshot) -> Result<()>;
 
@@ -293,8 +293,9 @@ impl ExecutionBackend for CandleExecutionBackend {
         self.forward_pass.last_allreduce_metrics
     }
 
-    fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
-        self.forward_pass.export_kv_cache_snapshot()
+    fn export_kv_cache(&self, max_cached_tokens: Option<usize>) -> Result<Option<KVCacheSnapshot>> {
+        self.forward_pass
+            .export_kv_cache_snapshot(max_cached_tokens)
     }
 
     fn import_kv_cache(&mut self, snapshot: &KVCacheSnapshot) -> Result<()> {
@@ -380,7 +381,10 @@ mod tests {
             RingAllReduceMetrics::default()
         }
 
-        fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
+        fn export_kv_cache(
+            &self,
+            _max_cached_tokens: Option<usize>,
+        ) -> Result<Option<KVCacheSnapshot>> {
             Ok(None)
         }
 

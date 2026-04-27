@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "name": "segmented-kv-checkpointing",
+  "steps": [
+    {
+      "name": "kv snapshots preserve nonzero base positions",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::kv_cache::tests::test_kv_snapshot_tracks_nonzero_base_position",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "forward pass exports segmented kv checkpoint windows",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_forward_pass_exports_segmented_kv_snapshot_window",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "checkpoint manager round trips segmented kv snapshots",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "checkpoint::manager::tests::test_save_and_load_segmented_checkpoint_kv_cache",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

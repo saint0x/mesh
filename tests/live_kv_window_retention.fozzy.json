@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "live-kv-window-retention",
+  "steps": [
+    {
+      "name": "host kv cache slides instead of failing at max sequence length",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::kv_cache::tests::test_kv_cache_enforces_max_seq_len",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "local incremental decode retains a moving kv window",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_local_incremental_decode_slides_live_kv_window",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}
