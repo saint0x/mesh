@@ -17,9 +17,14 @@ use crate::network::{
     CollectiveLane, ServingFrame, ServingReceiveSpec, ServingSessionTransport, TensorPlane,
 };
 use crate::provider::ExecutionProviderKind;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use candle_core::{backend::BackendStorage, DType, MetalStorage};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::ops::Range;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::slice;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -51,6 +56,152 @@ pub struct Tensor {
     pub data: Vec<f32>,
     /// Shape of the tensor (e.g., [100] for 1D, [10, 10] for 2D)
     pub shape: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectiveMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    backing: CollectiveMatrixBacking,
+}
+
+#[derive(Debug, Clone)]
+enum CollectiveMatrixBacking {
+    Host(Vec<f32>),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MetalShared(MetalStorage),
+}
+
+impl CollectiveMatrix {
+    pub fn new(data: Vec<f32>, rows: usize, cols: usize) -> Self {
+        assert_eq!(
+            data.len(),
+            rows.saturating_mul(cols),
+            "Data length {} doesn't match matrix shape {}x{}={}",
+            data.len(),
+            rows,
+            cols,
+            rows.saturating_mul(cols)
+        );
+        Self {
+            rows,
+            cols,
+            backing: CollectiveMatrixBacking::Host(data),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn from_shared_metal(storage: MetalStorage, rows: usize, cols: usize) -> Self {
+        assert_eq!(
+            rows.saturating_mul(cols),
+            rows.saturating_mul(cols),
+            "matrix shape overflow for {}x{}",
+            rows,
+            cols
+        );
+        assert_eq!(
+            storage.dtype(),
+            DType::F32,
+            "collective matrices must use f32"
+        );
+        Self {
+            rows,
+            cols,
+            backing: CollectiveMatrixBacking::MetalShared(storage),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.saturating_mul(self.cols)
+    }
+
+    pub fn chunk_ranges(&self, n: usize) -> Vec<std::ops::Range<usize>> {
+        assert!(n > 0, "Number of chunks must be positive");
+        let chunk_size = self.len().div_ceil(n);
+        let mut ranges = Vec::with_capacity(n);
+        let mut start = 0usize;
+        for _ in 0..n {
+            let end = if chunk_size == 0 {
+                start
+            } else {
+                (start + chunk_size).min(self.len())
+            };
+            ranges.push(start..end);
+            start = end;
+        }
+        ranges
+    }
+
+    pub fn to_host_vec(&self) -> Vec<f32> {
+        match &self.backing {
+            CollectiveMatrixBacking::Host(data) => data.clone(),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                slice::from_raw_parts(storage.buffer().contents() as *const f32, self.len())
+            }
+            .to_vec(),
+        }
+    }
+
+    pub fn host_range(&self, range: Range<usize>) -> &[f32] {
+        match &self.backing {
+            CollectiveMatrixBacking::Host(data) => &data[range],
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                &slice::from_raw_parts(storage.buffer().contents() as *const f32, self.len())[range]
+            },
+        }
+    }
+
+    pub fn accumulate_range(&mut self, range: Range<usize>, values: &[f32]) {
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => {
+                for (dst, src) in data[range].iter_mut().zip(values.iter()) {
+                    *dst += *src;
+                }
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                let dst = &mut slice::from_raw_parts_mut(
+                    storage.buffer().contents() as *mut f32,
+                    self.len(),
+                )[range];
+                for (slot, value) in dst.iter_mut().zip(values.iter()) {
+                    *slot += *value;
+                }
+            },
+        }
+    }
+
+    pub fn copy_range_from_slice(&mut self, range: Range<usize>, values: &[f32]) {
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => data[range].copy_from_slice(values),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                let dst = &mut slice::from_raw_parts_mut(
+                    storage.buffer().contents() as *mut f32,
+                    self.len(),
+                )[range];
+                dst.copy_from_slice(values);
+            },
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn metal_shared_storage(&self) -> Option<MetalStorage> {
+        match &self.backing {
+            CollectiveMatrixBacking::MetalShared(storage) => Some(storage.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for CollectiveMatrix {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.cols == other.cols
+            && self.to_host_vec() == other.to_host_vec()
+    }
 }
 
 impl Tensor {
@@ -267,6 +418,9 @@ impl<'a> WorkerRing<'a> {
     }
 
     pub async fn prepare_serving_group_channels(&mut self) -> Result<()> {
+        if self.total_workers <= 1 {
+            return Ok(());
+        }
         self.serving_transport = Some(
             self.tensor_plane
                 .serving_transport_for_neighbors(
@@ -300,6 +454,10 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<Tensor> {
+        if self.total_workers <= 1 {
+            self.last_run_metrics = RingAllReduceMetrics::default();
+            return Ok(partial_result);
+        }
         let n = self.total_workers as usize;
         let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
@@ -441,11 +599,119 @@ impl<'a> WorkerRing<'a> {
         })?
     }
 
+    pub async fn ring_all_reduce_matrix(
+        &mut self,
+        mut partial_result: CollectiveMatrix,
+        job_id: Uuid,
+        layer_idx: u32,
+    ) -> Result<CollectiveMatrix> {
+        if self.total_workers <= 1 {
+            self.last_run_metrics = RingAllReduceMetrics::default();
+            return Ok(partial_result);
+        }
+        let n = self.total_workers as usize;
+        let my_pos = self.my_position as usize;
+        let mut run_metrics = RingAllReduceMetrics::default();
+        let chunk_ranges = partial_result.chunk_ranges(n);
+
+        for step in 0..(n - 1) {
+            let send_idx = (my_pos + n - step) % n;
+            let recv_idx = (my_pos + n - step - 1) % n;
+            let send_range = &chunk_ranges[send_idx];
+            let send_shape = [send_range.len()];
+
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    layer_idx,
+                    step as u32,
+                    recv_idx as u32,
+                    partial_result.host_range(send_range.clone()),
+                    &send_shape,
+                )
+                .await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+
+            let recv_range = &chunk_ranges[recv_idx];
+            if recv_msg.chunk_data.len() != recv_range.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received reduce-scatter chunk len {} but expected {}",
+                    recv_msg.chunk_data.len(),
+                    recv_range.len()
+                )));
+            }
+            partial_result.accumulate_range(recv_range.clone(), &recv_msg.chunk_data);
+        }
+
+        for step in 0..(n - 1) {
+            let send_idx = (my_pos + n - step + 1) % n;
+            let recv_idx = (my_pos + n - step) % n;
+            let send_range = &chunk_ranges[send_idx];
+            let send_shape = [send_range.len()];
+
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::AllGather,
+                    job_id,
+                    layer_idx,
+                    step as u32,
+                    recv_idx as u32,
+                    partial_result.host_range(send_range.clone()),
+                    &send_shape,
+                )
+                .await?;
+            run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+
+            let recv_range = &chunk_ranges[recv_idx];
+            if recv_msg.chunk_data.len() != recv_range.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received all-gather chunk len {} but expected {}",
+                    recv_msg.chunk_data.len(),
+                    recv_range.len()
+                )));
+            }
+            partial_result.copy_range_from_slice(recv_range.clone(), &recv_msg.chunk_data);
+        }
+
+        self.last_run_metrics = run_metrics;
+        Ok(partial_result)
+    }
+
+    pub async fn ring_all_reduce_matrix_with_timeout(
+        &mut self,
+        partial_result: CollectiveMatrix,
+        job_id: Uuid,
+        layer_idx: u32,
+        timeout: Duration,
+    ) -> Result<CollectiveMatrix> {
+        tokio::time::timeout(
+            timeout,
+            self.ring_all_reduce_matrix(partial_result, job_id, layer_idx),
+        )
+        .await
+        .map_err(|_| {
+            AgentError::Execution(format!(
+                "Ring all-reduce matrix timed out after {:?}",
+                timeout
+            ))
+        })?
+    }
+
     /// Barrier synchronization - wait for all workers to reach this point
     ///
     /// Uses a ring-based barrier where each worker sends a message to its
     /// right neighbor and waits for a message from its left neighbor.
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
+        if self.total_workers <= 1 {
+            return Ok(());
+        }
         let (received, _, _) = self
             .send_chunk_to_right_recv_from_left(
                 CollectiveLane::Control,

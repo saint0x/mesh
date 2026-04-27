@@ -43,7 +43,13 @@ pub trait ExecutionBackend: Send {
         job_id: Uuid,
     ) -> Result<BackendLogits>;
 
-    fn sample(&self, logits: &BackendLogits, temperature: f32, top_p: f32, seed: u64) -> u32;
+    fn sample(
+        &self,
+        logits: &BackendLogits,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+    ) -> Result<u32>;
 
     fn cache_seq_len(&self) -> usize;
 
@@ -269,7 +275,13 @@ impl ExecutionBackend for CandleExecutionBackend {
             .await
     }
 
-    fn sample(&self, logits: &BackendLogits, temperature: f32, top_p: f32, seed: u64) -> u32 {
+    fn sample(
+        &self,
+        logits: &BackendLogits,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+    ) -> Result<u32> {
         self.forward_pass.sample(logits, temperature, top_p, seed)
     }
 
@@ -357,8 +369,8 @@ mod tests {
             _temperature: f32,
             _top_p: f32,
             _seed: u64,
-        ) -> u32 {
-            0
+        ) -> Result<u32> {
+            Ok(0)
         }
 
         fn cache_seq_len(&self) -> usize {

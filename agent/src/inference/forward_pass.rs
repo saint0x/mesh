@@ -50,12 +50,12 @@ use candle_core::{DType, Tensor as CandleTensor};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
 use super::tensor_ops::{
-    apply_rope, apply_rope_candle, candle_2d_from_collective_buffer,
+    apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
     collective_buffer_from_candle_2d, embed_tokens, execution_device, from_candle_2d, matmul,
     rms_norm, rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
@@ -1155,32 +1155,59 @@ impl ForwardPass {
     }
 
     /// Sample next token from logits
-    pub fn sample(&self, logits: &BackendLogits, temperature: f32, top_p: f32, seed: u64) -> u32 {
+    pub fn sample(
+        &self,
+        logits: &BackendLogits,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+    ) -> Result<u32> {
         match logits {
-            BackendLogits::Host(logits) => {
+            BackendLogits::Host(logits) => Ok({
                 if temperature <= 0.0 || temperature == 1.0 && top_p >= 1.0 {
                     sample_greedy(logits)
                 } else {
                     sample_token(logits, temperature, top_p, seed)
                 }
-            }
+            }),
             BackendLogits::Device(logits) => {
                 if temperature <= 0.0 || temperature == 1.0 && top_p >= 1.0 {
-                    logits
+                    let token_ids = logits
                         .argmax(1)
                         .and_then(|idx| idx.to_vec1::<u32>())
                         .map_err(device_error)
-                        .and_then(|values| {
-                            values.into_iter().next().ok_or_else(|| {
-                                AgentError::Execution(
-                                    "Device argmax produced no token ids".to_string(),
-                                )
-                            })
-                        })
-                        .expect("device argmax sampling failed")
+                        .or_else(|device_err| {
+                            let host_logits = Tensor1D::new(
+                                logits
+                                    .flatten_all()
+                                    .map_err(device_error)?
+                                    .to_vec1::<f32>()
+                                    .map_err(device_error)?,
+                            );
+                            warn!(
+                                error = %device_err,
+                                "device argmax sampling failed, falling back to host logits"
+                            );
+                            Ok::<Vec<u32>, AgentError>(vec![sample_greedy(&host_logits)])
+                        })?;
+                    token_ids.into_iter().next().ok_or_else(|| {
+                        AgentError::Execution("Device argmax produced no token ids".to_string())
+                    })
                 } else {
-                    sample_token_device(logits, temperature, top_p, seed)
-                        .expect("device stochastic sampling failed")
+                    sample_token_device(logits, temperature, top_p, seed).or_else(|device_err| {
+                        let host_logits = Tensor1D::new(
+                            logits
+                                .flatten_all()
+                                .map_err(device_error)?
+                                .to_vec1::<f32>()
+                                .map_err(device_error)?,
+                        );
+                        warn!(
+                            error = %device_err,
+                            "device stochastic sampling failed, falling back to host logits"
+                        );
+                        Ok(sample_token(&host_logits, temperature, top_p, seed))
+                    })
                 }
             }
         }
@@ -1275,11 +1302,11 @@ impl ForwardPass {
                     "Decode microbatch requested before prompt prefill".to_string(),
                 ));
             }
-            if forward_pass.device_kv_cache.seq_len() != forward_pass.position {
+            if forward_pass.device_kv_cache.next_position() != forward_pass.position {
                 return Err(crate::errors::AgentError::Execution(format!(
-                    "Forward pass position {} diverged from KV cache length {}",
+                    "Forward pass position {} diverged from KV cache next position {}",
                     forward_pass.position,
-                    forward_pass.device_kv_cache.seq_len()
+                    forward_pass.device_kv_cache.next_position()
                 )));
             }
             positions.push(forward_pass.position as u32);
@@ -1399,13 +1426,16 @@ impl ForwardPass {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<CandleTensor> {
+        if worker_ring.total_workers <= 1 {
+            return Ok(tensor.clone());
+        }
         let flat = collective_buffer_from_candle_2d(tensor)?;
         let reduced = worker_ring
-            .ring_all_reduce_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
+            .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
             .await?;
         self.last_allreduce_metrics
             .accumulate(worker_ring.last_run_metrics());
-        candle_2d_from_collective_buffer(&reduced)
+        candle_2d_from_collective_buffer_owned_like(reduced, tensor)
     }
 
     async fn ring_allreduce_candle_batch(
@@ -1416,12 +1446,15 @@ impl ForwardPass {
         allreduce_timeout: std::time::Duration,
         metrics: &mut RingAllReduceMetrics,
     ) -> Result<CandleTensor> {
+        if worker_ring.total_workers <= 1 {
+            return Ok(tensor.clone());
+        }
         let flat = collective_buffer_from_candle_2d(tensor)?;
         let reduced = worker_ring
-            .ring_all_reduce_with_timeout(flat, job_id, layer_idx, allreduce_timeout)
+            .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, allreduce_timeout)
             .await?;
         metrics.accumulate(worker_ring.last_run_metrics());
-        candle_2d_from_collective_buffer(&reduced)
+        candle_2d_from_collective_buffer_owned_like(reduced, tensor)
     }
 
     /// Clear KV cache (for new sequence)
@@ -1770,22 +1803,36 @@ fn attention_output_device_cached(
         .reshape((q_rows, local_q_heads, head_dim))
         .map_err(device_error)?
         .transpose(0, 1)
+        .map_err(device_error)?
+        .contiguous()
         .map_err(device_error)?;
     let k_heads = cached_k
         .reshape((cached_seq_len, local_kv_heads, head_dim))
         .map_err(device_error)?
         .transpose(0, 1)
+        .map_err(device_error)?
+        .contiguous()
         .map_err(device_error)?;
     let v_heads = cached_v
         .reshape((cached_seq_len, local_kv_heads, head_dim))
         .map_err(device_error)?
         .transpose(0, 1)
+        .map_err(device_error)?
+        .contiguous()
         .map_err(device_error)?;
 
     let kv_indices = CandleTensor::from_vec(local_kv_indices, local_q_heads, q_rope.device())
         .map_err(device_error)?;
-    let selected_k = k_heads.index_select(&kv_indices, 0).map_err(device_error)?;
-    let selected_v = v_heads.index_select(&kv_indices, 0).map_err(device_error)?;
+    let selected_k = k_heads
+        .index_select(&kv_indices, 0)
+        .map_err(device_error)?
+        .contiguous()
+        .map_err(device_error)?;
+    let selected_v = v_heads
+        .index_select(&kv_indices, 0)
+        .map_err(device_error)?
+        .contiguous()
+        .map_err(device_error)?;
     let scores = q_heads
         .matmul(&selected_k.transpose(1, 2).map_err(device_error)?)
         .map_err(device_error)?
@@ -2039,6 +2086,12 @@ impl LocalForwardPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::backend::CandleExecutionBackend;
+    use crate::inference::engine::InferenceRuntimeMode;
+    use crate::network::{TensorPlane, TensorPlaneConfig};
+    use crate::provider::ExecutionProviderKind;
+    use libp2p::PeerId;
+    use uuid::Uuid;
 
     fn create_test_config() -> ModelConfig {
         ModelConfig {
@@ -2302,6 +2355,88 @@ mod tests {
         let restored = exported.decode_cache().unwrap();
         assert_eq!(restored.base_position(), 2);
         assert_eq!(restored.seq_len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_decode_microbatch_respects_sliding_device_kv_window() {
+        let config = create_test_config();
+        let residency = Arc::new(
+            SharedModelResidency::from_host(create_test_weights(&config, config.hidden_dim))
+                .unwrap(),
+        );
+        let mut backend_a = CandleExecutionBackend::new(
+            Arc::clone(&residency),
+            0,
+            0,
+            config.hidden_dim,
+            1,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut backend_b = CandleExecutionBackend::new(
+            Arc::clone(&residency),
+            0,
+            0,
+            config.hidden_dim,
+            1,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        backend_a.forward_pass.device_kv_cache.config.max_seq_len = 2;
+        backend_b.forward_pass.device_kv_cache.config.max_seq_len = 2;
+
+        let mut tensor_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let local_addr = tensor_plane.local_addr();
+        let mut worker_ring = WorkerRing::new(
+            0,
+            1,
+            peer_id,
+            peer_id,
+            local_addr,
+            local_addr,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+            &mut tensor_plane,
+        );
+
+        let prompt = vec![1, 2, 3];
+        backend_a
+            .forward_pass
+            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .await
+            .unwrap();
+        backend_b
+            .forward_pass
+            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .await
+            .unwrap();
+
+        assert_eq!(backend_a.forward_pass.position, 3);
+        assert_eq!(backend_a.forward_pass.device_kv_cache.seq_len(), 2);
+        assert_eq!(backend_a.forward_pass.device_kv_cache.next_position(), 3);
+
+        let mut batch = vec![&mut backend_a, &mut backend_b];
+        let logits = ForwardPass::decode_microbatch(
+            &mut batch,
+            &[7, 8],
+            &[Uuid::new_v4(), Uuid::new_v4()],
+            &mut worker_ring,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logits.len(), 2);
+        assert_eq!(backend_a.forward_pass.position, 4);
+        assert_eq!(backend_b.forward_pass.position, 4);
+        assert_eq!(backend_a.forward_pass.device_kv_cache.seq_len(), 2);
+        assert_eq!(backend_b.forward_pass.device_kv_cache.seq_len(), 2);
+        assert_eq!(backend_a.forward_pass.device_kv_cache.base_position(), 2);
+        assert_eq!(backend_b.forward_pass.device_kv_cache.base_position(), 2);
+        assert_eq!(backend_a.forward_pass.device_kv_cache.next_position(), 4);
+        assert_eq!(backend_b.forward_pass.device_kv_cache.next_position(), 4);
     }
 
     #[test]

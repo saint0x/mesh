@@ -9,7 +9,12 @@
 
 use crate::errors::{AgentError, Result};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use candle_core::{DType, Device, Tensor as CandleTensor, D};
+use candle_core::{
+    backend::BackendStorage, CustomOp1, DType, Device, Layout, Shape, Storage,
+    Tensor as CandleTensor, D,
+};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use candle_core::{MetalStorage, Result as CandleResult};
 use candle_nn::ops as candle_ops;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
@@ -892,7 +897,7 @@ pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
 
 pub(crate) fn collective_buffer_from_candle_2d(
     tensor: &CandleTensor,
-) -> Result<crate::executor::ring_allreduce::Tensor> {
+) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
     let dims = tensor.dims();
     if dims.len() != 2 {
         return Err(AgentError::Execution(format!(
@@ -901,35 +906,126 @@ pub(crate) fn collective_buffer_from_candle_2d(
         )));
     }
 
-    let data = tensor
+    let flattened = tensor
         .flatten_all()
         .map_err(candle_error)?
         .to_dtype(DType::F32)
         .map_err(candle_error)?
-        .to_vec1::<f32>()
+        .contiguous()
         .map_err(candle_error)?;
-    Ok(crate::executor::ring_allreduce::Tensor::new(
-        data,
-        vec![dims[0], dims[1]],
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let (storage, layout) = flattened.storage_and_layout();
+        if let Storage::Metal(storage) = &*storage {
+            if layout.is_contiguous() {
+                let device = storage.device().clone();
+                let element_count = dims[0] * dims[1];
+                let shared_buffer = device
+                    .allocate_buffer(element_count * std::mem::size_of::<f32>())
+                    .map_err(candle_error)?;
+                {
+                    let blit = device.blit_command_encoder().map_err(candle_error)?;
+                    blit.copy_from_buffer(
+                        storage.buffer(),
+                        layout.start_offset() * std::mem::size_of::<f32>(),
+                        &shared_buffer,
+                        0,
+                        element_count * std::mem::size_of::<f32>(),
+                    );
+                }
+                device.wait_until_completed().map_err(candle_error)?;
+                let shared_storage =
+                    MetalStorage::new(shared_buffer, device, element_count, DType::F32);
+                return Ok(
+                    crate::executor::ring_allreduce::CollectiveMatrix::from_shared_metal(
+                        shared_storage,
+                        dims[0],
+                        dims[1],
+                    ),
+                );
+            }
+        }
+    }
+
+    let data = flattened.to_vec1::<f32>().map_err(candle_error)?;
+    Ok(crate::executor::ring_allreduce::CollectiveMatrix::new(
+        data, dims[0], dims[1],
     ))
 }
 
 pub(crate) fn candle_2d_from_collective_buffer(
-    tensor: &crate::executor::ring_allreduce::Tensor,
+    tensor: &crate::executor::ring_allreduce::CollectiveMatrix,
 ) -> Result<CandleTensor> {
-    if tensor.shape.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Expected 2D collective buffer, got {}D",
-            tensor.shape.len()
-        )));
-    }
-
     CandleTensor::from_vec(
-        tensor.data.clone(),
-        (tensor.shape[0], tensor.shape[1]),
+        tensor.to_host_vec(),
+        (tensor.rows, tensor.cols),
         execution_device()?,
     )
     .map_err(candle_error)
+}
+
+pub(crate) fn candle_2d_from_collective_buffer_owned_like(
+    tensor: crate::executor::ring_allreduce::CollectiveMatrix,
+    template: &CandleTensor,
+) -> Result<CandleTensor> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(storage) = tensor.metal_shared_storage() {
+        return restore_shared_metal_collective(storage, tensor.rows, tensor.cols, template)
+            .map_err(candle_error);
+    }
+
+    CandleTensor::from_vec(
+        tensor.to_host_vec(),
+        (tensor.rows, tensor.cols),
+        template.device(),
+    )
+    .map_err(candle_error)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+struct RestoreSharedMetalCollective {
+    storage: MetalStorage,
+    shape: Shape,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CustomOp1 for RestoreSharedMetalCollective {
+    fn name(&self) -> &'static str {
+        "restore-shared-metal-collective"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &Layout,
+    ) -> CandleResult<(candle_core::CpuStorage, Shape)> {
+        Err(candle_core::Error::Msg(
+            "restore-shared-metal-collective requires a metal tensor".into(),
+        ))
+    }
+
+    fn metal_fwd(
+        &self,
+        _storage: &MetalStorage,
+        _layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        Ok((self.storage.clone(), self.shape.clone()))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn restore_shared_metal_collective(
+    storage: MetalStorage,
+    rows: usize,
+    cols: usize,
+    template: &CandleTensor,
+) -> CandleResult<CandleTensor> {
+    template.apply_op1_no_bwd(&RestoreSharedMetalCollective {
+        storage,
+        shape: Shape::from((rows, cols)),
+    })
 }
 
 pub(crate) fn rms_norm_candle(
@@ -1248,8 +1344,10 @@ mod tests {
         let candle = to_candle_2d(&source).unwrap();
         let buffer = collective_buffer_from_candle_2d(&candle).unwrap();
 
-        assert_eq!(buffer.shape, vec![2, 2]);
-        assert_eq!(buffer.data, source.data);
+        assert_eq!(buffer.rows, 2);
+        assert_eq!(buffer.cols, 2);
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.to_host_vec(), source.data);
 
         let restored = candle_2d_from_collective_buffer(&buffer).unwrap();
         let round_trip = from_candle_2d(&restored).unwrap();

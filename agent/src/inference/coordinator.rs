@@ -1332,7 +1332,7 @@ impl InferenceCoordinator {
                 request.config.temperature,
                 request.config.top_p,
                 seed,
-            );
+            )?;
             self.sessions.insert(request.session_id, session);
             next_token
         };
@@ -1466,7 +1466,7 @@ impl InferenceCoordinator {
                 session.job.request.config.temperature,
                 session.job.request.config.top_p,
                 seed,
-            );
+            )?;
             session.job.add_token(sampled_token);
             session.job.current_layer = self.config.total_layers;
             session.decode_steps_served = session.decode_steps_served.saturating_add(1);
@@ -1898,8 +1898,8 @@ mod tests {
             _temperature: f32,
             _top_p: f32,
             _seed: u64,
-        ) -> u32 {
-            0
+        ) -> Result<u32> {
+            Ok(0)
         }
 
         fn cache_seq_len(&self) -> usize {
