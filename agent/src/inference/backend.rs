@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::errors::Result;
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+use candle_core::Tensor as CandleTensor;
 
 use super::engine::BackendOptimizationProfile;
 use std::sync::Arc;
@@ -13,6 +14,12 @@ use std::sync::Arc;
 use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
 use super::tensor_ops::Tensor1D;
+
+#[derive(Clone)]
+pub enum BackendLogits {
+    Host(Tensor1D),
+    Device(CandleTensor),
+}
 
 #[async_trait]
 pub trait ExecutionBackend: Send {
@@ -27,20 +34,22 @@ pub trait ExecutionBackend: Send {
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D>;
+    ) -> Result<BackendLogits>;
 
     async fn decode_step(
         &mut self,
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D>;
+    ) -> Result<BackendLogits>;
 
-    fn sample(&self, logits: &Tensor1D, temperature: f32, top_p: f32, seed: u64) -> u32;
+    fn sample(&self, logits: &BackendLogits, temperature: f32, top_p: f32, seed: u64) -> u32;
 
     fn cache_seq_len(&self) -> usize;
 
-    fn cache_memory_usage(&self) -> usize;
+    fn live_kv_cache_bytes(&self) -> usize;
+
+    fn logical_kv_tokens(&self) -> usize;
 
     fn sequence_position(&self) -> usize;
 
@@ -62,7 +71,7 @@ pub struct DecodeMicrobatchRequest<'a> {
 
 pub struct DecodeMicrobatchOutput {
     pub session_id: Uuid,
-    pub logits: Tensor1D,
+    pub logits: BackendLogits,
     pub execution_time_ms: u64,
 }
 
@@ -115,7 +124,8 @@ impl BackendMicrobatchExecutor {
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
-        if let Some(outputs) = CandleExecutionBackend::decode_step_batch(requests, worker_ring).await?
+        if let Some(outputs) =
+            CandleExecutionBackend::decode_step_batch(requests, worker_ring).await?
         {
             return Ok(outputs);
         }
@@ -203,8 +213,8 @@ impl CandleExecutionBackend {
         }
 
         let step_start = Instant::now();
-        let logits = ForwardPass::decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring)
-            .await?;
+        let logits =
+            ForwardPass::decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring).await?;
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
         Ok(Some(
@@ -244,7 +254,7 @@ impl ExecutionBackend for CandleExecutionBackend {
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D> {
+    ) -> Result<BackendLogits> {
         self.forward_pass.prefill(tokens, worker_ring, job_id).await
     }
 
@@ -253,13 +263,13 @@ impl ExecutionBackend for CandleExecutionBackend {
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D> {
+    ) -> Result<BackendLogits> {
         self.forward_pass
             .decode_step(token, worker_ring, job_id)
             .await
     }
 
-    fn sample(&self, logits: &Tensor1D, temperature: f32, top_p: f32, seed: u64) -> u32 {
+    fn sample(&self, logits: &BackendLogits, temperature: f32, top_p: f32, seed: u64) -> u32 {
         self.forward_pass.sample(logits, temperature, top_p, seed)
     }
 
@@ -267,8 +277,12 @@ impl ExecutionBackend for CandleExecutionBackend {
         self.forward_pass.cache_seq_len()
     }
 
-    fn cache_memory_usage(&self) -> usize {
-        self.forward_pass.cache_memory_usage()
+    fn live_kv_cache_bytes(&self) -> usize {
+        self.forward_pass.live_kv_cache_bytes()
+    }
+
+    fn logical_kv_tokens(&self) -> usize {
+        self.forward_pass.logical_kv_tokens()
     }
 
     fn sequence_position(&self) -> usize {
@@ -280,30 +294,11 @@ impl ExecutionBackend for CandleExecutionBackend {
     }
 
     fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
-        if self.forward_pass.kv_cache.seq_len() == 0 {
-            return Ok(None);
-        }
-        KVCacheSnapshot::from_cache(
-            &self.forward_pass.kv_cache,
-            self.forward_pass.position as u32,
-        )
-        .map(Some)
+        self.forward_pass.export_kv_cache_snapshot()
     }
 
     fn import_kv_cache(&mut self, snapshot: &KVCacheSnapshot) -> Result<()> {
-        snapshot.validate()?;
-        let kv_cache = snapshot.decode_cache()?;
-        if kv_cache.seq_len() as u32 != snapshot.sequence.cached_tokens {
-            return Err(crate::errors::AgentError::Execution(format!(
-                "Recovered KV cache length {} does not match snapshot cached token count {}",
-                kv_cache.seq_len(),
-                snapshot.sequence.cached_tokens
-            )));
-        }
-        let sequence_position = snapshot.sequence.next_position as usize;
-        self.forward_pass.kv_cache = kv_cache;
-        self.forward_pass.position = sequence_position;
-        Ok(())
+        self.forward_pass.import_kv_cache_snapshot(snapshot)
     }
 
     fn clear(&mut self) {
@@ -342,8 +337,8 @@ mod tests {
             _tokens: &[u32],
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<Tensor1D> {
-            Ok(Tensor1D::zeros(1))
+        ) -> Result<BackendLogits> {
+            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }
 
         async fn decode_step(
@@ -351,11 +346,17 @@ mod tests {
             _token: u32,
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<Tensor1D> {
-            Ok(Tensor1D::zeros(1))
+        ) -> Result<BackendLogits> {
+            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }
 
-        fn sample(&self, _logits: &Tensor1D, _temperature: f32, _top_p: f32, _seed: u64) -> u32 {
+        fn sample(
+            &self,
+            _logits: &BackendLogits,
+            _temperature: f32,
+            _top_p: f32,
+            _seed: u64,
+        ) -> u32 {
             0
         }
 
@@ -363,7 +364,11 @@ mod tests {
             0
         }
 
-        fn cache_memory_usage(&self) -> usize {
+        fn live_kv_cache_bytes(&self) -> usize {
+            0
+        }
+
+        fn logical_kv_tokens(&self) -> usize {
             0
         }
 

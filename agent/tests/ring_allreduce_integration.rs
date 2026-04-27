@@ -9,12 +9,11 @@
 #![allow(clippy::needless_range_loop)]
 
 use agent::executor::Tensor;
-use agent::network::{AllReducePhase, MeshEvent, MeshSwarm, TensorMessage};
+use agent::network::{MeshEvent, MeshSwarm};
 use futures::StreamExt;
 use relay_server::config::Config as RelayConfig;
 use relay_server::relay::{build_swarm as build_relay_swarm, configured_advertised_addrs};
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Simulates the ring all-reduce algorithm with n workers
 /// This is a comprehensive test of the algorithmic correctness.
@@ -145,27 +144,6 @@ fn test_ring_allreduce_varying_sizes() {
         }
     }
 }
-
-/// Test barrier message creation
-#[test]
-fn test_barrier_message_format() {
-    let job_id = Uuid::new_v4();
-    let msg = TensorMessage::new(
-        3,
-        job_id,
-        5,
-        AllReducePhase::Barrier,
-        TensorMessage::BARRIER_STEP,
-        vec![3.0], // Worker 3's position
-        vec![1],
-    );
-
-    assert!(msg.is_barrier());
-    assert_eq!(msg.phase, AllReducePhase::Barrier);
-    assert_eq!(msg.chunk_data[0] as u32, 3);
-}
-
-// Note: Tensor serialization is exercised through the dedicated tensor data plane.
 
 /// Test large tensor handling
 #[test]

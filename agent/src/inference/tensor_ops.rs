@@ -9,7 +9,7 @@
 
 use crate::errors::{AgentError, Result};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use candle_core::{DType, Device, Tensor as CandleTensor};
+use candle_core::{DType, Device, Tensor as CandleTensor, D};
 use candle_nn::ops as candle_ops;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
@@ -554,6 +554,119 @@ pub fn sample_token(logits: &Tensor1D, temperature: f32, top_p: f32, rng_seed: u
     indexed_probs[0].0 as u32
 }
 
+fn deterministic_sample_threshold(rng_seed: u64) -> f32 {
+    let mut rng_state = rng_seed;
+    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    ((rng_state >> 33) as f32) / (u32::MAX as f32)
+}
+
+fn deterministic_sample_thresholds(rng_seed: u64, batch_size: usize) -> Vec<f32> {
+    (0..batch_size)
+        .map(|idx| deterministic_sample_threshold(rng_seed.wrapping_add(idx as u64)))
+        .collect()
+}
+
+fn apply_top_p_device(sorted_probs: &CandleTensor, top_p: f32) -> Result<CandleTensor> {
+    let dims = sorted_probs.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Device top-p sampling expects rank-2 probabilities, got {:?}",
+            dims
+        )));
+    }
+
+    let cumulative = sorted_probs.cumsum(D::Minus1).map_err(candle_error)?;
+    let shifted = cumulative
+        .broadcast_sub(&sorted_probs)
+        .map_err(candle_error)?;
+    let threshold = CandleTensor::full(top_p, dims, sorted_probs.device()).map_err(candle_error)?;
+    let keep_sorted = shifted.lt(&threshold).map_err(candle_error)?;
+    keep_sorted
+        .where_cond(
+            &sorted_probs,
+            &sorted_probs.zeros_like().map_err(candle_error)?,
+        )
+        .map_err(candle_error)
+}
+
+pub(crate) fn sample_tokens_device(
+    logits: &CandleTensor,
+    temperature: f32,
+    top_p: f32,
+    rng_seed: u64,
+) -> Result<Vec<u32>> {
+    let dims = logits.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Device sampling expects rank-2 logits, got {:?}",
+            dims
+        )));
+    }
+    if dims[0] == 0 || dims[1] == 0 {
+        return Err(AgentError::Execution(
+            "Device sampling received an empty logits tensor".to_string(),
+        ));
+    }
+
+    if temperature <= 0.0 || top_p <= 0.0 {
+        return logits
+            .argmax(1)
+            .and_then(|idx| idx.to_vec1::<u32>())
+            .map_err(candle_error);
+    }
+
+    let logits = logits.to_dtype(DType::F32).map_err(candle_error)?;
+    let device = logits.device().clone();
+    let scaled_logits = if temperature == 1.0 {
+        logits
+    } else {
+        logits
+            .affine((1.0 / temperature) as f64, 0.0)
+            .map_err(candle_error)?
+    };
+    let probs = candle_ops::softmax(&scaled_logits, 1).map_err(candle_error)?;
+    let (sorted_probs, sorted_indices) = probs.sort_last_dim(false).map_err(candle_error)?;
+    let filtered_sorted_probs = if top_p >= 1.0 {
+        sorted_probs
+    } else {
+        apply_top_p_device(&sorted_probs, top_p)?
+    };
+    let denom = filtered_sorted_probs.sum_keepdim(1).map_err(candle_error)?;
+    let renormalized = filtered_sorted_probs
+        .broadcast_mul(&denom.recip().map_err(candle_error)?)
+        .map_err(candle_error)?;
+    let cdf = renormalized.cumsum(D::Minus1).map_err(candle_error)?;
+    let thresholds = deterministic_sample_thresholds(rng_seed, dims[0]);
+    let threshold = CandleTensor::from_vec(thresholds, (dims[0], 1), &device)
+        .map_err(candle_error)?
+        .broadcast_as((dims[0], dims[1]))
+        .map_err(candle_error)?;
+    let crossing = cdf
+        .ge(&threshold)
+        .map_err(candle_error)?
+        .to_dtype(DType::U32)
+        .map_err(candle_error)?;
+    let sampled_sorted = crossing.argmax(1).map_err(candle_error)?;
+    let sampled_token_ids = sorted_indices
+        .gather(&sampled_sorted.unsqueeze(1).map_err(candle_error)?, 1)
+        .and_then(|ids| ids.squeeze(1))
+        .and_then(|ids| ids.to_vec1::<u32>())
+        .map_err(candle_error)?;
+    Ok(sampled_token_ids)
+}
+
+pub(crate) fn sample_token_device(
+    logits: &CandleTensor,
+    temperature: f32,
+    top_p: f32,
+    rng_seed: u64,
+) -> Result<u32> {
+    sample_tokens_device(logits, temperature, top_p, rng_seed)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AgentError::Execution("Device sampling returned no token ids".to_string()))
+}
+
 /// Greedy sampling (argmax)
 pub fn sample_greedy(logits: &Tensor1D) -> u32 {
     let mut max_idx = 0;
@@ -691,30 +804,6 @@ pub fn apply_rope(
     )
 }
 
-// ============== Conversion to/from ring_allreduce::Tensor ==============
-
-impl Tensor2D {
-    /// Convert to flat Tensor for ring all-reduce
-    pub fn to_allreduce_tensor(&self) -> crate::executor::ring_allreduce::Tensor {
-        crate::executor::ring_allreduce::Tensor::new(self.data.clone(), vec![self.rows, self.cols])
-    }
-
-    /// Create from ring all-reduce Tensor
-    pub fn from_allreduce_tensor(tensor: &crate::executor::ring_allreduce::Tensor) -> Result<Self> {
-        if tensor.shape.len() != 2 {
-            return Err(AgentError::Execution(format!(
-                "Expected 2D tensor, got {}D",
-                tensor.shape.len()
-            )));
-        }
-        Ok(Self {
-            data: tensor.data.clone(),
-            rows: tensor.shape[0],
-            cols: tensor.shape[1],
-        })
-    }
-}
-
 fn candle_error(err: candle_core::Error) -> AgentError {
     AgentError::Execution(format!("Tensor backend error: {}", err))
 }
@@ -799,6 +888,48 @@ pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
         .to_vec1::<f32>()
         .map_err(candle_error)?;
     Tensor2D::new(data, dims[0], dims[1])
+}
+
+pub(crate) fn collective_buffer_from_candle_2d(
+    tensor: &CandleTensor,
+) -> Result<crate::executor::ring_allreduce::Tensor> {
+    let dims = tensor.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Expected 2D GPU tensor for collective buffer conversion, got shape {:?}",
+            dims
+        )));
+    }
+
+    let data = tensor
+        .flatten_all()
+        .map_err(candle_error)?
+        .to_dtype(DType::F32)
+        .map_err(candle_error)?
+        .to_vec1::<f32>()
+        .map_err(candle_error)?;
+    Ok(crate::executor::ring_allreduce::Tensor::new(
+        data,
+        vec![dims[0], dims[1]],
+    ))
+}
+
+pub(crate) fn candle_2d_from_collective_buffer(
+    tensor: &crate::executor::ring_allreduce::Tensor,
+) -> Result<CandleTensor> {
+    if tensor.shape.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Expected 2D collective buffer, got {}D",
+            tensor.shape.len()
+        )));
+    }
+
+    CandleTensor::from_vec(
+        tensor.data.clone(),
+        (tensor.shape[0], tensor.shape[1]),
+        execution_device()?,
+    )
+    .map_err(candle_error)
 }
 
 pub(crate) fn rms_norm_candle(
@@ -1034,6 +1165,36 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_device_sampling_matches_host_temperature_top_p() {
+        let host = Tensor1D::new(vec![0.1, 1.3, -0.4, 2.2, 0.7]);
+        let tensor = to_candle_2d(&host.reshape(1, host.len()).unwrap()).unwrap();
+        let seed = 424242;
+        let temperature = 0.85;
+        let top_p = 0.72;
+
+        let host_sample = sample_token(&host, temperature, top_p, seed);
+        let device_sample = sample_token_device(&tensor, temperature, top_p, seed).unwrap();
+
+        assert_eq!(device_sample, host_sample);
+    }
+
+    #[test]
+    #[serial]
+    fn test_device_sampling_matches_host_with_full_distribution() {
+        let host = Tensor1D::new(vec![0.5, -0.2, 0.8, 1.1, 0.0, -1.4]);
+        let tensor = to_candle_2d(&host.reshape(1, host.len()).unwrap()).unwrap();
+        let seed = 1337;
+        let temperature = 1.35;
+        let top_p = 1.0;
+
+        let host_sample = sample_token(&host, temperature, top_p, seed);
+        let device_sample = sample_token_device(&tensor, temperature, top_p, seed).unwrap();
+
+        assert_eq!(device_sample, host_sample);
+    }
+
+    #[test]
+    #[serial]
     fn test_column_slice() {
         let t = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3).unwrap();
         let slice = t.column_slice(1, 3).unwrap();
@@ -1078,5 +1239,22 @@ mod tests {
         assert_eq!(transposed.get(0, 0), 1.0);
         assert_eq!(transposed.get(0, 1), 4.0);
         assert_eq!(transposed.get(2, 1), 6.0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_collective_buffer_round_trip_from_candle_2d() {
+        let source = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
+        let candle = to_candle_2d(&source).unwrap();
+        let buffer = collective_buffer_from_candle_2d(&candle).unwrap();
+
+        assert_eq!(buffer.shape, vec![2, 2]);
+        assert_eq!(buffer.data, source.data);
+
+        let restored = candle_2d_from_collective_buffer(&buffer).unwrap();
+        let round_trip = from_candle_2d(&restored).unwrap();
+        assert_eq!(round_trip.rows, source.rows);
+        assert_eq!(round_trip.cols, source.cols);
+        assert_eq!(round_trip.data, source.data);
     }
 }

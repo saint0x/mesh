@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "name": "runtime-decode-guardrails",
+  "steps": [
+    {
+      "name": "throughput decode batching defers mixed-provider sessions instead of silently serializing",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_throughput_batch_guardrail_defers_mixed_provider_sessions",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "fit-first batching keeps mixed-provider admission available",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_fit_first_batch_allows_mixed_provider_sessions",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "runtime accounting separates live kv bytes from logical decode footprint",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::coordinator::tests::test_runtime_memory_snapshot_separates_live_bytes_from_logical_kv_tokens",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

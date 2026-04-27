@@ -40,8 +40,9 @@ pub use inference::{
 pub use model::{ModelInfo, ShardAssignment, ShardInfo, ShardRegistry, ShardStatus};
 pub use network::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
-    parse_tensor_plane_bind_addr_env, AllReducePhase, ConnectionInfo, ConnectionType, MeshEvent,
-    MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections, TensorMessage, TensorPlane,
+    parse_tensor_plane_bind_addr_env, AllReducePhase, CollectiveLane, ConnectionInfo,
+    ConnectionType, MeshEvent, MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections,
+    ServingFrame, ServingFrameHeader, ServingReceiveSpec, ServingSessionTransport, TensorPlane,
     TensorPlaneCapabilitiesSnapshot, TensorPlaneConfig, TensorPlaneMetricsSnapshot,
     TensorPlaneProfile, TensorTrafficClass, TransportFallbackPolicy,
 };

@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "device-sampling-cutover",
+  "steps": [
+    {
+      "name": "device sampling matches host temperature and top-p semantics",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::tensor_ops::tests::test_device_sampling_matches_host_temperature_top_p",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "device sampling matches host full-distribution sampling for seeded decode",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::tensor_ops::tests::test_device_sampling_matches_host_with_full_distribution",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "incremental decode remains stable after device sampling cutover",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_local_incremental_decode_matches_full_recompute",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

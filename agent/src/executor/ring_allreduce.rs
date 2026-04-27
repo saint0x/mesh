@@ -13,7 +13,9 @@
 
 use crate::errors::{AgentError, Result};
 use crate::inference::InferenceRuntimeMode;
-use crate::network::{AllReducePhase, TensorChunkHeader, TensorMessage, TensorPlane};
+use crate::network::{
+    CollectiveLane, ServingFrame, ServingReceiveSpec, ServingSessionTransport, TensorPlane,
+};
 use crate::provider::ExecutionProviderKind;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -184,6 +186,8 @@ pub struct WorkerRing<'a> {
     pub right_tensor_addr: SocketAddr,
     /// Dedicated tensor plane for network communication (borrowed).
     pub tensor_plane: &'a mut TensorPlane,
+    /// Long-lived collective-native serving transport.
+    serving_transport: Option<ServingSessionTransport>,
     /// Runtime mode for transport fallback and scheduling intent.
     runtime_mode: InferenceRuntimeMode,
     /// Provider kind used by the local execution backend.
@@ -254,6 +258,7 @@ impl<'a> WorkerRing<'a> {
             left_tensor_addr,
             right_tensor_addr,
             tensor_plane,
+            serving_transport: None,
             runtime_mode,
             provider,
             collective_profile,
@@ -261,14 +266,18 @@ impl<'a> WorkerRing<'a> {
         }
     }
 
-    pub async fn prepare_serving_group_channels(&self) -> Result<()> {
-        self.tensor_plane
-            .prepare_serving_peer_channels(
-                &[self.left_tensor_addr, self.right_tensor_addr],
-                self.runtime_mode,
-                self.provider,
-            )
-            .await
+    pub async fn prepare_serving_group_channels(&mut self) -> Result<()> {
+        self.serving_transport = Some(
+            self.tensor_plane
+                .serving_transport_for_neighbors(
+                    self.left_tensor_addr,
+                    self.right_tensor_addr,
+                    self.runtime_mode,
+                    self.provider,
+                )
+                .await?,
+        );
+        Ok(())
     }
 
     /// Perform ring all-reduce on a tensor
@@ -322,21 +331,17 @@ impl<'a> WorkerRing<'a> {
                 recv_idx
             );
 
-            // Create message for right neighbor
             let send_range = &chunk_ranges[send_idx];
             let send_shape = [send_range.len()];
-            let send_header = TensorChunkHeader::new(
-                self.my_position,
-                job_id,
-                layer_idx,
-                AllReducePhase::ReduceScatter,
-                step as u32,
-            );
 
             let step_started = std::time::Instant::now();
-            let (recv_msg, send_wait_ms, receive_wait_ms) =
-                self.send_chunk_to_right_recv_from_left(
-                    send_header,
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    layer_idx,
+                    step as u32,
+                    recv_idx as u32,
                     &work_buffer[send_range.start..send_range.end],
                     &send_shape,
                 )
@@ -382,18 +387,15 @@ impl<'a> WorkerRing<'a> {
 
             let send_range = &chunk_ranges[send_idx];
             let send_shape = [send_range.len()];
-            let send_header = TensorChunkHeader::new(
-                self.my_position,
-                job_id,
-                layer_idx,
-                AllReducePhase::AllGather,
-                step as u32,
-            );
 
             let step_started = std::time::Instant::now();
-            let (recv_msg, send_wait_ms, receive_wait_ms) =
-                self.send_chunk_to_right_recv_from_left(
-                    send_header,
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::AllGather,
+                    job_id,
+                    layer_idx,
+                    step as u32,
+                    recv_idx as u32,
                     &work_buffer[send_range.start..send_range.end],
                     &send_shape,
                 )
@@ -444,18 +446,17 @@ impl<'a> WorkerRing<'a> {
     /// Uses a ring-based barrier where each worker sends a message to its
     /// right neighbor and waits for a message from its left neighbor.
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
-        let barrier_msg = TensorMessage::new(
-            self.my_position,
-            job_id,
-            layer_idx,
-            AllReducePhase::Barrier,
-            TensorMessage::BARRIER_STEP,
-            vec![self.my_position as f32], // Send position as data
-            vec![1],
-        );
-
-        // Send barrier notification to right
-        let (received, _, _) = self.send_to_right_recv_from_left(barrier_msg).await?;
+        let (received, _, _) = self
+            .send_chunk_to_right_recv_from_left(
+                CollectiveLane::Control,
+                job_id,
+                layer_idx,
+                0,
+                0,
+                &[self.my_position as f32],
+                &[1],
+            )
+            .await?;
 
         // Verify received from left neighbor
         let expected_pos = (self.my_position + self.total_workers - 1) % self.total_workers;
@@ -470,101 +471,95 @@ impl<'a> WorkerRing<'a> {
         Ok(())
     }
 
-    /// Send a message to the right neighbor and receive from the left neighbor
-    ///
-    /// This is the core communication primitive for ring all-reduce.
-    /// The send and receive operations happen concurrently via the tensor protocol.
-    async fn send_to_right_recv_from_left(
-        &mut self,
-        message: TensorMessage,
-    ) -> Result<(TensorMessage, u64, u64)> {
-        let expected_sender_position =
-            (self.my_position + self.total_workers - 1) % self.total_workers;
-        let send_started = std::time::Instant::now();
-        let recv_started = std::time::Instant::now();
-        let (send_result, inbound) = tokio::join!(
-            self.tensor_plane.send_with_transport_context(
-                self.right_tensor_addr,
-                &message,
-                self.runtime_mode,
-                self.provider,
-            ),
-            self.tensor_plane.recv_matching(|inbound| {
-                let tensor = &inbound.tensor;
-                tensor.sender_position == expected_sender_position
-                    && tensor.job_id == message.job_id
-                    && tensor.layer_idx == message.layer_idx
-                    && tensor.phase == message.phase
-                    && tensor.step == message.step
-            })
-        );
-        send_result?;
-
-        debug!(
-            "Sent {:?} tensor to right neighbor {}, waiting for tensor from left neighbor {}",
-            message.traffic_class(),
-            self.right_neighbor,
-            self.left_neighbor
-        );
-
-        let inbound = inbound.ok_or_else(|| {
-            AgentError::Network(format!(
-                "Tensor plane closed while waiting for {:?} step {} from worker {}",
-                message.phase, message.step, expected_sender_position
-            ))
-        })?;
-
-        let tensor = inbound.tensor;
-        debug!(
-            "Received tensor from left neighbor {}, phase={:?}, step={}, remote_addr={}",
-            self.left_neighbor, tensor.phase, tensor.step, inbound.remote_addr
-        );
-        Ok((
-            tensor,
-            send_started.elapsed().as_millis() as u64,
-            recv_started.elapsed().as_millis() as u64,
-        ))
+    fn serving_transport(&self) -> Result<&ServingSessionTransport> {
+        self.serving_transport.as_ref().ok_or_else(|| {
+            AgentError::Execution(
+                "Serving session transport was used before preparation".to_string(),
+            )
+        })
     }
 
     async fn send_chunk_to_right_recv_from_left(
         &mut self,
-        header: TensorChunkHeader,
+        lane: CollectiveLane,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
         chunk_data: &[f32],
         chunk_shape: &[usize],
-    ) -> Result<(TensorMessage, u64, u64)> {
+    ) -> Result<(ServingFrame, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
+        let transport = self.serving_transport()?.clone();
         let send_started = std::time::Instant::now();
         let recv_started = std::time::Instant::now();
         let (send_result, inbound) = tokio::join!(
-            self.tensor_plane.send_chunk_with_transport_context(
-                self.right_tensor_addr,
-                header,
-                chunk_data,
-                chunk_shape,
-                self.runtime_mode,
-                self.provider,
-            ),
-            self.tensor_plane.recv_matching(|inbound| {
-                let tensor = &inbound.tensor;
-                tensor.sender_position == expected_sender_position
-                    && tensor.job_id == header.job_id
-                    && tensor.layer_idx == header.layer_idx
-                    && tensor.phase == header.phase
-                    && tensor.step == header.step
+            async {
+                match lane {
+                    CollectiveLane::ReduceScatter => {
+                        transport
+                            .send_reduce_scatter_chunk(
+                                collective_id,
+                                layer_idx,
+                                step,
+                                slot,
+                                0,
+                                self.my_position,
+                                chunk_data,
+                                chunk_shape,
+                            )
+                            .await
+                    }
+                    CollectiveLane::AllGather => {
+                        transport
+                            .send_all_gather_chunk(
+                                collective_id,
+                                layer_idx,
+                                step,
+                                slot,
+                                0,
+                                self.my_position,
+                                chunk_data,
+                                chunk_shape,
+                            )
+                            .await
+                    }
+                    CollectiveLane::Control => {
+                        transport
+                            .send_control(
+                                collective_id,
+                                layer_idx,
+                                step,
+                                slot,
+                                0,
+                                self.my_position,
+                                chunk_data,
+                                chunk_shape,
+                            )
+                            .await
+                    }
+                    other => Err(AgentError::Execution(format!(
+                        "Unsupported ring collective lane {:?}",
+                        other
+                    ))),
+                }
+            },
+            transport.recv_frame(ServingReceiveSpec {
+                collective_id,
+                lane,
+                layer_idx,
+                step,
+                slot,
+                stream_id: 0,
+                expected_sender_position,
             })
         );
         send_result?;
-
-        let inbound = inbound.ok_or_else(|| {
-            AgentError::Network(format!(
-                "Tensor plane closed while waiting for {:?} step {} from worker {}",
-                header.phase, header.step, expected_sender_position
-            ))
-        })?;
+        let inbound = inbound?;
 
         Ok((
-            inbound.tensor,
+            inbound,
             send_started.elapsed().as_millis() as u64,
             recv_started.elapsed().as_millis() as u64,
         ))
@@ -689,43 +684,6 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    // ============== TensorMessage Tests ==============
-
-    #[test]
-    fn test_tensor_message_new() {
-        let job_id = Uuid::new_v4();
-        let msg = TensorMessage::new(
-            0,
-            job_id,
-            5,
-            AllReducePhase::ReduceScatter,
-            2,
-            vec![1.0, 2.0],
-            vec![2],
-        );
-
-        assert_eq!(msg.job_id, job_id);
-        assert_eq!(msg.layer_idx, 5);
-        assert_eq!(msg.phase, AllReducePhase::ReduceScatter);
-        assert_eq!(msg.step, 2);
-        assert_eq!(msg.chunk_data, vec![1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_tensor_message_barrier() {
-        let msg = TensorMessage::new(
-            0,
-            Uuid::new_v4(),
-            0,
-            AllReducePhase::Barrier,
-            TensorMessage::BARRIER_STEP,
-            vec![0.0],
-            vec![1],
-        );
-
-        assert!(msg.is_barrier());
-    }
-
     #[test]
     fn test_collective_optimization_profile_tracks_provider_and_runtime_mode() {
         assert_eq!(
@@ -750,8 +708,6 @@ mod tests {
             CollectiveOptimizationProfile::CpuLowFanout
         );
     }
-
-    // Note: Tensor message serialization is tested at the data-plane boundary.
 
     // ============== Ring All-Reduce Logic Tests ==============
 

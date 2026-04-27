@@ -19,14 +19,14 @@
       "times": 1
     },
     {
-      "name": "latency critical transport still bypasses bulk throttle under mixed traffic",
+      "name": "serving control lane is accounted as latency critical",
       "type": "proc_when",
       "cmd": "cargo",
       "args": [
         "test",
         "-p",
         "agent",
-        "network::tensor_plane::tests::test_latency_critical_send_skips_bulk_bandwidth_throttle",
+        "network::tensor_plane::tests::test_control_lane_send_uses_latency_critical_accounting",
         "--",
         "--nocapture"
       ],
@@ -35,14 +35,14 @@
       "times": 1
     },
     {
-      "name": "transport policy helpers preserve runtime mode intent",
+      "name": "serving sessions route receives by direct slot instead of queue scans",
       "type": "proc_when",
       "cmd": "cargo",
       "args": [
         "test",
         "-p",
         "agent",
-        "network::tensor_plane::tests::test_transport_policy_helpers_preserve_runtime_mode_intent",
+        "network::tensor_plane::tests::test_serving_slot_receive_is_direct_and_preserves_nonmatching_frames",
         "--",
         "--nocapture"
       ],
@@ -51,7 +51,55 @@
       "times": 1
     },
     {
-      "name": "collective optimization profile tracks provider and runtime mode",
+      "name": "serving sessions support concurrent exact-slot waiters",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_serving_session_supports_multiple_concurrent_waiters_on_distinct_slots",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "serving transport reuses durable neighbor-pair sessions across runtime work",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_serving_transport_reuses_durable_neighbor_pair_session",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "bulk and checkpoint lanes are plumbed through the serving dataplane",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_checkpoint_and_bulk_lanes_use_serving_transport",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "collective optimization profile still tracks provider and runtime mode",
       "type": "proc_when",
       "cmd": "cargo",
       "args": [

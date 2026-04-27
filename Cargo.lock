@@ -44,6 +44,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "candle-core",
  "candle-nn",
  "chrono",

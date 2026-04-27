@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "collective-buffer-cutover",
+  "steps": [
+    {
+      "name": "collective buffer round trip preserves device tensor shape and payload",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::tensor_ops::tests::test_collective_buffer_round_trip_from_candle_2d",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "incremental decode still matches full recompute after collective buffer cutover",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_local_incremental_decode_matches_full_recompute",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "kv snapshot round trip remains intact after collective buffer cutover",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_forward_pass_kv_snapshot_round_trip",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

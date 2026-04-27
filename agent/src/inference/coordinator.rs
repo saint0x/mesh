@@ -280,7 +280,8 @@ struct DecodeBatchTelemetry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SessionMemoryFootprint {
     runtime_bytes: usize,
-    kv_cache_bytes: usize,
+    live_kv_cache_bytes: usize,
+    logical_kv_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,7 +289,8 @@ struct RuntimeMemorySnapshot {
     active_sessions: usize,
     model_resident_bytes: usize,
     total_runtime_bytes: usize,
-    total_kv_cache_bytes: usize,
+    total_live_kv_cache_bytes: usize,
+    total_logical_kv_tokens: usize,
 }
 
 impl InferenceCoordinator {
@@ -351,12 +353,17 @@ impl InferenceCoordinator {
     fn session_memory_footprint(session: &ActiveSession) -> SessionMemoryFootprint {
         let prompt_bytes = session.job.request.prompt_tokens.len() * std::mem::size_of::<u32>();
         let generated_bytes = session.job.generated_tokens.len() * std::mem::size_of::<u32>();
-        let kv_cache_bytes = session.backend.cache_memory_usage();
+        let live_kv_cache_bytes = session.backend.live_kv_cache_bytes();
+        let logical_kv_tokens = session
+            .backend
+            .logical_kv_tokens()
+            .max(session.job.request.prompt_tokens.len());
         SessionMemoryFootprint {
             runtime_bytes: prompt_bytes
                 .saturating_add(generated_bytes)
-                .saturating_add(kv_cache_bytes),
-            kv_cache_bytes,
+                .saturating_add(live_kv_cache_bytes),
+            live_kv_cache_bytes,
+            logical_kv_tokens,
         }
     }
 
@@ -383,13 +390,15 @@ impl InferenceCoordinator {
             .model_residency_cache
             .try_read()
             .map(|cache| {
-                cache.values()
+                cache
+                    .values()
                     .map(|residency| residency.resident_bytes())
                     .sum::<usize>()
             })
             .unwrap_or(0);
         let mut total_runtime_bytes = 0_usize;
-        let mut total_kv_cache_bytes = 0_usize;
+        let mut total_live_kv_cache_bytes = 0_usize;
+        let mut total_logical_kv_tokens = 0_usize;
         for session in self.sessions.values() {
             if matches!(
                 session.engine_state.runtime_status,
@@ -400,13 +409,17 @@ impl InferenceCoordinator {
             active_sessions = active_sessions.saturating_add(1);
             let footprint = Self::session_memory_footprint(session);
             total_runtime_bytes = total_runtime_bytes.saturating_add(footprint.runtime_bytes);
-            total_kv_cache_bytes = total_kv_cache_bytes.saturating_add(footprint.kv_cache_bytes);
+            total_live_kv_cache_bytes =
+                total_live_kv_cache_bytes.saturating_add(footprint.live_kv_cache_bytes);
+            total_logical_kv_tokens =
+                total_logical_kv_tokens.saturating_add(footprint.logical_kv_tokens);
         }
         RuntimeMemorySnapshot {
             active_sessions,
             model_resident_bytes,
             total_runtime_bytes: total_runtime_bytes.saturating_add(model_resident_bytes),
-            total_kv_cache_bytes,
+            total_live_kv_cache_bytes,
+            total_logical_kv_tokens,
         }
     }
 
@@ -486,9 +499,19 @@ impl InferenceCoordinator {
     fn session_decode_kv_tokens(session: &ActiveSession) -> usize {
         session
             .backend
-            .cache_seq_len()
-            .max(session.backend.sequence_position())
+            .logical_kv_tokens()
             .max(session.job.request.prompt_tokens.len())
+    }
+
+    fn same_decode_batch_class(primary: &ActiveSession, candidate: &ActiveSession) -> bool {
+        match primary.job.request.runtime_mode {
+            InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst => {
+                primary.backend.provider_kind() == candidate.backend.provider_kind()
+                    && primary.backend.optimization_profile()
+                        == candidate.backend.optimization_profile()
+            }
+            InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
+        }
     }
 
     fn enqueue_decode_task(&mut self, session_id: Uuid) -> Result<()> {
@@ -576,7 +599,7 @@ impl InferenceCoordinator {
             let snapshot = self.runtime_memory_snapshot();
             let over_active_sessions = snapshot.active_sessions > self.config.max_active_sessions;
             let over_kv_budget =
-                snapshot.total_kv_cache_bytes > self.config.max_total_kv_cache_bytes;
+                snapshot.total_live_kv_cache_bytes > self.config.max_total_kv_cache_bytes;
             let over_runtime_budget =
                 snapshot.total_runtime_bytes > self.config.max_total_runtime_bytes;
             if !over_active_sessions && !over_kv_budget && !over_runtime_budget {
@@ -592,10 +615,11 @@ impl InferenceCoordinator {
             };
 
             let detail = format!(
-                "active_sessions={} runtime_bytes={} kv_bytes={}",
+                "active_sessions={} runtime_bytes={} live_kv_bytes={} logical_kv_tokens={}",
                 snapshot.active_sessions,
                 snapshot.total_runtime_bytes,
-                snapshot.total_kv_cache_bytes
+                snapshot.total_live_kv_cache_bytes,
+                snapshot.total_logical_kv_tokens
             );
             self.evict_session(
                 session_id,
@@ -625,9 +649,9 @@ impl InferenceCoordinator {
                     InferenceRuntimeMode::ThroughputFirst => usize::MAX.saturating_sub(
                         (session.decode_steps_served as usize).saturating_mul(1024),
                     ),
-                    InferenceRuntimeMode::LatencyFirst => footprint.kv_cache_bytes,
+                    InferenceRuntimeMode::LatencyFirst => footprint.live_kv_cache_bytes,
                     InferenceRuntimeMode::ResilientEdge => {
-                        footprint.kv_cache_bytes / 2
+                        footprint.live_kv_cache_bytes / 2
                             + if matches!(
                                 session.engine_state.runtime_status,
                                 SessionRuntimeStatus::Paused
@@ -644,7 +668,7 @@ impl InferenceCoordinator {
                     idle_for < self.config.idle_session_evict_after,
                     mode_bias,
                     footprint.runtime_bytes,
-                    footprint.kv_cache_bytes,
+                    footprint.live_kv_cache_bytes,
                 )
             })
             .collect::<Vec<_>>();
@@ -672,6 +696,7 @@ impl InferenceCoordinator {
         let mut deferred = Vec::new();
         let mut deferred_for_capacity = 0_usize;
         let mut deferred_for_kv_budget = 0_usize;
+        let mut deferred_for_guardrail = 0_usize;
         let mut queue = std::mem::take(&mut self.decode_queue)
             .into_iter()
             .collect::<Vec<_>>();
@@ -695,6 +720,14 @@ impl InferenceCoordinator {
 
             if session.job.is_complete() {
                 continue;
+            }
+
+            if let Some(primary_session) = self.sessions.get(&primary_session_id) {
+                if !Self::same_decode_batch_class(primary_session, session) {
+                    deferred_for_guardrail = deferred_for_guardrail.saturating_add(1);
+                    deferred.push(task);
+                    continue;
+                }
             }
 
             let kv_tokens = Self::session_decode_kv_tokens(session);
@@ -733,6 +766,7 @@ impl InferenceCoordinator {
             total_kv_tokens,
             deferred_for_capacity,
             deferred_for_kv_budget,
+            deferred_for_guardrail,
         }
     }
 
@@ -1784,6 +1818,7 @@ impl InferenceCoordinator {
 mod tests {
     use super::*;
     use crate::executor::ring_allreduce::RingAllReduceMetrics;
+    use crate::inference::backend::BackendLogits;
     use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
     use crate::inference::job::InferenceRequest;
     use crate::inference::kv_cache::KVCacheSnapshot;
@@ -1792,8 +1827,10 @@ mod tests {
     use crate::provider::ExecutionProviderKind;
 
     struct TestBackend {
+        provider: ExecutionProviderKind,
         cache_seq_len: usize,
-        cache_memory_usage: usize,
+        live_kv_cache_bytes: usize,
+        logical_kv_tokens: usize,
         sequence_position: usize,
     }
 
@@ -1804,11 +1841,21 @@ mod tests {
         }
 
         fn provider_kind(&self) -> ExecutionProviderKind {
-            ExecutionProviderKind::Cpu
+            self.provider
         }
 
         fn optimization_profile(&self) -> crate::inference::BackendOptimizationProfile {
-            crate::inference::BackendOptimizationProfile::CpuSerial
+            match self.provider {
+                ExecutionProviderKind::Cpu => {
+                    crate::inference::BackendOptimizationProfile::CpuSerial
+                }
+                ExecutionProviderKind::Metal => {
+                    crate::inference::BackendOptimizationProfile::MetalVectorized
+                }
+                ExecutionProviderKind::Cuda => {
+                    crate::inference::BackendOptimizationProfile::CudaFused
+                }
+            }
         }
 
         async fn prefill(
@@ -1816,8 +1863,8 @@ mod tests {
             _tokens: &[u32],
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<Tensor1D> {
-            Ok(Tensor1D::zeros(1))
+        ) -> Result<BackendLogits> {
+            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }
 
         async fn decode_step(
@@ -1825,11 +1872,17 @@ mod tests {
             _token: u32,
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<Tensor1D> {
-            Ok(Tensor1D::zeros(1))
+        ) -> Result<BackendLogits> {
+            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }
 
-        fn sample(&self, _logits: &Tensor1D, _temperature: f32, _top_p: f32, _seed: u64) -> u32 {
+        fn sample(
+            &self,
+            _logits: &BackendLogits,
+            _temperature: f32,
+            _top_p: f32,
+            _seed: u64,
+        ) -> u32 {
             0
         }
 
@@ -1837,8 +1890,12 @@ mod tests {
             self.cache_seq_len
         }
 
-        fn cache_memory_usage(&self) -> usize {
-            self.cache_memory_usage
+        fn live_kv_cache_bytes(&self) -> usize {
+            self.live_kv_cache_bytes
+        }
+
+        fn logical_kv_tokens(&self) -> usize {
+            self.logical_kv_tokens
         }
 
         fn sequence_position(&self) -> usize {
@@ -1876,6 +1933,28 @@ mod tests {
         kv_tokens: usize,
         generated_token: u32,
     ) {
+        insert_decode_session_with_profile(
+            coordinator,
+            session_id,
+            kv_tokens,
+            kv_tokens * 1024,
+            kv_tokens,
+            generated_token,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+        );
+    }
+
+    fn insert_decode_session_with_profile(
+        coordinator: &mut InferenceCoordinator,
+        session_id: Uuid,
+        logical_kv_tokens: usize,
+        live_kv_cache_bytes: usize,
+        sequence_position: usize,
+        generated_token: u32,
+        runtime_mode: InferenceRuntimeMode,
+        provider: ExecutionProviderKind,
+    ) {
         let mut request = InferenceRequest::new(
             "test-network".to_string(),
             "llama-70b".to_string(),
@@ -1885,6 +1964,7 @@ mod tests {
         request.session_id = session_id;
         request.phase = ExecutionPhase::Decode;
         request.config.max_tokens = 8;
+        request.runtime_mode = runtime_mode;
 
         let mut job = InferenceJob::new(request.clone(), 70);
         job.add_token(generated_token);
@@ -1898,8 +1978,8 @@ mod tests {
                     "worker-1".to_string(),
                     vec!["worker-1".to_string()],
                     vec!["worker-1".to_string()],
-                    InferenceRuntimeMode::ThroughputFirst,
-                    ExecutionProviderKind::Cpu,
+                    runtime_mode,
+                    provider,
                     (0, 1024),
                     TransportCapabilityTier::DirectPreferred,
                     coordinator.runtime_memory_budget(),
@@ -1907,9 +1987,11 @@ mod tests {
                     request.prompt_tokens.len(),
                 ),
                 backend: Box::new(TestBackend {
-                    cache_seq_len: kv_tokens,
-                    cache_memory_usage: kv_tokens * 1024,
-                    sequence_position: kv_tokens,
+                    provider,
+                    cache_seq_len: logical_kv_tokens.min(sequence_position),
+                    live_kv_cache_bytes,
+                    logical_kv_tokens,
+                    sequence_position,
                 }),
                 job,
                 queued_for_decode: false,
@@ -1945,7 +2027,13 @@ mod tests {
         ModelWeights {
             model_id: "test-model".to_string(),
             embedding: Tensor2D::filled(64, 32, 0.05),
-            layers: vec![layer.clone(), LayerWeights { layer_idx: 1, ..layer }],
+            layers: vec![
+                layer.clone(),
+                LayerWeights {
+                    layer_idx: 1,
+                    ..layer
+                },
+            ],
             final_norm: Tensor1D::new(vec![1.0; 32]),
             lm_head: Tensor2D::filled(32, 64, 0.08),
             config,
@@ -2238,6 +2326,88 @@ mod tests {
         assert_eq!(batch.slots[0].session_id, session_a);
         assert_eq!(batch.deferred.len(), 1);
         assert_eq!(batch.deferred[0].session_id, session_b);
+        assert_eq!(batch.deferred_for_guardrail, 0);
+    }
+
+    #[test]
+    fn test_throughput_batch_guardrail_defers_mixed_provider_sessions() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_metal = Uuid::new_v4();
+        let session_cpu = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_metal,
+            4,
+            4 * 1024,
+            4,
+            11,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Metal,
+        );
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_cpu,
+            4,
+            4 * 1024,
+            4,
+            22,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+        );
+
+        coordinator.enqueue_decode_task(session_metal).unwrap();
+        coordinator.enqueue_decode_task(session_cpu).unwrap();
+
+        let batch =
+            coordinator.build_next_decode_batch(session_metal, DecodeBatchTargets::default());
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, session_metal);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred[0].session_id, session_cpu);
+        assert_eq!(batch.deferred_for_guardrail, 1);
+    }
+
+    #[test]
+    fn test_fit_first_batch_allows_mixed_provider_sessions() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_metal = Uuid::new_v4();
+        let session_cpu = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_metal,
+            4,
+            4 * 1024,
+            4,
+            11,
+            InferenceRuntimeMode::FitFirst,
+            ExecutionProviderKind::Metal,
+        );
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_cpu,
+            4,
+            4 * 1024,
+            4,
+            22,
+            InferenceRuntimeMode::FitFirst,
+            ExecutionProviderKind::Cpu,
+        );
+
+        coordinator.enqueue_decode_task(session_metal).unwrap();
+        coordinator.enqueue_decode_task(session_cpu).unwrap();
+
+        let batch =
+            coordinator.build_next_decode_batch(session_metal, DecodeBatchTargets::default());
+        assert_eq!(batch.slots.len(), 2);
+        assert_eq!(batch.deferred_for_guardrail, 0);
     }
 
     #[test]
@@ -2319,8 +2489,29 @@ mod tests {
         let snapshot = coordinator.runtime_memory_snapshot();
         assert_eq!(snapshot.active_sessions, 2);
         assert_eq!(snapshot.model_resident_bytes, 0);
-        assert_eq!(snapshot.total_kv_cache_bytes, (4 + 8) * 1024);
-        assert!(snapshot.total_runtime_bytes >= snapshot.total_kv_cache_bytes);
+        assert_eq!(snapshot.total_live_kv_cache_bytes, (4 + 8) * 1024);
+        assert_eq!(snapshot.total_logical_kv_tokens, 12);
+        assert!(snapshot.total_runtime_bytes >= snapshot.total_live_kv_cache_bytes);
+    }
+
+    #[test]
+    fn test_runtime_memory_snapshot_separates_live_bytes_from_logical_kv_tokens() {
+        let mut coordinator = test_coordinator(InferenceConfig::default());
+        let session_id = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_id,
+            32,
+            8 * 1024,
+            32,
+            11,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+        );
+
+        let snapshot = coordinator.runtime_memory_snapshot();
+        assert_eq!(snapshot.total_live_kv_cache_bytes, 8 * 1024);
+        assert_eq!(snapshot.total_logical_kv_tokens, 32);
     }
 
     #[test]

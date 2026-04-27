@@ -195,6 +195,7 @@ pub struct DecodeBatchPlan {
     pub total_kv_tokens: usize,
     pub deferred_for_capacity: usize,
     pub deferred_for_kv_budget: usize,
+    pub deferred_for_guardrail: usize,
 }
 
 impl DecodeBatchPlan {
