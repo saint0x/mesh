@@ -780,22 +780,22 @@ fn load_scheduler_candidates(
     let candidates = rows
         .into_iter()
         .map(|(execution_plan_json, mut candidate)| {
-            let runtime_mode = if let Some(runtime_mode) = runtime_mode_cache.get(&execution_plan_json)
-            {
-                *runtime_mode
-            } else {
-                let runtime_mode = parse_runtime_mode(
-                    serde_json::from_str::<InferenceExecutionPlan>(&execution_plan_json)
-                        .map_err(|err| {
-                            ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
-                                to_from_sql_error(err.to_string()),
-                            )))
-                        })?
-                        .runtime_mode,
-                );
-                runtime_mode_cache.insert(execution_plan_json, runtime_mode);
-                runtime_mode
-            };
+            let runtime_mode =
+                if let Some(runtime_mode) = runtime_mode_cache.get(&execution_plan_json) {
+                    *runtime_mode
+                } else {
+                    let runtime_mode = parse_runtime_mode(
+                        serde_json::from_str::<InferenceExecutionPlan>(&execution_plan_json)
+                            .map_err(|err| {
+                                ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
+                                    to_from_sql_error(err.to_string()),
+                                )))
+                            })?
+                            .runtime_mode,
+                    );
+                    runtime_mode_cache.insert(execution_plan_json, runtime_mode);
+                    runtime_mode
+                };
             candidate.runtime_mode = runtime_mode;
             Ok(candidate)
         })

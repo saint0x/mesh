@@ -188,7 +188,7 @@ enum RingCommands {
         model_id: String,
 
         /// Contributed memory for this ring membership (for example `8GB`)
-        #[arg(short, long)]
+        #[arg(short = 'M', long)]
         memory: Option<String>,
     },
     /// Leave the current ring membership
@@ -3402,6 +3402,7 @@ mod tests {
     use agent::api::types::{
         PeerPunchPlan, PunchPathReason, PunchPathStrategy, ShardInfo, WorkerInfo,
     };
+    use clap::CommandFactory;
 
     fn test_worker(
         device_id: &str,
@@ -3440,6 +3441,11 @@ mod tests {
             priority: 10,
             last_updated_ms: 1_700_000_000_000,
         }
+    }
+
+    #[test]
+    fn cli_definitions_pass_clap_debug_asserts() {
+        Cli::command().debug_assert();
     }
 
     #[test]
