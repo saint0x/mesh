@@ -96,6 +96,8 @@ explicit-segment serving stack into the full production `zip` engine.
 - ✅ Add long-lived decode worker loop that consumes scheduler-owned decode work
 - ✅ Add runtime batching interface at the execution backend boundary
 - ✅ Add explicit runtime memory budgeting for active sessions and KV
+- ✅ Share loaded model residency across sessions instead of cloning host/device weights per session
+- ✅ Count shared model residency in runtime memory budgeting and eviction pressure decisions
 - ✅ Add session eviction hooks driven by control-plane policy
 - ✅ Add runtime pause/resume semantics for regroup and failover
 - ✅ Add explicit transport prioritization between decode traffic and bulk transfer

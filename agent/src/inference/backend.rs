@@ -8,7 +8,9 @@ use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
 
 use super::engine::BackendOptimizationProfile;
-use super::forward_pass::{ForwardPass, ModelWeights};
+use std::sync::Arc;
+
+use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
 use super::tensor_ops::Tensor1D;
 
@@ -129,7 +131,7 @@ pub struct CandleExecutionBackend {
 
 impl CandleExecutionBackend {
     pub fn new(
-        weights: ModelWeights,
+        model: Arc<SharedModelResidency>,
         worker_position: u32,
         shard_start: usize,
         shard_end: usize,
@@ -137,10 +139,10 @@ impl CandleExecutionBackend {
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         Ok(Self {
-            model_id: weights.model_id.clone(),
+            model_id: model.model_id().to_string(),
             provider: selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
-            forward_pass: ForwardPass::new(
-                weights,
+            forward_pass: ForwardPass::from_residency(
+                model,
                 worker_position,
                 shard_start,
                 shard_end,

@@ -35,7 +35,7 @@ use super::engine::{
     SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
     TransportCapabilityTier,
 };
-use super::forward_pass::ModelWeights;
+use super::forward_pass::SharedModelResidency;
 use super::job::{
     DecodeBatchTargets, InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
     SegmentExecutionResult,
@@ -232,8 +232,8 @@ pub struct InferenceCoordinator {
     /// Production shard loader
     loader: Arc<dyn ShardLoader>,
 
-    /// Cached weights per model (model_id -> weights)
-    weight_cache: RwLock<HashMap<String, Arc<ModelWeights>>>,
+    /// Shared model residency per loaded shard assignment.
+    model_residency_cache: RwLock<HashMap<String, Arc<SharedModelResidency>>>,
 
     /// Engine-owned session runtime state.
     sessions: HashMap<Uuid, ActiveSession>,
@@ -286,6 +286,7 @@ struct SessionMemoryFootprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeMemorySnapshot {
     active_sessions: usize,
+    model_resident_bytes: usize,
     total_runtime_bytes: usize,
     total_kv_cache_bytes: usize,
 }
@@ -309,7 +310,7 @@ impl InferenceCoordinator {
             checkpoint_manager: None,
             shard_registry,
             loader,
-            weight_cache: RwLock::new(HashMap::new()),
+            model_residency_cache: RwLock::new(HashMap::new()),
             sessions: HashMap::new(),
             decode_queue: VecDeque::new(),
             next_decode_fairness_epoch: 0,
@@ -359,8 +360,34 @@ impl InferenceCoordinator {
         }
     }
 
+    fn model_residency_cache_key(model_id: &str, position: &WorkerPosition) -> String {
+        format!(
+            "{}:{}:{}:{}-{}",
+            model_id,
+            position.position,
+            position.total_workers,
+            position.shard_column_range.0,
+            position.shard_column_range.1
+        )
+    }
+
+    fn prune_unused_model_residency(&mut self) {
+        if let Ok(mut cache) = self.model_residency_cache.try_write() {
+            cache.retain(|_, residency| Arc::strong_count(residency) > 1);
+        }
+    }
+
     fn runtime_memory_snapshot(&self) -> RuntimeMemorySnapshot {
         let mut active_sessions = 0_usize;
+        let model_resident_bytes = self
+            .model_residency_cache
+            .try_read()
+            .map(|cache| {
+                cache.values()
+                    .map(|residency| residency.resident_bytes())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
         let mut total_runtime_bytes = 0_usize;
         let mut total_kv_cache_bytes = 0_usize;
         for session in self.sessions.values() {
@@ -377,7 +404,8 @@ impl InferenceCoordinator {
         }
         RuntimeMemorySnapshot {
             active_sessions,
-            total_runtime_bytes,
+            model_resident_bytes,
+            total_runtime_bytes: total_runtime_bytes.saturating_add(model_resident_bytes),
             total_kv_cache_bytes,
         }
     }
@@ -388,11 +416,11 @@ impl InferenceCoordinator {
         position: &WorkerPosition,
     ) -> Result<&'a mut ActiveSession> {
         if !self.sessions.contains_key(&request.session_id) {
-            let weights = self
-                .get_or_load_weights(&request.model_id, position)
+            let model = self
+                .get_or_load_model_residency(&request.model_id, position)
                 .await?;
             let backend = CandleExecutionBackend::new(
-                (*weights).clone(),
+                Arc::clone(&model),
                 position.position,
                 position.shard_column_range.0 as usize,
                 position.shard_column_range.1 as usize,
@@ -533,6 +561,7 @@ impl InferenceCoordinator {
             session.engine_state.runtime_status = SessionRuntimeStatus::Evicted;
             session.engine_state.evicted = Some(SessionEvictionState { reason, detail });
         }
+        self.prune_unused_model_residency();
         self.decode_queue
             .retain(|task| task.session_id != session_id);
         Ok(())
@@ -543,6 +572,7 @@ impl InferenceCoordinator {
         protected_session_id: Option<Uuid>,
     ) -> Result<()> {
         loop {
+            self.prune_unused_model_residency();
             let snapshot = self.runtime_memory_snapshot();
             let over_active_sessions = snapshot.active_sessions > self.config.max_active_sessions;
             let over_kv_budget =
@@ -806,21 +836,22 @@ impl InferenceCoordinator {
     /// it loads them from the production shard loader.
     ///
     /// Weights are cached per model_id to avoid regenerating them for each token.
-    async fn get_or_load_weights(
+    async fn get_or_load_model_residency(
         &mut self,
         model_id: &str,
         position: &WorkerPosition,
-    ) -> Result<Arc<ModelWeights>> {
+    ) -> Result<Arc<SharedModelResidency>> {
+        let cache_key = Self::model_residency_cache_key(model_id, position);
         // Check cache first
         {
-            let cache = self.weight_cache.read().await;
-            if let Some(weights) = cache.get(model_id) {
-                debug!(model_id = %model_id, "Using cached weights");
-                return Ok(Arc::clone(weights));
+            let cache = self.model_residency_cache.read().await;
+            if let Some(model) = cache.get(&cache_key) {
+                debug!(model_id = %model_id, cache_key = %cache_key, "Using cached model residency");
+                return Ok(Arc::clone(model));
             }
         }
 
-        debug!(model_id = %model_id, "Cache miss, loading weights");
+        debug!(model_id = %model_id, cache_key = %cache_key, "Cache miss, loading model residency");
 
         // Create shard assignment for this worker
         let assignment = ShardAssignment::from_column_range(
@@ -842,20 +873,20 @@ impl InferenceCoordinator {
             .load_shard(model_id, &assignment, &self.shard_registry)
             .await?;
 
-        // Cache it
-        let weights_arc = Arc::new(weights);
+        let model = Arc::new(SharedModelResidency::from_host(weights)?);
         {
-            let mut cache = self.weight_cache.write().await;
-            cache.insert(model_id.to_string(), Arc::clone(&weights_arc));
+            let mut cache = self.model_residency_cache.write().await;
+            cache.insert(cache_key.clone(), Arc::clone(&model));
         }
 
         info!(
             model_id = %model_id,
-            memory_mb = weights_arc.memory_usage() / 1_000_000,
-            "Weights loaded and cached"
+            cache_key = %cache_key,
+            resident_memory_mb = model.resident_bytes() / 1_000_000,
+            "Model residency loaded and cached"
         );
 
-        Ok(weights_arc)
+        Ok(model)
     }
 
     /// Join the ring topology
@@ -987,6 +1018,7 @@ impl InferenceCoordinator {
         {
             self.stats.record_failure();
             self.sessions.remove(&prefill_request.session_id);
+            self.prune_unused_model_residency();
             self.decode_queue
                 .retain(|task| task.session_id != prefill_request.session_id);
             return Ok(InferenceResult::failure(
@@ -1009,6 +1041,7 @@ impl InferenceCoordinator {
             Err(error) => {
                 self.stats.record_failure();
                 self.sessions.remove(&decode_request.session_id);
+                self.prune_unused_model_residency();
                 self.decode_queue
                     .retain(|task| task.session_id != decode_request.session_id);
                 Ok(InferenceResult::failure(
@@ -1552,6 +1585,7 @@ impl InferenceCoordinator {
         let session = self.sessions.remove(&request.session_id).ok_or_else(|| {
             AgentError::Execution("decode session vanished before finalization".to_string())
         })?;
+        self.prune_unused_model_residency();
         let mut result = session.job.into_result();
         if execution_time_ms > result.execution_time_ms {
             result.execution_time_ms = execution_time_ms;
@@ -1750,9 +1784,10 @@ impl InferenceCoordinator {
 mod tests {
     use super::*;
     use crate::executor::ring_allreduce::RingAllReduceMetrics;
+    use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
     use crate::inference::job::InferenceRequest;
     use crate::inference::kv_cache::KVCacheSnapshot;
-    use crate::inference::tensor_ops::Tensor1D;
+    use crate::inference::tensor_ops::{Tensor1D, Tensor2D};
     use crate::network::TensorPlaneConfig;
     use crate::provider::ExecutionProviderKind;
 
@@ -1882,6 +1917,39 @@ mod tests {
                 last_active_at: Instant::now(),
             },
         );
+    }
+
+    fn test_model_weights() -> ModelWeights {
+        let config = ModelConfig {
+            hidden_dim: 32,
+            num_heads: 4,
+            num_kv_heads: 2,
+            num_layers: 2,
+            vocab_size: 64,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_base: 10_000.0,
+        };
+        let layer = LayerWeights {
+            layer_idx: 0,
+            w_q: Tensor2D::filled(32, 8, 0.1),
+            w_k: Tensor2D::filled(32, 4, 0.1),
+            w_v: Tensor2D::filled(32, 4, 0.1),
+            w_o: Tensor2D::filled(8, 32, 0.1),
+            w_up: Tensor2D::filled(32, 16, 0.1),
+            w_gate: Tensor2D::filled(32, 16, 0.1),
+            w_down: Tensor2D::filled(16, 32, 0.1),
+            attn_norm: Tensor1D::new(vec![1.0; 32]),
+            mlp_norm: Tensor1D::new(vec![1.0; 32]),
+        };
+        ModelWeights {
+            model_id: "test-model".to_string(),
+            embedding: Tensor2D::filled(64, 32, 0.05),
+            layers: vec![layer.clone(), LayerWeights { layer_idx: 1, ..layer }],
+            final_norm: Tensor1D::new(vec![1.0; 32]),
+            lm_head: Tensor2D::filled(32, 64, 0.08),
+            config,
+        }
     }
 
     #[test]
@@ -2250,7 +2318,43 @@ mod tests {
 
         let snapshot = coordinator.runtime_memory_snapshot();
         assert_eq!(snapshot.active_sessions, 2);
+        assert_eq!(snapshot.model_resident_bytes, 0);
         assert_eq!(snapshot.total_kv_cache_bytes, (4 + 8) * 1024);
         assert!(snapshot.total_runtime_bytes >= snapshot.total_kv_cache_bytes);
+    }
+
+    #[test]
+    fn test_runtime_memory_snapshot_counts_shared_model_residency_once() {
+        let mut coordinator = test_coordinator(InferenceConfig::default());
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 8, 22);
+
+        let residency =
+            Arc::new(SharedModelResidency::from_host(test_model_weights()).expect("residency"));
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                coordinator
+                    .model_residency_cache
+                    .write()
+                    .await
+                    .insert("test-model:0:1:0-1024".to_string(), residency.clone());
+            });
+
+        let snapshot = coordinator.runtime_memory_snapshot();
+        assert_eq!(snapshot.active_sessions, 2);
+        assert_eq!(snapshot.model_resident_bytes, residency.resident_bytes());
+        let session_runtime_bytes = coordinator
+            .sessions
+            .values()
+            .map(InferenceCoordinator::session_memory_footprint)
+            .map(|footprint| footprint.runtime_bytes)
+            .sum::<usize>();
+        assert_eq!(
+            snapshot.total_runtime_bytes,
+            snapshot.model_resident_bytes + session_runtime_bytes
+        );
     }
 }

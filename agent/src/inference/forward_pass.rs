@@ -48,6 +48,7 @@ use crate::errors::Result;
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use candle_core::Tensor as CandleTensor;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -533,6 +534,29 @@ struct DeviceModelWeights {
     lm_head: CandleTensor,
 }
 
+fn candle_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
+    tensor
+        .dims()
+        .iter()
+        .copied()
+        .product::<usize>()
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+impl DeviceLayerWeights {
+    fn memory_usage_bytes(&self) -> usize {
+        candle_tensor_memory_usage_bytes(&self.w_q)
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_k))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_v))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_o))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_up))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_down))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.attn_norm))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.mlp_norm))
+    }
+}
+
 impl DeviceModelWeights {
     fn from_host(weights: &ModelWeights) -> Result<Self> {
         let embedding = to_candle_2d(&weights.embedding)?;
@@ -559,10 +583,57 @@ impl DeviceModelWeights {
             lm_head,
         })
     }
+
+    fn memory_usage_bytes(&self) -> usize {
+        candle_tensor_memory_usage_bytes(&self.embedding)
+            .saturating_add(
+                self.layers
+                    .iter()
+                    .map(DeviceLayerWeights::memory_usage_bytes)
+                    .sum(),
+            )
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.final_norm))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.lm_head))
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedModelResidency {
+    model_id: String,
+    config: ModelConfig,
+    device_weights: Arc<DeviceModelWeights>,
+    resident_bytes: usize,
+}
+
+impl SharedModelResidency {
+    pub fn from_host(weights: ModelWeights) -> Result<Self> {
+        let model_id = weights.model_id.clone();
+        let config = weights.config.clone();
+        let device_weights = Arc::new(DeviceModelWeights::from_host(&weights)?);
+        let resident_bytes = device_weights.memory_usage_bytes();
+        Ok(Self {
+            model_id,
+            config,
+            device_weights,
+            resident_bytes,
+        })
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
 }
 
 pub struct ForwardPass {
-    device_weights: DeviceModelWeights,
+    device_weights: Arc<DeviceModelWeights>,
     config: ModelConfig,
     allreduce_timeout: std::time::Duration,
 
@@ -587,16 +658,15 @@ pub struct ForwardPass {
 }
 
 impl ForwardPass {
-    /// Create a new forward pass state
-    pub fn new(
-        weights: ModelWeights,
+    pub fn from_residency(
+        residency: Arc<SharedModelResidency>,
         worker_position: u32,
         shard_start: usize,
         shard_end: usize,
         total_workers: u32,
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
-        let config = weights.config.clone();
+        let config = residency.config().clone();
         let kv_config = super::kv_cache::KVCacheConfig {
             num_layers: config.num_layers,
             num_heads: config.num_kv_heads,
@@ -605,7 +675,7 @@ impl ForwardPass {
         };
 
         Ok(Self {
-            device_weights: DeviceModelWeights::from_host(&weights)?,
+            device_weights: Arc::clone(&residency.device_weights),
             config,
             allreduce_timeout,
             kv_cache: KVCache::new(kv_config),
@@ -616,6 +686,26 @@ impl ForwardPass {
             position: 0,
             last_allreduce_metrics: RingAllReduceMetrics::default(),
         })
+    }
+
+    /// Create a new forward pass state
+    pub fn new(
+        weights: ModelWeights,
+        worker_position: u32,
+        shard_start: usize,
+        shard_end: usize,
+        total_workers: u32,
+        allreduce_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let residency = Arc::new(SharedModelResidency::from_host(weights)?);
+        Self::from_residency(
+            residency,
+            worker_position,
+            shard_start,
+            shard_end,
+            total_workers,
+            allreduce_timeout,
+        )
     }
 
     /// Embed input tokens
