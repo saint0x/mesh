@@ -1086,13 +1086,11 @@ impl ForwardPass {
         })
     }
 
-    /// Run forward pass for a single layer with ring all-reduce
+    /// Legacy per-layer executor kept only for fallback correctness paths.
     ///
-    /// This is the core tensor-parallel operation:
-    /// 1. Compute partial attention/MLP with local shard
-    /// 2. Ring all-reduce to combine results
-    /// 3. Apply activation and normalization
-    pub async fn forward_layer(
+    /// This remains the CPU-safe and recovery-safe implementation, but it is no
+    /// longer the intended high-throughput serving path.
+    async fn fallback_forward_layer(
         &mut self,
         hidden: &CandleTensor,
         layer_idx: usize,
@@ -1272,8 +1270,10 @@ impl ForwardPass {
         }
     }
 
-    /// Run full forward pass for all layers
-    pub async fn prefill(
+    /// Fallback single-session prefill path retained for correctness and
+    /// recovery-safe execution. Serious serving should prefer the explicit
+    /// fast-path bucket/runtime flow around this method.
+    pub async fn fallback_prefill(
         &mut self,
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
@@ -1297,7 +1297,9 @@ impl ForwardPass {
         self.compute_logits(&hidden)
     }
 
-    pub async fn decode_step(
+    /// Fallback single-session decode step retained for CPU execution and any
+    /// path that cannot satisfy fast-path invariants.
+    pub async fn fallback_decode_step(
         &mut self,
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
@@ -1323,7 +1325,9 @@ impl ForwardPass {
         self.compute_logits(&hidden)
     }
 
-    pub async fn decode_microbatch(
+    /// Provider-accelerated decode microbatch path used by the serving fast
+    /// path once bucket and metadata invariants have been validated.
+    pub async fn fast_path_decode_microbatch(
         backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
         tokens: &[u32],
         job_ids: &[Uuid],
@@ -1578,7 +1582,13 @@ impl ForwardPass {
 
         for layer_idx in 0..self.config.num_layers {
             hidden = self
-                .forward_layer(&hidden, layer_idx, &absolute_positions, worker_ring, job_id)
+                .fallback_forward_layer(
+                    &hidden,
+                    layer_idx,
+                    &absolute_positions,
+                    worker_ring,
+                    job_id,
+                )
                 .await?;
         }
 
@@ -2495,18 +2505,19 @@ mod tests {
             local_addr,
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
+            crate::inference::LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             &mut tensor_plane,
         );
 
         let prompt = vec![1, 2, 3];
         backend_a
             .forward_pass
-            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .fallback_prefill(&prompt, &mut worker_ring, Uuid::new_v4())
             .await
             .unwrap();
         backend_b
             .forward_pass
-            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .fallback_prefill(&prompt, &mut worker_ring, Uuid::new_v4())
             .await
             .unwrap();
 
@@ -2515,7 +2526,7 @@ mod tests {
         assert_eq!(backend_a.forward_pass.device_kv_cache.next_position(), 3);
 
         let mut batch = vec![&mut backend_a, &mut backend_b];
-        let logits = ForwardPass::decode_microbatch(
+        let logits = ForwardPass::fast_path_decode_microbatch(
             &mut batch,
             &[7, 8],
             &[Uuid::new_v4(), Uuid::new_v4()],

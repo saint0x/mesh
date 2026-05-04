@@ -143,6 +143,31 @@ impl CheckpointManager {
             .transpose()
     }
 
+    pub async fn load_recovery_point_for_checkpoint(
+        &self,
+        job_id: Uuid,
+        checkpoint_id: Uuid,
+    ) -> Result<Option<CheckpointRecoveryPoint>> {
+        let file_path = self
+            .config
+            .checkpoint_dir
+            .join(job_id.to_string())
+            .join(format!("{}.ckpt", checkpoint_id));
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        let checkpoint = self.load_checkpoint_file(&file_path).await?;
+        CheckpointRecoveryPoint::from_checkpoint(checkpoint)
+            .map(Some)
+            .map_err(|e| {
+                AgentError::Execution(format!(
+                    "Invalid recovery checkpoint {} for job {}: {}",
+                    checkpoint_id, job_id, e
+                ))
+            })
+    }
+
     pub async fn load_checkpoint_kv_cache(&self, job_id: Uuid) -> Result<Option<KVCache>> {
         Ok(self
             .load_recovery_point(job_id)
@@ -775,6 +800,46 @@ mod tests {
         assert_eq!(imported_handoff.owner_worker_id, "worker-target");
         assert_eq!(imported_handoff.source_worker_id, "worker-source");
         assert_eq!(imported_handoff.sequence.next_position, 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_recovery_point_for_checkpoint_returns_exact_match() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = CheckpointManager::new(
+            CheckpointConfig {
+                checkpoint_dir: temp_dir.path().to_path_buf(),
+                max_checkpoints_per_job: 10,
+                ..Default::default()
+            },
+            "worker-1".to_string(),
+        )
+        .unwrap();
+        let mut job = create_test_job();
+        let first = manager
+            .save_checkpoint(&job, Some(&create_test_snapshot()))
+            .await
+            .unwrap();
+        job.add_token(103);
+        let second = manager
+            .save_checkpoint(&job, Some(&create_test_snapshot()))
+            .await
+            .unwrap();
+
+        let recovery = manager
+            .load_recovery_point_for_checkpoint(job.request.job_id, first.checkpoint_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.checkpoint_id(), first.checkpoint_id);
+        assert_eq!(recovery.restore_job().current_token_idx, first.token_index);
+
+        let latest = manager
+            .load_recovery_point_for_checkpoint(job.request.job_id, second.checkpoint_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.checkpoint_id(), second.checkpoint_id);
+        assert_eq!(latest.restore_job().current_token_idx, second.token_index);
     }
 
     #[tokio::test]

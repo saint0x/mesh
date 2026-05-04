@@ -12,9 +12,10 @@
 //! bandwidth-optimal gradient aggregation in distributed training.
 
 use crate::errors::{AgentError, Result};
-use crate::inference::InferenceRuntimeMode;
+use crate::inference::{InferenceRuntimeMode, LocalExecutorContract};
 use crate::network::{
-    CollectiveLane, ServingFrame, ServingReceiveSpec, ServingSessionTransport, TensorPlane,
+    CollectiveLane, ServingBackgroundTransfer, ServingFrame, ServingReceiveSpec,
+    ServingSessionTransport, TensorPlane,
 };
 use crate::provider::ExecutionProviderKind;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -343,10 +344,31 @@ pub struct WorkerRing<'a> {
     runtime_mode: InferenceRuntimeMode,
     /// Provider kind used by the local execution backend.
     provider: ExecutionProviderKind,
+    /// Executor contract supplied by the local fast path owner.
+    executor_contract: LocalExecutorContract,
     /// Provider/runtime specialized collective transport plan.
     collective_profile: CollectiveOptimizationProfile,
+    /// Background bulk/checkpoint transfers intentionally overlapped with decode work.
+    background_transfers: Vec<ServingBackgroundTransfer>,
     /// Timings captured during the most recent all-reduce call.
     last_run_metrics: RingAllReduceMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectiveOverlapClass {
+    BlockingStageBoundary,
+    TransportStepPipelined,
+    BackgroundDecodeSafe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectiveOverlapPlan {
+    pub lane: CollectiveLane,
+    pub class: CollectiveOverlapClass,
+    pub can_overlap_decode_compute: bool,
+    pub requires_stage_completion: bool,
+    pub drain_before_blocking_collective: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +419,7 @@ impl<'a> WorkerRing<'a> {
         right_tensor_addr: SocketAddr,
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
+        executor_contract: LocalExecutorContract,
         tensor_plane: &'a mut TensorPlane,
     ) -> Self {
         let collective_profile =
@@ -412,7 +435,9 @@ impl<'a> WorkerRing<'a> {
             serving_transport: None,
             runtime_mode,
             provider,
+            executor_contract,
             collective_profile,
+            background_transfers: Vec::new(),
             last_run_metrics: RingAllReduceMetrics::default(),
         }
     }
@@ -454,6 +479,7 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<Tensor> {
+        self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
@@ -605,6 +631,7 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<CollectiveMatrix> {
+        self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
@@ -709,6 +736,7 @@ impl<'a> WorkerRing<'a> {
     /// Uses a ring-based barrier where each worker sends a message to its
     /// right neighbor and waits for a message from its left neighbor.
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
+        self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             return Ok(());
         }
@@ -734,6 +762,108 @@ impl<'a> WorkerRing<'a> {
         }
 
         debug!("Barrier sync complete for layer {}", layer_idx);
+        Ok(())
+    }
+
+    pub fn collective_overlap_plan(&self, lane: CollectiveLane) -> CollectiveOverlapPlan {
+        let decode_fast_path = self.executor_contract.supports_decode_microbatch()
+            && self.executor_contract.kv_runtime.append_only_decode
+            && self.executor_contract.kv_runtime.requires_paged_cache;
+        match lane {
+            CollectiveLane::ReduceScatter | CollectiveLane::AllGather => CollectiveOverlapPlan {
+                lane,
+                class: CollectiveOverlapClass::TransportStepPipelined,
+                can_overlap_decode_compute: false,
+                requires_stage_completion: true,
+                drain_before_blocking_collective: false,
+            },
+            CollectiveLane::Control => CollectiveOverlapPlan {
+                lane,
+                class: CollectiveOverlapClass::BlockingStageBoundary,
+                can_overlap_decode_compute: false,
+                requires_stage_completion: true,
+                drain_before_blocking_collective: true,
+            },
+            CollectiveLane::BulkTransfer | CollectiveLane::Checkpoint => CollectiveOverlapPlan {
+                lane,
+                class: if decode_fast_path {
+                    CollectiveOverlapClass::BackgroundDecodeSafe
+                } else {
+                    CollectiveOverlapClass::BlockingStageBoundary
+                },
+                can_overlap_decode_compute: decode_fast_path,
+                requires_stage_completion: !decode_fast_path,
+                drain_before_blocking_collective: true,
+            },
+        }
+    }
+
+    pub fn background_transfer_count(&self) -> usize {
+        self.background_transfers.len()
+    }
+
+    pub async fn send_bulk_transfer(
+        &mut self,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        chunk_data: Vec<f32>,
+        chunk_shape: Vec<usize>,
+    ) -> Result<()> {
+        self.send_background_eligible_lane(
+            CollectiveLane::BulkTransfer,
+            collective_id,
+            layer_idx,
+            step,
+            slot,
+            chunk_data,
+            chunk_shape,
+        )
+        .await
+    }
+
+    pub async fn send_checkpoint(
+        &mut self,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        chunk_data: Vec<f32>,
+        chunk_shape: Vec<usize>,
+    ) -> Result<()> {
+        self.send_background_eligible_lane(
+            CollectiveLane::Checkpoint,
+            collective_id,
+            layer_idx,
+            step,
+            slot,
+            chunk_data,
+            chunk_shape,
+        )
+        .await
+    }
+
+    pub async fn drain_background_transfers(&mut self) -> Result<()> {
+        if self.background_transfers.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            pending = self.background_transfers.len(),
+            "draining background serving-lane transfers before a blocking collective boundary"
+        );
+        let pending = std::mem::take(&mut self.background_transfers);
+        for transfer in pending {
+            debug!(
+                lane = ?transfer.lane(),
+                collective_id = %transfer.collective_id(),
+                step = transfer.step(),
+                slot = transfer.slot(),
+                stream_id = transfer.stream_id(),
+                "waiting for background serving-lane transfer"
+            );
+            transfer.wait().await?;
+        }
         Ok(())
     }
 
@@ -839,12 +969,106 @@ impl<'a> WorkerRing<'a> {
     pub fn collective_optimization_profile(&self) -> CollectiveOptimizationProfile {
         self.collective_profile
     }
+
+    async fn send_background_eligible_lane(
+        &mut self,
+        lane: CollectiveLane,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        chunk_data: Vec<f32>,
+        chunk_shape: Vec<usize>,
+    ) -> Result<()> {
+        let plan = self.collective_overlap_plan(lane);
+        let stream_id = self.serving_transport()?.stream_id_for(lane, step, slot);
+        let transport = self.serving_transport()?.clone();
+        match (lane, plan.class) {
+            (CollectiveLane::BulkTransfer, CollectiveOverlapClass::BackgroundDecodeSafe) => {
+                debug!(
+                    collective_id = %collective_id,
+                    layer_idx,
+                    step,
+                    slot,
+                    stream_id,
+                    "queueing bulk transfer on background serving lane for decode overlap"
+                );
+                self.background_transfers
+                    .push(transport.spawn_bulk_transfer(
+                        collective_id,
+                        layer_idx,
+                        step,
+                        slot,
+                        stream_id,
+                        self.my_position,
+                        chunk_data,
+                        chunk_shape,
+                    ));
+                Ok(())
+            }
+            (CollectiveLane::Checkpoint, CollectiveOverlapClass::BackgroundDecodeSafe) => {
+                debug!(
+                    collective_id = %collective_id,
+                    layer_idx,
+                    step,
+                    slot,
+                    stream_id,
+                    "queueing checkpoint transfer on background serving lane for decode overlap"
+                );
+                self.background_transfers.push(transport.spawn_checkpoint(
+                    collective_id,
+                    layer_idx,
+                    step,
+                    slot,
+                    stream_id,
+                    self.my_position,
+                    chunk_data,
+                    chunk_shape,
+                ));
+                Ok(())
+            }
+            (CollectiveLane::BulkTransfer, _) => {
+                transport
+                    .send_bulk_transfer(
+                        collective_id,
+                        layer_idx,
+                        step,
+                        slot,
+                        stream_id,
+                        self.my_position,
+                        &chunk_data,
+                        &chunk_shape,
+                    )
+                    .await
+            }
+            (CollectiveLane::Checkpoint, _) => {
+                transport
+                    .send_checkpoint(
+                        collective_id,
+                        layer_idx,
+                        step,
+                        slot,
+                        stream_id,
+                        self.my_position,
+                        &chunk_data,
+                        &chunk_shape,
+                    )
+                    .await
+            }
+            _ => Err(AgentError::Execution(format!(
+                "Lane {:?} is not eligible for background transfer dispatch",
+                lane
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
+    use crate::inference::LocalExecutorContract;
+    use crate::network::TensorPlaneConfig;
     use crate::provider::ExecutionProviderKind;
 
     // ============== Tensor Tests ==============
@@ -974,6 +1198,74 @@ mod tests {
             ),
             CollectiveOptimizationProfile::CpuLowFanout
         );
+    }
+
+    #[tokio::test]
+    async fn test_collective_overlap_plan_tracks_executor_contract() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let addr = plane.local_addr();
+        let mut cuda_ring = WorkerRing::new(
+            0,
+            2,
+            peer_id,
+            peer_id,
+            addr,
+            addr,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            &mut plane,
+        );
+        cuda_ring.prepare_serving_group_channels().await.unwrap();
+
+        let reduce_scatter = cuda_ring.collective_overlap_plan(CollectiveLane::ReduceScatter);
+        assert_eq!(
+            reduce_scatter.class,
+            CollectiveOverlapClass::TransportStepPipelined
+        );
+        assert!(!reduce_scatter.can_overlap_decode_compute);
+        assert!(reduce_scatter.requires_stage_completion);
+
+        let checkpoint = cuda_ring.collective_overlap_plan(CollectiveLane::Checkpoint);
+        assert_eq!(
+            checkpoint.class,
+            CollectiveOverlapClass::BackgroundDecodeSafe
+        );
+        assert!(checkpoint.can_overlap_decode_compute);
+        assert!(!checkpoint.requires_stage_completion);
+    }
+
+    #[tokio::test]
+    async fn test_background_checkpoint_transfers_are_drained_before_blocking_collectives() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let addr = plane.local_addr();
+        let mut ring = WorkerRing::new(
+            0,
+            2,
+            peer_id,
+            peer_id,
+            addr,
+            addr,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            &mut plane,
+        );
+        ring.prepare_serving_group_channels().await.unwrap();
+
+        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0], vec![1])
+            .await
+            .unwrap();
+        assert_eq!(ring.background_transfer_count(), 1);
+
+        ring.drain_background_transfers().await.unwrap();
+        assert_eq!(ring.background_transfer_count(), 0);
     }
 
     // ============== Ring All-Reduce Logic Tests ==============

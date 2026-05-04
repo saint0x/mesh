@@ -1269,7 +1269,7 @@ granularity expectations and with Agent 2 on live KV movement assumptions.
   - Metal-aware path
   - CUDA-oriented high-throughput path
 - ✅ Reduce unnecessary framing/copy overhead in active decode traffic.
-- [ ] Evaluate where collective steps can overlap or pipeline better with
+- ✅ Evaluate where collective steps can overlap or pipeline better with
   execution.
 - ✅ Preserve observability and timeout diagnostics without letting them bloat
   the core fast path.
@@ -1373,7 +1373,7 @@ without forcing the fast path to carry generic checkpoint-first assumptions.
 - ✅ Validate that ownership, residency, and checkpoint metadata still align
   with the new live executor contracts.
 - ✅ Ensure failover state transitions remain observable and debuggable.
-- [ ] Keep shrink, replace, and resume-ready semantics intact unless there is an
+- ✅ Keep shrink, replace, and resume-ready semantics intact unless there is an
   explicit system-level decision to alter them.
 
 ### Agent 6 boundaries

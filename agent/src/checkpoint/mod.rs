@@ -39,6 +39,6 @@ pub mod types;
 
 pub use manager::CheckpointManager;
 pub use types::{
-    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointRecoveryPoint, KVCacheHandoff,
-    KVCacheResidency, KVPayloadRef,
+    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointRecoveryPoint,
+    CheckpointResumeExpectation, KVCacheHandoff, KVCacheResidency, KVPayloadRef,
 };

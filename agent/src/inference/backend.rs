@@ -75,6 +75,10 @@ pub trait ExecutionBackend: Send {
     fn supports_decode_microbatch(&self) -> bool {
         self.executor_contract().supports_decode_microbatch()
     }
+
+    fn is_fast_path_backend(&self) -> bool {
+        self.executor_contract().is_fast_path()
+    }
 }
 
 pub struct DecodeMicrobatchRequest<'a> {
@@ -107,7 +111,7 @@ impl BackendMicrobatchExecutor {
         }
 
         if !Self::can_use_accelerated_decode_batch(requests) {
-            return Self::decode_step_batch_serial(requests, worker_ring).await;
+            return Self::decode_step_batch_fallback(requests, worker_ring).await;
         }
 
         let profile = requests
@@ -117,13 +121,13 @@ impl BackendMicrobatchExecutor {
 
         match profile {
             BackendOptimizationProfile::CpuSerial => {
-                Self::decode_step_batch_serial(requests, worker_ring).await
+                Self::decode_step_batch_fallback(requests, worker_ring).await
             }
             BackendOptimizationProfile::MetalVectorized => {
-                Self::decode_step_batch_accelerated(requests, worker_ring).await
+                Self::decode_step_batch_fast_path(requests, worker_ring).await
             }
             BackendOptimizationProfile::CudaFused => {
-                Self::decode_step_batch_accelerated(requests, worker_ring).await
+                Self::decode_step_batch_fast_path(requests, worker_ring).await
             }
         }
     }
@@ -150,7 +154,7 @@ impl BackendMicrobatchExecutor {
         })
     }
 
-    async fn decode_step_batch_serial(
+    async fn decode_step_batch_fallback(
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
@@ -170,19 +174,22 @@ impl BackendMicrobatchExecutor {
         Ok(outputs)
     }
 
-    async fn decode_step_batch_accelerated(
+    async fn decode_step_batch_fast_path(
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
         if let Some(outputs) =
-            CandleExecutionBackend::decode_step_batch(requests, worker_ring).await?
+            CandleExecutionBackend::decode_step_batch_fast_path(requests, worker_ring).await?
         {
             return Ok(outputs);
         }
-        Self::decode_step_batch_serial(requests, worker_ring).await
+        Self::decode_step_batch_fallback(requests, worker_ring).await
     }
 }
 
+/// The shared Candle backend still carries two intentionally different roles:
+/// a narrowly scoped legacy fallback for single-session correctness/recovery-safe
+/// execution, and the provider-gated fast path for serious decode serving.
 pub struct CandleExecutionBackend {
     pub(crate) model_id: String,
     pub(crate) provider: ExecutionProviderKind,
@@ -215,7 +222,7 @@ impl CandleExecutionBackend {
         })
     }
 
-    async fn decode_step_batch(
+    async fn decode_step_batch_fast_path(
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Option<Vec<DecodeMicrobatchOutput>>> {
@@ -280,7 +287,8 @@ impl CandleExecutionBackend {
 
         let step_start = Instant::now();
         let logits =
-            ForwardPass::decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring).await?;
+            ForwardPass::fast_path_decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring)
+                .await?;
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
         Ok(Some(
@@ -321,7 +329,9 @@ impl ExecutionBackend for CandleExecutionBackend {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<BackendLogits> {
-        self.forward_pass.prefill(tokens, worker_ring, job_id).await
+        self.forward_pass
+            .fallback_prefill(tokens, worker_ring, job_id)
+            .await
     }
 
     async fn decode_step(
@@ -331,7 +341,7 @@ impl ExecutionBackend for CandleExecutionBackend {
         job_id: Uuid,
     ) -> Result<BackendLogits> {
         self.forward_pass
-            .decode_step(token, worker_ring, job_id)
+            .fallback_decode_step(token, worker_ring, job_id)
             .await
     }
 

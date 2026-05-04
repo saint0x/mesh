@@ -18,7 +18,7 @@ pub mod telemetry;
 pub use api::RegistrationClient;
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, CheckpointRecoveryPoint,
-    KVCacheHandoff, KVCacheResidency, KVPayloadRef,
+    CheckpointResumeExpectation, KVCacheHandoff, KVCacheResidency, KVPayloadRef,
 };
 pub use connectivity::{
     build_direct_peer_candidates, build_direct_peer_candidates_from_records,

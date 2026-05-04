@@ -8,6 +8,7 @@ use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -312,6 +313,47 @@ pub struct ServingSessionTransport {
     checkpoint_plan: ServingLanePlan,
 }
 
+#[derive(Debug)]
+pub struct ServingBackgroundTransfer {
+    lane: CollectiveLane,
+    collective_id: Uuid,
+    step: u32,
+    slot: u32,
+    stream_id: u32,
+    join_handle: JoinHandle<Result<()>>,
+}
+
+impl ServingBackgroundTransfer {
+    pub fn lane(&self) -> CollectiveLane {
+        self.lane
+    }
+
+    pub fn collective_id(&self) -> Uuid {
+        self.collective_id
+    }
+
+    pub fn step(&self) -> u32 {
+        self.step
+    }
+
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+
+    pub async fn wait(self) -> Result<()> {
+        self.join_handle.await.map_err(|error| {
+            AgentError::Execution(format!(
+                "Background {:?} transfer task for collective {} step {} slot {} failed to join: {}",
+                self.lane, self.collective_id, self.step, self.slot, error
+            ))
+        })?
+    }
+}
+
 impl std::fmt::Debug for ServingSessionTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServingSessionTransport")
@@ -503,6 +545,54 @@ impl ServingSessionTransport {
         .await
     }
 
+    pub fn spawn_bulk_transfer(
+        &self,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        stream_id: u32,
+        sender_position: u32,
+        chunk_data: Vec<f32>,
+        chunk_shape: Vec<usize>,
+    ) -> ServingBackgroundTransfer {
+        self.spawn_background_frame(
+            collective_id,
+            layer_idx,
+            step,
+            slot,
+            stream_id,
+            sender_position,
+            chunk_data,
+            chunk_shape,
+            self.bulk_transfer_plan,
+        )
+    }
+
+    pub fn spawn_checkpoint(
+        &self,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        stream_id: u32,
+        sender_position: u32,
+        chunk_data: Vec<f32>,
+        chunk_shape: Vec<usize>,
+    ) -> ServingBackgroundTransfer {
+        self.spawn_background_frame(
+            collective_id,
+            layer_idx,
+            step,
+            slot,
+            stream_id,
+            sender_position,
+            chunk_data,
+            chunk_shape,
+            self.checkpoint_plan,
+        )
+    }
+
     pub async fn recv_frame(&self, spec: ServingReceiveSpec) -> Result<ServingFrame> {
         recv_slot(
             &self.state,
@@ -523,6 +613,53 @@ impl ServingSessionTransport {
         plan: ServingLanePlan,
     ) -> Result<()> {
         send_serving_frame_on_plan(&self.state, target, header, chunk_data, chunk_shape, plan).await
+    }
+
+    fn spawn_background_frame(
+        &self,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        stream_id: u32,
+        sender_position: u32,
+        chunk_data: Vec<f32>,
+        chunk_shape: Vec<usize>,
+        plan: ServingLanePlan,
+    ) -> ServingBackgroundTransfer {
+        let target = self.session.right_peer;
+        let session_id = self.session.session_id;
+        let state = Arc::clone(&self.state);
+        let join_handle = tokio::spawn(async move {
+            send_serving_frame_on_plan(
+                &state,
+                target,
+                ServingFrameHeader::new(
+                    session_id,
+                    collective_id,
+                    sender_position,
+                    layer_idx,
+                    step,
+                    slot,
+                    stream_id,
+                    plan.lane,
+                    chunk_data.len() as u32,
+                    chunk_shape.len() as u32,
+                ),
+                &chunk_data,
+                &chunk_shape,
+                plan,
+            )
+            .await
+        });
+        ServingBackgroundTransfer {
+            lane: plan.lane,
+            collective_id,
+            step,
+            slot,
+            stream_id,
+            join_handle,
+        }
     }
 }
 

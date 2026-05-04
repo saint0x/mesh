@@ -242,6 +242,20 @@ impl KVCacheHandoff {
     }
 }
 
+/// Recovery-side invariants that must hold before a worker resumes execution
+/// from a checkpoint selected by the control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointResumeExpectation {
+    pub checkpoint_id: Uuid,
+    pub job_id: Uuid,
+    pub session_id: Uuid,
+    pub model_id: String,
+    pub phase: ExecutionPhase,
+    pub source_worker_id: String,
+    pub owner_worker_id: String,
+    pub kv_sequence_position: u32,
+}
+
 /// Validated recovery-side checkpoint wrapper that isolates transfer semantics
 /// from the live executor's KV representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +274,10 @@ impl CheckpointRecoveryPoint {
 
     pub fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
+    }
+
+    pub fn checkpoint_id(&self) -> Uuid {
+        self.checkpoint.metadata.checkpoint_id
     }
 
     pub fn into_checkpoint(self) -> Checkpoint {
@@ -292,6 +310,16 @@ impl CheckpointRecoveryPoint {
         self.checkpoint.kv_handoff.as_ref()
     }
 
+    pub fn owner_worker_id(&self) -> Option<&str> {
+        self.kv_handoff()
+            .map(|handoff| handoff.owner_worker_id.as_str())
+    }
+
+    pub fn source_worker_id(&self) -> Option<&str> {
+        self.kv_handoff()
+            .map(|handoff| handoff.source_worker_id.as_str())
+    }
+
     pub fn kv_sequence_position(&self) -> Option<u32> {
         self.kv_handoff()
             .map(|handoff| handoff.sequence.next_position)
@@ -302,6 +330,70 @@ impl CheckpointRecoveryPoint {
             .map(KVCacheHandoff::materialize_snapshot)
             .transpose()
             .map(Option::flatten)
+    }
+
+    pub fn validate_resume_expectation(
+        &self,
+        expectation: &CheckpointResumeExpectation,
+    ) -> Result<(), String> {
+        if self.checkpoint_id() != expectation.checkpoint_id {
+            return Err(format!(
+                "checkpoint id mismatch: recovery point has {}, expected {}",
+                self.checkpoint_id(),
+                expectation.checkpoint_id
+            ));
+        }
+        if self.checkpoint.request.job_id != expectation.job_id {
+            return Err(format!(
+                "checkpoint job mismatch: recovery point has {}, expected {}",
+                self.checkpoint.request.job_id, expectation.job_id
+            ));
+        }
+        if self.checkpoint.request.session_id != expectation.session_id {
+            return Err(format!(
+                "checkpoint session mismatch: recovery point has {}, expected {}",
+                self.checkpoint.request.session_id, expectation.session_id
+            ));
+        }
+        if self.checkpoint.request.model_id != expectation.model_id {
+            return Err(format!(
+                "checkpoint model mismatch: recovery point has {}, expected {}",
+                self.checkpoint.request.model_id, expectation.model_id
+            ));
+        }
+        if self.checkpoint.request.phase != expectation.phase {
+            return Err(format!(
+                "checkpoint phase mismatch: recovery point has {:?}, expected {:?}",
+                self.checkpoint.request.phase, expectation.phase
+            ));
+        }
+
+        let Some(handoff) = self.kv_handoff() else {
+            if self.checkpoint.generated_tokens.is_empty() {
+                return Ok(());
+            }
+            return Err("resume checkpoint is missing KV handoff state".to_string());
+        };
+
+        if handoff.source_worker_id != expectation.source_worker_id {
+            return Err(format!(
+                "checkpoint source worker mismatch: recovery point has {}, expected {}",
+                handoff.source_worker_id, expectation.source_worker_id
+            ));
+        }
+        if handoff.owner_worker_id != expectation.owner_worker_id {
+            return Err(format!(
+                "checkpoint owner worker mismatch: recovery point has {}, expected {}",
+                handoff.owner_worker_id, expectation.owner_worker_id
+            ));
+        }
+        if handoff.sequence.next_position != expectation.kv_sequence_position {
+            return Err(format!(
+                "checkpoint sequence mismatch: recovery point has {}, expected {}",
+                handoff.sequence.next_position, expectation.kv_sequence_position
+            ));
+        }
+        Ok(())
     }
 
     pub fn restore_job(&self) -> InferenceJob {
@@ -858,5 +950,77 @@ mod tests {
         assert_eq!(restored_job.current_token_idx, 10);
         assert_eq!(recovery.kv_sequence_position(), Some(1));
         assert_eq!(restored_snapshot.sequence, snapshot.sequence);
+    }
+
+    #[test]
+    fn test_recovery_point_validates_resume_expectation() {
+        let mut cache = KVCache::new(crate::inference::kv_cache::KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 8,
+        });
+        cache
+            .update_layer(
+                0,
+                Tensor2D::new(vec![1.0; 8], 1, 8).unwrap(),
+                Tensor2D::new(vec![2.0; 8], 1, 8).unwrap(),
+            )
+            .unwrap();
+        let snapshot = KVCacheSnapshot::from_cache(&cache, 1).unwrap();
+        let job_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+
+        let checkpoint = Checkpoint {
+            metadata: CheckpointMetadata::new(
+                job_id,
+                10,
+                5,
+                "model".to_string(),
+                "worker-source".to_string(),
+                0,
+                "".to_string(),
+            ),
+            request: CheckpointedRequest {
+                job_id,
+                session_id,
+                network_id: "net".to_string(),
+                model_id: "model".to_string(),
+                prompt_tokens: vec![1, 2, 3],
+                executor_id: "exec".to_string(),
+                phase: ExecutionPhase::Decode,
+            },
+            generated_tokens: vec![100],
+            config: CheckpointedConfig {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_p: 0.9,
+                stop_sequences: vec![],
+                stream: false,
+                checkpoint_interval: 50,
+                total_layers: 70,
+            },
+            kv_handoff: Some(
+                KVCacheHandoff::checkpoint_resident(snapshot, "worker-source".to_string())
+                    .imported_for("worker-target".to_string()),
+            ),
+            kv_cache_state: None,
+            sequence_position: None,
+            rng_state: None,
+        };
+
+        let recovery = CheckpointRecoveryPoint::from_checkpoint(checkpoint).unwrap();
+        recovery
+            .validate_resume_expectation(&CheckpointResumeExpectation {
+                checkpoint_id: recovery.checkpoint_id(),
+                job_id,
+                session_id,
+                model_id: "model".to_string(),
+                phase: ExecutionPhase::Decode,
+                source_worker_id: "worker-source".to_string(),
+                owner_worker_id: "worker-target".to_string(),
+                kv_sequence_position: 1,
+            })
+            .unwrap();
     }
 }

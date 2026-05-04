@@ -305,14 +305,16 @@ impl RegistrationClient {
         &self,
         device_id: Uuid,
         network_id: &str,
+        include_queue_state: bool,
+        include_serving_session: bool,
     ) -> Result<Option<ClaimInferenceAssignmentResponse>> {
         let explicit_url = format!("{}/api/inference/decode/claim", self.control_plane_url);
         let request = ClaimInferenceAssignmentRequest {
             device_id: device_id.to_string(),
             network_id: network_id.to_string(),
             claim_mode: WorkClaimMode::Decode,
-            include_queue_state: true,
-            include_serving_session: true,
+            include_queue_state,
+            include_serving_session,
         };
 
         if let Some(response) = self

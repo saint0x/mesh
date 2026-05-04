@@ -61,10 +61,17 @@ use libp2p::{Multiaddr, PeerId};
 use std::net::SocketAddr;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing::{error, info, warn};
 use ui::cmd_ui;
 use uuid::Uuid;
+
+const CLAIM_POLL_INTERVAL_SECS: u64 = 2;
+const IDLE_QUEUE_OBSERVATION_POLL_INTERVAL: u32 = 5;
+const DECODE_PROGRESS_FLUSH_INTERVAL_MS: u64 = 1500;
+const DECODE_PROGRESS_EAGER_TOKEN_DELTA: u32 = 16;
 
 /// Mesh AI Agent - Distributed compute sharing network
 #[derive(Parser, Debug)]
@@ -837,6 +844,185 @@ async fn release_decode_lease_if_needed(
     }
 }
 
+enum DecodeProgressReporterCommand {
+    Update(agent::inference::InferenceProgressUpdate),
+    Flush(oneshot::Sender<std::result::Result<(), String>>),
+    Shutdown(oneshot::Sender<std::result::Result<(), String>>),
+}
+
+struct DecodeProgressReporter {
+    tx: mpsc::UnboundedSender<DecodeProgressReporterCommand>,
+    handle: JoinHandle<()>,
+}
+
+async fn send_decode_progress_update(
+    registration_client: &RegistrationClient,
+    job_id: Uuid,
+    device_id: Uuid,
+    segment_id: &str,
+    progress: agent::inference::InferenceProgressUpdate,
+) -> std::result::Result<(), String> {
+    registration_client
+        .report_inference_progress(
+            job_id,
+            ReportInferenceAssignmentProgressRequest {
+                device_id: device_id.to_string(),
+                segment_id: segment_id.to_string(),
+                phase: api_phase(progress.phase),
+                event: ProgressEventKind::DecodeProgress,
+                completion_tokens: progress.completion_tokens,
+                execution_time_ms: progress.execution_time_ms,
+                time_to_first_token_ms: progress.time_to_first_token_ms,
+                kv_cache_seq_len: progress.kv_cache_seq_len,
+                batch_size: progress.batch_size,
+                active_decode_sessions: progress.active_decode_sessions,
+                batch_kv_tokens: progress.batch_kv_tokens,
+                deferred_decode_sessions: progress.deferred_decode_sessions,
+                scheduler_queue: None,
+                serving_session: None,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+impl DecodeProgressReporter {
+    fn spawn(
+        registration_client: RegistrationClient,
+        job_id: Uuid,
+        device_id: Uuid,
+        segment_id: String,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let mut latest_pending = None::<agent::inference::InferenceProgressUpdate>;
+            let mut last_flushed_completion_tokens = 0u32;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
+                DECODE_PROGRESS_FLUSH_INTERVAL_MS,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Some(progress) = latest_pending.take() {
+                            let completion_tokens = progress.completion_tokens;
+                            if let Err(error) = send_decode_progress_update(
+                                &registration_client,
+                                job_id,
+                                device_id,
+                                &segment_id,
+                                progress,
+                            ).await {
+                                warn!(job_id = %job_id, segment_id = %segment_id, error, "Buffered decode progress flush failed");
+                            } else {
+                                last_flushed_completion_tokens = completion_tokens;
+                            }
+                        }
+                    }
+                    Some(command) = rx.recv() => {
+                        match command {
+                            DecodeProgressReporterCommand::Update(progress) => {
+                                let eager_flush = progress
+                                    .completion_tokens
+                                    .saturating_sub(last_flushed_completion_tokens)
+                                    >= DECODE_PROGRESS_EAGER_TOKEN_DELTA;
+                                latest_pending = Some(progress);
+                                if eager_flush {
+                                    if let Some(progress) = latest_pending.take() {
+                                        let completion_tokens = progress.completion_tokens;
+                                        if let Err(error) = send_decode_progress_update(
+                                            &registration_client,
+                                            job_id,
+                                            device_id,
+                                            &segment_id,
+                                            progress,
+                                        ).await {
+                                            warn!(job_id = %job_id, segment_id = %segment_id, error, "Eager decode progress flush failed");
+                                        } else {
+                                            last_flushed_completion_tokens = completion_tokens;
+                                        }
+                                    }
+                                }
+                            }
+                            DecodeProgressReporterCommand::Flush(reply) => {
+                                let result = if let Some(progress) = latest_pending.take() {
+                                    let completion_tokens = progress.completion_tokens;
+                                    let result = send_decode_progress_update(
+                                        &registration_client,
+                                        job_id,
+                                        device_id,
+                                        &segment_id,
+                                        progress,
+                                    ).await;
+                                    if result.is_ok() {
+                                        last_flushed_completion_tokens = completion_tokens;
+                                    }
+                                    result
+                                } else {
+                                    Ok(())
+                                };
+                                let _ = reply.send(result);
+                            }
+                            DecodeProgressReporterCommand::Shutdown(reply) => {
+                                let result = if let Some(progress) = latest_pending.take() {
+                                    send_decode_progress_update(
+                                        &registration_client,
+                                        job_id,
+                                        device_id,
+                                        &segment_id,
+                                        progress,
+                                    )
+                                    .await
+                                } else {
+                                    Ok(())
+                                };
+                                let _ = reply.send(result);
+                                break;
+                            }
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        Self { tx, handle }
+    }
+
+    fn update(&self, progress: agent::inference::InferenceProgressUpdate) -> Result<()> {
+        self.tx
+            .send(DecodeProgressReporterCommand::Update(progress))
+            .map_err(|_| anyhow::anyhow!("decode progress reporter task stopped"))?;
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(DecodeProgressReporterCommand::Flush(reply_tx))
+            .map_err(|_| anyhow::anyhow!("decode progress reporter task stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("decode progress reporter flush reply dropped"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(DecodeProgressReporterCommand::Shutdown(reply_tx))
+            .map_err(|_| anyhow::anyhow!("decode progress reporter task stopped"))?;
+        let flush_result = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("decode progress reporter shutdown reply dropped"))?;
+        self.handle
+            .await
+            .map_err(|e| anyhow::anyhow!("decode progress reporter join failed: {}", e))?;
+        flush_result.map_err(anyhow::Error::msg)
+    }
+}
+
 fn find_peer_punch_plan(
     topology: &RingTopologyResponse,
     source_device_id: &Uuid,
@@ -1551,13 +1737,21 @@ async fn cmd_runtime() -> Result<()> {
 
         // Claim and execute inference assignments
         let mut explicit_decode_claim_supported = true;
+        let mut idle_claim_polls = 0u32;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)).await;
             let mut claim_response = None;
+            let include_idle_queue_observation =
+                idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
 
             if explicit_decode_claim_supported {
                 match registration_client
-                    .claim_decode_work(device_id, &network_id)
+                    .claim_decode_work(
+                        device_id,
+                        &network_id,
+                        include_idle_queue_observation,
+                        false,
+                    )
                     .await
                 {
                     Ok(Some(response)) => {
@@ -1575,39 +1769,23 @@ async fn cmd_runtime() -> Result<()> {
                                 explicit_decode_claim_supported = false;
                             }
                         } else {
-                            if let Some(queue_state) = response.queue_state.as_ref() {
-                                debug!(
-                                    queue_status = queue_state.status.as_deref(),
-                                    ready_sessions = queue_state.ready_sessions,
-                                    blocked_sessions = queue_state.blocked_sessions,
-                                    local_ready_sessions = queue_state.local_ready_sessions,
-                                    "No decode work claimed; scheduler queue state observed"
-                                );
-                            }
-                            claim_response = Some(response);
-                        }
-                    }
-                    Ok(None) => {
-                        match registration_client
-                            .observe_decode_queue_state(device_id, &network_id)
-                            .await
-                        {
-                            Ok(Some(observed)) => {
-                                if let Some(queue_state) = observed.queue_state.as_ref() {
+                            if include_idle_queue_observation {
+                                if let Some(queue_state) = response.queue_state.as_ref() {
                                     debug!(
                                         queue_status = queue_state.status.as_deref(),
                                         ready_sessions = queue_state.ready_sessions,
                                         blocked_sessions = queue_state.blocked_sessions,
                                         local_ready_sessions = queue_state.local_ready_sessions,
-                                        "Observed decode queue state without claiming work"
+                                        "No decode work claimed; scheduler queue state observed"
                                     );
                                 }
                             }
-                            Ok(None) => {}
-                            Err(e) => {
-                                debug!(error = %e, "Decode queue observation failed");
-                            }
+                            claim_response = Some(response);
                         }
+                    }
+                    Ok(None) => {
+                        debug!("Explicit decode claim endpoint unavailable");
+                        explicit_decode_claim_supported = false;
                     }
                     Err(e) => {
                         debug!(error = %e, "Explicit decode claim failed");
@@ -1622,12 +1800,25 @@ async fn cmd_runtime() -> Result<()> {
                         device_id: device_id.to_string(),
                         network_id: network_id.clone(),
                         claim_mode: WorkClaimMode::Any,
-                        include_queue_state: true,
-                        include_serving_session: true,
+                        include_queue_state: include_idle_queue_observation,
+                        include_serving_session: false,
                     })
                     .await
                 {
-                    Ok(response) => response,
+                    Ok(response) => {
+                        if response.assignment.is_none() && include_idle_queue_observation {
+                            if let Some(queue_state) = response.queue_state.as_ref() {
+                                debug!(
+                                    queue_status = queue_state.status.as_deref(),
+                                    ready_sessions = queue_state.ready_sessions,
+                                    blocked_sessions = queue_state.blocked_sessions,
+                                    local_ready_sessions = queue_state.local_ready_sessions,
+                                    "No inference work claimed; scheduler queue state observed"
+                                );
+                            }
+                        }
+                        response
+                    }
                     Err(e) => {
                         debug!(error = %e, "Inference assignment claim failed");
                         continue;
@@ -1646,8 +1837,14 @@ async fn cmd_runtime() -> Result<()> {
             );
 
             let assignment = match claim_response.assignment {
-                Some(assignment) => assignment,
-                None => continue,
+                Some(assignment) => {
+                    idle_claim_polls = 0;
+                    assignment
+                }
+                None => {
+                    idle_claim_polls = idle_claim_polls.saturating_add(1);
+                    continue;
+                }
             };
 
             let job_id = match Uuid::parse_str(&assignment.job_id) {
@@ -1875,20 +2072,47 @@ async fn cmd_runtime() -> Result<()> {
                 && !coordinator.has_session(request.session_id)
             {
                 if let Some(checkpoint) = session_checkpoint.as_ref() {
+                    let Some(manager) = coordinator.checkpoint_manager() else {
+                        error!(
+                            job_id = %job_id,
+                            session_id = %request.session_id,
+                            "Checkpoint manager missing before decode recovery"
+                        );
+                        continue;
+                    };
+                    let expected_checkpoint_id = match Uuid::parse_str(&checkpoint.checkpoint_id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error!(
+                                job_id = %job_id,
+                                session_id = %request.session_id,
+                                checkpoint_id = %checkpoint.checkpoint_id,
+                                error = %e,
+                                "Lease carried an invalid checkpoint identifier"
+                            );
+                            continue;
+                        }
+                    };
+                    let expected_resume = agent::CheckpointResumeExpectation {
+                        checkpoint_id: expected_checkpoint_id,
+                        job_id,
+                        session_id: request.session_id,
+                        model_id: assignment.model_id.clone(),
+                        phase: match checkpoint.phase {
+                            ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
+                            ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
+                        },
+                        source_worker_id: checkpoint.source_device_id.clone(),
+                        owner_worker_id: device_id.to_string(),
+                        kv_sequence_position: checkpoint.kv_sequence_position,
+                    };
+
                     if checkpoint.source_device_id != device_id.to_string() {
                         match registration_client
                             .download_inference_session_checkpoint(job_id, request.session_id)
                             .await
                         {
                             Ok(Some(remote_checkpoint)) => {
-                                let Some(manager) = coordinator.checkpoint_manager() else {
-                                    error!(
-                                        job_id = %job_id,
-                                        session_id = %request.session_id,
-                                        "Checkpoint manager missing before remote decode import"
-                                    );
-                                    continue;
-                                };
                                 if remote_checkpoint.metadata.checkpoint_id
                                     != checkpoint.checkpoint_id
                                 {
@@ -1938,15 +2162,15 @@ async fn cmd_runtime() -> Result<()> {
                                         error = %e,
                                         "Failed to import remote session checkpoint before decode"
                                     );
-                                } else {
-                                    info!(
-                                        job_id = %job_id,
-                                        session_id = %request.session_id,
-                                        checkpoint_id = %remote_checkpoint.metadata.checkpoint_id,
-                                        source_device_id = %remote_checkpoint.metadata.source_device_id,
-                                        "Imported remote session checkpoint before decode"
-                                    );
+                                    continue;
                                 }
+                                info!(
+                                    job_id = %job_id,
+                                    session_id = %request.session_id,
+                                    checkpoint_id = %remote_checkpoint.metadata.checkpoint_id,
+                                    source_device_id = %remote_checkpoint.metadata.source_device_id,
+                                    "Imported remote session checkpoint before decode"
+                                );
                             }
                             Ok(None) => {
                                 if coordinator.has_session(request.session_id) {
@@ -1961,6 +2185,7 @@ async fn cmd_runtime() -> Result<()> {
                                     session_id = %request.session_id,
                                     "Decode lease referenced remote checkpoint but no payload was available yet"
                                 );
+                                continue;
                             }
                             Err(e) => {
                                 if coordinator.has_session(request.session_id) {
@@ -1976,8 +2201,58 @@ async fn cmd_runtime() -> Result<()> {
                                     error = %e,
                                     "Failed to download remote session checkpoint before decode"
                                 );
+                                continue;
                             }
                         }
+                    }
+
+                    let recovery_point = match manager
+                        .load_recovery_point_for_checkpoint(job_id, expected_checkpoint_id)
+                        .await
+                    {
+                        Ok(Some(point)) => point,
+                        Ok(None) => {
+                            error!(
+                                job_id = %job_id,
+                                session_id = %request.session_id,
+                                checkpoint_id = %checkpoint.checkpoint_id,
+                                "Expected resume checkpoint was not present on the local worker"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(
+                                job_id = %job_id,
+                                session_id = %request.session_id,
+                                checkpoint_id = %checkpoint.checkpoint_id,
+                                error = %e,
+                                "Failed to load local recovery point for decode resume"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = recovery_point.validate_resume_expectation(&expected_resume) {
+                        error!(
+                            job_id = %job_id,
+                            session_id = %request.session_id,
+                            checkpoint_id = %checkpoint.checkpoint_id,
+                            error = %e,
+                            "Local recovery point did not satisfy the control-plane resume contract"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = coordinator
+                        .hydrate_session_from_recovery_point(&request, recovery_point)
+                        .await
+                    {
+                        error!(
+                            job_id = %job_id,
+                            session_id = %request.session_id,
+                            checkpoint_id = %checkpoint.checkpoint_id,
+                            error = %e,
+                            "Failed to hydrate decode session from the selected recovery point"
+                        );
+                        continue;
                     }
                 }
             }
@@ -2040,12 +2315,34 @@ async fn cmd_runtime() -> Result<()> {
                 None
             };
 
+            let decode_progress_reporter =
+                if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+                    Some(DecodeProgressReporter::spawn(
+                        registration_client.clone(),
+                        job_id,
+                        device_id,
+                        active_segment_id.clone(),
+                    ))
+                } else {
+                    None
+                };
+
             let execution_result = coordinator
                 .process_segment_with_progress(request, |progress| {
                     let registration_client = registration_client.clone();
                     let device_id = device_id;
                     let segment_id = active_segment_id.clone();
+                    let decode_progress_reporter = decode_progress_reporter.as_ref();
                     async move {
+                        if progress.phase == agent::inference::ExecutionPhase::Decode {
+                            if let Some(reporter) = decode_progress_reporter {
+                                reporter.update(progress).map_err(|e| {
+                                    agent::errors::AgentError::Execution(e.to_string())
+                                })?;
+                                return Ok(());
+                            }
+                        }
+
                         registration_client
                             .report_inference_progress(
                                 job_id,
@@ -2077,8 +2374,19 @@ async fn cmd_runtime() -> Result<()> {
                 })
                 .await;
 
+            if let Some(reporter) = decode_progress_reporter.as_ref() {
+                if let Err(e) = reporter.flush().await {
+                    warn!(job_id = %job_id, error = %e, "Final buffered decode progress flush failed");
+                }
+            }
+
             if let Some(handle) = lease_renew_handle {
                 handle.abort();
+            }
+            if let Some(reporter) = decode_progress_reporter {
+                if let Err(e) = reporter.shutdown().await {
+                    warn!(job_id = %job_id, error = %e, "Decode progress reporter shutdown failed");
+                }
             }
 
             match execution_result {

@@ -773,28 +773,38 @@ impl InferenceCoordinator {
         let fast_path = if slots.is_empty() {
             None
         } else {
-            let contexts = slots
+            let sessions = slots
                 .iter()
                 .filter_map(|slot| self.sessions.get(&slot.session_id))
-                .map(|session| session.backend.fast_path_context())
                 .collect::<Vec<_>>();
-            let max_sequence_len = contexts
+            if sessions
                 .iter()
-                .map(|context| context.logical_kv_tokens)
-                .max()
-                .unwrap_or(total_kv_tokens);
+                .any(|session| !session.backend.is_fast_path_backend())
+            {
+                None
+            } else {
+                let contexts = sessions
+                    .iter()
+                    .map(|session| session.backend.fast_path_context())
+                    .collect::<Vec<_>>();
+                let max_sequence_len = contexts
+                    .iter()
+                    .map(|context| context.logical_kv_tokens)
+                    .max()
+                    .unwrap_or(total_kv_tokens);
 
-            contexts.first().and_then(|context| {
-                let plan = FastPathPlanner::plan_decode(
-                    context,
-                    slots.len(),
-                    total_kv_tokens,
-                    max_sequence_len,
-                )
-                .ok()?;
-                FastPathPlanner::validate_decode_contexts(&plan, &contexts).ok()?;
-                Some(plan)
-            })
+                contexts.first().and_then(|context| {
+                    let plan = FastPathPlanner::plan_decode(
+                        context,
+                        slots.len(),
+                        total_kv_tokens,
+                        max_sequence_len,
+                    )
+                    .ok()?;
+                    FastPathPlanner::validate_decode_contexts(&plan, &contexts).ok()?;
+                    Some(plan)
+                })
+            }
         };
 
         self.decode_queue = deferred.iter().copied().collect();
@@ -1177,6 +1187,19 @@ impl InferenceCoordinator {
         Ok(recovered_job)
     }
 
+    pub async fn hydrate_session_from_recovery_point(
+        &mut self,
+        request: &InferenceRequest,
+        recovery_point: CheckpointRecoveryPoint,
+    ) -> Result<()> {
+        let position = self.position.clone().ok_or_else(|| {
+            AgentError::Execution("Worker is not part of a ring topology".to_string())
+        })?;
+        self.restore_session_from_recovery_point(request, &position, recovery_point)
+            .await?;
+        Ok(())
+    }
+
     /// Create a checkpoint of the current inference state
     async fn checkpoint(&mut self, job: &InferenceJob) -> Result<()> {
         if let Some(ref manager) = self.checkpoint_manager {
@@ -1331,13 +1354,17 @@ impl InferenceCoordinator {
                     "session backend missing at prefill execution time".to_string(),
                 )
             })?;
-            let prefill_plan = FastPathPlanner::plan_prefill(
-                &session.backend.fast_path_context(),
-                request.prompt_tokens.len(),
-            )?;
-            let reservation = FastPathRuntime::prepare(&prefill_plan)?;
-            self.stats
-                .record_prefill_fast_path_plan(&prefill_plan, reservation.reused_existing_arena);
+            if session.backend.is_fast_path_backend() {
+                let prefill_plan = FastPathPlanner::plan_prefill(
+                    &session.backend.fast_path_context(),
+                    request.prompt_tokens.len(),
+                )?;
+                let reservation = FastPathRuntime::prepare(&prefill_plan)?;
+                self.stats.record_prefill_fast_path_plan(
+                    &prefill_plan,
+                    reservation.reused_existing_arena,
+                );
+            }
             let mut worker_ring = WorkerRing::new(
                 position.position,
                 position.total_workers,
@@ -1347,6 +1374,7 @@ impl InferenceCoordinator {
                 position.right_neighbor_tensor_addr,
                 session.job.request.runtime_mode,
                 session.backend.provider_kind(),
+                session.backend.executor_contract().clone(),
                 self.tensor_plane_mut(),
             );
             worker_ring.prepare_serving_group_channels().await?;
@@ -1473,6 +1501,14 @@ impl InferenceCoordinator {
                 .first()
                 .map(|(_, session, _)| session.backend.provider_kind())
                 .unwrap_or(crate::provider::ExecutionProviderKind::Cpu),
+            batch_sessions
+                .first()
+                .map(|(_, session, _)| session.backend.executor_contract().clone())
+                .unwrap_or_else(|| {
+                    crate::inference::LocalExecutorContract::for_provider(
+                        crate::provider::ExecutionProviderKind::Cpu,
+                    )
+                }),
             self.tensor_plane_mut(),
         );
         worker_ring.prepare_serving_group_channels().await?;
@@ -2251,8 +2287,26 @@ mod tests {
         });
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
-        insert_decode_session(&mut coordinator, session_a, 8, 11);
-        insert_decode_session(&mut coordinator, session_b, 12, 22);
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_a,
+            8,
+            8 * 1024,
+            8,
+            11,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+        );
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_b,
+            12,
+            12 * 1024,
+            12,
+            22,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+        );
 
         coordinator.enqueue_decode_task(session_a).unwrap();
         coordinator.enqueue_decode_task(session_b).unwrap();

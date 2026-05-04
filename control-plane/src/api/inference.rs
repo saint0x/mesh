@@ -4093,7 +4093,11 @@ fn report_assignment_progress(
     job_id: &str,
     req: &ReportInferenceAssignmentProgressRequest,
 ) -> ApiResult<()> {
-    let scheduling_policy = {
+    let prefill_complete = matches!(
+        req.event,
+        crate::api::types::ProgressEventKind::PrefillComplete
+    );
+    let scheduling_policy = if prefill_complete {
         let db = state.db.clone();
         let conn = db.get_conn()?;
         let network_id: String = conn
@@ -4103,17 +4107,15 @@ fn report_assignment_progress(
                 |row| row.get(0),
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        network_service::load_network_settings(&db, &network_id)?.scheduling_policy
+        Some(network_service::load_network_settings(&db, &network_id)?.scheduling_policy)
+    } else {
+        None
     };
 
     let mut conn = state.db.get_conn()?;
     let tx = conn
         .transaction()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    let prefill_complete = matches!(
-        req.event,
-        crate::api::types::ProgressEventKind::PrefillComplete
-    );
     let segment_completed_at = if prefill_complete {
         Some(now_rfc3339()?)
     } else {
@@ -4190,6 +4192,141 @@ fn report_assignment_progress(
             "Assignment not found for progress report on job {} and device {}",
             job_id, req.device_id
         )));
+    }
+
+    if !prefill_complete {
+        let now = now_rfc3339()?;
+        tx.execute(
+            r#"
+            UPDATE inference_sessions
+            SET kv_sequence_position = COALESCE(?, kv_sequence_position),
+                latest_batch_size = COALESCE(?, latest_batch_size),
+                latest_active_decode_sessions = COALESCE(?, latest_active_decode_sessions),
+                latest_batch_kv_tokens = COALESCE(?, latest_batch_kv_tokens),
+                latest_deferred_decode_sessions = COALESCE(?, latest_deferred_decode_sessions),
+                updated_at = ?,
+                last_error = NULL
+            WHERE job_id = ?
+            "#,
+            params![
+                req.kv_cache_seq_len.map(i64::from),
+                req.batch_size.map(i64::from),
+                req.active_decode_sessions.map(i64::from),
+                req.batch_kv_tokens.map(i64::from),
+                req.deferred_decode_sessions.map(i64::from),
+                &now,
+                job_id
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        tx.execute(
+            r#"
+            UPDATE inference_session_replicas
+            SET kv_sequence_position = COALESCE(?, kv_sequence_position),
+                updated_at = ?,
+                last_error = NULL
+            WHERE job_id = ? AND device_id = ?
+            "#,
+            params![
+                req.kv_cache_seq_len.map(i64::from),
+                &now,
+                job_id,
+                &req.device_id
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+        let job_context = load_job_context(&tx, job_id)?;
+        if req.batch_size.is_some()
+            || req.active_decode_sessions.is_some()
+            || req.batch_kv_tokens.is_some()
+            || req.deferred_decode_sessions.is_some()
+        {
+            let observed_at = now_rfc3339()?;
+            let session_id: String = tx
+                .query_row(
+                    "SELECT session_id FROM inference_sessions WHERE job_id = ?",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let decode_batch_targets = tx
+                .query_row(
+                    r#"
+                    SELECT lease_target_session_count, lease_target_batch_size
+                    FROM inference_decode_queue
+                    WHERE session_id = ?
+                    "#,
+                    params![&session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?.map(|v| v as u32),
+                            row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            tx.execute(
+                r#"
+                INSERT INTO inference_decode_batch_events (
+                    session_id, job_id, network_id, device_id, segment_id, completion_tokens,
+                    execution_time_ms, batch_size, target_session_count, target_batch_size,
+                    active_decode_sessions, batch_kv_tokens, deferred_decode_sessions,
+                    kv_cache_seq_len, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                params![
+                    session_id,
+                    job_id,
+                    &job_context.network_id,
+                    &req.device_id,
+                    &req.segment_id,
+                    i64::from(req.completion_tokens),
+                    req.execution_time_ms as i64,
+                    req.batch_size.map(i64::from),
+                    decode_batch_targets
+                        .as_ref()
+                        .and_then(|targets| targets.0)
+                        .map(i64::from),
+                    decode_batch_targets
+                        .as_ref()
+                        .and_then(|targets| targets.1)
+                        .map(i64::from),
+                    req.active_decode_sessions.map(i64::from),
+                    req.batch_kv_tokens.map(i64::from),
+                    req.deferred_decode_sessions.map(i64::from),
+                    req.kv_cache_seq_len.map(i64::from),
+                    &observed_at,
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        }
+
+        let settlement_state = load_job_settlement_state(&tx, job_id)?;
+        let relevant_participants = job_context
+            .execution_plan
+            .as_ref()
+            .map(|plan| participants_for_segment(plan, &req.segment_id))
+            .transpose()?
+            .unwrap_or_else(|| {
+                load_assignment_states(&tx, job_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(device_id, _, _)| device_id)
+                    .collect()
+            });
+        reconcile_realtime_job_accounting(
+            &tx,
+            job_id,
+            &job_context,
+            &settlement_state,
+            &relevant_participants,
+        )?;
+
+        tx.commit()
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        return Ok(());
     }
 
     if prefill_complete {
@@ -4296,7 +4433,9 @@ fn report_assignment_progress(
                 &tx,
                 &job_context.network_id,
                 &execution_plan,
-                &scheduling_policy,
+                scheduling_policy
+                    .as_ref()
+                    .expect("prefill scheduling policy should be loaded"),
             )? {
                 let execution_plan_json = serde_json::to_string(&refreshed_plan).map_err(|e| {
                     ApiError::Internal(format!(
@@ -4564,168 +4703,7 @@ fn report_assignment_progress(
                 }
             }
         }
-    } else {
-        let now = now_rfc3339()?;
-        tx.execute(
-            r#"
-            UPDATE inference_sessions
-            SET status = 'decode_active',
-                kv_sequence_position = COALESCE(?, kv_sequence_position),
-                latest_batch_size = COALESCE(?, latest_batch_size),
-                latest_active_decode_sessions = COALESCE(?, latest_active_decode_sessions),
-                latest_batch_kv_tokens = COALESCE(?, latest_batch_kv_tokens),
-                latest_deferred_decode_sessions = COALESCE(?, latest_deferred_decode_sessions),
-                updated_at = ?,
-                last_error = NULL
-            WHERE job_id = ?
-            "#,
-            params![
-                req.kv_cache_seq_len.map(i64::from),
-                req.batch_size.map(i64::from),
-                req.active_decode_sessions.map(i64::from),
-                req.batch_kv_tokens.map(i64::from),
-                req.deferred_decode_sessions.map(i64::from),
-                &now,
-                job_id
-            ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
-            UPDATE inference_session_replicas
-            SET status = 'decode_active',
-                active_segment_id = ?,
-                kv_sequence_position = COALESCE(?, kv_sequence_position),
-                updated_at = ?,
-                last_error = NULL
-            WHERE job_id = ? AND device_id = ?
-            "#,
-            params![
-                &req.segment_id,
-                req.kv_cache_seq_len.map(i64::from),
-                &now,
-                job_id,
-                &req.device_id
-            ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
-            UPDATE inference_decode_queue
-            SET status = 'active',
-                ready_at = COALESCE(ready_at, ?),
-                updated_at = ?,
-                last_error = NULL
-            WHERE job_id = ?
-            "#,
-            params![&now, &now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     }
-
-    let job_context = load_job_context(&tx, job_id)?;
-    if !prefill_complete {
-        let execution_plan = job_context.execution_plan.as_ref().ok_or_else(|| {
-            ApiError::Internal(format!(
-                "Missing execution plan while refreshing decode targets for job {}",
-                job_id
-            ))
-        })?;
-        let batch_group_key = decode_batch_group_key(execution_plan, &req.segment_id)?;
-        let active = active_segment(execution_plan, &req.segment_id)?;
-        refresh_decode_batch_targets(
-            &tx,
-            &job_context.network_id,
-            &batch_group_key,
-            &active.execution_group_id,
-        )?;
-    }
-    if !prefill_complete
-        && (req.batch_size.is_some()
-            || req.active_decode_sessions.is_some()
-            || req.batch_kv_tokens.is_some()
-            || req.deferred_decode_sessions.is_some())
-    {
-        let observed_at = now_rfc3339()?;
-        let session_id: String = tx
-            .query_row(
-                "SELECT session_id FROM inference_sessions WHERE job_id = ?",
-                params![job_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        let decode_batch_targets = tx
-            .query_row(
-                r#"
-                SELECT lease_target_session_count, lease_target_batch_size
-                FROM inference_decode_queue
-                WHERE session_id = ?
-                "#,
-                params![&session_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?.map(|v| v as u32),
-                        row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
-            INSERT INTO inference_decode_batch_events (
-                session_id, job_id, network_id, device_id, segment_id, completion_tokens,
-                execution_time_ms, batch_size, target_session_count, target_batch_size,
-                active_decode_sessions, batch_kv_tokens, deferred_decode_sessions,
-                kv_cache_seq_len, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                session_id,
-                job_id,
-                &job_context.network_id,
-                &req.device_id,
-                &req.segment_id,
-                i64::from(req.completion_tokens),
-                req.execution_time_ms as i64,
-                req.batch_size.map(i64::from),
-                decode_batch_targets
-                    .as_ref()
-                    .and_then(|targets| targets.0)
-                    .map(i64::from),
-                decode_batch_targets
-                    .as_ref()
-                    .and_then(|targets| targets.1)
-                    .map(i64::from),
-                req.active_decode_sessions.map(i64::from),
-                req.batch_kv_tokens.map(i64::from),
-                req.deferred_decode_sessions.map(i64::from),
-                req.kv_cache_seq_len.map(i64::from),
-                &observed_at,
-            ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    }
-    let settlement_state = load_job_settlement_state(&tx, job_id)?;
-    let relevant_participants = job_context
-        .execution_plan
-        .as_ref()
-        .map(|plan| participants_for_segment(plan, &req.segment_id))
-        .transpose()?
-        .unwrap_or_else(|| {
-            load_assignment_states(&tx, job_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(device_id, _, _)| device_id)
-                .collect()
-        });
-    reconcile_realtime_job_accounting(
-        &tx,
-        job_id,
-        &job_context,
-        &settlement_state,
-        &relevant_participants,
-    )?;
 
     tx.commit()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;

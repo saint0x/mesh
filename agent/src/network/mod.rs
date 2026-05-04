@@ -20,7 +20,8 @@ pub use tensor_message::{
 };
 pub use tensor_plane::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
-    parse_tensor_plane_bind_addr_env, ServingReceiveSpec, ServingSessionTransport, TensorPlane,
-    TensorPlaneCapabilitiesSnapshot, TensorPlaneConfig, TensorPlaneMetricsSnapshot,
-    TensorPlaneProfile, TransportFallbackPolicy, DATA_PLANE_ENDPOINT_PREFIX,
+    parse_tensor_plane_bind_addr_env, ServingBackgroundTransfer, ServingReceiveSpec,
+    ServingSessionTransport, TensorPlane, TensorPlaneCapabilitiesSnapshot, TensorPlaneConfig,
+    TensorPlaneMetricsSnapshot, TensorPlaneProfile, TransportFallbackPolicy,
+    DATA_PLANE_ENDPOINT_PREFIX,
 };
