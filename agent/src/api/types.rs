@@ -441,6 +441,12 @@ pub struct RenewDecodeLeaseRequest {
     pub session_id: String,
     pub segment_id: String,
     #[serde(default)]
+    pub include_decode_lease: bool,
+    #[serde(default)]
+    pub include_queue_state: bool,
+    #[serde(default)]
+    pub include_serving_session: bool,
+    #[serde(default)]
     pub scheduler_queue: Option<InferenceSchedulerQueueState>,
 }
 

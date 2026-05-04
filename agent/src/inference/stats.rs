@@ -9,6 +9,8 @@ use tracing::info;
 use crate::executor::ring_allreduce::RingAllReduceMetrics;
 use crate::network::TensorPlaneMetricsSnapshot;
 
+use super::fast_path::{FastPathExecutionPlan, GraphCaptureStrategy};
+
 /// Statistics for inference operations
 #[derive(Debug)]
 pub struct InferenceStats {
@@ -54,6 +56,30 @@ pub struct InferenceStats {
     /// Number of decode sessions deferred because the KV-token budget would be exceeded.
     pub decode_batch_kv_budget_deferrals: AtomicU64,
 
+    /// Number of prefill executions that resolved an explicit fast-path bucket plan.
+    pub prefill_fast_path_plans: AtomicU64,
+
+    /// Number of decode microbatches that resolved an explicit fast-path bucket plan.
+    pub decode_fast_path_plans: AtomicU64,
+
+    /// Number of fast-path executions that reused a previously reserved arena.
+    pub fast_path_arena_reuses: AtomicU64,
+
+    /// Number of fast-path executions that were layout validated without graph replay.
+    pub fast_path_layout_validated_plans: AtomicU64,
+
+    /// Number of fast-path executions that used replay-preferred bucket strategies.
+    pub fast_path_replay_preferred_plans: AtomicU64,
+
+    /// Peak decode bucket batch-size ceiling admitted by the planner.
+    pub fast_path_decode_bucket_batch_ceiling_peak: AtomicU64,
+
+    /// Peak decode bucket KV-token ceiling admitted by the planner.
+    pub fast_path_decode_bucket_token_ceiling_peak: AtomicU64,
+
+    /// Peak prefill token ceiling admitted by the planner.
+    pub fast_path_prefill_token_ceiling_peak: AtomicU64,
+
     /// Number of checkpoints created
     pub checkpoints_created: AtomicU64,
 
@@ -93,6 +119,10 @@ pub struct InferenceStats {
     pub tensor_all_gather_bytes_received: AtomicU64,
     pub tensor_barrier_bytes_sent: AtomicU64,
     pub tensor_barrier_bytes_received: AtomicU64,
+    pub tensor_bulk_transfer_bytes_sent: AtomicU64,
+    pub tensor_bulk_transfer_bytes_received: AtomicU64,
+    pub tensor_checkpoint_bytes_sent: AtomicU64,
+    pub tensor_checkpoint_bytes_received: AtomicU64,
 
     /// Number of outbound sends that had to wait for byte-budget permits.
     pub tensor_outbound_backpressure_wait_count: AtomicU64,
@@ -164,6 +194,14 @@ impl InferenceStats {
             decode_batch_deferred_sessions: AtomicU64::new(0),
             decode_batch_capacity_deferrals: AtomicU64::new(0),
             decode_batch_kv_budget_deferrals: AtomicU64::new(0),
+            prefill_fast_path_plans: AtomicU64::new(0),
+            decode_fast_path_plans: AtomicU64::new(0),
+            fast_path_arena_reuses: AtomicU64::new(0),
+            fast_path_layout_validated_plans: AtomicU64::new(0),
+            fast_path_replay_preferred_plans: AtomicU64::new(0),
+            fast_path_decode_bucket_batch_ceiling_peak: AtomicU64::new(0),
+            fast_path_decode_bucket_token_ceiling_peak: AtomicU64::new(0),
+            fast_path_prefill_token_ceiling_peak: AtomicU64::new(0),
             checkpoints_created: AtomicU64::new(0),
             checkpoint_recoveries: AtomicU64::new(0),
             recovery_attempts: AtomicU64::new(0),
@@ -181,6 +219,10 @@ impl InferenceStats {
             tensor_all_gather_bytes_received: AtomicU64::new(0),
             tensor_barrier_bytes_sent: AtomicU64::new(0),
             tensor_barrier_bytes_received: AtomicU64::new(0),
+            tensor_bulk_transfer_bytes_sent: AtomicU64::new(0),
+            tensor_bulk_transfer_bytes_received: AtomicU64::new(0),
+            tensor_checkpoint_bytes_sent: AtomicU64::new(0),
+            tensor_checkpoint_bytes_received: AtomicU64::new(0),
             tensor_outbound_backpressure_wait_count: AtomicU64::new(0),
             tensor_outbound_backpressure_wait_ms: AtomicU64::new(0),
             tensor_outbound_bandwidth_wait_count: AtomicU64::new(0),
@@ -275,6 +317,42 @@ impl InferenceStats {
         }
     }
 
+    pub fn record_prefill_fast_path_plan(
+        &self,
+        plan: &FastPathExecutionPlan,
+        reused_existing_arena: bool,
+    ) {
+        self.prefill_fast_path_plans.fetch_add(1, Ordering::Relaxed);
+        if reused_existing_arena {
+            self.fast_path_arena_reuses.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_capture_strategy(plan.capture_strategy);
+        self.update_peak(
+            &self.fast_path_prefill_token_ceiling_peak,
+            plan.bucket.token_ceiling as u64,
+        );
+    }
+
+    pub fn record_decode_fast_path_plan(
+        &self,
+        plan: &FastPathExecutionPlan,
+        reused_existing_arena: bool,
+    ) {
+        self.decode_fast_path_plans.fetch_add(1, Ordering::Relaxed);
+        if reused_existing_arena {
+            self.fast_path_arena_reuses.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_capture_strategy(plan.capture_strategy);
+        self.update_peak(
+            &self.fast_path_decode_bucket_batch_ceiling_peak,
+            plan.bucket.batch_size_ceiling as u64,
+        );
+        self.update_peak(
+            &self.fast_path_decode_bucket_token_ceiling_peak,
+            plan.bucket.token_ceiling as u64,
+        );
+    }
+
     /// Record a layer processed
     pub fn record_layer(&self) {
         self.total_layers_processed.fetch_add(1, Ordering::Relaxed);
@@ -320,6 +398,34 @@ impl InferenceStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_capture_strategy(&self, strategy: GraphCaptureStrategy) {
+        match strategy {
+            GraphCaptureStrategy::Unsupported | GraphCaptureStrategy::LayoutValidated => {
+                self.fast_path_layout_validated_plans
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            GraphCaptureStrategy::ReplayPreferred => {
+                self.fast_path_replay_preferred_plans
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn update_peak(&self, metric: &AtomicU64, observed: u64) {
+        let mut current_peak = metric.load(Ordering::Relaxed);
+        while observed > current_peak {
+            match metric.compare_exchange_weak(
+                current_peak,
+                observed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(latest) => current_peak = latest,
+            }
+        }
+    }
+
     pub fn update_tensor_plane_metrics(&self, snapshot: TensorPlaneMetricsSnapshot) {
         self.tensor_bytes_sent
             .store(snapshot.bytes_sent, Ordering::Relaxed);
@@ -337,6 +443,14 @@ impl InferenceStats {
             .store(snapshot.barrier_bytes_sent, Ordering::Relaxed);
         self.tensor_barrier_bytes_received
             .store(snapshot.barrier_bytes_received, Ordering::Relaxed);
+        self.tensor_bulk_transfer_bytes_sent
+            .store(snapshot.bulk_transfer_bytes_sent, Ordering::Relaxed);
+        self.tensor_bulk_transfer_bytes_received
+            .store(snapshot.bulk_transfer_bytes_received, Ordering::Relaxed);
+        self.tensor_checkpoint_bytes_sent
+            .store(snapshot.checkpoint_bytes_sent, Ordering::Relaxed);
+        self.tensor_checkpoint_bytes_received
+            .store(snapshot.checkpoint_bytes_received, Ordering::Relaxed);
         self.tensor_outbound_backpressure_wait_count
             .store(snapshot.outbound_backpressure_wait_count, Ordering::Relaxed);
         self.tensor_outbound_backpressure_wait_ms
@@ -484,6 +598,24 @@ impl InferenceStats {
                 .load(Ordering::Relaxed),
             decode_batch_kv_budget_deferrals = self
                 .decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed),
+            prefill_fast_path_plans = self.prefill_fast_path_plans.load(Ordering::Relaxed),
+            decode_fast_path_plans = self.decode_fast_path_plans.load(Ordering::Relaxed),
+            fast_path_arena_reuses = self.fast_path_arena_reuses.load(Ordering::Relaxed),
+            fast_path_layout_validated_plans = self
+                .fast_path_layout_validated_plans
+                .load(Ordering::Relaxed),
+            fast_path_replay_preferred_plans = self
+                .fast_path_replay_preferred_plans
+                .load(Ordering::Relaxed),
+            fast_path_decode_bucket_batch_ceiling_peak = self
+                .fast_path_decode_bucket_batch_ceiling_peak
+                .load(Ordering::Relaxed),
+            fast_path_decode_bucket_token_ceiling_peak = self
+                .fast_path_decode_bucket_token_ceiling_peak
+                .load(Ordering::Relaxed),
+            fast_path_prefill_token_ceiling_peak = self
+                .fast_path_prefill_token_ceiling_peak
                 .load(Ordering::Relaxed),
             checkpoints_created = checkpoints,
             checkpoint_recoveries = recoveries,
@@ -639,6 +771,40 @@ impl InferenceStats {
             self.decode_batch_kv_budget_deferrals
                 .load(Ordering::Relaxed)
         );
+        println!(
+            "  Prefill Plans:       {}",
+            self.prefill_fast_path_plans.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Decode Plans:        {}",
+            self.decode_fast_path_plans.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Arena Reuses:        {}",
+            self.fast_path_arena_reuses.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Layout Validations:  {}",
+            self.fast_path_layout_validated_plans
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Replay-Preferred:    {}",
+            self.fast_path_replay_preferred_plans
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Peak Decode Bucket:  b{} / kv{}",
+            self.fast_path_decode_bucket_batch_ceiling_peak
+                .load(Ordering::Relaxed),
+            self.fast_path_decode_bucket_token_ceiling_peak
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Peak Prefill Bucket: {}",
+            self.fast_path_prefill_token_ceiling_peak
+                .load(Ordering::Relaxed)
+        );
 
         println!("\n{}", "Fault Tolerance:".bold());
         println!(
@@ -753,6 +919,51 @@ impl InferenceStats {
         );
         insert_u64(
             &mut map,
+            "prefill_fast_path_plans",
+            self.prefill_fast_path_plans.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_fast_path_plans",
+            self.decode_fast_path_plans.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "fast_path_arena_reuses",
+            self.fast_path_arena_reuses.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "fast_path_layout_validated_plans",
+            self.fast_path_layout_validated_plans
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "fast_path_replay_preferred_plans",
+            self.fast_path_replay_preferred_plans
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "fast_path_decode_bucket_batch_ceiling_peak",
+            self.fast_path_decode_bucket_batch_ceiling_peak
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "fast_path_decode_bucket_token_ceiling_peak",
+            self.fast_path_decode_bucket_token_ceiling_peak
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "fast_path_prefill_token_ceiling_peak",
+            self.fast_path_prefill_token_ceiling_peak
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
             "allreduce_operations",
             self.allreduce_operations.load(Ordering::Relaxed),
         );
@@ -833,6 +1044,28 @@ impl InferenceStats {
             &mut map,
             "tensor_barrier_bytes_received",
             self.tensor_barrier_bytes_received.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_bulk_transfer_bytes_sent",
+            self.tensor_bulk_transfer_bytes_sent.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_bulk_transfer_bytes_received",
+            self.tensor_bulk_transfer_bytes_received
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_checkpoint_bytes_sent",
+            self.tensor_checkpoint_bytes_sent.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_checkpoint_bytes_received",
+            self.tensor_checkpoint_bytes_received
+                .load(Ordering::Relaxed),
         );
         insert_u64(
             &mut map,
@@ -1012,6 +1245,7 @@ impl InferenceStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ExecutionProviderKind;
 
     #[test]
     fn test_stats_new() {
@@ -1136,6 +1370,55 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_record_fast_path_plans() {
+        let stats = InferenceStats::new();
+        let plan = FastPathExecutionPlan {
+            bucket: super::super::fast_path::FastPathBucketKey {
+                phase: super::super::engine::ExecutionPhase::Decode,
+                provider: ExecutionProviderKind::Cuda,
+                optimization_profile: super::super::engine::BackendOptimizationProfile::CudaFused,
+                batch_size_ceiling: 4,
+                token_ceiling: 8_192,
+            },
+            bucket_label: "decode-b4-kv8192-cuda".to_string(),
+            actual_batch_size: 3,
+            actual_token_count: 4_096,
+            max_sequence_len: 2_048,
+            metadata: super::super::fast_path::BucketMetadataLayout {
+                version: 1,
+                total_bytes: 512,
+                layout_hash: 99,
+                fields: Vec::new(),
+            },
+            workspace: super::super::fast_path::WorkspaceRequirements {
+                bytes: 4_096,
+                alignment_bytes: 256,
+            },
+            capture_strategy: GraphCaptureStrategy::ReplayPreferred,
+            prefill_strategy: None,
+        };
+
+        stats.record_prefill_fast_path_plan(&plan, false);
+        stats.record_decode_fast_path_plan(&plan, true);
+
+        assert_eq!(stats.prefill_fast_path_plans.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.decode_fast_path_plans.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.fast_path_arena_reuses.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats
+                .fast_path_replay_preferred_plans
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats
+                .fast_path_decode_bucket_batch_ceiling_peak
+                .load(Ordering::Relaxed),
+            4
+        );
+    }
+
+    #[test]
     fn test_stats_update_tensor_plane_metrics() {
         let stats = InferenceStats::new();
         stats.update_tensor_plane_metrics(TensorPlaneMetricsSnapshot {
@@ -1147,6 +1430,10 @@ mod tests {
             all_gather_bytes_received: 96,
             barrier_bytes_sent: 8,
             barrier_bytes_received: 16,
+            bulk_transfer_bytes_sent: 12,
+            bulk_transfer_bytes_received: 14,
+            checkpoint_bytes_sent: 18,
+            checkpoint_bytes_received: 20,
             outbound_backpressure_wait_count: 3,
             outbound_backpressure_wait_ms: 42,
             outbound_bandwidth_wait_count: 4,
@@ -1173,6 +1460,18 @@ mod tests {
 
         assert_eq!(stats.tensor_bytes_sent.load(Ordering::Relaxed), 128);
         assert_eq!(stats.tensor_bytes_received.load(Ordering::Relaxed), 256);
+        assert_eq!(
+            stats
+                .tensor_bulk_transfer_bytes_sent
+                .load(Ordering::Relaxed),
+            12
+        );
+        assert_eq!(
+            stats
+                .tensor_checkpoint_bytes_received
+                .load(Ordering::Relaxed),
+            20
+        );
         assert_eq!(
             stats
                 .tensor_outbound_backpressure_wait_count

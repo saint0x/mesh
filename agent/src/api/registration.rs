@@ -1,11 +1,11 @@
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DownloadInferenceSessionCheckpointResponse, HeartbeatRequest,
-    HeartbeatResponse, InferenceExecutionLease, ObserveDecodeQueueStateResponse,
-    RegisterDeviceRequest, RegisterDeviceResponse, ReleaseDecodeLeaseRequest,
-    ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest, RenewDecodeLeaseResponse,
-    ReportInferenceAssignmentProgressRequest, ReportInferenceAssignmentRequest,
-    UploadInferenceSessionCheckpointRequest, WorkClaimMode,
+    HeartbeatResponse, InferenceExecutionLease, InferenceSessionCheckpointPayload,
+    ObserveDecodeQueueStateResponse, RegisterDeviceRequest, RegisterDeviceResponse,
+    ReleaseDecodeLeaseRequest, ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest,
+    RenewDecodeLeaseResponse, ReportInferenceAssignmentProgressRequest,
+    ReportInferenceAssignmentRequest, UploadInferenceSessionCheckpointRequest, WorkClaimMode,
 };
 use crate::connectivity::{
     build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
@@ -506,7 +506,7 @@ impl RegistrationClient {
         &self,
         job_id: Uuid,
         session_id: Uuid,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<InferenceSessionCheckpointPayload>> {
         let url = format!(
             "{}/api/inference/jobs/{}/session-checkpoints/{}",
             self.control_plane_url, job_id, session_id
@@ -536,16 +536,17 @@ impl RegistrationClient {
                 ))
             })?;
 
-        body.checkpoint
-            .map(|checkpoint| {
-                hex::decode(checkpoint.checkpoint_hex).map_err(|e| {
-                    AgentError::Serialization(format!(
-                        "Downloaded session checkpoint had invalid hex payload: {}",
-                        e
-                    ))
-                })
-            })
-            .transpose()
+        if let Some(checkpoint) = body.checkpoint {
+            hex::decode(&checkpoint.checkpoint_hex).map_err(|e| {
+                AgentError::Serialization(format!(
+                    "Downloaded session checkpoint had invalid hex payload: {}",
+                    e
+                ))
+            })?;
+            Ok(Some(checkpoint))
+        } else {
+            Ok(None)
+        }
     }
 }
 

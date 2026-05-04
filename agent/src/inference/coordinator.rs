@@ -10,6 +10,7 @@
 //! - Returning results to the control plane
 
 use crate::api::types::PeerPunchPlan;
+use crate::checkpoint::CheckpointRecoveryPoint;
 use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::WorkerRing;
 use crate::model::registry::ShardRegistry;
@@ -35,6 +36,7 @@ use super::engine::{
     SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
     TransportCapabilityTier,
 };
+use super::fast_path::{FastPathPlanner, FastPathRuntime};
 use super::forward_pass::SharedModelResidency;
 use super::job::{
     DecodeBatchTargets, InferenceJob, InferenceProgressUpdate, InferenceRequest, InferenceResult,
@@ -332,7 +334,7 @@ impl InferenceCoordinator {
         &self,
         request: &InferenceRequest,
         position: &WorkerPosition,
-        provider: crate::provider::ExecutionProviderKind,
+        backend: &dyn ExecutionBackend,
     ) -> EngineSessionState {
         EngineSessionState::new(
             request.session_id,
@@ -341,9 +343,11 @@ impl InferenceCoordinator {
             vec![request.executor_id.clone()],
             vec![request.executor_id.clone()],
             request.runtime_mode,
-            provider,
+            backend.provider_kind(),
+            backend.optimization_profile(),
             position.shard_column_range,
             TransportCapabilityTier::DirectTcp,
+            backend.executor_contract().clone(),
             self.runtime_memory_budget(),
             request.config.max_tokens,
             request.prompt_tokens.len(),
@@ -448,8 +452,7 @@ impl InferenceCoordinator {
                 position.total_workers,
                 self.config.allreduce_timeout,
             )?;
-            let provider = backend.provider_kind();
-            let state = self.build_session_state(request, position, provider);
+            let state = self.build_session_state(request, position, &backend);
             self.sessions.insert(
                 request.session_id,
                 ActiveSession {
@@ -517,6 +520,7 @@ impl InferenceCoordinator {
                 primary.backend.provider_kind() == candidate.backend.provider_kind()
                     && primary.backend.optimization_profile()
                         == candidate.backend.optimization_profile()
+                    && primary.backend.executor_contract() == candidate.backend.executor_contract()
             }
             InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
         }
@@ -766,6 +770,33 @@ impl InferenceCoordinator {
             }
         }
 
+        let fast_path = if slots.is_empty() {
+            None
+        } else {
+            let contexts = slots
+                .iter()
+                .filter_map(|slot| self.sessions.get(&slot.session_id))
+                .map(|session| session.backend.fast_path_context())
+                .collect::<Vec<_>>();
+            let max_sequence_len = contexts
+                .iter()
+                .map(|context| context.logical_kv_tokens)
+                .max()
+                .unwrap_or(total_kv_tokens);
+
+            contexts.first().and_then(|context| {
+                let plan = FastPathPlanner::plan_decode(
+                    context,
+                    slots.len(),
+                    total_kv_tokens,
+                    max_sequence_len,
+                )
+                .ok()?;
+                FastPathPlanner::validate_decode_contexts(&plan, &contexts).ok()?;
+                Some(plan)
+            })
+        };
+
         self.decode_queue = deferred.iter().copied().collect();
 
         DecodeBatchPlan {
@@ -775,6 +806,7 @@ impl InferenceCoordinator {
             deferred_for_capacity,
             deferred_for_kv_budget,
             deferred_for_guardrail,
+            fast_path,
         }
     }
 
@@ -1110,6 +1142,41 @@ impl InferenceCoordinator {
         )))
     }
 
+    async fn restore_session_from_recovery_point(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+        recovery_point: CheckpointRecoveryPoint,
+    ) -> Result<InferenceJob> {
+        let recovered_job = recovery_point.restore_job();
+        if recovered_job.request.session_id != request.session_id {
+            return Err(AgentError::Execution(format!(
+                "Checkpoint session {} does not match requested session {}",
+                recovered_job.request.session_id, request.session_id
+            )));
+        }
+
+        let live_kv_snapshot = recovery_point.materialize_live_kv_snapshot().map_err(|e| {
+            AgentError::Execution(format!(
+                "Checkpoint KV state for job {} could not be materialized: {}",
+                request.job_id, e
+            ))
+        })?;
+        let session = self
+            .ensure_session_backend(&recovered_job.request, position)
+            .await?;
+        session.job = recovered_job.clone();
+
+        if let Some(snapshot) = live_kv_snapshot {
+            session.backend.import_kv_cache(&snapshot)?;
+        } else {
+            Self::ensure_checkpoint_resume_safe(&recovered_job, false)?;
+            session.backend.clear();
+        }
+
+        Ok(recovered_job)
+    }
+
     /// Create a checkpoint of the current inference state
     async fn checkpoint(&mut self, job: &InferenceJob) -> Result<()> {
         if let Some(ref manager) = self.checkpoint_manager {
@@ -1149,30 +1216,14 @@ impl InferenceCoordinator {
     #[instrument(skip(self))]
     pub async fn recover_from_checkpoint(&mut self, job_id: Uuid) -> Result<Option<InferenceJob>> {
         if let Some(manager) = self.checkpoint_manager.clone() {
-            if let Some(job) = manager.load_checkpoint(job_id).await? {
-                if let Some(position) = self.position.clone() {
-                    let session = self.ensure_session_backend(&job.request, &position).await?;
-                    session.job = job.clone();
-
-                    if let Some(kv_handoff) = manager.load_checkpoint_kv_handoff(job_id).await? {
-                        let snapshot = kv_handoff.materialize_snapshot().map_err(|e| {
-                            AgentError::Execution(format!(
-                                "Checkpoint KV state for job {} is not locally materialized: {}",
-                                job_id, e
-                            ))
-                        })?;
-                        let snapshot = snapshot.ok_or_else(|| {
-                            AgentError::Execution(format!(
-                                "Checkpoint KV state for job {} requires external fetch",
-                                job_id
-                            ))
-                        })?;
-                        session.backend.import_kv_cache(&snapshot)?;
-                    } else {
-                        Self::ensure_checkpoint_resume_safe(&job, false)?;
-                        session.backend.clear();
-                    }
-                }
+            if let Some(recovery_point) = manager.load_recovery_point(job_id).await? {
+                let job = if let Some(position) = self.position.clone() {
+                    let request = recovery_point.restore_job().request.clone();
+                    self.restore_session_from_recovery_point(&request, &position, recovery_point)
+                        .await?
+                } else {
+                    recovery_point.restore_job()
+                };
 
                 self.stats.record_recovery();
                 info!(
@@ -1233,40 +1284,11 @@ impl InferenceCoordinator {
             return Ok(false);
         };
 
-        let Some(recovered_job) = manager.load_checkpoint(request.job_id).await? else {
+        let Some(recovery_point) = manager.load_recovery_point(request.job_id).await? else {
             return Ok(false);
         };
-
-        if recovered_job.request.session_id != request.session_id {
-            return Err(AgentError::Execution(format!(
-                "Checkpoint session {} does not match requested session {}",
-                recovered_job.request.session_id, request.session_id
-            )));
-        }
-
-        let session = self
-            .ensure_session_backend(&recovered_job.request, position)
+        self.restore_session_from_recovery_point(request, position, recovery_point)
             .await?;
-        session.job = recovered_job.clone();
-
-        if let Some(kv_handoff) = manager.load_checkpoint_kv_handoff(request.job_id).await? {
-            let snapshot = kv_handoff.materialize_snapshot().map_err(|e| {
-                AgentError::Execution(format!(
-                    "Checkpoint KV state for job {} is not locally materialized: {}",
-                    request.job_id, e
-                ))
-            })?;
-            let snapshot = snapshot.ok_or_else(|| {
-                AgentError::Execution(format!(
-                    "Checkpoint KV state for job {} requires external fetch",
-                    request.job_id
-                ))
-            })?;
-            session.backend.import_kv_cache(&snapshot)?;
-        } else {
-            Self::ensure_checkpoint_resume_safe(&recovered_job, false)?;
-            session.backend.clear();
-        }
 
         Ok(true)
     }
@@ -1309,6 +1331,13 @@ impl InferenceCoordinator {
                     "session backend missing at prefill execution time".to_string(),
                 )
             })?;
+            let prefill_plan = FastPathPlanner::plan_prefill(
+                &session.backend.fast_path_context(),
+                request.prompt_tokens.len(),
+            )?;
+            let reservation = FastPathRuntime::prepare(&prefill_plan)?;
+            self.stats
+                .record_prefill_fast_path_plan(&prefill_plan, reservation.reused_existing_arena);
             let mut worker_ring = WorkerRing::new(
                 position.position,
                 position.total_workers,
@@ -1404,6 +1433,13 @@ impl InferenceCoordinator {
             return Ok(Vec::new());
         }
 
+        let fast_path = batch.fast_path.clone();
+        if let Some(plan) = fast_path.as_ref() {
+            let reservation = FastPathRuntime::prepare(plan)?;
+            self.stats
+                .record_decode_fast_path_plan(plan, reservation.reused_existing_arena);
+        }
+
         let mut batch_sessions = Vec::with_capacity(batch.slots.len());
         for slot in batch.slots {
             let mut session = self.sessions.remove(&slot.session_id).ok_or_else(|| {
@@ -1451,8 +1487,12 @@ impl InferenceCoordinator {
                 },
             )
             .collect::<Vec<_>>();
-        let outputs =
-            BackendMicrobatchExecutor::decode_step_batch(&mut requests, &mut worker_ring).await?;
+        let outputs = BackendMicrobatchExecutor::decode_step_batch(
+            &mut requests,
+            fast_path.as_ref(),
+            &mut worker_ring,
+        )
+        .await?;
 
         let mut outcomes = Vec::with_capacity(outputs.len());
         let mut sessions_to_requeue = Vec::new();
@@ -1844,6 +1884,7 @@ mod tests {
 
     struct TestBackend {
         provider: ExecutionProviderKind,
+        contract: crate::inference::LocalExecutorContract,
         cache_seq_len: usize,
         live_kv_cache_bytes: usize,
         logical_kv_tokens: usize,
@@ -1861,17 +1902,11 @@ mod tests {
         }
 
         fn optimization_profile(&self) -> crate::inference::BackendOptimizationProfile {
-            match self.provider {
-                ExecutionProviderKind::Cpu => {
-                    crate::inference::BackendOptimizationProfile::CpuSerial
-                }
-                ExecutionProviderKind::Metal => {
-                    crate::inference::BackendOptimizationProfile::MetalVectorized
-                }
-                ExecutionProviderKind::Cuda => {
-                    crate::inference::BackendOptimizationProfile::CudaFused
-                }
-            }
+            self.contract.optimization_profile
+        }
+
+        fn executor_contract(&self) -> &crate::inference::LocalExecutorContract {
+            &self.contract
         }
 
         async fn prefill(
@@ -1934,6 +1969,15 @@ mod tests {
         }
 
         fn clear(&mut self) {}
+
+        fn fast_path_context(&self) -> crate::inference::FastPathBackendContext {
+            crate::inference::FastPathBackendContext {
+                provider: self.provider,
+                optimization_profile: self.contract.optimization_profile,
+                model_id: Some("test-model".to_string()),
+                logical_kv_tokens: self.logical_kv_tokens,
+            }
+        }
     }
 
     fn test_coordinator(config: InferenceConfig) -> InferenceCoordinator {
@@ -1999,14 +2043,18 @@ mod tests {
                     vec!["worker-1".to_string()],
                     runtime_mode,
                     provider,
+                    crate::inference::LocalExecutorContract::for_provider(provider)
+                        .optimization_profile,
                     (0, 1024),
                     TransportCapabilityTier::DirectPreferred,
+                    crate::inference::LocalExecutorContract::for_provider(provider),
                     coordinator.runtime_memory_budget(),
                     request.config.max_tokens,
                     request.prompt_tokens.len(),
                 ),
                 backend: Box::new(TestBackend {
                     provider,
+                    contract: crate::inference::LocalExecutorContract::for_provider(provider),
                     cache_seq_len: logical_kv_tokens.min(sequence_position),
                     live_kv_cache_bytes,
                     logical_kv_tokens,
@@ -2215,6 +2263,7 @@ mod tests {
         assert!(batch.deferred.is_empty());
         assert_eq!(batch.deferred_for_capacity, 0);
         assert_eq!(batch.deferred_for_kv_budget, 0);
+        assert!(batch.fast_path.is_some());
     }
 
     #[test]
@@ -2428,6 +2477,7 @@ mod tests {
             coordinator.build_next_decode_batch(session_metal, DecodeBatchTargets::default());
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.deferred_for_guardrail, 0);
+        assert!(batch.fast_path.is_none());
     }
 
     #[test]

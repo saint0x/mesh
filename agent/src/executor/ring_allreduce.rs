@@ -758,6 +758,7 @@ impl<'a> WorkerRing<'a> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
         let transport = self.serving_transport()?.clone();
+        let stream_id = transport.stream_id_for(lane, step, slot);
         let send_started = std::time::Instant::now();
         let recv_started = std::time::Instant::now();
         let (send_result, inbound) = tokio::join!(
@@ -770,7 +771,7 @@ impl<'a> WorkerRing<'a> {
                                 layer_idx,
                                 step,
                                 slot,
-                                0,
+                                stream_id,
                                 self.my_position,
                                 chunk_data,
                                 chunk_shape,
@@ -784,7 +785,7 @@ impl<'a> WorkerRing<'a> {
                                 layer_idx,
                                 step,
                                 slot,
-                                0,
+                                stream_id,
                                 self.my_position,
                                 chunk_data,
                                 chunk_shape,
@@ -798,7 +799,7 @@ impl<'a> WorkerRing<'a> {
                                 layer_idx,
                                 step,
                                 slot,
-                                0,
+                                stream_id,
                                 self.my_position,
                                 chunk_data,
                                 chunk_shape,
@@ -817,7 +818,7 @@ impl<'a> WorkerRing<'a> {
                 layer_idx,
                 step,
                 slot,
-                stream_id: 0,
+                stream_id,
                 expected_sender_position,
             })
         );

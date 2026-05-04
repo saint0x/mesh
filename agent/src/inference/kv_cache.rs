@@ -138,6 +138,42 @@ impl KVCacheSnapshot {
         }
         Ok(())
     }
+
+    pub fn live_metadata(
+        &self,
+        config: &KVCacheConfig,
+        residency: LiveKVResidency,
+        owner_session_id: Option<String>,
+        owner_worker_id: Option<String>,
+    ) -> LiveKVSequenceMetadata {
+        let page_tokens = config.live_page_tokens();
+        let cached_tokens = self.sequence.cached_tokens as usize;
+        LiveKVSequenceMetadata {
+            next_position: self.sequence.next_position,
+            first_cached_position: self.sequence.first_cached_position(),
+            cached_tokens: self.sequence.cached_tokens,
+            page_tokens,
+            block_table_len: cached_tokens.div_ceil(page_tokens),
+            tail_tokens: cached_tokens % page_tokens,
+            residency,
+            owner_session_id,
+            owner_worker_id,
+        }
+    }
+
+    pub fn transfer_hooks(
+        &self,
+        config: &KVCacheConfig,
+        residency: LiveKVResidency,
+        owner_session_id: Option<String>,
+        owner_worker_id: Option<String>,
+    ) -> KVTransferHooks {
+        KVTransferHooks {
+            live_layout: LiveKVLayout::from_config(config),
+            sequence: self.live_metadata(config, residency, owner_session_id, owner_worker_id),
+            snapshot_encoding: self.blob.encoding,
+        }
+    }
 }
 
 /// Configuration for KV cache
@@ -162,6 +198,90 @@ impl Default for KVCacheConfig {
             max_seq_len: 4096, // 4K context
         }
     }
+}
+
+/// Canonical token capacity of one live KV page.
+pub const DEFAULT_LIVE_KV_PAGE_TOKENS: usize = 16;
+
+impl KVCacheConfig {
+    /// Fixed live page size used by the paged execution cache.
+    pub fn live_page_tokens(&self) -> usize {
+        self.max_seq_len.clamp(1, DEFAULT_LIVE_KV_PAGE_TOKENS)
+    }
+}
+
+/// Where the active live KV currently resides.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LiveKVResidency {
+    LocalOnly,
+    ImportedFromSnapshot,
+    RemoteOwned,
+}
+
+/// Canonical live-KV layout contract for decode/prefill execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveKVLayout {
+    /// Fixed token capacity per page.
+    pub page_tokens: usize,
+    /// Number of transformer layers covered by the cache.
+    pub num_layers: usize,
+    /// Number of KV heads stored per layer.
+    pub num_heads: usize,
+    /// Width of one attention head.
+    pub head_dim: usize,
+    /// Flattened scalar width of one token row.
+    pub row_width: usize,
+    /// Number of scalars reserved for one key or value page.
+    pub page_stride_scalars: usize,
+}
+
+impl LiveKVLayout {
+    pub fn from_config(config: &KVCacheConfig) -> Self {
+        let page_tokens = config.live_page_tokens();
+        let row_width = config.num_heads.saturating_mul(config.head_dim);
+        Self {
+            page_tokens,
+            num_layers: config.num_layers,
+            num_heads: config.num_heads,
+            head_dim: config.head_dim,
+            row_width,
+            page_stride_scalars: page_tokens.saturating_mul(row_width),
+        }
+    }
+}
+
+/// Minimal session metadata the executor needs to reason about live KV residency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveKVSequenceMetadata {
+    /// Absolute sequence position of the next token to execute.
+    pub next_position: u32,
+    /// First absolute position still represented by the live cache.
+    pub first_cached_position: u32,
+    /// Number of cached tokens currently resident.
+    pub cached_tokens: u32,
+    /// Fixed tokens per page in the live layout.
+    pub page_tokens: usize,
+    /// Number of pages in the block table for each layer.
+    pub block_table_len: usize,
+    /// Number of valid rows in the tail page.
+    pub tail_tokens: usize,
+    /// Where this live cache currently resides.
+    pub residency: LiveKVResidency,
+    /// Optional distributed session owner identifier.
+    pub owner_session_id: Option<String>,
+    /// Optional distributed worker owner identifier.
+    pub owner_worker_id: Option<String>,
+}
+
+/// Export/import hooks for converting the live layout into transfer-friendly blobs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KVTransferHooks {
+    /// The paged live layout that the exporter must read from.
+    pub live_layout: LiveKVLayout,
+    /// Sequence metadata that describes the live residency window.
+    pub sequence: LiveKVSequenceMetadata,
+    /// The current transfer encoding used by snapshots.
+    pub snapshot_encoding: KVCacheEncoding,
 }
 
 /// Key-Value cache for a single attention layer
@@ -418,6 +538,44 @@ impl KVCache {
 
     pub fn next_position(&self) -> usize {
         self.base_position.saturating_add(self.seq_len())
+    }
+
+    pub fn live_layout(&self) -> LiveKVLayout {
+        LiveKVLayout::from_config(&self.config)
+    }
+
+    pub fn live_sequence_metadata(
+        &self,
+        residency: LiveKVResidency,
+        owner_session_id: Option<String>,
+        owner_worker_id: Option<String>,
+    ) -> LiveKVSequenceMetadata {
+        let page_tokens = self.config.live_page_tokens();
+        let seq_len = self.seq_len();
+        LiveKVSequenceMetadata {
+            next_position: self.next_position() as u32,
+            first_cached_position: self.base_position as u32,
+            cached_tokens: seq_len as u32,
+            page_tokens,
+            block_table_len: seq_len.div_ceil(page_tokens),
+            tail_tokens: seq_len % page_tokens,
+            residency,
+            owner_session_id,
+            owner_worker_id,
+        }
+    }
+
+    pub fn transfer_hooks(
+        &self,
+        residency: LiveKVResidency,
+        owner_session_id: Option<String>,
+        owner_worker_id: Option<String>,
+    ) -> KVTransferHooks {
+        KVTransferHooks {
+            live_layout: self.live_layout(),
+            sequence: self.live_sequence_metadata(residency, owner_session_id, owner_worker_id),
+            snapshot_encoding: KVCacheEncoding::FullSnapshotCbor,
+        }
     }
 
     pub fn layer_seq_len(&self, layer_idx: usize) -> Result<usize> {
@@ -773,5 +931,53 @@ mod tests {
             .unwrap();
         assert_eq!(cache.seq_len(), 2);
         assert_eq!(cache.base_position(), 1);
+    }
+
+    #[test]
+    fn test_live_kv_layout_metadata_tracks_block_table() {
+        let mut cache = KVCache::new(KVCacheConfig {
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 64,
+        });
+
+        for layer_idx in 0..2 {
+            cache
+                .append_layer(
+                    layer_idx,
+                    Tensor2D::filled(17, 8, 1.0 + layer_idx as f32),
+                    Tensor2D::filled(17, 8, 2.0 + layer_idx as f32),
+                )
+                .unwrap();
+        }
+
+        let layout = cache.live_layout();
+        assert_eq!(layout.page_tokens, DEFAULT_LIVE_KV_PAGE_TOKENS);
+        assert_eq!(layout.row_width, 8);
+        assert_eq!(layout.page_stride_scalars, DEFAULT_LIVE_KV_PAGE_TOKENS * 8);
+
+        let metadata = cache.live_sequence_metadata(
+            LiveKVResidency::LocalOnly,
+            Some("session-a".to_string()),
+            Some("worker-2".to_string()),
+        );
+        assert_eq!(metadata.cached_tokens, 17);
+        assert_eq!(metadata.block_table_len, 2);
+        assert_eq!(metadata.tail_tokens, 1);
+        assert_eq!(metadata.owner_session_id.as_deref(), Some("session-a"));
+        assert_eq!(metadata.owner_worker_id.as_deref(), Some("worker-2"));
+
+        let hooks = cache.transfer_hooks(
+            LiveKVResidency::ImportedFromSnapshot,
+            Some("session-a".to_string()),
+            None,
+        );
+        assert_eq!(hooks.live_layout, layout);
+        assert_eq!(hooks.snapshot_encoding, KVCacheEncoding::FullSnapshotCbor);
+        assert_eq!(
+            hooks.sequence.residency,
+            LiveKVResidency::ImportedFromSnapshot
+        );
     }
 }

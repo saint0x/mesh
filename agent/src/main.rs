@@ -1880,7 +1880,7 @@ async fn cmd_runtime() -> Result<()> {
                             .download_inference_session_checkpoint(job_id, request.session_id)
                             .await
                         {
-                            Ok(Some(bytes)) => {
+                            Ok(Some(remote_checkpoint)) => {
                                 let Some(manager) = coordinator.checkpoint_manager() else {
                                     error!(
                                         job_id = %job_id,
@@ -1889,7 +1889,49 @@ async fn cmd_runtime() -> Result<()> {
                                     );
                                     continue;
                                 };
-                                if let Err(e) = manager.import_checkpoint_bytes(&bytes).await {
+                                if remote_checkpoint.metadata.checkpoint_id
+                                    != checkpoint.checkpoint_id
+                                {
+                                    error!(
+                                        job_id = %job_id,
+                                        session_id = %request.session_id,
+                                        downloaded_checkpoint_id = %remote_checkpoint.metadata.checkpoint_id,
+                                        expected_checkpoint_id = %checkpoint.checkpoint_id,
+                                        "Downloaded remote session checkpoint metadata drifted from lease state"
+                                    );
+                                    continue;
+                                }
+                                if remote_checkpoint.metadata.kv_sequence_position
+                                    != checkpoint.kv_sequence_position
+                                {
+                                    error!(
+                                        job_id = %job_id,
+                                        session_id = %request.session_id,
+                                        downloaded_kv_sequence_position = remote_checkpoint.metadata.kv_sequence_position,
+                                        expected_kv_sequence_position = checkpoint.kv_sequence_position,
+                                        "Downloaded remote session checkpoint sequence position drifted from lease state"
+                                    );
+                                    continue;
+                                }
+
+                                let checkpoint_bytes = match hex::decode(
+                                    &remote_checkpoint.checkpoint_hex,
+                                ) {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        error!(
+                                            job_id = %job_id,
+                                            session_id = %request.session_id,
+                                            error = %e,
+                                            "Downloaded remote session checkpoint hex was invalid"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                if let Err(e) =
+                                    manager.import_checkpoint_bytes(&checkpoint_bytes).await
+                                {
                                     error!(
                                         job_id = %job_id,
                                         session_id = %request.session_id,
@@ -1900,8 +1942,8 @@ async fn cmd_runtime() -> Result<()> {
                                     info!(
                                         job_id = %job_id,
                                         session_id = %request.session_id,
-                                        checkpoint_id = %checkpoint.checkpoint_id,
-                                        source_device_id = %checkpoint.source_device_id,
+                                        checkpoint_id = %remote_checkpoint.metadata.checkpoint_id,
+                                        source_device_id = %remote_checkpoint.metadata.source_device_id,
                                         "Imported remote session checkpoint before decode"
                                     );
                                 }
@@ -1950,7 +1992,6 @@ async fn cmd_runtime() -> Result<()> {
                 let network_id = assignment.network_id.clone();
                 let session_id = assignment.active_segment.session_id.clone();
                 let segment_id = active_segment_id.clone();
-                let queue_snapshot = queue_state.clone();
                 Some(tokio::spawn(async move {
                     let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(20));
                     loop {
@@ -1963,7 +2004,10 @@ async fn cmd_runtime() -> Result<()> {
                                     network_id: network_id.clone(),
                                     session_id: session_id.clone(),
                                     segment_id: segment_id.clone(),
-                                    scheduler_queue: queue_snapshot.clone(),
+                                    include_decode_lease: false,
+                                    include_queue_state: false,
+                                    include_serving_session: false,
+                                    scheduler_queue: None,
                                 },
                             )
                             .await
@@ -2001,8 +2045,6 @@ async fn cmd_runtime() -> Result<()> {
                     let registration_client = registration_client.clone();
                     let device_id = device_id;
                     let segment_id = active_segment_id.clone();
-                    let scheduler_queue = queue_state.clone();
-                    let serving_session = serving_session.clone();
                     async move {
                         registration_client
                             .report_inference_progress(
@@ -2026,8 +2068,8 @@ async fn cmd_runtime() -> Result<()> {
                                     active_decode_sessions: progress.active_decode_sessions,
                                     batch_kv_tokens: progress.batch_kv_tokens,
                                     deferred_decode_sessions: progress.deferred_decode_sessions,
-                                    scheduler_queue: scheduler_queue.clone(),
-                                    serving_session: serving_session.clone(),
+                                    scheduler_queue: None,
+                                    serving_session: None,
                                 },
                             )
                             .await
@@ -2822,6 +2864,12 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(ag_bytes) = stats.get("tensor_all_gather_bytes_sent") {
         println!("  AG Bytes Sent:     {}", ag_bytes);
+    }
+    if let Some(bulk_bytes) = stats.get("tensor_bulk_transfer_bytes_sent") {
+        println!("  Bulk Bytes Sent:   {}", bulk_bytes);
+    }
+    if let Some(checkpoint_bytes) = stats.get("tensor_checkpoint_bytes_sent") {
+        println!("  Ckpt Bytes Sent:   {}", checkpoint_bytes);
     }
     if let Some(open_connections) = stats.get("tensor_current_outbound_connections") {
         println!("  Open Connections:  {}", open_connections);

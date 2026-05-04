@@ -56,8 +56,8 @@ use uuid::Uuid;
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
 use super::tensor_ops::{
     apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
-    collective_buffer_from_candle_2d, embed_tokens, execution_device, from_candle_2d, matmul,
-    rms_norm, rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
+    collective_buffer_from_candle_2d, embed_tokens, from_candle_2d, matmul, rms_norm,
+    rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
 use crate::inference::backend::BackendLogits;
@@ -226,76 +226,87 @@ fn merge_heads(heads: &[Tensor2D]) -> Result<Tensor2D> {
 }
 
 #[derive(Clone)]
+struct DeviceKVPage {
+    keys: CandleTensor,
+    values: CandleTensor,
+    used_rows: usize,
+}
+
+impl DeviceKVPage {
+    fn new(page_rows: usize, cols: usize, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            keys: CandleTensor::zeros((page_rows, cols), DType::F32, device)
+                .map_err(device_error)?,
+            values: CandleTensor::zeros((page_rows, cols), DType::F32, device)
+                .map_err(device_error)?,
+            used_rows: 0,
+        })
+    }
+
+    fn free_rows(&self, page_rows: usize) -> usize {
+        page_rows.saturating_sub(self.used_rows)
+    }
+}
+
+#[derive(Clone)]
 struct DeviceLayerKVCache {
-    keys: Option<CandleTensor>,
-    values: Option<CandleTensor>,
+    pages: Vec<DeviceKVPage>,
+    block_table: Vec<usize>,
     seq_len: usize,
-    capacity_rows: usize,
     cols: usize,
+    page_rows: usize,
 }
 
 impl DeviceLayerKVCache {
-    fn new() -> Self {
+    fn new(page_rows: usize) -> Self {
         Self {
-            keys: None,
-            values: None,
+            pages: Vec::new(),
+            block_table: Vec::new(),
             seq_len: 0,
-            capacity_rows: 0,
             cols: 0,
+            page_rows,
         }
     }
 
-    fn ensure_capacity(
-        &mut self,
-        required_rows: usize,
-        cols: usize,
-        device: &candle_core::Device,
-    ) -> Result<()> {
-        if self.capacity_rows >= required_rows {
-            if self.cols != 0 && self.cols != cols {
-                return Err(AgentError::Execution(format!(
-                    "Device KV width mismatch: existing {} vs requested {}",
-                    self.cols, cols
-                )));
-            }
+    fn ensure_page_shape(&mut self, cols: usize) -> Result<()> {
+        if self.cols == 0 {
+            self.cols = cols;
             return Ok(());
         }
+        if self.cols != cols {
+            return Err(AgentError::Execution(format!(
+                "Device KV width mismatch: existing {} vs requested {}",
+                self.cols, cols
+            )));
+        }
+        Ok(())
+    }
 
-        let new_capacity = required_rows.max(self.capacity_rows.max(8) * 2);
-        let new_keys =
-            CandleTensor::zeros((new_capacity, cols), DType::F32, device).map_err(device_error)?;
-        let new_values =
-            CandleTensor::zeros((new_capacity, cols), DType::F32, device).map_err(device_error)?;
+    fn ensure_writable_tail(&mut self, cols: usize, device: &candle_core::Device) -> Result<usize> {
+        self.ensure_page_shape(cols)?;
 
-        if let (Some(existing_keys), Some(existing_values)) = (&self.keys, &self.values) {
-            if self.seq_len > 0 {
-                let active_keys = existing_keys
-                    .narrow(0, 0, self.seq_len)
-                    .map_err(device_error)?;
-                let active_values = existing_values
-                    .narrow(0, 0, self.seq_len)
-                    .map_err(device_error)?;
-                let row_ranges = &[0..self.seq_len, 0..cols];
-                let copied_keys = new_keys
-                    .slice_assign(row_ranges, &active_keys)
-                    .map_err(device_error)?;
-                let copied_values = new_values
-                    .slice_assign(row_ranges, &active_values)
-                    .map_err(device_error)?;
-                self.keys = Some(copied_keys);
-                self.values = Some(copied_values);
-            } else {
-                self.keys = Some(new_keys);
-                self.values = Some(new_values);
+        if self.block_table.is_empty() {
+            if self.pages.is_empty() {
+                self.pages
+                    .push(DeviceKVPage::new(self.page_rows, cols, device)?);
             }
-        } else {
-            self.keys = Some(new_keys);
-            self.values = Some(new_values);
+            self.block_table.push(0);
+            return Ok(0);
         }
 
-        self.capacity_rows = new_capacity;
-        self.cols = cols;
-        Ok(())
+        let tail_index = *self
+            .block_table
+            .last()
+            .ok_or_else(|| AgentError::Execution("Device KV block table is empty".to_string()))?;
+        if self.pages[tail_index].free_rows(self.page_rows) > 0 {
+            return Ok(tail_index);
+        }
+
+        let new_index = self.pages.len();
+        self.pages
+            .push(DeviceKVPage::new(self.page_rows, cols, device)?);
+        self.block_table.push(new_index);
+        Ok(new_index)
     }
 
     fn append(&mut self, new_keys: &CandleTensor, new_values: &CandleTensor) -> Result<()> {
@@ -316,81 +327,123 @@ impl DeviceLayerKVCache {
 
         let new_rows = key_dims[0];
         let cols = key_dims[1];
-        let required_rows = self.seq_len.saturating_add(new_rows);
-        self.ensure_capacity(required_rows, cols, new_keys.device())?;
-
-        let row_indices = device_row_indices(self.seq_len, new_rows, cols, new_keys.device())?;
-        let keys = self.keys.as_ref().ok_or_else(|| {
-            AgentError::Execution("Device KV keys buffer was not allocated".to_string())
-        })?;
-        let values = self.values.as_ref().ok_or_else(|| {
-            AgentError::Execution("Device KV values buffer was not allocated".to_string())
-        })?;
-        keys.scatter_set(&row_indices, new_keys, 0)
-            .map_err(device_error)?;
-        values
-            .scatter_set(&row_indices, new_values, 0)
-            .map_err(device_error)?;
-        self.seq_len = required_rows;
+        let mut appended_rows = 0;
+        while appended_rows < new_rows {
+            let page_index = self.ensure_writable_tail(cols, new_keys.device())?;
+            let page = self.pages.get_mut(page_index).ok_or_else(|| {
+                AgentError::Execution(format!("Invalid device KV page index {}", page_index))
+            })?;
+            let copy_rows = page
+                .free_rows(self.page_rows)
+                .min(new_rows.saturating_sub(appended_rows));
+            let key_chunk = new_keys
+                .narrow(0, appended_rows, copy_rows)
+                .map_err(device_error)?;
+            let value_chunk = new_values
+                .narrow(0, appended_rows, copy_rows)
+                .map_err(device_error)?;
+            let row_ranges = &[page.used_rows..page.used_rows + copy_rows, 0..cols];
+            page.keys = page
+                .keys
+                .slice_assign(row_ranges, &key_chunk)
+                .map_err(device_error)?;
+            page.values = page
+                .values
+                .slice_assign(row_ranges, &value_chunk)
+                .map_err(device_error)?;
+            page.used_rows += copy_rows;
+            appended_rows += copy_rows;
+            self.seq_len += copy_rows;
+        }
         Ok(())
     }
 
-    fn active(&self) -> Result<(&CandleTensor, &CandleTensor, usize)> {
-        match (&self.keys, &self.values) {
-            (Some(keys), Some(values)) => Ok((keys, values, self.seq_len)),
-            _ => Err(AgentError::Execution(
+    fn active_tensors(&self) -> Result<(CandleTensor, CandleTensor, usize)> {
+        if self.seq_len == 0 || self.block_table.is_empty() {
+            return Err(AgentError::Execution(
                 "Requested device KV state before cache initialization".to_string(),
-            )),
+            ));
         }
+
+        let mut key_chunks = Vec::with_capacity(self.block_table.len());
+        let mut value_chunks = Vec::with_capacity(self.block_table.len());
+        for &page_index in &self.block_table {
+            let page = self.pages.get(page_index).ok_or_else(|| {
+                AgentError::Execution(format!("Invalid device KV page index {}", page_index))
+            })?;
+            if page.used_rows == 0 {
+                continue;
+            }
+            key_chunks.push(
+                page.keys
+                    .narrow(0, 0, page.used_rows)
+                    .map_err(device_error)?,
+            );
+            value_chunks.push(
+                page.values
+                    .narrow(0, 0, page.used_rows)
+                    .map_err(device_error)?,
+            );
+        }
+
+        if key_chunks.is_empty() || value_chunks.is_empty() {
+            return Err(AgentError::Execution(
+                "Device KV block table contained no active rows".to_string(),
+            ));
+        }
+
+        let active_keys = if key_chunks.len() == 1 {
+            key_chunks[0].clone()
+        } else {
+            let key_refs = key_chunks.iter().collect::<Vec<_>>();
+            CandleTensor::cat(&key_refs, 0).map_err(device_error)?
+        };
+        let active_values = if value_chunks.len() == 1 {
+            value_chunks[0].clone()
+        } else {
+            let value_refs = value_chunks.iter().collect::<Vec<_>>();
+            CandleTensor::cat(&value_refs, 0).map_err(device_error)?
+        };
+        Ok((active_keys, active_values, self.seq_len))
+    }
+
+    fn block_table_len(&self) -> usize {
+        self.block_table.len()
     }
 
     fn clear(&mut self) {
+        for page in &mut self.pages {
+            page.used_rows = 0;
+        }
+        self.block_table.clear();
         self.seq_len = 0;
     }
 
-    fn retain_suffix(&mut self, keep_rows: usize, device: &candle_core::Device) -> Result<()> {
+    fn retain_suffix(&mut self, keep_rows: usize) -> Result<()> {
         if self.seq_len <= keep_rows {
             return Ok(());
         }
         if keep_rows == 0 {
-            self.seq_len = 0;
+            self.clear();
             return Ok(());
         }
-        let start_row = self.seq_len - keep_rows;
-        let cols = self.cols;
-        let new_keys = CandleTensor::zeros((self.capacity_rows, cols), DType::F32, device)
-            .map_err(device_error)?;
-        let new_values = CandleTensor::zeros((self.capacity_rows, cols), DType::F32, device)
-            .map_err(device_error)?;
-        let existing_keys = self.keys.as_ref().ok_or_else(|| {
-            AgentError::Execution("Device KV keys buffer was not allocated".to_string())
-        })?;
-        let existing_values = self.values.as_ref().ok_or_else(|| {
-            AgentError::Execution("Device KV values buffer was not allocated".to_string())
-        })?;
-        let kept_keys = existing_keys
+        let (active_keys, active_values, active_rows) = self.active_tensors()?;
+        let start_row = active_rows - keep_rows;
+        let kept_keys = active_keys
             .narrow(0, start_row, keep_rows)
             .map_err(device_error)?;
-        let kept_values = existing_values
+        let kept_values = active_values
             .narrow(0, start_row, keep_rows)
             .map_err(device_error)?;
-        let row_ranges = &[0..keep_rows, 0..cols];
-        self.keys = Some(
-            new_keys
-                .slice_assign(row_ranges, &kept_keys)
-                .map_err(device_error)?,
-        );
-        self.values = Some(
-            new_values
-                .slice_assign(row_ranges, &kept_values)
-                .map_err(device_error)?,
-        );
-        self.seq_len = keep_rows;
+        self.clear();
+        self.append(&kept_keys, &kept_values)?;
         Ok(())
     }
 
     fn memory_usage(&self) -> usize {
-        self.capacity_rows
+        self.pages
+            .len()
+            .saturating_mul(self.page_rows)
             .saturating_mul(self.cols)
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_mul(2)
@@ -406,9 +459,10 @@ struct DeviceKVCache {
 
 impl DeviceKVCache {
     fn new(config: KVCacheConfig) -> Self {
+        let page_rows = config.live_page_tokens();
         Self {
             layers: (0..config.num_layers)
-                .map(|_| DeviceLayerKVCache::new())
+                .map(|_| DeviceLayerKVCache::new(page_rows))
                 .collect(),
             base_position: 0,
             config,
@@ -466,10 +520,7 @@ impl DeviceKVCache {
             .layers
             .get(layer_idx)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
-        let (keys, values, seq_len) = layer.active()?;
-        let active_keys = keys.narrow(0, 0, seq_len).map_err(device_error)?;
-        let active_values = values.narrow(0, 0, seq_len).map_err(device_error)?;
-        Ok((active_keys, active_values, seq_len))
+        layer.active_tensors()
     }
 
     fn seq_len(&self) -> usize {
@@ -496,12 +547,22 @@ impl DeviceKVCache {
         if seq_len <= keep_rows {
             return Ok(());
         }
-        let device = execution_device()?;
         for layer in &mut self.layers {
-            layer.retain_suffix(keep_rows, &device)?;
+            layer.retain_suffix(keep_rows)?;
         }
         self.base_position = self.base_position.saturating_add(seq_len - keep_rows);
         Ok(())
+    }
+
+    fn live_page_tokens(&self) -> usize {
+        self.config.live_page_tokens()
+    }
+
+    fn live_block_table_len(&self, layer_idx: usize) -> Result<usize> {
+        self.layers
+            .get(layer_idx)
+            .map(DeviceLayerKVCache::block_table_len)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))
     }
 
     fn memory_usage(&self) -> usize {
@@ -545,7 +606,6 @@ impl DeviceKVCache {
     fn import_snapshot(&mut self, snapshot: &KVCacheSnapshot) -> Result<()> {
         snapshot.validate()?;
         let host_cache = snapshot.decode_cache()?;
-        let device = execution_device()?;
         self.clear();
         self.base_position = host_cache.base_position();
         for (layer_idx, layer) in host_cache.layers.iter().enumerate() {
@@ -578,7 +638,6 @@ impl DeviceKVCache {
                 snapshot.sequence.first_cached_position()
             )));
         }
-        let _ = device;
         Ok(())
     }
 }
@@ -1904,20 +1963,6 @@ fn causal_attention_mask(
     CandleTensor::from_vec(mask, (1, q_rows, cached_seq_len), device).map_err(device_error)
 }
 
-fn device_row_indices(
-    start_row: usize,
-    rows: usize,
-    cols: usize,
-    device: &candle_core::Device,
-) -> Result<CandleTensor> {
-    let mut indices = Vec::with_capacity(rows * cols);
-    for row_offset in 0..rows {
-        let row_index = (start_row + row_offset) as u32;
-        indices.extend(std::iter::repeat_n(row_index, cols));
-    }
-    CandleTensor::from_vec(indices, (rows, cols), device).map_err(device_error)
-}
-
 fn device_error(err: candle_core::Error) -> AgentError {
     AgentError::Execution(format!("GPU tensor backend error: {}", err))
 }
@@ -2355,6 +2400,57 @@ mod tests {
         let restored = exported.decode_cache().unwrap();
         assert_eq!(restored.base_position(), 2);
         assert_eq!(restored.seq_len(), 2);
+    }
+
+    #[test]
+    fn test_forward_pass_imports_paged_live_kv_layout() {
+        let config = create_test_config();
+        let weights = create_test_weights(&config, config.hidden_dim);
+        let mut forward = ForwardPass::new(
+            weights,
+            0,
+            0,
+            config.hidden_dim,
+            1,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let kv_cols = config.num_kv_heads * (config.hidden_dim / config.num_heads);
+        let mut host_cache = KVCache::new(KVCacheConfig {
+            num_layers: config.num_layers,
+            num_heads: config.num_kv_heads,
+            head_dim: config.hidden_dim / config.num_heads,
+            max_seq_len: 64,
+        });
+        for layer_idx in 0..config.num_layers {
+            host_cache
+                .append_layer(
+                    layer_idx,
+                    Tensor2D::filled(17, kv_cols, 0.25 + layer_idx as f32),
+                    Tensor2D::filled(17, kv_cols, 0.5 + layer_idx as f32),
+                )
+                .unwrap();
+        }
+
+        let snapshot = KVCacheSnapshot::from_cache(&host_cache, 17).unwrap();
+        forward.import_kv_cache_snapshot(&snapshot).unwrap();
+
+        assert_eq!(forward.device_kv_cache.live_page_tokens(), 16);
+        assert_eq!(forward.device_kv_cache.live_block_table_len(0).unwrap(), 2);
+
+        let exported = forward
+            .export_kv_cache_snapshot(None)
+            .unwrap()
+            .expect("paged snapshot should be present");
+        let metadata = exported.live_metadata(
+            &forward.device_kv_cache.config,
+            crate::inference::kv_cache::LiveKVResidency::ImportedFromSnapshot,
+            Some("session-17".to_string()),
+            Some("worker-0".to_string()),
+        );
+        assert_eq!(metadata.block_table_len, 2);
+        assert_eq!(metadata.tail_tokens, 1);
     }
 
     #[tokio::test]

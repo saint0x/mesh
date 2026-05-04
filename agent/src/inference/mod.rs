@@ -45,6 +45,7 @@ pub mod artifact_loader;
 pub mod backend;
 pub mod coordinator;
 pub mod engine;
+pub mod fast_path;
 pub mod forward_pass;
 pub mod job;
 pub mod kv_cache;
@@ -59,10 +60,16 @@ pub use backend::{
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{
     BackendInstanceSpec, BackendOptimizationProfile, DecodeBatchPlan, DecodeBatchPolicy,
-    DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase, InferenceRuntimeMode,
-    KvTransferPolicy, RuntimeMemoryBudget, SessionAssignment, SessionEvictionReason,
-    SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
-    TransportCapabilityTier,
+    DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase, ExecutorPhasePlan,
+    FallbackKernel, FusedKernelStage, InferenceRuntimeMode, KvRuntimeContract, KvTransferPolicy,
+    LocalExecutorClass, LocalExecutorContract, RuntimeMemoryBudget, SessionAssignment,
+    SessionEvictionReason, SessionEvictionState, SessionPauseReason, SessionPauseState,
+    SessionRuntimeStatus, TransportCapabilityTier,
+};
+pub use fast_path::{
+    FastPathBackendContext, FastPathBucketKey, FastPathExecutionPlan, FastPathInvariantError,
+    FastPathPlanner, FastPathRuntime, GraphCaptureStrategy, PrefillBucketStrategy,
+    WorkspaceRequirements,
 };
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
 pub use job::{

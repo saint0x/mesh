@@ -99,6 +99,22 @@
       "times": 1
     },
     {
+      "name": "serving lane plans expose stream reuse for throughput-oriented transports",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "network::tensor_plane::tests::test_serving_transport_stream_ids_follow_lane_plan",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
       "name": "collective optimization profile still tracks provider and runtime mode",
       "type": "proc_when",
       "cmd": "cargo",

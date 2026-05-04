@@ -7,8 +7,9 @@ use sha2::Digest;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::inference::job::{GenerationConfig, InferenceJob, InferenceRequest};
 use crate::inference::kv_cache::{KVCacheBlob, KVCacheEncoding, KVCacheSnapshot, KVSequenceState};
-use crate::inference::ExecutionPhase;
+use crate::inference::{DecodeBatchTargets, ExecutionPhase, InferenceRuntimeMode};
 
 /// Configuration for checkpoint management
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +239,103 @@ impl KVCacheHandoff {
                 Err("KV handoff is missing inline payload bytes".to_string())
             }
         }
+    }
+}
+
+/// Validated recovery-side checkpoint wrapper that isolates transfer semantics
+/// from the live executor's KV representation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRecoveryPoint {
+    checkpoint: Checkpoint,
+}
+
+impl CheckpointRecoveryPoint {
+    pub fn from_checkpoint(mut checkpoint: Checkpoint) -> Result<Self, String> {
+        checkpoint.validate()?;
+        checkpoint.kv_handoff = checkpoint.kv_handoff()?;
+        checkpoint.kv_cache_state = None;
+        checkpoint.sequence_position = None;
+        Ok(Self { checkpoint })
+    }
+
+    pub fn checkpoint(&self) -> &Checkpoint {
+        &self.checkpoint
+    }
+
+    pub fn into_checkpoint(self) -> Checkpoint {
+        self.checkpoint
+    }
+
+    pub fn to_cbor(&self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+        self.checkpoint.to_cbor()
+    }
+
+    pub fn transfer_bundle(mut self) -> Self {
+        self.checkpoint.kv_handoff = self
+            .checkpoint
+            .kv_handoff
+            .take()
+            .map(|handoff| handoff.transfer_bundle());
+        self
+    }
+
+    pub fn imported_for(mut self, owner_worker_id: String) -> Self {
+        self.checkpoint.kv_handoff = self
+            .checkpoint
+            .kv_handoff
+            .take()
+            .map(|handoff| handoff.imported_for(owner_worker_id));
+        self
+    }
+
+    pub fn kv_handoff(&self) -> Option<&KVCacheHandoff> {
+        self.checkpoint.kv_handoff.as_ref()
+    }
+
+    pub fn kv_sequence_position(&self) -> Option<u32> {
+        self.kv_handoff()
+            .map(|handoff| handoff.sequence.next_position)
+    }
+
+    pub fn materialize_live_kv_snapshot(&self) -> Result<Option<KVCacheSnapshot>, String> {
+        self.kv_handoff()
+            .map(KVCacheHandoff::materialize_snapshot)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn restore_job(&self) -> InferenceJob {
+        let checkpoint = &self.checkpoint;
+        let config = GenerationConfig {
+            max_tokens: checkpoint.config.max_tokens,
+            temperature: checkpoint.config.temperature,
+            top_p: checkpoint.config.top_p,
+            stop_sequences: checkpoint.config.stop_sequences.clone(),
+            stream: checkpoint.config.stream,
+            checkpoint_interval: checkpoint.config.checkpoint_interval,
+            progress_report_interval: GenerationConfig::default().progress_report_interval,
+        };
+
+        let request = InferenceRequest {
+            job_id: checkpoint.request.job_id,
+            network_id: checkpoint.request.network_id.clone(),
+            model_id: checkpoint.request.model_id.clone(),
+            prompt_tokens: checkpoint.request.prompt_tokens.clone(),
+            config,
+            session_id: checkpoint.request.session_id,
+            phase: checkpoint.request.phase,
+            decode_batch_targets: DecodeBatchTargets::default(),
+            runtime_mode: InferenceRuntimeMode::default(),
+            executor_id: checkpoint.request.executor_id.clone(),
+            created_at: checkpoint.metadata.created_at,
+        };
+
+        let mut job = InferenceJob::new(request, checkpoint.config.total_layers);
+        job.generated_tokens = checkpoint.generated_tokens.clone();
+        job.current_token_idx = checkpoint.metadata.token_index;
+        job.current_layer = checkpoint.metadata.current_layer;
+        job.last_checkpoint_idx = checkpoint.metadata.token_index;
+        job
     }
 }
 
@@ -695,5 +793,70 @@ mod tests {
         assert_eq!(handoff.owner_worker_id, "worker");
         assert_eq!(handoff.sequence.next_position, 0);
         assert_eq!(handoff.sequence.cached_tokens, 0);
+    }
+
+    #[test]
+    fn test_recovery_point_materializes_live_snapshot_and_job() {
+        let mut cache = KVCache::new(crate::inference::kv_cache::KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 8,
+        });
+        cache
+            .update_layer(
+                0,
+                Tensor2D::new(vec![1.0; 8], 1, 8).unwrap(),
+                Tensor2D::new(vec![2.0; 8], 1, 8).unwrap(),
+            )
+            .unwrap();
+        let snapshot = KVCacheSnapshot::from_cache(&cache, 1).unwrap();
+
+        let checkpoint = Checkpoint {
+            metadata: CheckpointMetadata::new(
+                Uuid::new_v4(),
+                10,
+                5,
+                "model".to_string(),
+                "worker".to_string(),
+                0,
+                "".to_string(),
+            ),
+            request: CheckpointedRequest {
+                job_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                network_id: "net".to_string(),
+                model_id: "model".to_string(),
+                prompt_tokens: vec![1, 2, 3],
+                executor_id: "exec".to_string(),
+                phase: ExecutionPhase::Decode,
+            },
+            generated_tokens: vec![100],
+            config: CheckpointedConfig {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_p: 0.9,
+                stop_sequences: vec![],
+                stream: false,
+                checkpoint_interval: 50,
+                total_layers: 70,
+            },
+            kv_handoff: Some(KVCacheHandoff::checkpoint_resident(
+                snapshot.clone(),
+                "worker".to_string(),
+            )),
+            kv_cache_state: None,
+            sequence_position: None,
+            rng_state: None,
+        };
+
+        let recovery = CheckpointRecoveryPoint::from_checkpoint(checkpoint).unwrap();
+        let restored_job = recovery.restore_job();
+        let restored_snapshot = recovery.materialize_live_kv_snapshot().unwrap().unwrap();
+
+        assert_eq!(restored_job.generated_tokens, vec![100]);
+        assert_eq!(restored_job.current_token_idx, 10);
+        assert_eq!(recovery.kv_sequence_position(), Some(1));
+        assert_eq!(restored_snapshot.sequence, snapshot.sequence);
     }
 }

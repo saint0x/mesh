@@ -16,8 +16,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::types::{
-    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointedConfig, CheckpointedRequest,
-    KVCacheHandoff,
+    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointRecoveryPoint, CheckpointedConfig,
+    CheckpointedRequest, KVCacheHandoff,
 };
 
 /// Manages checkpoint creation, storage, and retrieval
@@ -113,8 +113,8 @@ impl CheckpointManager {
 
     /// Load the latest checkpoint for a job
     pub async fn load_checkpoint(&self, job_id: Uuid) -> Result<Option<InferenceJob>> {
-        if let Some(checkpoint) = self.load_latest_checkpoint(job_id).await? {
-            let job = self.restore_job(checkpoint)?;
+        if let Some(recovery_point) = self.load_recovery_point(job_id).await? {
+            let job = recovery_point.restore_job();
             info!(
                 job_id = %job_id,
                 token_index = job.current_token_idx,
@@ -126,11 +126,28 @@ impl CheckpointManager {
         Ok(None)
     }
 
+    pub async fn load_recovery_point(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<CheckpointRecoveryPoint>> {
+        self.load_latest_checkpoint(job_id)
+            .await?
+            .map(|checkpoint| {
+                CheckpointRecoveryPoint::from_checkpoint(checkpoint).map_err(|e| {
+                    AgentError::Execution(format!(
+                        "Invalid recovery checkpoint for job {}: {}",
+                        job_id, e
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     pub async fn load_checkpoint_kv_cache(&self, job_id: Uuid) -> Result<Option<KVCache>> {
         Ok(self
-            .load_checkpoint_kv_handoff(job_id)
+            .load_recovery_point(job_id)
             .await?
-            .map(|handoff| handoff.materialize_snapshot())
+            .map(|point| point.materialize_live_kv_snapshot())
             .transpose()
             .map_err(AgentError::Execution)?
             .flatten()
@@ -140,56 +157,37 @@ impl CheckpointManager {
 
     pub async fn load_checkpoint_sequence_position(&self, job_id: Uuid) -> Result<Option<u32>> {
         Ok(self
-            .load_checkpoint_kv_handoff(job_id)
+            .load_recovery_point(job_id)
             .await?
-            .map(|handoff| handoff.sequence.next_position))
+            .and_then(|point| point.kv_sequence_position()))
     }
 
     pub async fn load_checkpoint_kv_handoff(&self, job_id: Uuid) -> Result<Option<KVCacheHandoff>> {
         Ok(self
-            .load_latest_checkpoint(job_id)
+            .load_recovery_point(job_id)
             .await?
-            .map(|checkpoint| {
-                checkpoint.kv_handoff().map_err(|e| {
-                    AgentError::Execution(format!(
-                        "Invalid KV handoff in checkpoint {}: {}",
-                        checkpoint.metadata.checkpoint_id, e
-                    ))
-                })
-            })
-            .transpose()?
-            .flatten())
+            .and_then(|point| point.kv_handoff().cloned()))
     }
 
     pub async fn export_latest_checkpoint_bytes(&self, job_id: Uuid) -> Result<Option<Vec<u8>>> {
-        let Some(mut checkpoint) = self.load_latest_checkpoint(job_id).await? else {
+        let Some(recovery_point) = self.load_recovery_point(job_id).await? else {
             return Ok(None);
         };
-        checkpoint.kv_handoff = checkpoint
-            .kv_handoff()
-            .map_err(AgentError::Execution)?
-            .map(|handoff| handoff.transfer_bundle());
-        checkpoint.kv_cache_state = None;
-        checkpoint.sequence_position = None;
-        let bytes = checkpoint
+        let bytes = recovery_point
+            .transfer_bundle()
             .to_cbor()
             .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?;
         Ok(Some(bytes))
     }
 
     pub async fn import_checkpoint_bytes(&self, bytes: &[u8]) -> Result<CheckpointMetadata> {
-        let mut checkpoint = Checkpoint::from_cbor(bytes)
+        let checkpoint = Checkpoint::from_cbor(bytes)
             .map_err(|e| AgentError::Config(format!("Failed to deserialize checkpoint: {}", e)))?;
-        checkpoint
-            .validate()
-            .map_err(|e| AgentError::Execution(format!("Invalid imported checkpoint: {}", e)))?;
-        checkpoint.kv_handoff = checkpoint
-            .kv_handoff()
-            .map_err(AgentError::Execution)?
-            .map(|handoff| handoff.imported_for(self.worker_id.clone()));
-        checkpoint.kv_cache_state = None;
-        checkpoint.sequence_position = None;
-        let bytes = checkpoint
+        let recovery_point = CheckpointRecoveryPoint::from_checkpoint(checkpoint)
+            .map_err(|e| AgentError::Execution(format!("Invalid imported checkpoint: {}", e)))?
+            .imported_for(self.worker_id.clone());
+        let checkpoint = recovery_point.checkpoint().clone();
+        let bytes = recovery_point
             .to_cbor()
             .map_err(|e| AgentError::Config(format!("Failed to serialize checkpoint: {}", e)))?;
         let job_dir = self
@@ -445,45 +443,6 @@ impl CheckpointManager {
         }
 
         Ok(latest)
-    }
-
-    /// Restore an InferenceJob from checkpoint
-    fn restore_job(&self, checkpoint: Checkpoint) -> Result<InferenceJob> {
-        use crate::inference::job::{GenerationConfig, InferenceRequest};
-
-        // Reconstruct the request
-        let config = GenerationConfig {
-            max_tokens: checkpoint.config.max_tokens,
-            temperature: checkpoint.config.temperature,
-            top_p: checkpoint.config.top_p,
-            stop_sequences: checkpoint.config.stop_sequences,
-            stream: checkpoint.config.stream,
-            checkpoint_interval: checkpoint.config.checkpoint_interval,
-            progress_report_interval: GenerationConfig::default().progress_report_interval,
-        };
-
-        let request = InferenceRequest {
-            job_id: checkpoint.request.job_id,
-            network_id: checkpoint.request.network_id,
-            model_id: checkpoint.request.model_id,
-            prompt_tokens: checkpoint.request.prompt_tokens,
-            config,
-            session_id: checkpoint.request.session_id,
-            phase: checkpoint.request.phase,
-            decode_batch_targets: crate::inference::DecodeBatchTargets::default(),
-            runtime_mode: crate::inference::InferenceRuntimeMode::default(),
-            executor_id: checkpoint.request.executor_id,
-            created_at: checkpoint.metadata.created_at,
-        };
-
-        // Create job and restore state
-        let mut job = InferenceJob::new(request, checkpoint.config.total_layers);
-        job.generated_tokens = checkpoint.generated_tokens;
-        job.current_token_idx = checkpoint.metadata.token_index;
-        job.current_layer = checkpoint.metadata.current_layer;
-        job.last_checkpoint_idx = checkpoint.metadata.token_index;
-
-        Ok(job)
     }
 
     /// Cleanup old checkpoints for a specific job

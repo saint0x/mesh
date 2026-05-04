@@ -92,6 +92,10 @@ pub struct TensorPlaneMetricsSnapshot {
     pub all_gather_bytes_received: u64,
     pub barrier_bytes_sent: u64,
     pub barrier_bytes_received: u64,
+    pub bulk_transfer_bytes_sent: u64,
+    pub bulk_transfer_bytes_received: u64,
+    pub checkpoint_bytes_sent: u64,
+    pub checkpoint_bytes_received: u64,
     pub outbound_backpressure_wait_count: u64,
     pub outbound_backpressure_wait_ms: u64,
     pub outbound_bandwidth_wait_count: u64,
@@ -146,6 +150,10 @@ struct TensorPlaneMetrics {
     all_gather_bytes_received: AtomicU64,
     barrier_bytes_sent: AtomicU64,
     barrier_bytes_received: AtomicU64,
+    bulk_transfer_bytes_sent: AtomicU64,
+    bulk_transfer_bytes_received: AtomicU64,
+    checkpoint_bytes_sent: AtomicU64,
+    checkpoint_bytes_received: AtomicU64,
     outbound_backpressure_wait_count: AtomicU64,
     outbound_backpressure_wait_ms: AtomicU64,
     outbound_bandwidth_wait_count: AtomicU64,
@@ -179,6 +187,10 @@ impl TensorPlaneMetrics {
             all_gather_bytes_received: AtomicU64::new(0),
             barrier_bytes_sent: AtomicU64::new(0),
             barrier_bytes_received: AtomicU64::new(0),
+            bulk_transfer_bytes_sent: AtomicU64::new(0),
+            bulk_transfer_bytes_received: AtomicU64::new(0),
+            checkpoint_bytes_sent: AtomicU64::new(0),
+            checkpoint_bytes_received: AtomicU64::new(0),
             outbound_backpressure_wait_count: AtomicU64::new(0),
             outbound_backpressure_wait_ms: AtomicU64::new(0),
             outbound_bandwidth_wait_count: AtomicU64::new(0),
@@ -313,6 +325,22 @@ impl std::fmt::Debug for ServingSessionTransport {
 impl ServingSessionTransport {
     pub fn session_id(&self) -> Uuid {
         self.session.session_id
+    }
+
+    pub fn stream_id_for(&self, lane: CollectiveLane, step: u32, slot: u32) -> u32 {
+        let plan = match lane {
+            CollectiveLane::ReduceScatter => self.reduce_scatter_plan,
+            CollectiveLane::AllGather => self.all_gather_plan,
+            CollectiveLane::Control => self.control_plan,
+            CollectiveLane::BulkTransfer => self.bulk_transfer_plan,
+            CollectiveLane::Checkpoint => self.checkpoint_plan,
+        };
+        let stream_count = plan.desired_stream_count.max(1) as u32;
+        if stream_count == 1 {
+            0
+        } else {
+            step.wrapping_add(slot) % stream_count
+        }
     }
 
     pub async fn send_reduce_scatter_chunk(
@@ -788,6 +816,26 @@ impl TensorPlane {
                 .metrics
                 .barrier_bytes_received
                 .load(Ordering::Relaxed),
+            bulk_transfer_bytes_sent: self
+                .state
+                .metrics
+                .bulk_transfer_bytes_sent
+                .load(Ordering::Relaxed),
+            bulk_transfer_bytes_received: self
+                .state
+                .metrics
+                .bulk_transfer_bytes_received
+                .load(Ordering::Relaxed),
+            checkpoint_bytes_sent: self
+                .state
+                .metrics
+                .checkpoint_bytes_sent
+                .load(Ordering::Relaxed),
+            checkpoint_bytes_received: self
+                .state
+                .metrics
+                .checkpoint_bytes_received
+                .load(Ordering::Relaxed),
             outbound_backpressure_wait_count: self
                 .state
                 .metrics
@@ -887,26 +935,11 @@ impl TensorPlane {
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
     ) -> Result<()> {
-        let hot_lane_plans = [
-            lane_plan(
-                CollectiveLane::ReduceScatter,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-            lane_plan(
-                CollectiveLane::AllGather,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-            lane_plan(
-                CollectiveLane::Control,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-        ];
+        let hot_lane_plans = serving_lane_plans(
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
         for &peer in peers {
             for plan in hot_lane_plans {
                 self.ensure_connection_pool(peer, plan.lane, plan.desired_stream_count, true)
@@ -1371,17 +1404,59 @@ fn lane_plan(
     let bulk_streams = preferred_serving_stream_count(runtime_mode, provider, max_streams);
     let interactive_streams = bulk_streams.min(2).max(1);
     let control_streams = 1;
+    let checkpoint_streams = match (provider, runtime_mode) {
+        (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => interactive_streams,
+        (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
+            interactive_streams
+        }
+        _ => 1,
+    };
     let desired_stream_count = match lane {
         CollectiveLane::ReduceScatter => bulk_streams.max(1),
         CollectiveLane::AllGather => interactive_streams,
         CollectiveLane::Control => control_streams,
-        CollectiveLane::BulkTransfer | CollectiveLane::Checkpoint => 1,
+        CollectiveLane::BulkTransfer => interactive_streams,
+        CollectiveLane::Checkpoint => checkpoint_streams,
     };
     ServingLanePlan {
         lane,
         traffic_class: lane.traffic_class(),
         desired_stream_count,
     }
+}
+
+fn serving_lane_plans(
+    runtime_mode: InferenceRuntimeMode,
+    provider: ExecutionProviderKind,
+    max_streams: usize,
+) -> [ServingLanePlan; 5] {
+    [
+        lane_plan(
+            CollectiveLane::ReduceScatter,
+            runtime_mode,
+            provider,
+            max_streams,
+        ),
+        lane_plan(
+            CollectiveLane::AllGather,
+            runtime_mode,
+            provider,
+            max_streams,
+        ),
+        lane_plan(CollectiveLane::Control, runtime_mode, provider, max_streams),
+        lane_plan(
+            CollectiveLane::BulkTransfer,
+            runtime_mode,
+            provider,
+            max_streams,
+        ),
+        lane_plan(
+            CollectiveLane::Checkpoint,
+            runtime_mode,
+            provider,
+            max_streams,
+        ),
+    ]
 }
 
 fn reserved_priority_outbound_budget(total: usize) -> usize {
@@ -1463,7 +1538,10 @@ fn record_phase_bytes(metrics: &TensorPlaneMetrics, lane: CollectiveLane, bytes:
         (CollectiveLane::AllGather, false) => &metrics.all_gather_bytes_received,
         (CollectiveLane::Control, true) => &metrics.barrier_bytes_sent,
         (CollectiveLane::Control, false) => &metrics.barrier_bytes_received,
-        (CollectiveLane::BulkTransfer | CollectiveLane::Checkpoint, _) => return,
+        (CollectiveLane::BulkTransfer, true) => &metrics.bulk_transfer_bytes_sent,
+        (CollectiveLane::BulkTransfer, false) => &metrics.bulk_transfer_bytes_received,
+        (CollectiveLane::Checkpoint, true) => &metrics.checkpoint_bytes_sent,
+        (CollectiveLane::Checkpoint, false) => &metrics.checkpoint_bytes_received,
     };
     metric.fetch_add(bytes, Ordering::Relaxed);
 }
@@ -1730,7 +1808,7 @@ mod tests {
             .unwrap();
 
         wait_for_metric(&plane, |snapshot| {
-            snapshot.current_outbound_connections >= 4
+            snapshot.current_outbound_connections >= 10
         })
         .await;
 
@@ -1740,6 +1818,30 @@ mod tests {
         assert!(capabilities.reserved_priority_outbound_inflight_bytes > 0);
         assert!(capabilities.bulk_send_bandwidth_bytes_per_sec > 0);
         assert!(capabilities.per_peer_bulk_fairness);
+    }
+
+    #[tokio::test]
+    async fn test_serving_transport_stream_ids_follow_lane_plan() {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
+            max_concurrent_outbound_streams_per_peer: 3,
+            ..TensorPlaneConfig::default()
+        })
+        .await
+        .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(session.stream_id_for(CollectiveLane::Control, 7, 9), 0);
+        assert_eq!(session.stream_id_for(CollectiveLane::AllGather, 1, 0), 1);
+        assert_eq!(session.stream_id_for(CollectiveLane::BulkTransfer, 1, 0), 1);
+        assert_eq!(session.stream_id_for(CollectiveLane::Checkpoint, 2, 1), 1);
     }
 
     #[tokio::test]
@@ -1822,6 +1924,11 @@ mod tests {
 
         assert_eq!(bulk.chunk_data, vec![1.0, 2.0, 3.0]);
         assert_eq!(checkpoint.chunk_data, vec![9.0]);
+        let snapshot = plane.metrics_snapshot();
+        assert!(snapshot.bulk_transfer_bytes_sent > 0);
+        assert!(snapshot.bulk_transfer_bytes_received > 0);
+        assert!(snapshot.checkpoint_bytes_sent > 0);
+        assert!(snapshot.checkpoint_bytes_received > 0);
     }
 
     #[tokio::test]

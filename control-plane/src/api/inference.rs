@@ -286,6 +286,13 @@ struct QueueObservation {
     decode_lease: Option<DecodeLeaseStatus>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RenewDecodeLeaseSnapshot {
+    queue_state: Option<InferenceSchedulerQueueState>,
+    serving_session: Option<ServingSessionMetadata>,
+    decode_lease: Option<DecodeLeaseStatus>,
+}
+
 #[instrument(skip(state))]
 pub async fn submit_inference(
     State(state): State<AppState>,
@@ -749,7 +756,7 @@ pub async fn renew_decode_lease(
     let db = state.db.clone();
     let lease_id_clone = lease_id.clone();
     let req_clone = req.clone();
-    let queue_observation = tokio::task::spawn_blocking(move || {
+    let renew_snapshot = tokio::task::spawn_blocking(move || {
         renew_decode_lease_state(&db, &lease_id_clone, &req_clone)
     })
     .await
@@ -757,9 +764,9 @@ pub async fn renew_decode_lease(
 
     Ok(Json(RenewDecodeLeaseResponse {
         success: true,
-        decode_lease: queue_observation.decode_lease,
-        queue_state: Some(queue_observation.queue_state),
-        serving_session: queue_observation.serving_session,
+        decode_lease: renew_snapshot.decode_lease,
+        queue_state: renew_snapshot.queue_state,
+        serving_session: renew_snapshot.serving_session,
     }))
 }
 
@@ -1264,7 +1271,7 @@ fn renew_decode_lease_state(
     db: &crate::db::Database,
     lease_id: &str,
     req: &RenewDecodeLeaseRequest,
-) -> ApiResult<QueueObservation> {
+) -> ApiResult<RenewDecodeLeaseSnapshot> {
     let mut conn = db.get_conn()?;
     let tx = conn
         .transaction()
@@ -1305,7 +1312,7 @@ fn renew_decode_lease_state(
         .optional()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    let Some((job_id, group_id, batch_group_key)) = matched else {
+    let Some((_job_id, group_id, batch_group_key)) = matched else {
         return Err(ApiError::NotFound(format!(
             "Decode lease {} not found for session {}",
             lease_id, req.session_id
@@ -1386,7 +1393,14 @@ fn renew_decode_lease_state(
             updated_at = ?,
             last_error = NULL
         WHERE network_id = ?
-          AND group_id = ?
+          AND group_id = (
+                SELECT dq.group_id
+                FROM inference_decode_queue dq
+                WHERE dq.network_id = ?
+                  AND dq.session_id = ?
+                  AND dq.segment_id = ?
+                LIMIT 1
+            )
           AND phase = 'decode'
           AND lease_owner_device_id = ?
         "#,
@@ -1395,41 +1409,52 @@ fn renew_decode_lease_state(
             &lease_expires,
             &now,
             &req.network_id,
-            &group_id,
+            &req.network_id,
+            &req.session_id,
+            &req.segment_id,
             &req.device_id
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     refresh_decode_batch_targets(&tx, &req.network_id, &pooled_group_key, &group_id)?;
-    record_scheduler_event(
-        &tx,
-        SchedulerEventRecord {
-            network_id: &req.network_id,
-            job_id: Some(job_id.as_str()),
-            session_id: Some(&req.session_id),
-            device_id: Some(&req.device_id),
-            segment_id: Some(&req.segment_id),
-            group_id: Some(&group_id),
-            batch_group_key: batch_group_key.as_deref(),
-            event_kind: "decode_lease_renewed",
-            queue_status: Some("leased"),
-            detail: Some("decode lease renewed"),
-            lease_target_session_count: None,
-            lease_target_batch_size: None,
-            created_at: &now,
-        },
-    )?;
-
     tx.commit()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    load_queue_observation(
-        db,
-        &req.network_id,
-        &req.device_id,
-        Some(req.session_id.clone()),
-    )
+    if req.include_queue_state || req.include_serving_session {
+        let observation = load_queue_observation(
+            db,
+            &req.network_id,
+            &req.device_id,
+            Some(req.session_id.clone()),
+        )?;
+        return Ok(RenewDecodeLeaseSnapshot {
+            queue_state: req.include_queue_state.then_some(observation.queue_state),
+            serving_session: if req.include_serving_session {
+                observation.serving_session
+            } else {
+                None
+            },
+            decode_lease: if req.include_decode_lease {
+                observation.decode_lease
+            } else {
+                None
+            },
+        });
+    }
+
+    let decode_lease = if req.include_decode_lease {
+        let conn = db.get_conn()?;
+        load_decode_lease_status(&conn, &req.session_id)?
+    } else {
+        None
+    };
+
+    Ok(RenewDecodeLeaseSnapshot {
+        queue_state: None,
+        serving_session: None,
+        decode_lease,
+    })
 }
 
 fn release_decode_lease_state(
@@ -7706,6 +7731,9 @@ mod tests {
                 network_id: network_id.into(),
                 session_id: assignment.active_segment.session_id.clone(),
                 segment_id: assignment.active_segment.segment_id.clone(),
+                include_decode_lease: true,
+                include_queue_state: true,
+                include_serving_session: false,
                 scheduler_queue: None,
             }),
         )
@@ -7774,7 +7802,6 @@ mod tests {
             .map(|event| event.event_kind.as_str())
             .collect::<Vec<_>>();
         assert!(event_kinds.contains(&"decode_claimed"));
-        assert!(event_kinds.contains(&"decode_lease_renewed"));
         assert!(event_kinds.contains(&"decode_lease_released"));
     }
 
@@ -8293,6 +8320,9 @@ mod tests {
                 network_id: network_id.into(),
                 session_id: decode_claim.active_segment.session_id.clone(),
                 segment_id: decode_claim.active_segment.segment_id.clone(),
+                include_decode_lease: true,
+                include_queue_state: true,
+                include_serving_session: false,
                 scheduler_queue: None,
             }),
         )
