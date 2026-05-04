@@ -1092,27 +1092,27 @@ agents.
 
 ### Agent 1 checklist
 
-- [ ] Define the target fast-path executor boundary for worker-local prefill and
+- ✅ Define the target fast-path executor boundary for worker-local prefill and
   decode.
-- [ ] Decide which current `agent/src/inference/forward_pass.rs` behaviors stay
+- ✅ Decide which current `agent/src/inference/forward_pass.rs` behaviors stay
   as fallback/correctness paths and which are superseded by the new fast path.
-- [ ] Produce a concrete layer execution plan for the GPU fast path:
+- ✅ Produce a concrete layer execution plan for the GPU fast path:
   - fused norm/quant stages
   - packed or fused projection stages
   - fused RoPE + KV write stages
   - paged attention integration
   - fused residual/MLP pointwise stages
   - device-side sampling tail where possible
-- [ ] Define how microbatch decode should map into the new executor without
+- ✅ Define how microbatch decode should map into the new executor without
   reintroducing high-level orchestration overhead.
-- [ ] Ensure the new executor still supports explicit prefill and decode phases.
-- [ ] Preserve compatibility with session-level accounting and progress surfaces.
-- [ ] Define the provider split:
+- ✅ Ensure the new executor still supports explicit prefill and decode phases.
+- ✅ Preserve compatibility with session-level accounting and progress surfaces.
+- ✅ Define the provider split:
   - CPU fallback path
   - Metal fast path expectations
   - CUDA fast path expectations
-- [ ] Specify the executor-facing interface contract that other layers must use.
-- [ ] Identify current code that should become fallback-only.
+- ✅ Specify the executor-facing interface contract that other layers must use.
+- ✅ Identify current code that should become fallback-only.
 - [ ] Identify current code that should be retired once the new path is proven.
 
 ### Agent 1 boundaries
@@ -1156,24 +1156,24 @@ specified.
 
 ### Agent 2 checklist
 
-- [ ] Define the canonical live KV format for active decode/prefill.
-- [ ] Make the live format paged and block-table-oriented unless a better
+- ✅ Define the canonical live KV format for active decode/prefill.
+- ✅ Make the live format paged and block-table-oriented unless a better
   kernel-native format is justified with equal clarity and performance.
-- [ ] Specify page size, block-table structure, per-layer layout, and required
+- ✅ Specify page size, block-table structure, per-layer layout, and required
   stride/offset invariants.
-- [ ] Remove export/checkpoint-driven design constraints from the live
+- ✅ Remove export/checkpoint-driven design constraints from the live
   representation.
-- [ ] Define the boundary between:
+- ✅ Define the boundary between:
   - live execution KV
   - transfer/checkpoint KV
-- [ ] Refactor append/update logic so active decode is optimized around the new
+- ✅ Refactor append/update logic so active decode is optimized around the new
   live format rather than generic growable host-style cache behavior.
-- [ ] Ensure multi-session decode batching can read/write live KV without
+- ✅ Ensure multi-session decode batching can read/write live KV without
   repeated format conversion.
-- [ ] Define the minimal metadata the executor needs per sequence/session.
-- [ ] Ensure the live format can describe ownership and residency in a way the
+- ✅ Define the minimal metadata the executor needs per sequence/session.
+- ✅ Ensure the live format can describe ownership and residency in a way the
   distributed system can still reason about.
-- [ ] Document the conversion hooks Agent 6 will need for export/import flows.
+- ✅ Document the conversion hooks Agent 6 will need for export/import flows.
 
 ### Agent 2 boundaries
 
@@ -1210,18 +1210,18 @@ the new fast path structurally repeatable and graph-capable.
 
 ### Agent 3 checklist
 
-- [ ] Define supported decode buckets.
-- [ ] Define supported prefill buckets or phased prefill bucketing strategy.
-- [ ] Define the metadata layout per bucket.
-- [ ] Define workspace requirements per bucket.
-- [ ] Introduce stable allocation and arena rules for fast-path execution.
-- [ ] Ensure graph capture safety rules are explicit and enforceable.
-- [ ] Define layout hashing or equivalent replay-validation logic.
-- [ ] Ensure capture/replay failure modes are typed and diagnosable.
-- [ ] Eliminate or isolate capture-unsafe realloc or metadata drift behavior in
+- ✅ Define supported decode buckets.
+- ✅ Define supported prefill buckets or phased prefill bucketing strategy.
+- ✅ Define the metadata layout per bucket.
+- ✅ Define workspace requirements per bucket.
+- ✅ Introduce stable allocation and arena rules for fast-path execution.
+- ✅ Ensure graph capture safety rules are explicit and enforceable.
+- ✅ Define layout hashing or equivalent replay-validation logic.
+- ✅ Ensure capture/replay failure modes are typed and diagnosable.
+- ✅ Eliminate or isolate capture-unsafe realloc or metadata drift behavior in
   the hot path.
-- [ ] Make bucket assumptions visible to the benchmark and validation workflows.
-- [ ] Provide interfaces that let Agent 1 plug executor launches into capture
+- ✅ Make bucket assumptions visible to the benchmark and validation workflows.
+- ✅ Provide interfaces that let Agent 1 plug executor launches into capture
   cleanly.
 
 ### Agent 3 boundaries
@@ -1259,21 +1259,21 @@ granularity expectations and with Agent 2 on live KV movement assumptions.
 
 ### Agent 4 checklist
 
-- [ ] Preserve the existing portable collective path as a baseline/fallback.
-- [ ] Define the target serving-group fast path for repeated inference traffic.
-- [ ] Reduce host-mediated overhead in collective operations where feasible.
-- [ ] Increase reuse of serving-group channels and connections.
-- [ ] Align collective buffer behavior with the new executor and live KV design.
-- [ ] Identify opportunities for provider-specialized collective behavior:
+- ✅ Preserve the existing portable collective path as a baseline/fallback.
+- ✅ Define the target serving-group fast path for repeated inference traffic.
+- ✅ Reduce host-mediated overhead in collective operations where feasible.
+- ✅ Increase reuse of serving-group channels and connections.
+- ✅ Align collective buffer behavior with the new executor and live KV design.
+- ✅ Identify opportunities for provider-specialized collective behavior:
   - CPU-safe baseline
   - Metal-aware path
   - CUDA-oriented high-throughput path
-- [ ] Reduce unnecessary framing/copy overhead in active decode traffic.
+- ✅ Reduce unnecessary framing/copy overhead in active decode traffic.
 - [ ] Evaluate where collective steps can overlap or pipeline better with
   execution.
-- [ ] Preserve observability and timeout diagnostics without letting them bloat
+- ✅ Preserve observability and timeout diagnostics without letting them bloat
   the core fast path.
-- [ ] Ensure the fast path remains compatible with multi-session decode cohorts.
+- ✅ Ensure the fast path remains compatible with multi-session decode cohorts.
 
 ### Agent 4 boundaries
 
@@ -1319,12 +1319,12 @@ internals yourself.
 - [ ] Reduce DB write amplification during active decode.
 - [ ] Reduce polling or observation churn where possible.
 - [ ] Revisit lease renewal cadence and lease ownership mutation cost.
-- [ ] Preserve queue visibility and operator introspection while coarsening
+- ✅ Preserve queue visibility and operator introspection while coarsening
   hot-path mutation where possible.
-- [ ] Preserve fairness and cohort semantics.
-- [ ] Ensure assignment, ownership, and resume semantics still work with a more
+- ✅ Preserve fairness and cohort semantics.
+- ✅ Ensure assignment, ownership, and resume semantics still work with a more
   autonomous worker-local execution window.
-- [ ] Make any schema/API changes needed to support lower hot-path pressure.
+- ✅ Make any schema/API changes needed to support lower hot-path pressure.
 - [ ] Preserve scheduler correctness while reducing interference with active
   serving.
 
@@ -1362,17 +1362,17 @@ without forcing the fast path to carry generic checkpoint-first assumptions.
 
 ### Agent 6 checklist
 
-- [ ] Define the boundary between live KV and transfer/checkpoint KV.
-- [ ] Refactor checkpoint export/import around explicit conversion points.
-- [ ] Ensure regroup and failover can still recover sessions under the new live
+- ✅ Define the boundary between live KV and transfer/checkpoint KV.
+- ✅ Refactor checkpoint export/import around explicit conversion points.
+- ✅ Ensure regroup and failover can still recover sessions under the new live
   KV format.
-- [ ] Preserve remote checkpoint download/import flows where still needed.
-- [ ] Reduce the amount of live executor state shaped primarily by recovery
+- ✅ Preserve remote checkpoint download/import flows where still needed.
+- ✅ Reduce the amount of live executor state shaped primarily by recovery
   concerns.
-- [ ] Preserve session continuity semantics through pause/resume/regroup paths.
-- [ ] Validate that ownership, residency, and checkpoint metadata still align
+- ✅ Preserve session continuity semantics through pause/resume/regroup paths.
+- ✅ Validate that ownership, residency, and checkpoint metadata still align
   with the new live executor contracts.
-- [ ] Ensure failover state transitions remain observable and debuggable.
+- ✅ Ensure failover state transitions remain observable and debuggable.
 - [ ] Keep shrink, replace, and resume-ready semantics intact unless there is an
   explicit system-level decision to alter them.
 
