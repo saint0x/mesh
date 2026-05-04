@@ -531,6 +531,78 @@ impl InferenceStats {
         self.decode_sessions_batched.load(Ordering::Relaxed) as f64 / microbatches as f64
     }
 
+    pub fn fast_path_decode_plan_rate(&self) -> f64 {
+        let microbatches = self.decode_microbatches_executed.load(Ordering::Relaxed);
+        if microbatches == 0 {
+            return 0.0;
+        }
+        self.decode_fast_path_plans.load(Ordering::Relaxed) as f64 / microbatches as f64
+    }
+
+    pub fn multi_session_batch_rate(&self) -> f64 {
+        let microbatches = self.decode_microbatches_executed.load(Ordering::Relaxed);
+        if microbatches == 0 {
+            return 0.0;
+        }
+        self.decode_multi_session_microbatches.load(Ordering::Relaxed) as f64 / microbatches as f64
+    }
+
+    pub fn avg_deferred_sessions_per_microbatch(&self) -> f64 {
+        let microbatches = self.decode_microbatches_executed.load(Ordering::Relaxed);
+        if microbatches == 0 {
+            return 0.0;
+        }
+        self.decode_batch_deferred_sessions.load(Ordering::Relaxed) as f64 / microbatches as f64
+    }
+
+    pub fn allreduce_send_wait_share(&self) -> f64 {
+        let total = self.total_allreduce_time_ms.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        self.total_allreduce_send_wait_ms.load(Ordering::Relaxed) as f64 / total as f64
+    }
+
+    pub fn allreduce_receive_wait_share(&self) -> f64 {
+        let total = self.total_allreduce_time_ms.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        self.total_allreduce_receive_wait_ms.load(Ordering::Relaxed) as f64 / total as f64
+    }
+
+    pub fn collective_transport_share_of_runtime(&self) -> f64 {
+        let total_runtime = self.total_inference_time_ms.load(Ordering::Relaxed);
+        if total_runtime == 0 {
+            return 0.0;
+        }
+        let collective_ms = self.total_reduce_scatter_time_ms.load(Ordering::Relaxed)
+            + self.total_all_gather_time_ms.load(Ordering::Relaxed)
+            + self.total_allreduce_send_wait_ms.load(Ordering::Relaxed)
+            + self.total_allreduce_receive_wait_ms.load(Ordering::Relaxed);
+        collective_ms as f64 / total_runtime as f64
+    }
+
+    pub fn recovery_success_rate(&self) -> f64 {
+        let attempts = self.recovery_attempts.load(Ordering::Relaxed);
+        if attempts == 0 {
+            return 0.0;
+        }
+        self.checkpoint_recoveries.load(Ordering::Relaxed) as f64 / attempts as f64
+    }
+
+    pub fn recovery_rejection_rate(&self) -> f64 {
+        let attempts = self.recovery_attempts.load(Ordering::Relaxed);
+        if attempts == 0 {
+            return 0.0;
+        }
+        let rejections = self
+            .recovery_cooldown_rejections
+            .load(Ordering::Relaxed)
+            + self.recovery_budget_rejections.load(Ordering::Relaxed);
+        rejections as f64 / attempts as f64
+    }
+
     /// Get average inference time per job in milliseconds
     pub fn avg_inference_time_ms(&self) -> f64 {
         let jobs = self.jobs_completed.load(Ordering::Relaxed);
@@ -583,6 +655,18 @@ impl InferenceStats {
             avg_allreduce_latency_ms = format!("{:.2}", self.avg_allreduce_latency_ms()),
             decode_microbatches_executed = decode_microbatches,
             avg_decode_batch_size = format!("{:.2}", self.avg_decode_batch_size()),
+            fast_path_decode_plan_rate = format!("{:.3}", self.fast_path_decode_plan_rate()),
+            multi_session_batch_rate = format!("{:.3}", self.multi_session_batch_rate()),
+            avg_deferred_sessions_per_microbatch = format!(
+                "{:.2}",
+                self.avg_deferred_sessions_per_microbatch()
+            ),
+            allreduce_send_wait_share = format!("{:.3}", self.allreduce_send_wait_share()),
+            allreduce_receive_wait_share = format!("{:.3}", self.allreduce_receive_wait_share()),
+            collective_transport_share_of_runtime = format!(
+                "{:.3}",
+                self.collective_transport_share_of_runtime()
+            ),
             decode_multi_session_microbatches = self
                 .decode_multi_session_microbatches
                 .load(Ordering::Relaxed),
@@ -620,6 +704,8 @@ impl InferenceStats {
             checkpoints_created = checkpoints,
             checkpoint_recoveries = recoveries,
             recovery_attempts = recovery_attempts,
+            recovery_success_rate = format!("{:.3}", self.recovery_success_rate()),
+            recovery_rejection_rate = format!("{:.3}", self.recovery_rejection_rate()),
             tensor_bytes_sent = self.tensor_bytes_sent.load(Ordering::Relaxed),
             tensor_bytes_received = self.tensor_bytes_received.load(Ordering::Relaxed),
             tensor_reduce_scatter_bytes_sent = self
@@ -746,6 +832,18 @@ impl InferenceStats {
         );
         println!("  Avg Batch Size:      {:.2}", self.avg_decode_batch_size());
         println!(
+            "  Fast-Path Plan Rate: {:.1}%",
+            self.fast_path_decode_plan_rate() * 100.0
+        );
+        println!(
+            "  Multi-Session Rate:  {:.1}%",
+            self.multi_session_batch_rate() * 100.0
+        );
+        println!(
+            "  Avg Deferred/Btch:   {:.2}",
+            self.avg_deferred_sessions_per_microbatch()
+        );
+        println!(
             "  Peak Batch Size:     {}",
             self.decode_batch_size_peak.load(Ordering::Relaxed)
         );
@@ -816,8 +914,16 @@ impl InferenceStats {
             self.checkpoint_recoveries.load(Ordering::Relaxed)
         );
         println!(
+            "  Recovery Success:    {:.1}%",
+            self.recovery_success_rate() * 100.0
+        );
+        println!(
             "  Recovery Attempts:   {}",
             self.recovery_attempts.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Recovery Reject Rate:{:.1}%",
+            self.recovery_rejection_rate() * 100.0
         );
         println!(
             "  Recovery Cooldowns:  {}",
@@ -1212,6 +1318,38 @@ impl InferenceStats {
             serde_json::Value::from(self.avg_decode_batch_size()),
         );
         map.insert(
+            "fast_path_decode_plan_rate".to_string(),
+            serde_json::Value::from(self.fast_path_decode_plan_rate()),
+        );
+        map.insert(
+            "multi_session_batch_rate".to_string(),
+            serde_json::Value::from(self.multi_session_batch_rate()),
+        );
+        map.insert(
+            "avg_deferred_sessions_per_microbatch".to_string(),
+            serde_json::Value::from(self.avg_deferred_sessions_per_microbatch()),
+        );
+        map.insert(
+            "allreduce_send_wait_share".to_string(),
+            serde_json::Value::from(self.allreduce_send_wait_share()),
+        );
+        map.insert(
+            "allreduce_receive_wait_share".to_string(),
+            serde_json::Value::from(self.allreduce_receive_wait_share()),
+        );
+        map.insert(
+            "collective_transport_share_of_runtime".to_string(),
+            serde_json::Value::from(self.collective_transport_share_of_runtime()),
+        );
+        map.insert(
+            "recovery_success_rate".to_string(),
+            serde_json::Value::from(self.recovery_success_rate()),
+        );
+        map.insert(
+            "recovery_rejection_rate".to_string(),
+            serde_json::Value::from(self.recovery_rejection_rate()),
+        );
+        map.insert(
             "uptime".to_string(),
             serde_json::Value::from(self.uptime_string()),
         );
@@ -1332,6 +1470,9 @@ mod tests {
             1
         );
         assert_eq!(stats.avg_decode_batch_size(), 2.0);
+        assert_eq!(stats.fast_path_decode_plan_rate(), 0.0);
+        assert_eq!(stats.multi_session_batch_rate(), 0.5);
+        assert_eq!(stats.avg_deferred_sessions_per_microbatch(), 1.0);
     }
 
     #[test]
@@ -1355,6 +1496,8 @@ mod tests {
         );
         assert_eq!(stats.recovery_budget_rejections.load(Ordering::Relaxed), 1);
         assert_eq!(stats.recovery_checkpoint_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.recovery_success_rate(), 1.0);
+        assert_eq!(stats.recovery_rejection_rate(), 2.0);
     }
 
     #[test]
@@ -1367,6 +1510,7 @@ mod tests {
         assert_eq!(json["jobs_completed"], 1);
         assert_eq!(json["total_tokens_generated"], 50);
         assert_eq!(json["avg_decode_batch_size"], 0.0);
+        assert_eq!(json["fast_path_decode_plan_rate"], 0.0);
     }
 
     #[test]
@@ -1403,6 +1547,7 @@ mod tests {
 
         assert_eq!(stats.prefill_fast_path_plans.load(Ordering::Relaxed), 1);
         assert_eq!(stats.decode_fast_path_plans.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.fast_path_decode_plan_rate(), 0.0);
         assert_eq!(stats.fast_path_arena_reuses.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats
@@ -1416,6 +1561,23 @@ mod tests {
                 .load(Ordering::Relaxed),
             4
         );
+    }
+
+    #[test]
+    fn test_stats_transport_attribution_metrics() {
+        let stats = InferenceStats::new();
+        stats.record_success(10, 20, 100);
+        stats.record_allreduce(40);
+        stats.record_allreduce_breakdown(RingAllReduceMetrics {
+            reduce_scatter_step_time_ms: 10,
+            all_gather_step_time_ms: 12,
+            send_wait_time_ms: 4,
+            receive_wait_time_ms: 6,
+        });
+
+        assert!((stats.allreduce_send_wait_share() - 0.1).abs() < f64::EPSILON);
+        assert!((stats.allreduce_receive_wait_share() - 0.15).abs() < f64::EPSILON);
+        assert!((stats.collective_transport_share_of_runtime() - 0.32).abs() < f64::EPSILON);
     }
 
     #[test]

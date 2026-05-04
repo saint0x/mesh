@@ -3191,6 +3191,44 @@ async fn cmd_inference_stats() -> Result<()> {
     if let Some(oversize_drops) = stats.get("tensor_oversized_message_rejections") {
         println!("  Oversize Drops:    {}", oversize_drops);
     }
+    if let Some(share) = stats.get("allreduce_send_wait_share") {
+        println!(
+            "  Send Wait Share:   {:.1}%",
+            share.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(share) = stats.get("allreduce_receive_wait_share") {
+        println!(
+            "  Recv Wait Share:   {:.1}%",
+            share.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(share) = stats.get("collective_transport_share_of_runtime") {
+        println!(
+            "  Collective Runtime:{:.1}%",
+            share.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+
+    println!("\n{}", "Decode Batching:".bold());
+    if let Some(avg) = stats.get("avg_decode_batch_size") {
+        println!("  Avg Batch Size:    {:.2}", avg.as_f64().unwrap_or(0.0));
+    }
+    if let Some(rate) = stats.get("fast_path_decode_plan_rate") {
+        println!(
+            "  Fast-Path Rate:    {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("multi_session_batch_rate") {
+        println!(
+            "  Multi-Session Rate:{:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(avg) = stats.get("avg_deferred_sessions_per_microbatch") {
+        println!("  Avg Deferred/Btch: {:.2}", avg.as_f64().unwrap_or(0.0));
+    }
 
     println!("\n{}", "Fault Tolerance:".bold());
     if let Some(ckpts) = stats.get("checkpoints_created") {
@@ -3201,6 +3239,18 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(attempts) = stats.get("recovery_attempts") {
         println!("  Recovery Attempts: {}", attempts);
+    }
+    if let Some(rate) = stats.get("recovery_success_rate") {
+        println!(
+            "  Recovery Success:  {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("recovery_rejection_rate") {
+        println!(
+            "  Recovery Rejects:  {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
     }
     if let Some(cooldown_hits) = stats.get("recovery_cooldown_rejections") {
         println!("  Recovery Cooldowns: {}", cooldown_hits);

@@ -1412,7 +1412,7 @@ their implementation logic, but do require measurable success criteria.
 
 ### Agent 7 checklist
 
-- [ ] Define benchmark suites for:
+- ✅ Define benchmark suites for:
   - local executor throughput/latency
   - decode batch scaling
   - prefill scaling
@@ -1424,16 +1424,16 @@ their implementation logic, but do require measurable success criteria.
 - ✅ Keep at least one real trace recorded and validated for each major active
   goal area.
 - ✅ Add host-backed checks where they are meaningful for runtime delivery.
-- [ ] Make regressions attributable by capturing enough telemetry to separate:
+- ✅ Make regressions attributable by capturing enough telemetry to separate:
   - executor loss
   - collective loss
   - scheduler/control-plane loss
   - recovery-path interference
-- [ ] Update or replace performance logs such as `ZIPPERF.md` as the system
+- ✅ Update or replace performance logs such as `ZIPPERF.md` as the system
   evolves.
-- [ ] Ensure old benchmark paths are clearly marked invalid when architectural
+- ✅ Ensure old benchmark paths are clearly marked invalid when architectural
   assumptions change.
-- [ ] Give each other agent measurable acceptance targets.
+- ✅ Give each other agent measurable acceptance targets.
 
 ### Agent 7 boundaries
 
@@ -1449,6 +1449,25 @@ their implementation logic, but do require measurable success criteria.
   is built in, not bolted on later.
 - If a workstream cannot be meaningfully measured yet, force it to define proxy
   metrics rather than letting the implementation proceed unobserved.
+
+### Agent 7 proof surfaces
+
+- Local runtime attribution now includes:
+  - fast-path decode plan rate
+  - multi-session batch rate
+  - average deferred sessions per microbatch
+  - all-reduce send-wait share
+  - all-reduce receive-wait share
+  - collective transport share of runtime
+  - recovery success rate
+  - recovery rejection rate
+- Control-plane attribution continues to rely on scheduler/operator status for:
+  - decode queue depth and blocked/runnable mix
+  - batch telemetry coverage
+  - checkpoint fallback transfer rate
+  - regroup and recovery latency metrics
+- `ZIPPERF.md` now defines the benchmark suite taxonomy, attribution rules, and
+  current acceptance gates.
 
 ## Cross-Agent Interface Checklist
 

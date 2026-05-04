@@ -1,5 +1,212 @@
 # ZIPPERF
 
+## Current Status
+
+- Date: 2026-05-04
+- Current local repo head when this benchmark framework was refreshed:
+  - `39da3a5b`
+- Current status:
+  - runtime/core integration is validation-green
+  - strict deterministic Fozzy scenarios are green
+  - workspace Rust tests are green
+  - OSS `zip` mirror has been resynced to the validated shared runtime surface
+- What this file now is:
+  - the benchmark contract for Agent 7
+  - the source of truth for which perf claims are still unproven
+  - the place where stale benchmark interpretations must be invalidated when architecture changes
+
+## Agent 7 Benchmark Suite
+
+The benchmark program is now split into distinct proof buckets so regressions
+can be attributed instead of blended together.
+
+### 1. Local executor throughput and latency
+
+Purpose:
+
+- determine whether the fast path materially improves node-local serving cost
+- separate local executor wins from distributed transport effects
+
+Required measurements:
+
+- TTFT
+- completion tok/s
+- prompt tok/s
+- fast-path decode plan rate
+- replay-preferred versus layout-validated fast-path mix
+
+Required command surfaces:
+
+- `cargo test --workspace -- --test-threads=1`
+- `fozzy test --det --strict tests/serving_production_integrated.fozzy.json --json`
+- `mesh inference stats`
+
+### 2. Decode batch scaling
+
+Purpose:
+
+- validate that multi-session decode batching is actually being admitted and used
+- identify whether performance loss is due to batching gaps versus executor cost
+
+Required measurements:
+
+- average decode batch size
+- peak decode batch size
+- multi-session batch rate
+- average deferred sessions per microbatch
+- batch KV-token footprint
+
+Primary observability surfaces:
+
+- local inference stats JSON and CLI
+- scheduler/operator status batch telemetry
+- `tests/continuous_batching.fozzy.json`
+
+### 3. Prefill scaling
+
+Purpose:
+
+- verify that prefill bucketing and workspace reuse are working as intended
+- prevent regressions where decode improves but prefill silently worsens
+
+Required measurements:
+
+- prefill fast-path plan count
+- prefill bucket ceiling usage
+- arena reuse rate
+- TTFT deltas under prompt-length growth
+
+### 4. Collective and transport overhead
+
+Purpose:
+
+- isolate distributed communication cost from executor cost
+- prove whether overlap and background transfer changes are helping
+
+Required measurements:
+
+- average all-reduce latency
+- reduce-scatter and all-gather total time
+- all-reduce send-wait share
+- all-reduce receive-wait share
+- collective transport share of total runtime
+- checkpoint and bulk transfer byte volume
+
+Primary observability surfaces:
+
+- local inference stats JSON and CLI
+- `tests/transport_collective_evolution.fozzy.json`
+
+### 5. Control-plane pressure under active serving
+
+Purpose:
+
+- prove that active decode is less entangled with control-plane churn
+- separate scheduler/DB loss from executor and transport loss
+
+Required measurements:
+
+- decode queue depth
+- runnable/blocked/leased/active session mix
+- deferred decode session count
+- batch telemetry coverage
+- checkpoint fallback transfer rate
+- recent regroup counts
+- recent recovery latency metrics
+
+Primary observability surfaces:
+
+- `/api/status/networks/:network_id/scheduler`
+- `/api/status/jobs/:job_id/scheduler`
+- control-plane scheduler event stream
+
+### 6. Checkpoint, recovery, and KV conversion overhead
+
+Purpose:
+
+- preserve distributed product semantics without letting recovery costs hide in the hot path
+
+Required measurements:
+
+- checkpoints created
+- recovery attempts
+- recovery success rate
+- recovery rejection rate
+- recent average and peak recovery latency
+- checkpoint fallback transfer count and rate
+
+Primary observability surfaces:
+
+- local inference stats JSON and CLI
+- scheduler/operator status recovery metrics
+- `tests/incremental_decode_recovery.fozzy.json`
+
+### 7. End-to-end distributed inference
+
+Purpose:
+
+- establish whether the distributed engine itself is better, not just isolated components
+
+Required measurements:
+
+- successful distributed completion
+- TTFT
+- steady-state tok/s
+- failure-free completion under serving topology
+- comparison between same-host and cross-host serving topologies
+
+## Attribution Rules
+
+When a run regresses, classify it before calling it “slower.”
+
+- executor loss:
+  - low fast-path decode plan rate
+  - low arena reuse
+  - low multi-session batch rate without corresponding transport pressure
+- collective loss:
+  - elevated all-reduce latency
+  - elevated send/receive wait share
+  - elevated collective-runtime share
+- scheduler/control-plane loss:
+  - growing queue depth
+  - higher blocked/leased churn
+  - elevated deferred decode sessions with stable local executor counters
+- recovery-path interference:
+  - checkpoint fallback transfer growth
+  - elevated recovery latency
+  - increased recovery rejection rate or regroup churn
+
+## Current Acceptance Gates
+
+These are the minimum proof gates for claiming the tune-up is performance-positive.
+
+- Local fast path:
+  - fast-path decode plan rate should remain high on accelerated providers
+  - multi-session batching should be observable, not theoretical
+- Collective path:
+  - send/receive wait share must not dominate runtime under healthy serving conditions
+  - background checkpoint/bulk transfer behavior must not break blocking collective correctness
+- Recovery path:
+  - shrink/replace/resume-ready semantics must remain green under failover coverage
+  - checkpoint fallback rate should be observable and trendable
+- End-to-end:
+  - no claim of TTFT or tok/s improvement is valid until a distributed completion baseline exists
+
+## Invalidated Historical Read
+
+The older April 2026 same-host benchmark notes below remain useful as incident
+history, but they should no longer be treated as the current performance read.
+
+Reasons they are stale:
+
+- the runtime architecture has materially changed
+- fast-path planning, paged KV semantics, collective overlap behavior, and
+  recovery conversion boundaries have all moved since that snapshot
+- the attribution metrics available now did not exist during that earlier run
+
+Treat the remainder of this document as historical context until replaced by a
+fresh successful distributed benchmark pass under the current runtime.
+
 ## Purpose
 
 This file is the running performance and benchmark log for the Mesh/zip inference
