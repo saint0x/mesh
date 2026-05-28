@@ -363,6 +363,8 @@ impl InferenceCoordinator {
             backend.provider_kind(),
             backend.optimization_profile(),
             position.shard_column_range,
+            position.shard_worker_position,
+            position.shard_total_workers,
             TransportCapabilityTier::DirectTcp,
             backend.executor_contract().clone(),
             self.runtime_memory_budget(),
@@ -488,6 +490,40 @@ impl InferenceCoordinator {
         self.sessions.get_mut(&request.session_id).ok_or_else(|| {
             AgentError::Execution("session backend vanished during initialization".to_string())
         })
+    }
+
+    fn session_backend_matches_position(
+        session: &ActiveSession,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> bool {
+        session.job.request.model_id == request.model_id
+            && session.engine_state.backend.shard_column_range == position.shard_column_range
+            && session.engine_state.backend.shard_worker_position == position.shard_worker_position
+            && session.engine_state.backend.shard_total_workers == position.shard_total_workers
+    }
+
+    async fn invalidate_session_for_layout_change(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> Result<()> {
+        let Some(existing) = self.sessions.get(&request.session_id) else {
+            return Ok(());
+        };
+        if Self::session_backend_matches_position(existing, request, position) {
+            return Ok(());
+        }
+
+        if self.config.checkpointing_enabled && self.checkpoint_manager.is_some() && !existing.job.is_complete() {
+            let snapshot = existing.job.clone();
+            self.checkpoint(&snapshot).await?;
+        }
+
+        self.sessions.remove(&request.session_id);
+        self.remove_decode_task(request.session_id);
+        self.prune_unused_model_residency();
+        Ok(())
     }
 
     /// Set the checkpoint manager
@@ -1128,9 +1164,9 @@ impl InferenceCoordinator {
             "Starting execution segment"
         );
 
-        self.ensure_session_backend(&request, &position).await?;
         match request.phase {
             ExecutionPhase::Prefill => {
+                self.ensure_session_backend(&request, &position).await?;
                 let result = self
                     .run_prefill_segment(&request, &position, &mut on_progress)
                     .await?;
@@ -1816,6 +1852,8 @@ impl InferenceCoordinator {
         F: FnMut(InferenceProgressUpdate) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        self.invalidate_session_for_layout_change(request, position)
+            .await?;
         if !self.sessions.contains_key(&request.session_id) {
             let recovered = self
                 .recover_session_from_checkpoint(request, position)
@@ -2152,6 +2190,8 @@ mod tests {
                     crate::inference::LocalExecutorContract::for_provider(provider)
                         .optimization_profile,
                     (0, 1024),
+                    0,
+                    1,
                     TransportCapabilityTier::DirectPreferred,
                     crate::inference::LocalExecutorContract::for_provider(provider),
                     coordinator.runtime_memory_budget(),

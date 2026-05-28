@@ -8,7 +8,9 @@ use crate::api::types::{
     ExecutionGroup, ExecutionGroupMember, ExecutionPhase, InferenceExecutionPlan,
     InferenceRuntimeMode,
 };
+use crate::connectivity::{InferenceSchedulingPolicy, NetworkSettings};
 use crate::db::Database;
+use crate::services::scheduler::refresh_decode_plan_for_job;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceSessionRecord {
@@ -137,15 +139,17 @@ pub struct ResumePlan {
     pub next_kv_owner_device_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FailoverDecision {
     pub recovery_state: RecoveryState,
     pub strategy: RegroupStrategy,
     pub pause: PausePlan,
     pub resume: ResumePlan,
+    pub updated_plan: Option<InferenceExecutionPlan>,
     pub target_group_id: Option<String>,
     pub target_segment_id: Option<String>,
     pub target_participant_device_ids: Vec<String>,
+    pub transfer_source_device_id: Option<String>,
     pub replica_updates: Vec<DeviceStatusUpdate>,
     pub serving_group_updates: Vec<DeviceStatusUpdate>,
     pub reason: String,
@@ -157,6 +161,7 @@ impl FailoverEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         plan: &InferenceExecutionPlan,
+        refreshed_plan: Option<&InferenceExecutionPlan>,
         session: &InferenceSessionRecord,
         replicas: &[SessionReplicaRecord],
         serving_groups: &[ServingGroupRecord],
@@ -220,9 +225,11 @@ impl FailoverEngine {
                     decode_queue_status: None,
                     next_kv_owner_device_id: None,
                 },
+                updated_plan: None,
                 target_group_id: Some(active_group.group_id.clone()),
                 target_segment_id: Some(active_segment.segment_id.clone()),
                 target_participant_device_ids: active_segment.participant_device_ids.clone(),
+                transfer_source_device_id: None,
                 replica_updates: Vec::new(),
                 serving_group_updates: Vec::new(),
                 reason: "No active participant loss detected".to_string(),
@@ -239,6 +246,7 @@ impl FailoverEngine {
             ExecutionPhase::Decode => Self::decode_failover(
                 active_group,
                 active_segment,
+                refreshed_plan,
                 session,
                 replicas,
                 serving_groups,
@@ -279,9 +287,11 @@ impl FailoverEngine {
                 decode_queue_status: Some("failed".to_string()),
                 next_kv_owner_device_id: Some(session.kv_owner_device_id.clone()),
             },
+            updated_plan: None,
             target_group_id: None,
             target_segment_id: session.active_segment_id.clone(),
             target_participant_device_ids: Vec::new(),
+            transfer_source_device_id: None,
             replica_updates: lost_active
                 .iter()
                 .filter(|device_id| {
@@ -316,6 +326,7 @@ impl FailoverEngine {
     fn decode_failover(
         active_group: &ExecutionGroup,
         active_segment: &crate::api::types::ExecutionSegment,
+        refreshed_plan: Option<&InferenceExecutionPlan>,
         session: &InferenceSessionRecord,
         replicas: &[SessionReplicaRecord],
         serving_groups: &[ServingGroupRecord],
@@ -370,45 +381,82 @@ impl FailoverEngine {
                     .unwrap_or(true)
             })
             .collect::<Vec<_>>();
+        let refreshed_target = refreshed_plan.and_then(|plan| {
+            plan.segments
+                .iter()
+                .find(|segment| matches!(segment.phase, ExecutionPhase::Decode))
+                .and_then(|segment| {
+                    plan.execution_groups
+                        .iter()
+                        .find(|group| group.group_id == segment.execution_group_id)
+                        .map(|group| (segment, group))
+                })
+        });
 
-        let survivor_only_target = find_covering_set(
-            &available_members,
-            &survivor_ids,
-            required_span,
-            Some(survivor_ids.len()),
-        );
-        let mut target = survivor_only_target
-            .or_else(|| {
-                if config.prefer_replacement {
-                    find_covering_set(
-                        &available_members,
-                        &survivor_ids,
-                        required_span,
-                        Some(active_count),
-                    )
-                } else {
-                    None
-                }
-            })
-            .or_else(|| find_covering_set(&available_members, &survivor_ids, required_span, None));
+        let (target_group_id, target_segment_id, target_participants, next_kv_owner_device_id, updated_plan) =
+            if let Some((segment, group)) = refreshed_target {
+                (
+                    group.group_id.clone(),
+                    segment.segment_id.clone(),
+                    segment.participant_device_ids.clone(),
+                    segment.kv_owner_device_id.clone(),
+                    Some(refreshed_plan.expect("refreshed plan").clone()),
+                )
+            } else {
+                let survivor_only_target = find_covering_set(
+                    &available_members,
+                    &survivor_ids,
+                    required_span,
+                    Some(survivor_ids.len()),
+                );
+                let mut target = survivor_only_target
+                    .or_else(|| {
+                        if config.prefer_replacement {
+                            find_covering_set(
+                                &available_members,
+                                &survivor_ids,
+                                required_span,
+                                Some(active_count),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        find_covering_set(&available_members, &survivor_ids, required_span, None)
+                    });
 
-        let Some(target_participants) = target.take() else {
-            return Ok(Self::failed_decode_decision(
-                session,
-                replicas,
-                member_records.as_slice(),
-                lost_active,
-                "Remaining decode members can no longer cover the active shard span",
-            ));
-        };
+                let Some(target_participants) = target.take() else {
+                    return Ok(Self::failed_decode_decision(
+                        session,
+                        replicas,
+                        member_records.as_slice(),
+                        lost_active,
+                        "Remaining decode members can no longer cover the active shard span",
+                    ));
+                };
+                let next_kv_owner_device_id = select_next_kv_owner(
+                    &target_participants,
+                    session,
+                    &replica_map,
+                    &member_map,
+                )?;
+                (
+                    active_group.group_id.clone(),
+                    active_segment.segment_id.clone(),
+                    target_participants,
+                    next_kv_owner_device_id,
+                    None,
+                )
+            };
 
         let introduced = target_participants
             .iter()
             .filter(|device_id| !active_participants.contains(device_id))
             .cloned()
             .collect::<Vec<_>>();
-        let next_kv_owner_device_id =
-            select_next_kv_owner(&target_participants, session, &replica_map, &member_map)?;
+        let transfer_source_device_id =
+            select_transfer_source_device_id(session, lost_set, &target_participants);
 
         let requires_transfer = if introduced.is_empty() {
             false
@@ -421,7 +469,10 @@ impl FailoverEngine {
             true
         };
 
-        if requires_transfer && !checkpoint_available(session, replicas, &target_participants) {
+        if requires_transfer
+            && (transfer_source_device_id.is_none()
+                || !checkpoint_available(session, replicas, &target_participants))
+        {
             return Ok(Self::failed_decode_decision(
                 session,
                 replicas,
@@ -511,9 +562,11 @@ impl FailoverEngine {
                 decode_queue_status: Some("ready".to_string()),
                 next_kv_owner_device_id: Some(next_kv_owner_device_id),
             },
-            target_group_id: Some(active_group.group_id.clone()),
-            target_segment_id: Some(active_segment.segment_id.clone()),
+            updated_plan,
+            target_group_id: Some(target_group_id),
+            target_segment_id: Some(target_segment_id),
             target_participant_device_ids: target_participants,
+            transfer_source_device_id,
             replica_updates,
             serving_group_updates,
             reason,
@@ -546,9 +599,11 @@ impl FailoverEngine {
                 decode_queue_status: Some("failed".to_string()),
                 next_kv_owner_device_id: Some(session.kv_owner_device_id.clone()),
             },
+            updated_plan: None,
             target_group_id: None,
             target_segment_id: session.active_segment_id.clone(),
             target_participant_device_ids: Vec::new(),
+            transfer_source_device_id: None,
             replica_updates: lost_active
                 .iter()
                 .filter(|device_id| {
@@ -587,7 +642,6 @@ struct FailoverSessionContext {
     replicas: Vec<SessionReplicaRecord>,
     serving_groups: Vec<ServingGroupRecord>,
     decode_queue: Option<DecodeQueueRecord>,
-    batch_group_key: Option<String>,
 }
 
 pub fn reconcile_failover_state(db: &Database, lost_device_ids: &[String]) -> ApiResult<usize> {
@@ -600,8 +654,17 @@ pub fn reconcile_failover_state(db: &Database, lost_device_ids: &[String]) -> Ap
 
     for context in load_impacted_sessions(&tx, lost_device_ids)? {
         let config = failover_config_for_runtime_mode(context.plan.runtime_mode);
+        let scheduling_policy =
+            load_network_scheduling_policy(&tx, &context.session.network_id)?;
+        let refreshed_plan = refresh_decode_plan_for_job(
+            &tx,
+            &context.session.network_id,
+            &context.plan,
+            &scheduling_policy,
+        )?;
         let decision = FailoverEngine::evaluate(
             &context.plan,
+            refreshed_plan.as_ref(),
             &context.session,
             &context.replicas,
             &context.serving_groups,
@@ -634,8 +697,7 @@ fn build_replica_updates(
     let target_set = target_participants.iter().collect::<HashSet<_>>();
     let active_set = active_participants.iter().collect::<HashSet<_>>();
     let lost_set = lost_active.iter().collect::<HashSet<_>>();
-
-    replicas
+    let mut updates = replicas
         .iter()
         .filter_map(|replica| {
             if lost_set.contains(&replica.device_id) {
@@ -658,7 +720,28 @@ fn build_replica_updates(
                 None
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let known = updates
+        .iter()
+        .map(|update| update.device_id.clone())
+        .collect::<HashSet<_>>();
+    for device_id in target_participants {
+        if known.contains(device_id) {
+            continue;
+        }
+        updates.push(DeviceStatusUpdate {
+            device_id: device_id.clone(),
+            status: if active_set.contains(device_id) || !requires_transfer {
+                "decode_ready".to_string()
+            } else {
+                "decode_pending_transfer".to_string()
+            },
+            last_error: None,
+        });
+    }
+
+    updates
 }
 
 fn load_impacted_sessions(
@@ -819,7 +902,7 @@ fn load_session_context(
         collected
     };
 
-    let (decode_queue, batch_group_key) = conn
+    let decode_queue = conn
         .query_row(
             r#"
             SELECT session_id, job_id, network_id, segment_id, group_id, status,
@@ -830,27 +913,22 @@ fn load_session_context(
             "#,
             params![session_id],
             |row| {
-                Ok((
-                    DecodeQueueRecord {
-                        session_id: row.get(0)?,
-                        job_id: row.get(1)?,
-                        network_id: row.get(2)?,
-                        segment_id: row.get(3)?,
-                        group_id: row.get(4)?,
-                        status: row.get(5)?,
-                        ready_at: row.get(6)?,
-                        lease_owner_device_id: row.get(7)?,
-                        lease_expires_at: row.get(8)?,
-                        last_error: row.get(9)?,
-                    },
-                    row.get::<_, Option<String>>(10)?,
-                ))
+                Ok(DecodeQueueRecord {
+                    session_id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    network_id: row.get(2)?,
+                    segment_id: row.get(3)?,
+                    group_id: row.get(4)?,
+                    status: row.get(5)?,
+                    ready_at: row.get(6)?,
+                    lease_owner_device_id: row.get(7)?,
+                    lease_expires_at: row.get(8)?,
+                    last_error: row.get(9)?,
+                })
             },
         )
         .optional()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
-        .map(|(queue, key)| (Some(queue), key))
-        .unwrap_or((None, None));
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     Ok(FailoverSessionContext {
         plan,
@@ -858,7 +936,6 @@ fn load_session_context(
         replicas,
         serving_groups,
         decode_queue,
-        batch_group_key,
     })
 }
 
@@ -868,8 +945,13 @@ fn apply_failover_decision(
     decision: &FailoverDecision,
     now: &str,
 ) -> ApiResult<()> {
-    let mut plan = context.plan.clone();
-    update_plan_for_failover(&mut plan, decision)?;
+    let mut plan = decision
+        .updated_plan
+        .clone()
+        .unwrap_or_else(|| context.plan.clone());
+    if decision.updated_plan.is_none() {
+        update_plan_for_failover(&mut plan, decision)?;
+    }
     let execution_plan_json = serde_json::to_string(&plan)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize regrouped plan: {}", e)))?;
 
@@ -972,6 +1054,22 @@ fn apply_failover_decision(
         target_group_id,
         now,
     )?;
+    refresh_regroup_decode_batch_targets(
+        tx,
+        &context.session.network_id,
+        &batch_group_key_for_devices(&decision.target_participant_device_ids),
+        target_group_id,
+    )?;
+    if matches!(decision.resume.mode, ResumeMode::RequiresCheckpointTransfer) {
+        plan_checkpoint_transfer_records(
+            tx,
+            context,
+            decision,
+            target_segment_id,
+            target_group_id,
+            now,
+        )?;
+    }
     record_regroup_scheduler_events(tx, context, decision, now)?;
 
     Ok(())
@@ -1621,6 +1719,7 @@ fn upsert_decode_queue_regroup_state(
     target_group_id: &str,
     now: &str,
 ) -> ApiResult<()> {
+    let batch_group_key = batch_group_key_for_devices(&decision.target_participant_device_ids);
     let queue_status = decision
         .pause
         .decode_queue_status
@@ -1632,13 +1731,14 @@ fn upsert_decode_queue_regroup_state(
         UPDATE inference_decode_queue
         SET segment_id = ?,
             group_id = ?,
+            batch_group_key = ?,
             status = ?,
             ready_at = CASE
                 WHEN ? = 'ready' THEN COALESCE(ready_at, ?)
                 ELSE ready_at
             END,
             blocked_reason = CASE
-                WHEN ? = 'blocked_on_transfer' THEN 'participant_lost'
+                WHEN ? = 'blocked_on_transfer' THEN 'transfer'
                 ELSE NULL
             END,
             lease_owner_device_id = NULL,
@@ -1650,6 +1750,7 @@ fn upsert_decode_queue_regroup_state(
         params![
             target_segment_id,
             target_group_id,
+            &batch_group_key,
             queue_status,
             queue_status,
             now,
@@ -1663,12 +1764,84 @@ fn upsert_decode_queue_regroup_state(
     Ok(())
 }
 
+fn plan_checkpoint_transfer_records(
+    tx: &Transaction<'_>,
+    context: &FailoverSessionContext,
+    decision: &FailoverDecision,
+    target_segment_id: &str,
+    target_group_id: &str,
+    now: &str,
+) -> ApiResult<()> {
+    let Some(source_device_id) = decision.transfer_source_device_id.as_deref() else {
+        return Err(ApiError::Conflict(
+            "Missing checkpoint transfer source for regroup".to_string(),
+        ));
+    };
+    let batch_group_key = batch_group_key_for_devices(&decision.target_participant_device_ids);
+
+    for target_device_id in &decision.target_participant_device_ids {
+        if target_device_id == source_device_id {
+            continue;
+        }
+
+        tx.execute(
+            r#"
+            INSERT INTO inference_session_kv_transfers (
+                transfer_id, session_id, job_id, network_id, model_id, segment_id, group_id,
+                batch_group_key, source_device_id, target_device_id, transfer_kind, status,
+                checkpoint_id, remote_access_uri, kv_sequence_position, bytes_total, bytes_transferred,
+                started_at, completed_at, updated_at, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'checkpoint_handoff', 'queued',
+                      NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, NULL)
+            ON CONFLICT(session_id, segment_id, target_device_id) DO UPDATE SET
+                group_id = excluded.group_id,
+                batch_group_key = excluded.batch_group_key,
+                source_device_id = excluded.source_device_id,
+                status = 'queued',
+                checkpoint_id = NULL,
+                remote_access_uri = NULL,
+                kv_sequence_position = NULL,
+                bytes_total = NULL,
+                bytes_transferred = NULL,
+                started_at = excluded.started_at,
+                completed_at = NULL,
+                updated_at = excluded.updated_at,
+                last_error = NULL
+            "#,
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                &context.session.session_id,
+                &context.session.job_id,
+                &context.session.network_id,
+                &context.session.model_id,
+                target_segment_id,
+                target_group_id,
+                &batch_group_key,
+                source_device_id,
+                target_device_id,
+                now,
+                now
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    }
+
+    Ok(())
+}
+
+fn batch_group_key_for_devices(device_ids: &[String]) -> String {
+    let mut sorted = device_ids.to_vec();
+    sorted.sort();
+    format!("decode:regroup:{}", sorted.join(","))
+}
+
 fn record_regroup_scheduler_events(
     tx: &Transaction<'_>,
     context: &FailoverSessionContext,
     decision: &FailoverDecision,
     now: &str,
 ) -> ApiResult<()> {
+    let batch_group_key = batch_group_key_for_devices(&decision.target_participant_device_ids);
     let event_kind = match (&decision.strategy, &decision.resume.mode) {
         (RegroupStrategy::Replace { .. }, ResumeMode::RequiresCheckpointTransfer) => {
             "decode_regroup_transfer"
@@ -1692,7 +1865,7 @@ fn record_regroup_scheduler_events(
             decision.resume.next_kv_owner_device_id.as_deref(),
             decision.target_segment_id.as_deref(),
             decision.target_group_id.as_deref(),
-            context.batch_group_key.as_deref(),
+            Some(batch_group_key.as_str()),
             event_kind,
             decision
                 .pause
@@ -1705,6 +1878,75 @@ fn record_regroup_scheduler_events(
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(())
+}
+
+fn refresh_regroup_decode_batch_targets(
+    tx: &Transaction<'_>,
+    network_id: &str,
+    batch_group_key: &str,
+    group_id: &str,
+) -> ApiResult<()> {
+    let (target_session_count, target_batch_size) =
+        compute_regroup_decode_lease_targets(tx, network_id, batch_group_key, group_id)?;
+    tx.execute(
+        r#"
+        UPDATE inference_decode_queue
+        SET lease_target_session_count = ?,
+            lease_target_batch_size = ?
+        WHERE network_id = ?
+          AND COALESCE(batch_group_key, group_id) = ?
+          AND status IN ('ready', 'leased', 'active', 'blocked_on_transfer')
+        "#,
+        params![
+            i64::from(target_session_count),
+            i64::from(target_batch_size),
+            network_id,
+            batch_group_key
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
+}
+
+fn compute_regroup_decode_lease_targets(
+    tx: &Transaction<'_>,
+    network_id: &str,
+    batch_group_key: &str,
+    group_id: &str,
+) -> ApiResult<(u32, u32)> {
+    let pooled_group_key = if batch_group_key.is_empty() {
+        group_id.to_string()
+    } else {
+        batch_group_key.to_string()
+    };
+    let (target_session_count, observed_peak): (u32, Option<u32>) = tx
+        .query_row(
+            r#"
+            SELECT
+                COUNT(*),
+                MAX(COALESCE(s.latest_active_decode_sessions, s.latest_batch_size))
+            FROM inference_decode_queue dq
+            LEFT JOIN inference_sessions s
+              ON s.session_id = dq.session_id
+            WHERE dq.network_id = ?1
+              AND COALESCE(dq.batch_group_key, dq.group_id) = ?2
+              AND dq.status IN ('ready', 'leased', 'active', 'blocked_on_transfer')
+            "#,
+            params![network_id, &pooled_group_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Option<i64>>(1)?.map(|value| value as u32),
+                ))
+            },
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let target_session_count = target_session_count.max(1);
+    let target_batch_size = observed_peak
+        .map(|peak| peak.min(target_session_count).max(1))
+        .unwrap_or(target_session_count);
+    Ok((target_session_count, target_batch_size))
 }
 
 fn cleanup_terminal_session_state(tx: &Transaction<'_>, now: &str) -> ApiResult<()> {
@@ -1902,8 +2144,7 @@ fn build_group_updates(
     let target_set = target_participants.iter().collect::<HashSet<_>>();
     let active_set = active_participants.iter().collect::<HashSet<_>>();
     let lost_set = lost_active.iter().collect::<HashSet<_>>();
-
-    serving_groups
+    let mut updates = serving_groups
         .iter()
         .filter_map(|member| {
             if lost_set.contains(&member.device_id) {
@@ -1926,7 +2167,28 @@ fn build_group_updates(
                 None
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let known = updates
+        .iter()
+        .map(|update| update.device_id.clone())
+        .collect::<HashSet<_>>();
+    for device_id in target_participants {
+        if known.contains(device_id) {
+            continue;
+        }
+        updates.push(DeviceStatusUpdate {
+            device_id: device_id.clone(),
+            status: if active_set.contains(device_id) || !requires_transfer {
+                "decode_ready".to_string()
+            } else {
+                "decode_pending_transfer".to_string()
+            },
+            last_error: None,
+        });
+    }
+
+    updates
 }
 
 fn checkpoint_available(
@@ -1935,6 +2197,36 @@ fn checkpoint_available(
     _target_participants: &[String],
 ) -> bool {
     session.latest_checkpoint_device_id.is_some() && session.latest_checkpoint_created_at.is_some()
+}
+
+fn select_transfer_source_device_id(
+    session: &InferenceSessionRecord,
+    lost_set: &HashSet<String>,
+    target_participants: &[String],
+) -> Option<String> {
+    if target_participants.contains(&session.kv_owner_device_id)
+        && !lost_set.contains(&session.kv_owner_device_id)
+    {
+        return Some(session.kv_owner_device_id.clone());
+    }
+
+    session.latest_checkpoint_device_id.clone()
+}
+
+fn load_network_scheduling_policy(
+    conn: &Transaction<'_>,
+    network_id: &str,
+) -> ApiResult<InferenceSchedulingPolicy> {
+    let settings_json: String = conn
+        .query_row(
+            "SELECT settings FROM networks WHERE network_id = ?",
+            params![network_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let settings = serde_json::from_str::<NetworkSettings>(&settings_json)
+        .map_err(|e| ApiError::Internal(format!("Failed to parse network settings: {}", e)))?;
+    Ok(settings.scheduling_policy)
 }
 
 fn load_latest_checkpoint_identity(
@@ -2186,6 +2478,7 @@ mod tests {
 
         let decision = FailoverEngine::evaluate(
             &plan,
+            None,
             &session,
             &replicas,
             &groups,
@@ -2205,6 +2498,7 @@ mod tests {
 
         let decision = FailoverEngine::evaluate(
             &plan,
+            None,
             &session,
             &replicas,
             &groups,
@@ -2235,6 +2529,7 @@ mod tests {
 
         let decision = FailoverEngine::evaluate(
             &plan,
+            None,
             &session,
             &replicas,
             &groups,
@@ -2283,6 +2578,7 @@ mod tests {
 
         let decision = FailoverEngine::evaluate(
             &plan,
+            None,
             &session,
             &replicas,
             &groups,
@@ -2323,6 +2619,7 @@ mod tests {
 
         let decision = FailoverEngine::evaluate(
             &plan,
+            None,
             &session,
             &replicas,
             &groups,

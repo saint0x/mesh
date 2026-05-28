@@ -1,7 +1,10 @@
 use crate::connectivity::DeviceConnectivityState;
 use crate::db::Database;
 use crate::services::failover::reconcile_failover_state;
+use crate::services::ring_manager::RingTopologyManager;
 use rusqlite::params;
+use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info};
@@ -12,7 +15,7 @@ fn presence_poll_interval() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_secs(1))
+        .unwrap_or_else(|| Duration::from_millis(250))
 }
 
 fn stale_device_timeout() -> time::Duration {
@@ -21,7 +24,15 @@ fn stale_device_timeout() -> time::Duration {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .map(time::Duration::milliseconds)
-        .unwrap_or_else(|| time::Duration::seconds(6))
+        .unwrap_or_else(|| time::Duration::milliseconds(1500))
+}
+
+#[derive(Debug, Clone)]
+struct StaleDeviceRecord {
+    device_id: String,
+    network_id: String,
+    connectivity_state_json: Option<String>,
+    in_ring: bool,
 }
 
 /// Background task that marks devices offline shortly after they stop heartbeating.
@@ -36,12 +47,41 @@ pub async fn presence_monitor(db: Database) {
         let db_clone = db.clone();
         match tokio::task::spawn_blocking(move || {
             let stale_devices = mark_offline_devices(&db_clone)?;
-            reconcile_failover_state(&db_clone, &stale_devices).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(e.to_string()))
-                },
-            )?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stale_devices.len())
+            let stale_count = stale_devices.len();
+            if !stale_devices.is_empty() {
+                let mut managers_by_network = HashMap::<String, RingTopologyManager>::new();
+                let mut direct_failover = Vec::new();
+
+                for device in stale_devices {
+                    if device.in_ring {
+                        let manager = managers_by_network.entry(device.network_id.clone()).or_insert_with(|| {
+                            RingTopologyManager::new(Arc::new(db_clone.clone()))
+                        });
+                        manager.load_from_db(&device.network_id).map_err(
+                            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                Box::new(std::io::Error::other(e.to_string()))
+                            },
+                        )?;
+                        manager.handle_worker_failure(device.device_id.clone()).map_err(
+                            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                Box::new(std::io::Error::other(e.to_string()))
+                            },
+                        )?;
+                    } else {
+                        mark_device_offline(&db_clone, &device)?;
+                        direct_failover.push(device.device_id);
+                    }
+                }
+
+                if !direct_failover.is_empty() {
+                    reconcile_failover_state(&db_clone, &direct_failover).map_err(
+                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(std::io::Error::other(e.to_string()))
+                        },
+                    )?;
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stale_count)
         })
         .await
         {
@@ -55,7 +95,7 @@ pub async fn presence_monitor(db: Database) {
 /// Mark devices as offline if last_seen is older than the configured timeout.
 fn mark_offline_devices(
     db: &Database,
-) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<StaleDeviceRecord>, Box<dyn std::error::Error + Send + Sync>> {
     let threshold = OffsetDateTime::now_utc() - stale_device_timeout();
     let threshold_str = threshold
         .format(&time::format_description::well_known::Rfc3339)
@@ -65,7 +105,7 @@ fn mark_offline_devices(
 
     let mut stale_stmt = conn.prepare(
         r#"
-        SELECT device_id, connectivity_state
+        SELECT device_id, network_id, connectivity_state, ring_position
         FROM devices
         WHERE status = 'online'
           AND (last_seen IS NULL OR datetime(last_seen) < datetime(?))
@@ -74,42 +114,48 @@ fn mark_offline_devices(
 
     let stale_devices = stale_stmt
         .query_map(params![&threshold_str], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok(StaleDeviceRecord {
+                device_id: row.get(0)?,
+                network_id: row.get(1)?,
+                connectivity_state_json: row.get(2)?,
+                in_ring: row.get::<_, Option<i64>>(3)?.is_some(),
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    for (device_id, connectivity_state_json) in &stale_devices {
-        let connectivity_state = connectivity_state_json
-            .as_ref()
-            .and_then(|json| serde_json::from_str::<DeviceConnectivityState>(json).ok())
-            .map(|state| state.disconnected());
-
-        let connectivity_state_json = connectivity_state
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-
-        conn.execute(
-            r#"
-            UPDATE devices
-            SET status = 'offline', connectivity_state = ?, listen_addrs = '[]'
-            WHERE device_id = ?
-            "#,
-            params![connectivity_state_json, device_id],
-        )?;
-    }
-
     let affected = stale_devices.len();
-    let affected_ids = stale_devices
-        .iter()
-        .map(|(device_id, _)| device_id.clone())
-        .collect::<Vec<_>>();
-
     if affected > 0 {
         debug!(count = affected, "Marked devices offline");
     }
 
-    Ok(affected_ids)
+    Ok(stale_devices)
+}
+
+fn mark_device_offline(
+    db: &Database,
+    device: &StaleDeviceRecord,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = db.get_conn()?;
+    let connectivity_state = device
+        .connectivity_state_json
+        .as_ref()
+        .and_then(|json| serde_json::from_str::<DeviceConnectivityState>(json).ok())
+        .map(|state| state.disconnected());
+    let connectivity_state_json = connectivity_state
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    conn.execute(
+        r#"
+        UPDATE devices
+        SET status = 'offline', connectivity_state = ?, listen_addrs = '[]'
+        WHERE device_id = ?
+        "#,
+        params![connectivity_state_json, &device.device_id],
+    )?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -218,7 +264,9 @@ mod tests {
 
         // Mark offline devices
         let affected = mark_offline_devices(&db).unwrap();
-        assert_eq!(affected, vec![device_id.to_string()]);
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0].device_id, device_id.to_string());
+        mark_device_offline(&db, &affected[0]).unwrap();
 
         // Device should now be offline
         let status: String = conn
@@ -259,8 +307,8 @@ mod tests {
         )
         .unwrap();
 
-        // Set last_seen to 3 seconds ago so it remains inside the tighter failover window.
-        let recent_timestamp = (OffsetDateTime::now_utc() - time::Duration::seconds(3))
+        // Set last_seen to 1 second ago so it remains inside the tighter failover window.
+        let recent_timestamp = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
 
