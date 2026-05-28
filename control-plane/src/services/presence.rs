@@ -54,19 +54,21 @@ pub async fn presence_monitor(db: Database) {
 
                 for device in stale_devices {
                     if device.in_ring {
-                        let manager = managers_by_network.entry(device.network_id.clone()).or_insert_with(|| {
-                            RingTopologyManager::new(Arc::new(db_clone.clone()))
-                        });
+                        let manager = managers_by_network
+                            .entry(device.network_id.clone())
+                            .or_insert_with(|| {
+                                RingTopologyManager::new(Arc::new(db_clone.clone()))
+                            });
                         manager.load_from_db(&device.network_id).map_err(
                             |e| -> Box<dyn std::error::Error + Send + Sync> {
                                 Box::new(std::io::Error::other(e.to_string()))
                             },
                         )?;
-                        manager.handle_worker_failure(device.device_id.clone()).map_err(
-                            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        manager
+                            .handle_worker_failure(device.device_id.clone())
+                            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                                 Box::new(std::io::Error::other(e.to_string()))
-                            },
-                        )?;
+                            })?;
                     } else {
                         mark_device_offline(&db_clone, &device)?;
                         direct_failover.push(device.device_id);

@@ -30,6 +30,7 @@ use crate::credit_policy::{
 };
 use crate::device::DeviceCapabilities;
 use crate::model_assets;
+use crate::services::planner::adjusted_capacity_units;
 use crate::services::{
     device_metadata_from_capabilities, network_service, refresh_decode_plan_for_job,
     select_claim_assignment_id, ExecutionPlanner, PlannerDeviceMetadata,
@@ -373,6 +374,7 @@ pub async fn submit_inference(
                 &conn,
                 &request.network_id,
                 &worker.device_id,
+                &request.model_id,
                 &scheduling_policy,
             ))
             .collect::<ApiResult<Vec<_>>>()?;
@@ -3200,6 +3202,7 @@ fn load_device_assignment_metadata_from_connection(
     conn: &rusqlite::Connection,
     network_id: &str,
     device_id: &str,
+    model_id: &str,
     scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<PlannerDeviceMetadata> {
     let capabilities_json: String = conn
@@ -3211,10 +3214,109 @@ fn load_device_assignment_metadata_from_connection(
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
         .map_err(|e| ApiError::Internal(format!("Failed to parse device capabilities: {}", e)))?;
-    Ok(device_metadata_from_capabilities(
-        scheduling_policy,
-        &capabilities,
-    ))
+    let mut metadata = device_metadata_from_capabilities(scheduling_policy, &capabilities);
+    if !model_id.is_empty() {
+        let multiplier = load_recent_device_throughput_multiplier_from_connection(
+            conn, network_id, device_id, model_id,
+        )?;
+        metadata.assigned_capacity_units =
+            adjusted_capacity_units(metadata.assigned_capacity_units, multiplier);
+    }
+    Ok(metadata)
+}
+
+fn load_recent_device_throughput_multiplier_from_connection(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    device_id: &str,
+    model_id: &str,
+) -> ApiResult<f64> {
+    let rows = load_recent_device_service_rate_rows_from_connection(conn, network_id, model_id)?;
+    Ok(throughput_multiplier_for_device_rows(&rows, device_id))
+}
+
+fn load_recent_device_service_rate_rows_from_connection(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    model_id: &str,
+) -> ApiResult<Vec<(String, f64)>> {
+    let total_columns = model_assets::load_model_manifest(model_id)
+        .map_err(|e| ApiError::Internal(format!("Failed to load model manifest: {}", e)))?
+        .tensor_parallelism_dim
+        .max(1);
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT a.device_id,
+                   a.assigned_capacity_units,
+                   a.shard_column_start,
+                   a.shard_column_end,
+                   a.execution_time_ms
+            FROM inference_job_assignments a
+            INNER JOIN inference_jobs j ON j.job_id = a.job_id
+            WHERE a.network_id = ?
+              AND j.model_id = ?
+              AND a.execution_time_ms > 0
+              AND a.status IN ('acknowledged', 'completed')
+            ORDER BY COALESCE(a.segment_completed_at, a.acknowledged_at, a.assigned_at) DESC,
+                     a.assignment_id DESC
+            LIMIT 256
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let rows = stmt
+        .query_map(params![network_id, model_id], |row| {
+            let assigned_capacity_units = row.get::<_, i64>(1)?.max(1) as f64;
+            let shard_start = row.get::<_, i64>(2)?.max(0) as u32;
+            let shard_end = row.get::<_, i64>(3)?.max(0) as u32;
+            let execution_time_ms = row.get::<_, i64>(4)?.max(1) as f64;
+            let shard_columns = shard_end.saturating_sub(shard_start).max(1) as f64;
+            let shard_fraction = shard_columns / total_columns as f64;
+            let service_rate = (assigned_capacity_units * shard_fraction.max(f64::EPSILON))
+                / (execution_time_ms / 1000.0).max(0.001);
+            Ok((row.get::<_, String>(0)?, service_rate))
+        })
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
+fn throughput_multiplier_for_device_rows(rows: &[(String, f64)], device_id: &str) -> f64 {
+    let mut per_device = HashMap::<&str, (f64, u32)>::new();
+    for (row_device_id, service_rate) in rows {
+        let entry = per_device
+            .entry(row_device_id.as_str())
+            .or_insert((0.0_f64, 0_u32));
+        entry.0 += *service_rate;
+        entry.1 = entry.1.saturating_add(1);
+    }
+
+    let mut averages = per_device
+        .values()
+        .filter_map(|(total, count)| {
+            if *count == 0 {
+                None
+            } else {
+                Some(*total / *count as f64)
+            }
+        })
+        .collect::<Vec<_>>();
+    if averages.is_empty() {
+        return 1.0;
+    }
+    averages.sort_by(|left, right| left.total_cmp(right));
+    let median = if averages.len() % 2 == 0 {
+        let idx = averages.len() / 2;
+        (averages[idx - 1] + averages[idx]) / 2.0
+    } else {
+        averages[averages.len() / 2]
+    }
+    .max(f64::EPSILON);
+
+    per_device
+        .get(device_id)
+        .map(|(total, count)| (*total / (*count).max(1) as f64) / median)
+        .unwrap_or(1.0)
 }
 
 fn claim_assignment(

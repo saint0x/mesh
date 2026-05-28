@@ -515,7 +515,10 @@ impl InferenceCoordinator {
             return Ok(());
         }
 
-        if self.config.checkpointing_enabled && self.checkpoint_manager.is_some() && !existing.job.is_complete() {
+        if self.config.checkpointing_enabled
+            && self.checkpoint_manager.is_some()
+            && !existing.job.is_complete()
+        {
             let snapshot = existing.job.clone();
             self.checkpoint(&snapshot).await?;
         }

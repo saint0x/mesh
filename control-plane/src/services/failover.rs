@@ -393,62 +393,63 @@ impl FailoverEngine {
                 })
         });
 
-        let (target_group_id, target_segment_id, target_participants, next_kv_owner_device_id, updated_plan) =
-            if let Some((segment, group)) = refreshed_target {
-                (
-                    group.group_id.clone(),
-                    segment.segment_id.clone(),
-                    segment.participant_device_ids.clone(),
-                    segment.kv_owner_device_id.clone(),
-                    Some(refreshed_plan.expect("refreshed plan").clone()),
-                )
-            } else {
-                let survivor_only_target = find_covering_set(
-                    &available_members,
-                    &survivor_ids,
-                    required_span,
-                    Some(survivor_ids.len()),
-                );
-                let mut target = survivor_only_target
-                    .or_else(|| {
-                        if config.prefer_replacement {
-                            find_covering_set(
-                                &available_members,
-                                &survivor_ids,
-                                required_span,
-                                Some(active_count),
-                            )
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| {
-                        find_covering_set(&available_members, &survivor_ids, required_span, None)
-                    });
+        let (
+            target_group_id,
+            target_segment_id,
+            target_participants,
+            next_kv_owner_device_id,
+            updated_plan,
+        ) = if let Some((segment, group)) = refreshed_target {
+            (
+                group.group_id.clone(),
+                segment.segment_id.clone(),
+                segment.participant_device_ids.clone(),
+                segment.kv_owner_device_id.clone(),
+                Some(refreshed_plan.expect("refreshed plan").clone()),
+            )
+        } else {
+            let survivor_only_target = find_covering_set(
+                &available_members,
+                &survivor_ids,
+                required_span,
+                Some(survivor_ids.len()),
+            );
+            let mut target = survivor_only_target
+                .or_else(|| {
+                    if config.prefer_replacement {
+                        find_covering_set(
+                            &available_members,
+                            &survivor_ids,
+                            required_span,
+                            Some(active_count),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    find_covering_set(&available_members, &survivor_ids, required_span, None)
+                });
 
-                let Some(target_participants) = target.take() else {
-                    return Ok(Self::failed_decode_decision(
-                        session,
-                        replicas,
-                        member_records.as_slice(),
-                        lost_active,
-                        "Remaining decode members can no longer cover the active shard span",
-                    ));
-                };
-                let next_kv_owner_device_id = select_next_kv_owner(
-                    &target_participants,
+            let Some(target_participants) = target.take() else {
+                return Ok(Self::failed_decode_decision(
                     session,
-                    &replica_map,
-                    &member_map,
-                )?;
-                (
-                    active_group.group_id.clone(),
-                    active_segment.segment_id.clone(),
-                    target_participants,
-                    next_kv_owner_device_id,
-                    None,
-                )
+                    replicas,
+                    member_records.as_slice(),
+                    lost_active,
+                    "Remaining decode members can no longer cover the active shard span",
+                ));
             };
+            let next_kv_owner_device_id =
+                select_next_kv_owner(&target_participants, session, &replica_map, &member_map)?;
+            (
+                active_group.group_id.clone(),
+                active_segment.segment_id.clone(),
+                target_participants,
+                next_kv_owner_device_id,
+                None,
+            )
+        };
 
         let introduced = target_participants
             .iter()
@@ -654,8 +655,7 @@ pub fn reconcile_failover_state(db: &Database, lost_device_ids: &[String]) -> Ap
 
     for context in load_impacted_sessions(&tx, lost_device_ids)? {
         let config = failover_config_for_runtime_mode(context.plan.runtime_mode);
-        let scheduling_policy =
-            load_network_scheduling_policy(&tx, &context.session.network_id)?;
+        let scheduling_policy = load_network_scheduling_policy(&tx, &context.session.network_id)?;
         let refreshed_plan = refresh_decode_plan_for_job(
             &tx,
             &context.session.network_id,
@@ -2235,10 +2235,16 @@ fn load_latest_checkpoint_identity(
 ) -> ApiResult<Option<(String, String)>> {
     conn.query_row(
         r#"
-        SELECT source_device_id, created_at
-        FROM inference_session_checkpoints
-        WHERE session_id = ?
-        ORDER BY created_at DESC, checkpoint_id DESC
+        SELECT checkpoint.source_device_id, checkpoint.created_at
+        FROM inference_session_checkpoints checkpoint
+        INNER JOIN inference_sessions session
+            ON session.session_id = checkpoint.session_id
+        INNER JOIN devices device
+            ON device.device_id = checkpoint.source_device_id
+           AND device.network_id = session.network_id
+        WHERE checkpoint.session_id = ?
+          AND device.status = 'online'
+        ORDER BY checkpoint.created_at DESC, checkpoint.checkpoint_id DESC
         LIMIT 1
         "#,
         params![session_id],
@@ -2317,11 +2323,23 @@ fn find_covering_set(
     preferred_size: Option<usize>,
 ) -> Option<Vec<String>> {
     let required_set = required_device_ids.iter().collect::<HashSet<_>>();
-    let candidate_pool = members
+    let mut candidate_pool = members
         .iter()
         .filter(|member| !required_set.contains(&member.device_id))
         .copied()
         .collect::<Vec<_>>();
+    candidate_pool.sort_by(|left, right| {
+        right
+            .assigned_capacity_units
+            .cmp(&left.assigned_capacity_units)
+            .then_with(|| {
+                right
+                    .shard
+                    .estimated_memory
+                    .cmp(&left.shard.estimated_memory)
+            })
+            .then_with(|| left.ring_position.cmp(&right.ring_position))
+    });
 
     let min_size = preferred_size
         .unwrap_or(required_device_ids.len())
@@ -2344,7 +2362,7 @@ fn find_covering_set(
         let mut selection = required_device_ids.to_vec();
         if extra_needed == 0 {
             if covers_required_span(members, &selection, required_span) {
-                selection.sort();
+                order_selected_devices_by_ring(members, &mut selection);
                 return Some(selection);
             }
             continue;
@@ -2383,7 +2401,7 @@ fn choose_members(
     if remaining == 0 {
         if covers_required_span(all_members, current, required_span) {
             let mut selected = current.clone();
-            selected.sort();
+            order_selected_devices_by_ring(all_members, &mut selected);
             *result = Some(selected);
         }
         return;
@@ -2432,7 +2450,7 @@ fn covers_required_span(
 
     let mut covered_end = ranges[0].1;
     for (start, end) in ranges.into_iter().skip(1) {
-        if start > covered_end.saturating_add(1) {
+        if start > covered_end {
             return false;
         }
         if end > covered_end {
@@ -2441,6 +2459,24 @@ fn covers_required_span(
     }
 
     covered_end >= required_span.1
+}
+
+fn order_selected_devices_by_ring(
+    members: &[&ExecutionGroupMember],
+    selected_device_ids: &mut [String],
+) {
+    let positions = members
+        .iter()
+        .map(|member| (member.device_id.as_str(), member.ring_position))
+        .collect::<HashMap<_, _>>();
+    selected_device_ids.sort_by(|left, right| {
+        positions
+            .get(left.as_str())
+            .copied()
+            .unwrap_or(u32::MAX)
+            .cmp(&positions.get(right.as_str()).copied().unwrap_or(u32::MAX))
+            .then_with(|| left.cmp(right))
+    });
 }
 
 #[cfg(test)]
@@ -2788,6 +2824,58 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_failover_state_fails_when_latest_checkpoint_source_is_offline() {
+        let db = create_test_db();
+        register_fixture_devices(&db, &["worker-1", "worker-2", "worker-3"]);
+        let (plan, session, replicas, groups, queue) = decode_fixture(
+            KvTransferPolicy::ExportOnHandoff,
+            vec![
+                member("worker-1", 0, 49),
+                member("worker-2", 50, 99),
+                member("worker-3", 50, 99),
+            ],
+            vec!["worker-1".into(), "worker-2".into()],
+            "worker-1",
+            Some("2026-04-25T12:00:00Z"),
+        );
+        persist_session_fixture(
+            &db,
+            &plan,
+            &session,
+            &replicas,
+            &groups,
+            Some(&queue),
+            "running",
+        );
+        let conn = db.get_conn().unwrap();
+        conn.execute(
+            "UPDATE inference_session_checkpoints SET source_device_id = 'worker-2' WHERE session_id = 'session-a'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        mark_device_status(&db, "worker-2", "offline");
+
+        let reconciled = reconcile_failover_state(&db, &["worker-2".to_string()]).unwrap();
+        assert_eq!(reconciled, 1);
+
+        let conn = db.get_conn().unwrap();
+        let job_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error FROM inference_jobs WHERE job_id = 'job-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(job_state.0, "failed");
+        assert!(job_state
+            .1
+            .unwrap_or_default()
+            .contains("no checkpoint is available"));
+    }
+
+    #[test]
     fn reconcile_failover_state_releases_reserved_credits_when_it_fails_the_job() {
         let db = create_test_db();
         register_fixture_devices(&db, &["worker-1", "worker-2"]);
@@ -2824,6 +2912,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(release_events, 1);
+    }
+
+    #[test]
+    fn covers_required_span_rejects_one_column_gap() {
+        let left = member("worker-1", 0, 49);
+        let right = member("worker-2", 50, 99);
+        let gapped = member("worker-3", 51, 99);
+        let members = vec![&left, &gapped];
+        assert!(!covers_required_span(
+            &members,
+            &["worker-1".to_string(), "worker-3".to_string()],
+            (0, 99),
+        ));
+
+        let contiguous_members = vec![&left, &right];
+        assert!(covers_required_span(
+            &contiguous_members,
+            &["worker-1".to_string(), "worker-2".to_string()],
+            (0, 99),
+        ));
     }
 
     #[test]
@@ -3136,7 +3244,7 @@ mod tests {
             shard: ShardInfo {
                 model_id: "model-a".into(),
                 column_start: start,
-                column_end: end,
+                column_end: end.saturating_add(1),
                 estimated_memory: 1024,
             },
             shard_worker_position: start,

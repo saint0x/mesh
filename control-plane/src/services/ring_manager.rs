@@ -18,6 +18,9 @@ use tracing::{info, warn};
 /// Unique identifier for a device in the ring
 pub type DeviceId = String;
 
+const MIN_RUNTIME_WEIGHT_MULTIPLIER: f64 = 0.5;
+const MAX_RUNTIME_WEIGHT_MULTIPLIER: f64 = 2.0;
+
 /// Model shard assignment for a worker
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelShard {
@@ -130,6 +133,7 @@ struct WorkerCapacityProfile {
     tier: Tier,
     contributed_memory: u64,
     fallback_memory_mb: u64,
+    throughput_multiplier: f64,
 }
 
 fn tier_capacity_units(policy: &InferenceSchedulingPolicy, tier: Tier) -> u32 {
@@ -151,7 +155,13 @@ fn effective_capacity_weight(
     } else {
         profile.fallback_memory_mb.max(1)
     };
-    u128::from(tier_capacity_units(scheduling_policy, profile.tier).max(1)) * u128::from(memory_mb)
+    let base = u128::from(tier_capacity_units(scheduling_policy, profile.tier).max(1))
+        * u128::from(memory_mb);
+    let scaled = (base as f64)
+        * profile
+            .throughput_multiplier
+            .clamp(MIN_RUNTIME_WEIGHT_MULTIPLIER, MAX_RUNTIME_WEIGHT_MULTIPLIER);
+    scaled.round().max(1.0) as u128
 }
 
 fn allocate_weighted_column_ranges(
@@ -272,6 +282,18 @@ impl RingTopologyManager {
         );
 
         Ok(())
+    }
+
+    fn sync_workers_map_positions(
+        workers_map: &mut HashMap<DeviceId, Worker>,
+        ring_seq: &[DeviceId],
+    ) {
+        for (position, device_id) in ring_seq.iter().enumerate() {
+            if let Some(worker) = workers_map.get_mut(device_id) {
+                worker.ring_position = Some(position as u32);
+                worker.status = "online".to_string();
+            }
+        }
     }
 
     /// Add a worker to the ring topology
@@ -405,6 +427,8 @@ impl RingTopologyManager {
             "Worker added to ring"
         );
 
+        Self::sync_workers_map_positions(&mut workers_map, &ring_seq);
+
         Ok(RingPosition {
             position: new_position,
             shard,
@@ -416,8 +440,17 @@ impl RingTopologyManager {
     fn load_worker_capacity_profiles(
         &self,
         conn: &rusqlite::Connection,
+        network_id: &str,
+        model_id: &str,
         ring_seq: &[DeviceId],
     ) -> ApiResult<Vec<WorkerCapacityProfile>> {
+        let manifest = model_assets::load_model_manifest(model_id)?;
+        let service_rows = load_recent_device_service_rate_rows(
+            conn,
+            network_id,
+            model_id,
+            manifest.tensor_parallelism_dim.max(1),
+        )?;
         let mut profiles = Vec::with_capacity(ring_seq.len());
         for device_id in ring_seq {
             let (capabilities_json, contributed_memory): (String, Option<i64>) = conn
@@ -436,6 +469,7 @@ impl RingTopologyManager {
                 contributed_memory: contributed_memory.unwrap_or_default().max(0) as u64,
                 fallback_memory_mb: capabilities.ram_mb as u64
                     + capabilities.gpu_vram_mb.unwrap_or_default() as u64,
+                throughput_multiplier: throughput_multiplier_for_device(&service_rows, device_id),
             });
         }
         Ok(profiles)
@@ -476,7 +510,8 @@ impl RingTopologyManager {
 
         let scheduling_policy =
             network_service::load_network_settings(&self.db, &network_id)?.scheduling_policy;
-        let profiles = self.load_worker_capacity_profiles(conn, ring_seq)?;
+        let profiles =
+            self.load_worker_capacity_profiles(conn, &network_id, &model_id, ring_seq)?;
         let manifest = model_assets::load_model_manifest(&model_id)?;
         let ranges = allocate_weighted_column_ranges(
             manifest.tensor_parallelism_dim,
@@ -511,6 +546,7 @@ impl RingTopologyManager {
                 tier: Tier::Tier1,
                 contributed_memory: 1,
                 fallback_memory_mb: 1,
+                throughput_multiplier: 1.0,
             })
             .collect::<Vec<_>>();
         let ranges = allocate_weighted_column_ranges(
@@ -558,6 +594,12 @@ impl RingTopologyManager {
 
         conn.execute("COMMIT", [])
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+        let mut workers_map = self
+            .workers
+            .write()
+            .map_err(|_| ApiError::Internal("Failed to acquire workers write lock".to_string()))?;
+        Self::sync_workers_map_positions(&mut workers_map, &ring_seq);
 
         info!(
             network_id = %network_id,
@@ -734,12 +776,12 @@ impl RingTopologyManager {
             "Worker removed from ring due to failure"
         );
 
-        // Log redistribution trigger (actual redistribution in Phase 2)
         info!(
             remaining_workers = remaining_workers,
-            "Shard redistribution triggered (logging only for Phase 1)"
+            "Shard redistribution completed for surviving workers"
         );
 
+        Self::sync_workers_map_positions(&mut workers_map, &ring_seq);
         drop(ring_seq);
         drop(workers_map);
         reconcile_failover_state(&self.db, std::slice::from_ref(&failed_worker_id))?;
@@ -951,6 +993,87 @@ fn current_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn load_recent_device_service_rate_rows(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    model_id: &str,
+    total_columns: u32,
+) -> ApiResult<Vec<(String, f64)>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT a.device_id,
+                   a.assigned_capacity_units,
+                   a.shard_column_start,
+                   a.shard_column_end,
+                   a.execution_time_ms
+            FROM inference_job_assignments a
+            INNER JOIN inference_jobs j ON j.job_id = a.job_id
+            WHERE a.network_id = ?
+              AND j.model_id = ?
+              AND a.execution_time_ms > 0
+              AND a.status IN ('acknowledged', 'completed')
+            ORDER BY COALESCE(a.segment_completed_at, a.acknowledged_at, a.assigned_at) DESC,
+                     a.assignment_id DESC
+            LIMIT 256
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let rows = stmt
+        .query_map(params![network_id, model_id], |row| {
+            let assigned_capacity_units = row.get::<_, i64>(1)?.max(1) as f64;
+            let shard_start = row.get::<_, i64>(2)?.max(0) as u32;
+            let shard_end = row.get::<_, i64>(3)?.max(0) as u32;
+            let execution_time_ms = row.get::<_, i64>(4)?.max(1) as f64;
+            let shard_columns = shard_end.saturating_sub(shard_start).max(1) as f64;
+            let shard_fraction = shard_columns / total_columns.max(1) as f64;
+            let service_rate = (assigned_capacity_units * shard_fraction.max(f64::EPSILON))
+                / (execution_time_ms / 1000.0).max(0.001);
+            Ok((row.get::<_, String>(0)?, service_rate))
+        })
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
+fn throughput_multiplier_for_device(rows: &[(String, f64)], device_id: &str) -> f64 {
+    let mut per_device = HashMap::<&str, (f64, u32)>::new();
+    for (row_device_id, service_rate) in rows {
+        let entry = per_device
+            .entry(row_device_id.as_str())
+            .or_insert((0.0_f64, 0_u32));
+        entry.0 += *service_rate;
+        entry.1 = entry.1.saturating_add(1);
+    }
+
+    let mut averages = per_device
+        .values()
+        .filter_map(|(total, count)| {
+            if *count == 0 {
+                None
+            } else {
+                Some(*total / *count as f64)
+            }
+        })
+        .collect::<Vec<_>>();
+    if averages.is_empty() {
+        return 1.0;
+    }
+    averages.sort_by(|left, right| left.total_cmp(right));
+    let median = if averages.len() % 2 == 0 {
+        let idx = averages.len() / 2;
+        (averages[idx - 1] + averages[idx]) / 2.0
+    } else {
+        averages[averages.len() / 2]
+    }
+    .max(f64::EPSILON);
+
+    per_device
+        .get(device_id)
+        .map(|(total, count)| (*total / (*count).max(1) as f64) / median)
+        .unwrap_or(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,11 +1254,13 @@ mod tests {
                     tier: Tier::Tier4,
                     contributed_memory: 16 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 16384,
+                    throughput_multiplier: 1.0,
                 },
                 WorkerCapacityProfile {
                     tier: Tier::Tier0,
                     contributed_memory: 2 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 2048,
+                    throughput_multiplier: 1.0,
                 },
             ],
             &InferenceSchedulingPolicy::default(),
@@ -1160,16 +1285,19 @@ mod tests {
                     tier: Tier::Tier3,
                     contributed_memory: 12 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 12288,
+                    throughput_multiplier: 1.0,
                 },
                 WorkerCapacityProfile {
                     tier: Tier::Tier2,
                     contributed_memory: 8 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 8192,
+                    throughput_multiplier: 1.0,
                 },
                 WorkerCapacityProfile {
                     tier: Tier::Tier1,
                     contributed_memory: 4 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 4096,
+                    throughput_multiplier: 1.0,
                 },
             ],
             &InferenceSchedulingPolicy::default(),

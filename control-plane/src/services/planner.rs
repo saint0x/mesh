@@ -14,6 +14,9 @@ use crate::model_assets::{
 use crate::provider::ExecutionProviderKind;
 use crate::services::ring_manager::{RingTopology, WorkerTopologyInfo};
 
+const MIN_RUNTIME_CAPACITY_MULTIPLIER: f64 = 0.5;
+const MAX_RUNTIME_CAPACITY_MULTIPLIER: f64 = 2.0;
+
 #[derive(Debug, Clone)]
 pub struct PlannerDeviceMetadata {
     pub assigned_capacity_units: u32,
@@ -655,7 +658,7 @@ fn same_participants(left: &[ExecutionGroupMember], right: &[ExecutionGroupMembe
 }
 
 fn derive_runtime_mode(
-    scheduling_policy: &InferenceSchedulingPolicy,
+    _scheduling_policy: &InferenceSchedulingPolicy,
     members: &[ExecutionGroupMember],
 ) -> InferenceRuntimeMode {
     let has_relay_or_degraded = members.iter().any(|member| {
@@ -670,16 +673,31 @@ fn derive_runtime_mode(
         return InferenceRuntimeMode::ResilientEdge;
     }
 
-    let wide_capacity_spread = scheduling_policy.tier_capacity_units.tier4
-        > scheduling_policy
-            .tier_capacity_units
-            .tier1
-            .saturating_mul(4);
+    let min_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1))
+        .min()
+        .unwrap_or(1);
+    let max_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1))
+        .max()
+        .unwrap_or(min_capacity);
+    let wide_capacity_spread = max_capacity >= min_capacity.saturating_mul(4).max(4);
     if wide_capacity_spread {
         InferenceRuntimeMode::ThroughputFirst
     } else {
         InferenceRuntimeMode::LatencyFirst
     }
+}
+
+pub fn adjusted_capacity_units(base_units: u32, throughput_multiplier: f64) -> u32 {
+    let adjusted = (base_units.max(1) as f64)
+        * throughput_multiplier.clamp(
+            MIN_RUNTIME_CAPACITY_MULTIPLIER,
+            MAX_RUNTIME_CAPACITY_MULTIPLIER,
+        );
+    adjusted.round().max(1.0) as u32
 }
 
 fn map_peer_punch_plan(
