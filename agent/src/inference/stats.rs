@@ -544,7 +544,9 @@ impl InferenceStats {
         if microbatches == 0 {
             return 0.0;
         }
-        self.decode_multi_session_microbatches.load(Ordering::Relaxed) as f64 / microbatches as f64
+        self.decode_multi_session_microbatches
+            .load(Ordering::Relaxed) as f64
+            / microbatches as f64
     }
 
     pub fn avg_deferred_sessions_per_microbatch(&self) -> f64 {
@@ -596,9 +598,7 @@ impl InferenceStats {
         if attempts == 0 {
             return 0.0;
         }
-        let rejections = self
-            .recovery_cooldown_rejections
-            .load(Ordering::Relaxed)
+        let rejections = self.recovery_cooldown_rejections.load(Ordering::Relaxed)
             + self.recovery_budget_rejections.load(Ordering::Relaxed);
         rejections as f64 / attempts as f64
     }

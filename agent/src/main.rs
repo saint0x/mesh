@@ -701,6 +701,8 @@ fn build_worker_position_from_topology(
         right_neighbor_tensor_addr: extract_tensor_addr(&right_worker.listen_addrs)
             .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
         shard_column_range: (self_worker.shard.column_start, self_worker.shard.column_end),
+        shard_worker_position: self_worker.shard_worker_position,
+        shard_total_workers: self_worker.shard_total_workers,
         shard_memory_bytes: self_worker.contributed_memory,
     })
 }
@@ -746,6 +748,8 @@ fn topology_from_execution_lease(lease: &InferenceExecutionLease) -> RingTopolog
                 status: member.status.clone(),
                 contributed_memory: member.contributed_memory,
                 shard: member.shard.clone(),
+                shard_worker_position: member.shard_worker_position,
+                shard_total_workers: member.shard_total_workers,
                 left_neighbor: member.left_neighbor.clone(),
                 right_neighbor: member.right_neighbor.clone(),
                 connectivity_state: member.connectivity_state.clone(),
@@ -3827,6 +3831,8 @@ mod tests {
                 column_end: 4096,
                 estimated_memory: 8_000_000_000,
             },
+            shard_worker_position: 0,
+            shard_total_workers: 2,
             left_neighbor: device_id.to_string(),
             right_neighbor: device_id.to_string(),
             connectivity_state: None,
@@ -3914,6 +3920,8 @@ mod tests {
                         column_end: 4096,
                         estimated_memory: 8_000_000_000,
                     },
+                    shard_worker_position: 0,
+                    shard_total_workers: 3,
                     left_neighbor: "left".to_string(),
                     right_neighbor: "right".to_string(),
                     connectivity_state: None,
@@ -3932,6 +3940,8 @@ mod tests {
                         column_end: 6144,
                         estimated_memory: 8_000_000_000,
                     },
+                    shard_worker_position: 1,
+                    shard_total_workers: 3,
                     left_neighbor: "right".to_string(),
                     right_neighbor: self_device_id.to_string(),
                     connectivity_state: None,
@@ -3950,6 +3960,8 @@ mod tests {
                         column_end: 8192,
                         estimated_memory: 8_000_000_000,
                     },
+                    shard_worker_position: 2,
+                    shard_total_workers: 3,
                     left_neighbor: self_device_id.to_string(),
                     right_neighbor: "left".to_string(),
                     connectivity_state: None,
@@ -3988,6 +4000,8 @@ mod tests {
 
         assert!(position.left_neighbor_punch_plan.is_some());
         assert!(position.right_neighbor_punch_plan.is_some());
+        assert_eq!(position.shard_worker_position, 0);
+        assert_eq!(position.shard_total_workers, 3);
         assert!(position.left_neighbor_addrs[0]
             .to_string()
             .contains("34.120.0.11"));

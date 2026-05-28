@@ -208,6 +208,10 @@ pub struct WorkerInfo {
     pub contributed_memory: u64,
     /// Assigned shard
     pub shard: ShardInfo,
+    /// Shard artifact worker position used to identify model shard files.
+    pub shard_worker_position: u32,
+    /// Total shard workers used to identify model shard files.
+    pub shard_total_workers: u32,
     /// Left neighbor device ID
     pub left_neighbor: String,
     /// Right neighbor device ID
@@ -414,6 +418,8 @@ pub struct ExecutionGroupMember {
     pub status: String,
     pub contributed_memory: u64,
     pub shard: ShardInfo,
+    pub shard_worker_position: u32,
+    pub shard_total_workers: u32,
     pub left_neighbor: String,
     pub right_neighbor: String,
     #[serde(skip_serializing_if = "Option::is_none")]

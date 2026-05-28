@@ -956,7 +956,14 @@ fn apply_failover_decision(
         now,
     )?;
     apply_replica_regroup_updates(tx, context, decision, target_segment_id, now)?;
-    apply_serving_group_regroup_updates(tx, context, decision, now)?;
+    apply_serving_group_regroup_updates(
+        tx,
+        context,
+        decision,
+        target_group,
+        target_segment_id,
+        now,
+    )?;
     upsert_decode_queue_regroup_state(
         tx,
         context,
@@ -993,7 +1000,137 @@ fn update_plan_for_failover(
     if let Some(next_kv_owner) = &decision.resume.next_kv_owner_device_id {
         segment.kv_owner_device_id = next_kv_owner.clone();
     }
+    if let Some(target_group_id) = decision.target_group_id.as_deref() {
+        let group = plan
+            .execution_groups
+            .iter_mut()
+            .find(|group| group.group_id == target_group_id)
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "Execution plan {} missing regroup target group {}",
+                    plan.plan_id, target_group_id
+                ))
+            })?;
+        *group = rebuild_execution_group_for_regroup(group, decision)?;
+    }
     Ok(())
+}
+
+fn rebuild_execution_group_for_regroup(
+    group: &ExecutionGroup,
+    decision: &FailoverDecision,
+) -> ApiResult<ExecutionGroup> {
+    let target_set = decision
+        .target_participant_device_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let status_overrides = decision
+        .serving_group_updates
+        .iter()
+        .map(|update| {
+            (
+                update.device_id.as_str(),
+                (update.status.as_str(), update.last_error.as_deref()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let original_members = group
+        .members
+        .iter()
+        .filter(|member| target_set.contains(&member.device_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if original_members.len() != decision.target_participant_device_ids.len() {
+        return Err(ApiError::Conflict(format!(
+            "Execution group {} could not rebuild regroup topology for participants {:?}",
+            group.group_id, decision.target_participant_device_ids
+        )));
+    }
+
+    let ordered = decision
+        .target_participant_device_ids
+        .iter()
+        .filter_map(|device_id| {
+            original_members
+                .iter()
+                .find(|member| &member.device_id == device_id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let compacted = compact_serving_group_topology(&ordered, &status_overrides);
+    Ok(ExecutionGroup {
+        group_id: group.group_id.clone(),
+        model_id: group.model_id.clone(),
+        phase: group.phase,
+        transport_tier: classify_regroup_transport_tier(&compacted),
+        kv_transfer_policy: group.kv_transfer_policy,
+        total_capacity_units: compacted
+            .iter()
+            .map(|member| member.assigned_capacity_units)
+            .sum(),
+        peer_punch_plans: group
+            .peer_punch_plans
+            .iter()
+            .filter(|plan| {
+                target_set.contains(&plan.source_device_id)
+                    && target_set.contains(&plan.target_device_id)
+            })
+            .cloned()
+            .collect(),
+        members: compacted,
+    })
+}
+
+fn compact_serving_group_topology(
+    members: &[ExecutionGroupMember],
+    status_overrides: &HashMap<&str, (&str, Option<&str>)>,
+) -> Vec<ExecutionGroupMember> {
+    let len = members.len();
+    members
+        .iter()
+        .enumerate()
+        .map(|(idx, member)| {
+            let mut compacted = member.clone();
+            compacted.ring_position = idx as u32;
+            compacted.left_neighbor = members[(idx + len - 1) % len].device_id.clone();
+            compacted.right_neighbor = members[(idx + 1) % len].device_id.clone();
+            if let Some((status, _)) = status_overrides.get(member.device_id.as_str()) {
+                compacted.status = (*status).to_string();
+            }
+            compacted
+        })
+        .collect()
+}
+
+fn classify_regroup_transport_tier(
+    members: &[ExecutionGroupMember],
+) -> crate::api::types::TransportCapabilityTier {
+    if members.iter().all(|member| {
+        member
+            .listen_addrs
+            .iter()
+            .any(|addr| addr.starts_with("dataplane://"))
+            && member
+                .connectivity_state
+                .as_ref()
+                .map(|state| {
+                    state.status == crate::connectivity::ConnectivityStatus::Connected
+                        && state.active_path == crate::connectivity::ConnectivityPath::Direct
+                })
+                .unwrap_or(false)
+    }) {
+        crate::api::types::TransportCapabilityTier::DirectPreferred
+    } else if members.iter().all(|member| {
+        member
+            .listen_addrs
+            .iter()
+            .any(|addr| addr.starts_with("dataplane://"))
+    }) {
+        crate::api::types::TransportCapabilityTier::DirectTcp
+    } else {
+        crate::api::types::TransportCapabilityTier::RelayFallback
+    }
 }
 
 fn fail_session_job(
@@ -1003,11 +1140,16 @@ fn fail_session_job(
     execution_plan_json: &str,
     now: &str,
 ) -> ApiResult<()> {
+    let accounting = load_failover_failure_accounting(tx, &context.session.job_id)?;
     tx.execute(
         r#"
         UPDATE inference_jobs
         SET status = 'failed',
             active_segment_id = NULL,
+            released_credits = CASE
+                WHEN released_credits > 0 THEN released_credits
+                ELSE reserved_credits
+            END,
             updated_at = ?,
             completed_at = COALESCE(completed_at, ?),
             error = ?
@@ -1097,7 +1239,100 @@ fn fail_session_job(
         params![&decision.reason, now, &context.session.session_id],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    settle_failover_failure_accounting(tx, &accounting, now)?;
     record_regroup_scheduler_events(tx, context, decision, now)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct FailoverFailureAccounting {
+    job_id: String,
+    network_id: String,
+    model_id: String,
+    submitted_by_device_id: String,
+    reserved_credits: f64,
+    released_credits: f64,
+}
+
+fn load_failover_failure_accounting(
+    tx: &Transaction<'_>,
+    job_id: &str,
+) -> ApiResult<FailoverFailureAccounting> {
+    tx.query_row(
+        r#"
+        SELECT network_id, model_id, submitted_by_device_id, reserved_credits, released_credits
+        FROM inference_jobs
+        WHERE job_id = ?
+        "#,
+        params![job_id],
+        |row| {
+            Ok(FailoverFailureAccounting {
+                job_id: job_id.to_string(),
+                network_id: row.get(0)?,
+                model_id: row.get(1)?,
+                submitted_by_device_id: row.get(2)?,
+                reserved_credits: row.get(3)?,
+                released_credits: row.get(4)?,
+            })
+        },
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
+fn settle_failover_failure_accounting(
+    tx: &Transaction<'_>,
+    accounting: &FailoverFailureAccounting,
+    now: &str,
+) -> ApiResult<()> {
+    if accounting.released_credits <= f64::EPSILON {
+        insert_failover_ledger_event(
+            tx,
+            &accounting.network_id,
+            "credits_released",
+            Some(&accounting.job_id),
+            Some(&accounting.submitted_by_device_id),
+            None,
+            serde_json::json!({
+                "credit_model": "consumption_v1",
+                "model_id": accounting.model_id,
+                "reserved_credits": accounting.reserved_credits,
+                "release_reason": "job_failed_failover",
+            }),
+            now,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn insert_failover_ledger_event(
+    tx: &Transaction<'_>,
+    network_id: &str,
+    event_type: &str,
+    job_id: Option<&str>,
+    device_id: Option<&str>,
+    credits_amount: Option<f64>,
+    metadata: serde_json::Value,
+    now: &str,
+) -> ApiResult<()> {
+    tx.execute(
+        r#"
+        INSERT INTO ledger_events (
+            event_id, network_id, event_type, job_id, device_id, credits_amount, metadata, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            network_id,
+            event_type,
+            job_id,
+            device_id,
+            credits_amount,
+            metadata.to_string(),
+            now,
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(())
 }
 
@@ -1290,21 +1525,83 @@ fn apply_serving_group_regroup_updates(
     tx: &Transaction<'_>,
     context: &FailoverSessionContext,
     decision: &FailoverDecision,
+    target_group: &ExecutionGroup,
+    _target_segment_id: &str,
     now: &str,
 ) -> ApiResult<()> {
+    let member_by_device = target_group
+        .members
+        .iter()
+        .map(|member| (member.device_id.as_str(), member))
+        .collect::<HashMap<_, _>>();
+    for member in &target_group.members {
+        let exists: Option<String> = tx
+            .query_row(
+                r#"
+                SELECT device_id
+                FROM inference_serving_groups
+                WHERE session_id = ? AND device_id = ? AND phase = 'decode'
+                "#,
+                params![&context.session.session_id, &member.device_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        if exists.is_none() {
+            tx.execute(
+                r#"
+                INSERT INTO inference_serving_groups (
+                    group_id, session_id, job_id, network_id, model_id, phase, device_id,
+                    ring_position, shard_column_start, shard_column_end, assigned_capacity_units,
+                    execution_provider, status, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, 'decode', ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                "#,
+                params![
+                    &target_group.group_id,
+                    &context.session.session_id,
+                    &context.session.job_id,
+                    &context.session.network_id,
+                    &context.session.model_id,
+                    &member.device_id,
+                    i64::from(member.ring_position),
+                    i64::from(member.shard.column_start),
+                    i64::from(member.shard.column_end),
+                    i64::from(member.assigned_capacity_units),
+                    &member.execution_provider,
+                    member.status.as_str(),
+                    now
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        }
+    }
+
     for update in &decision.serving_group_updates {
+        let member = member_by_device.get(update.device_id.as_str()).copied();
         tx.execute(
             r#"
             UPDATE inference_serving_groups
             SET status = ?,
+                group_id = ?,
+                ring_position = COALESCE(?, ring_position),
                 lease_owner_device_id = NULL,
                 lease_expires_at = NULL,
+                shard_column_start = COALESCE(?, shard_column_start),
+                shard_column_end = COALESCE(?, shard_column_end),
+                assigned_capacity_units = COALESCE(?, assigned_capacity_units),
+                execution_provider = COALESCE(?, execution_provider),
                 updated_at = ?,
                 last_error = ?
             WHERE session_id = ? AND device_id = ? AND phase = 'decode'
             "#,
             params![
                 &update.status,
+                &target_group.group_id,
+                member.map(|member| i64::from(member.ring_position)),
+                member.map(|member| i64::from(member.shard.column_start)),
+                member.map(|member| i64::from(member.shard.column_end)),
+                member.map(|member| i64::from(member.assigned_capacity_units)),
+                member.map(|member| member.execution_provider.as_str()),
                 now,
                 update.last_error.as_deref(),
                 &context.session.session_id,
@@ -2108,6 +2405,18 @@ mod tests {
             decode_segment.participant_device_ids,
             vec!["worker-1".to_string()]
         );
+        let decode_group = regrouped_plan
+            .execution_groups
+            .iter()
+            .find(|group| group.group_id == "group-decode")
+            .unwrap();
+        assert_eq!(decode_group.members.len(), 1);
+        assert_eq!(decode_group.members[0].device_id, "worker-1");
+        assert_eq!(decode_group.members[0].ring_position, 0);
+        assert_eq!(decode_group.members[0].left_neighbor, "worker-1");
+        assert_eq!(decode_group.members[0].right_neighbor, "worker-1");
+        assert_eq!(decode_group.members[0].shard_worker_position, 0);
+        assert_eq!(decode_group.members[0].shard_total_workers, 4);
 
         let assignment_statuses = load_assignment_statuses(&conn);
         assert_eq!(
@@ -2179,6 +2488,45 @@ mod tests {
             replica_statuses.get("worker-3").map(String::as_str),
             Some("decode_pending_transfer")
         );
+    }
+
+    #[test]
+    fn reconcile_failover_state_releases_reserved_credits_when_it_fails_the_job() {
+        let db = create_test_db();
+        register_fixture_devices(&db, &["worker-1", "worker-2"]);
+        let (plan, session, replicas, groups) = prefill_fixture();
+        persist_session_fixture(&db, &plan, &session, &replicas, &groups, None, "running");
+
+        let conn = db.get_conn().unwrap();
+        conn.execute(
+            "UPDATE inference_jobs SET reserved_credits = 42.0 WHERE job_id = 'job-a'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        mark_device_status(&db, "worker-2", "offline");
+        let reconciled = reconcile_failover_state(&db, &["worker-2".to_string()]).unwrap();
+        assert_eq!(reconciled, 1);
+
+        let conn = db.get_conn().unwrap();
+        let released_credits: f64 = conn
+            .query_row(
+                "SELECT released_credits FROM inference_jobs WHERE job_id = 'job-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(released_credits, 42.0);
+
+        let release_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events WHERE job_id = 'job-a' AND event_type = 'credits_released'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(release_events, 1);
     }
 
     #[test]
@@ -2494,6 +2842,8 @@ mod tests {
                 column_end: end,
                 estimated_memory: 1024,
             },
+            shard_worker_position: start,
+            shard_total_workers: 4,
             left_neighbor: String::new(),
             right_neighbor: String::new(),
             connectivity_state: None,

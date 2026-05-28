@@ -205,6 +205,12 @@ pub struct WorkerPosition {
     /// Column range this worker is responsible for
     pub shard_column_range: (u32, u32),
 
+    /// Shard artifact worker position used to load the correct model shard.
+    pub shard_worker_position: u32,
+
+    /// Total shard workers used to load the correct model shard.
+    pub shard_total_workers: u32,
+
     /// Model shard memory usage in bytes
     pub shard_memory_bytes: u64,
 }
@@ -383,8 +389,8 @@ impl InferenceCoordinator {
         format!(
             "{}:{}:{}:{}-{}",
             model_id,
-            position.position,
-            position.total_workers,
+            position.shard_worker_position,
+            position.shard_total_workers,
             position.shard_column_range.0,
             position.shard_column_range.1
         )
@@ -446,10 +452,10 @@ impl InferenceCoordinator {
                 .await?;
             let backend = CandleExecutionBackend::new(
                 Arc::clone(&model),
-                position.position,
+                position.shard_worker_position,
                 position.shard_column_range.0 as usize,
                 position.shard_column_range.1 as usize,
-                position.total_workers,
+                position.shard_total_workers,
                 self.config.allreduce_timeout,
             )?;
             let state = self.build_session_state(request, position, &backend);
@@ -944,8 +950,8 @@ impl InferenceCoordinator {
         // Create shard assignment for this worker
         let assignment = ShardAssignment::from_column_range(
             model_id.to_string(),
-            position.position,
-            position.total_workers,
+            position.shard_worker_position,
+            position.shard_total_workers,
             position.shard_column_range.0,
             position.shard_column_range.1,
         );
@@ -2172,11 +2178,15 @@ mod tests {
             right_neighbor_punch_plan: None,
             right_neighbor_tensor_addr: "127.0.0.1:5002".parse().unwrap(),
             shard_column_range: (2457, 3276),
+            shard_worker_position: 3,
+            shard_total_workers: 10,
             shard_memory_bytes: 7_000_000_000,
         };
 
         assert_eq!(position.position, 3);
         assert_eq!(position.total_workers, 10);
+        assert_eq!(position.shard_worker_position, 3);
+        assert_eq!(position.shard_total_workers, 10);
     }
 
     #[test]

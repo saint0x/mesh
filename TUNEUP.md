@@ -1313,19 +1313,19 @@ internals yourself.
 
 ### Agent 5 checklist
 
-- [ ] Map every control-plane interaction that occurs during active decode.
-- [ ] Classify which interactions are essential at token cadence and which are
+- ✅ Map every control-plane interaction that occurs during active decode.
+- ✅ Classify which interactions are essential at token cadence and which are
   not.
-- [ ] Reduce DB write amplification during active decode.
-- [ ] Reduce polling or observation churn where possible.
-- [ ] Revisit lease renewal cadence and lease ownership mutation cost.
+- ✅ Reduce DB write amplification during active decode.
+- ✅ Reduce polling or observation churn where possible.
+- ✅ Revisit lease renewal cadence and lease ownership mutation cost.
 - ✅ Preserve queue visibility and operator introspection while coarsening
   hot-path mutation where possible.
 - ✅ Preserve fairness and cohort semantics.
 - ✅ Ensure assignment, ownership, and resume semantics still work with a more
   autonomous worker-local execution window.
 - ✅ Make any schema/API changes needed to support lower hot-path pressure.
-- [ ] Preserve scheduler correctness while reducing interference with active
+- ✅ Preserve scheduler correctness while reducing interference with active
   serving.
 
 ### Agent 5 boundaries
@@ -1344,6 +1344,72 @@ internals yourself.
 - If failover state mutations are creating too much hot-path interference,
   isolate the mutation path and hand recovery-specific changes to Agent 6 rather
   than weakening the scheduler model.
+
+### Agent 5 interaction map
+
+The active decode path now touches the control plane in a narrower and more
+explicit way:
+
+- work claiming:
+  - decode-only claims are attempted first
+  - generic claims are used as fallback
+  - idle queue observation is throttled rather than emitted every claim loop
+- lease ownership:
+  - decode leases are renewed on a coarse interval instead of token cadence
+  - decode leases are explicitly released on failure and completion boundaries
+- progress reporting:
+  - prefill completion is reported immediately
+  - decode progress is buffered locally and flushed on interval or meaningful
+    token delta
+- scheduler/operator visibility:
+  - queue state, lease state, pooled cohort state, batch telemetry, and decode
+    residency state remain externally visible
+- accounting and settlement:
+  - progress/result writes still reconcile realtime job accounting and session
+    status, but batch telemetry is aggregated into dedicated fields and event
+    tables rather than requiring token-by-token queue mutation
+
+### Agent 5 classification
+
+- token-cadence essential:
+  - local decode execution
+  - local batching decisions
+  - local fairness ordering
+- coarse-interval/runtime-window essential:
+  - decode lease renewal
+  - buffered decode progress flush
+  - idle queue observation
+- completion-boundary essential:
+  - decode lease release
+  - final result reporting
+  - checkpoint upload/export when required
+- operator-only/observability surfaces:
+  - scheduler queue snapshots
+  - pooled cohort visibility
+  - decode batch telemetry events
+
+### Agent 5 verified implementation notes
+
+- Idle queue observation is throttled by `IDLE_QUEUE_OBSERVATION_POLL_INTERVAL`
+  in [agent/src/main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs:72).
+- Decode lease renewal is decoupled from token cadence and runs on a `20s`
+  interval in [agent/src/main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs:2266).
+- Decode progress is buffered and coalesced through
+  `DecodeProgressReporter` in
+  [agent/src/main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs:853),
+  with interval flushes at `1500ms` and eager flushes only after a `16` token
+  delta.
+- Scheduler-owned decode batching preserves fairness with monotonic
+  `fairness_epoch` ordering in
+  [agent/src/inference/coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs:250).
+- Control-plane decode progress writes update aggregated session telemetry and
+  append decode batch events rather than forcing queue churn on every token in
+  [control-plane/src/api/inference.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/api/inference.rs:4091).
+- Scheduler correctness and visibility remain covered by existing tests for:
+  - pooled lease renew/release behavior
+  - scheduler batch target honoring
+  - queue/KV residency status
+  - regroup and lease status reporting
 
 ## Agent 6: Checkpoint, Failover, And KV Conversion Owner
 

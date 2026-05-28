@@ -20,6 +20,23 @@
       "times": 1
     },
     {
+      "name": "control-plane regroup rewrites decode topology to the compact surviving serving group",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_shrinks_decode_session_and_makes_it_resume_ready",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
       "name": "decode failover can pause regroup until checkpoint transfer completes",
       "type": "proc_when",
       "cmd": "cargo",
@@ -28,6 +45,23 @@
         "-p",
         "control-plane",
         "services::failover::tests::reconcile_failover_state_pauses_decode_until_checkpoint_transfer_for_replacement",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "terminal failover releases reserved credits immediately",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_releases_reserved_credits_when_it_fails_the_job",
         "--",
         "--nocapture",
         "--test-threads=1"
