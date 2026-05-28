@@ -1129,8 +1129,8 @@ fn load_live_ring_topology(conn: &Transaction<'_>, network_id: &str) -> ApiResul
         .prepare(
             r#"
             SELECT device_id, peer_id, ring_position, status, contributed_memory, shard_model_id,
-                   shard_column_start, shard_column_end, connectivity_state, listen_addrs,
-                   direct_candidates, left_neighbor_id, right_neighbor_id
+                   shard_column_start, shard_column_end, shard_worker_position, shard_total_workers,
+                   connectivity_state, listen_addrs, direct_candidates, left_neighbor_id, right_neighbor_id
             FROM devices
             WHERE network_id = ?
               AND ring_position IS NOT NULL
@@ -1143,9 +1143,9 @@ fn load_live_ring_topology(conn: &Transaction<'_>, network_id: &str) -> ApiResul
 
     let workers = stmt
         .query_map(params![network_id], |row| {
-            let connectivity_state_json = row.get::<_, Option<String>>(8)?;
-            let listen_addrs_json = row.get::<_, Option<String>>(9)?;
-            let direct_candidates_json = row.get::<_, Option<String>>(10)?;
+            let connectivity_state_json = row.get::<_, Option<String>>(10)?;
+            let listen_addrs_json = row.get::<_, Option<String>>(11)?;
+            let direct_candidates_json = row.get::<_, Option<String>>(12)?;
             Ok(WorkerTopologyInfo {
                 device_id: row.get(0)?,
                 peer_id: row.get(1)?,
@@ -1161,13 +1161,17 @@ fn load_live_ring_topology(conn: &Transaction<'_>, network_id: &str) -> ApiResul
                     estimated_memory: row.get::<_, Option<i64>>(4)?.unwrap_or_default().max(0)
                         as u64,
                 },
+                shard_worker_position: row.get::<_, Option<i64>>(8)?.unwrap_or_default().max(0)
+                    as u32,
+                shard_total_workers: row.get::<_, Option<i64>>(9)?.unwrap_or_default().max(0)
+                    as u32,
                 connectivity_state: connectivity_state_json
                     .as_deref()
                     .map(serde_json::from_str::<DeviceConnectivityState>)
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            8,
+                            10,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -1178,7 +1182,7 @@ fn load_live_ring_topology(conn: &Transaction<'_>, network_id: &str) -> ApiResul
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            9,
+                            11,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -1190,14 +1194,14 @@ fn load_live_ring_topology(conn: &Transaction<'_>, network_id: &str) -> ApiResul
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            10,
+                            12,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
                     })?
                     .unwrap_or_default(),
-                left_neighbor: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                right_neighbor: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                left_neighbor: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                right_neighbor: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
             })
         })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?

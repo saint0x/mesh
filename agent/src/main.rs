@@ -68,7 +68,7 @@ use tracing::{error, info, warn};
 use ui::cmd_ui;
 use uuid::Uuid;
 
-const CLAIM_POLL_INTERVAL_SECS: u64 = 2;
+const CLAIM_POLL_INTERVAL_SECS: u64 = 1;
 const IDLE_QUEUE_OBSERVATION_POLL_INTERVAL: u32 = 5;
 const DECODE_PROGRESS_FLUSH_INTERVAL_MS: u64 = 1500;
 const DECODE_PROGRESS_EAGER_TOKEN_DELTA: u32 = 16;

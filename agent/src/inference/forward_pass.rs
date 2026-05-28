@@ -407,6 +407,7 @@ impl DeviceLayerKVCache {
         Ok((active_keys, active_values, self.seq_len))
     }
 
+    #[cfg(test)]
     fn block_table_len(&self) -> usize {
         self.block_table.len()
     }
@@ -554,10 +555,12 @@ impl DeviceKVCache {
         Ok(())
     }
 
+    #[cfg(test)]
     fn live_page_tokens(&self) -> usize {
         self.config.live_page_tokens()
     }
 
+    #[cfg(test)]
     fn live_block_table_len(&self, layer_idx: usize) -> Result<usize> {
         self.layers
             .get(layer_idx)

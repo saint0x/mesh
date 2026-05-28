@@ -17,7 +17,7 @@ use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
 use crate::network::{MeshSwarm, TensorPlane};
 use libp2p::PeerId;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -251,7 +251,10 @@ pub struct InferenceCoordinator {
     sessions: HashMap<Uuid, ActiveSession>,
 
     /// Fair decode-work queue populated by session owners and consumed by the runtime.
-    decode_queue: VecDeque<DecodeTask>,
+    decode_queue: BTreeSet<QueuedDecodeTask>,
+
+    /// Fast lookup for removing or prioritizing a queued session without scanning the whole set.
+    decode_queue_index: HashMap<Uuid, QueuedDecodeTask>,
 
     /// Monotonic counter used to preserve queue fairness across re-enqueues.
     next_decode_fairness_epoch: u64,
@@ -278,6 +281,13 @@ struct DecodeStepOutcome {
     should_checkpoint: bool,
     completed: bool,
     time_to_first_token_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct QueuedDecodeTask {
+    decode_steps_served: u64,
+    fairness_epoch: u64,
+    session_id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -330,7 +340,8 @@ impl InferenceCoordinator {
             loader,
             model_residency_cache: RwLock::new(HashMap::new()),
             sessions: HashMap::new(),
-            decode_queue: VecDeque::new(),
+            decode_queue: BTreeSet::new(),
+            decode_queue_index: HashMap::new(),
             next_decode_fairness_epoch: 0,
             recovery_governor: RecoveryGovernor::default(),
         }
@@ -520,18 +531,6 @@ impl InferenceCoordinator {
             .max(session.job.request.prompt_tokens.len())
     }
 
-    fn same_decode_batch_class(primary: &ActiveSession, candidate: &ActiveSession) -> bool {
-        match primary.job.request.runtime_mode {
-            InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst => {
-                primary.backend.provider_kind() == candidate.backend.provider_kind()
-                    && primary.backend.optimization_profile()
-                        == candidate.backend.optimization_profile()
-                    && primary.backend.executor_contract() == candidate.backend.executor_contract()
-            }
-            InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
-        }
-    }
-
     fn enqueue_decode_task(&mut self, session_id: Uuid) -> Result<()> {
         let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
             AgentError::Execution(format!(
@@ -553,11 +552,20 @@ impl InferenceCoordinator {
 
         self.next_decode_fairness_epoch = self.next_decode_fairness_epoch.saturating_add(1);
         session.queued_for_decode = true;
-        self.decode_queue.push_back(DecodeTask {
-            session_id,
+        let task = QueuedDecodeTask {
+            decode_steps_served: session.decode_steps_served,
             fairness_epoch: self.next_decode_fairness_epoch,
-        });
+            session_id,
+        };
+        self.decode_queue.insert(task);
+        self.decode_queue_index.insert(session_id, task);
         Ok(())
+    }
+
+    fn remove_decode_task(&mut self, session_id: Uuid) {
+        if let Some(task) = self.decode_queue_index.remove(&session_id) {
+            self.decode_queue.remove(&task);
+        }
     }
 
     fn pause_session(&mut self, session_id: Uuid, reason: SessionPauseReason, detail: String) {
@@ -566,8 +574,7 @@ impl InferenceCoordinator {
             session.engine_state.runtime_status = SessionRuntimeStatus::Paused;
             session.engine_state.paused = Some(SessionPauseState { reason, detail });
         }
-        self.decode_queue
-            .retain(|task| task.session_id != session_id);
+        self.remove_decode_task(session_id);
     }
 
     fn resume_session(&mut self, session_id: Uuid) -> Result<()> {
@@ -603,8 +610,7 @@ impl InferenceCoordinator {
             session.engine_state.evicted = Some(SessionEvictionState { reason, detail });
         }
         self.prune_unused_model_residency();
-        self.decode_queue
-            .retain(|task| task.session_id != session_id);
+        self.remove_decode_task(session_id);
         Ok(())
     }
 
@@ -715,37 +721,95 @@ impl InferenceCoordinator {
         let mut deferred_for_capacity = 0_usize;
         let mut deferred_for_kv_budget = 0_usize;
         let mut deferred_for_guardrail = 0_usize;
-        let mut queue = std::mem::take(&mut self.decode_queue)
-            .into_iter()
-            .collect::<Vec<_>>();
-        queue.sort_by_key(|task| {
-            self.sessions
-                .get(&task.session_id)
-                .map(|session| {
-                    (
-                        task.session_id != primary_session_id,
-                        session.decode_steps_served,
-                        task.fairness_epoch,
-                    )
-                })
-                .unwrap_or((true, u64::MAX, task.fairness_epoch))
-        });
+        let primary_task = self.decode_queue_index.get(&primary_session_id).copied();
+        let ordered_tasks = self.decode_queue.iter().copied().collect::<Vec<_>>();
+        let mut primary_batch_class = None::<(
+            InferenceRuntimeMode,
+            crate::provider::ExecutionProviderKind,
+            super::engine::BackendOptimizationProfile,
+            super::engine::LocalExecutorContract,
+        )>;
 
-        for task in queue {
-            let Some(session) = self.sessions.get(&task.session_id) else {
-                continue;
-            };
+        if let Some(task) = primary_task {
+            let mut should_defer = false;
+            if let Some(session) = self.sessions.get(&task.session_id) {
+                if !session.job.is_complete() && session.queued_for_decode {
+                    let kv_tokens = Self::session_decode_kv_tokens(session);
+                    primary_batch_class = Some((
+                        session.job.request.runtime_mode,
+                        session.backend.provider_kind(),
+                        session.backend.optimization_profile(),
+                        session.backend.executor_contract().clone(),
+                    ));
+                    slots.push(DecodeBatchSlot {
+                        session_id: task.session_id,
+                        fairness_epoch: task.fairness_epoch,
+                        kv_tokens,
+                    });
+                    total_kv_tokens = total_kv_tokens.saturating_add(kv_tokens);
+                    self.remove_decode_task(task.session_id);
+                } else {
+                    should_defer = true;
+                }
+            } else {
+                should_defer = true;
+            }
+            if should_defer {
+                self.remove_decode_task(task.session_id);
+            }
+        }
 
-            if session.job.is_complete() {
+        for task in ordered_tasks {
+            if Some(task) == primary_task {
                 continue;
             }
 
-            if let Some(primary_session) = self.sessions.get(&primary_session_id) {
-                if !Self::same_decode_batch_class(primary_session, session) {
+            let Some(session) = self.sessions.get(&task.session_id) else {
+                self.remove_decode_task(task.session_id);
+                continue;
+            };
+
+            if session.job.is_complete() || !session.queued_for_decode {
+                self.remove_decode_task(task.session_id);
+                continue;
+            }
+
+            if self
+                .decode_queue_index
+                .get(&task.session_id)
+                .copied()
+                .filter(|queued| *queued == task)
+                .is_none()
+            {
+                continue;
+            }
+
+            if let Some((runtime_mode, provider, optimization_profile, executor_contract)) =
+                primary_batch_class.as_ref()
+            {
+                let same_class = match runtime_mode {
+                    InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst => {
+                        session.backend.provider_kind() == *provider
+                            && session.backend.optimization_profile() == *optimization_profile
+                            && session.backend.executor_contract() == executor_contract
+                    }
+                    InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
+                };
+                if !same_class {
                     deferred_for_guardrail = deferred_for_guardrail.saturating_add(1);
-                    deferred.push(task);
+                    deferred.push(DecodeTask {
+                        session_id: task.session_id,
+                        fairness_epoch: task.fairness_epoch,
+                    });
                     continue;
                 }
+            } else {
+                primary_batch_class = Some((
+                    session.job.request.runtime_mode,
+                    session.backend.provider_kind(),
+                    session.backend.optimization_profile(),
+                    session.backend.executor_contract().clone(),
+                ));
             }
 
             let kv_tokens = Self::session_decode_kv_tokens(session);
@@ -758,7 +822,10 @@ impl InferenceCoordinator {
                 } else {
                     deferred_for_kv_budget = deferred_for_kv_budget.saturating_add(1);
                 }
-                deferred.push(task);
+                deferred.push(DecodeTask {
+                    session_id: task.session_id,
+                    fairness_epoch: task.fairness_epoch,
+                });
                 continue;
             }
 
@@ -768,6 +835,7 @@ impl InferenceCoordinator {
                 kv_tokens,
             });
             total_kv_tokens = total_kv_tokens.saturating_add(kv_tokens);
+            self.remove_decode_task(task.session_id);
         }
 
         for slot in &slots {
@@ -812,8 +880,6 @@ impl InferenceCoordinator {
                 })
             }
         };
-
-        self.decode_queue = deferred.iter().copied().collect();
 
         DecodeBatchPlan {
             slots,
@@ -1113,8 +1179,7 @@ impl InferenceCoordinator {
             self.stats.record_failure();
             self.sessions.remove(&prefill_request.session_id);
             self.prune_unused_model_residency();
-            self.decode_queue
-                .retain(|task| task.session_id != prefill_request.session_id);
+            self.remove_decode_task(prefill_request.session_id);
             return Ok(InferenceResult::failure(
                 prefill_request.job_id,
                 error.to_string(),
@@ -1136,8 +1201,7 @@ impl InferenceCoordinator {
                 self.stats.record_failure();
                 self.sessions.remove(&decode_request.session_id);
                 self.prune_unused_model_residency();
-                self.decode_queue
-                    .retain(|task| task.session_id != decode_request.session_id);
+                self.remove_decode_task(decode_request.session_id);
                 Ok(InferenceResult::failure(
                     decode_request.job_id,
                     error.to_string(),
@@ -2356,7 +2420,14 @@ mod tests {
         assert_eq!(batch.deferred_for_kv_budget, 1);
         assert_eq!(batch.deferred[0].session_id, session_c);
         assert_eq!(coordinator.decode_queue.len(), 1);
-        assert_eq!(coordinator.decode_queue[0].session_id, session_c);
+        assert_eq!(
+            coordinator
+                .decode_queue
+                .iter()
+                .next()
+                .map(|task| task.session_id),
+            Some(session_c)
+        );
     }
 
     #[test]

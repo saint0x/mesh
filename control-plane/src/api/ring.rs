@@ -153,7 +153,6 @@ pub async fn get_topology(
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
     // Convert to API response types
-    let shard_total_workers = topology.workers.len() as u32;
     let workers: Vec<WorkerInfo> = topology
         .workers
         .into_iter()
@@ -169,8 +168,8 @@ pub async fn get_topology(
                 column_end: w.shard.column_range.1,
                 estimated_memory: w.shard.estimated_memory,
             },
-            shard_worker_position: w.position,
-            shard_total_workers,
+            shard_worker_position: w.shard_worker_position,
+            shard_total_workers: w.shard_total_workers,
             left_neighbor: w.left_neighbor,
             right_neighbor: w.right_neighbor,
             connectivity_state: w.connectivity_state,

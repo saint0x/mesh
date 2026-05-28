@@ -231,7 +231,6 @@ impl CandleExecutionBackend {
         }
 
         let mut backends = Vec::with_capacity(requests.len());
-        let mut session_ids = Vec::with_capacity(requests.len());
         let mut job_ids = Vec::with_capacity(requests.len());
         let mut tokens = Vec::with_capacity(requests.len());
         let mut expected_model_id = None::<String>;
@@ -280,7 +279,6 @@ impl CandleExecutionBackend {
             }
 
             backends.push(backend);
-            session_ids.push(request.session_id);
             job_ids.push(request.job_id);
             tokens.push(request.token);
         }
@@ -292,8 +290,9 @@ impl CandleExecutionBackend {
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
         Ok(Some(
-            session_ids
-                .into_iter()
+            requests
+                .iter()
+                .map(|request| request.session_id)
                 .zip(logits)
                 .map(|(session_id, logits)| DecodeMicrobatchOutput {
                     session_id,

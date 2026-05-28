@@ -6,11 +6,29 @@ use time::OffsetDateTime;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info};
 
-/// Background task that marks devices offline after 20 seconds of inactivity
+fn presence_poll_interval() -> Duration {
+    std::env::var("MESHNET_PRESENCE_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(1))
+}
+
+fn stale_device_timeout() -> time::Duration {
+    std::env::var("MESHNET_PRESENCE_STALE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .map(time::Duration::milliseconds)
+        .unwrap_or_else(|| time::Duration::seconds(6))
+}
+
+/// Background task that marks devices offline shortly after they stop heartbeating.
 pub async fn presence_monitor(db: Database) {
     info!("Starting presence monitor task");
 
-    let mut tick = interval(Duration::from_secs(10));
+    let mut tick = interval(presence_poll_interval());
 
     loop {
         tick.tick().await;
@@ -34,11 +52,11 @@ pub async fn presence_monitor(db: Database) {
     }
 }
 
-/// Mark devices as offline if last_seen > 20 seconds ago
+/// Mark devices as offline if last_seen is older than the configured timeout.
 fn mark_offline_devices(
     db: &Database,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let threshold = OffsetDateTime::now_utc() - time::Duration::seconds(20);
+    let threshold = OffsetDateTime::now_utc() - stale_device_timeout();
     let threshold_str = threshold
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -241,8 +259,8 @@ mod tests {
         )
         .unwrap();
 
-        // Set last_seen to 10 seconds ago (recent)
-        let recent_timestamp = (OffsetDateTime::now_utc() - time::Duration::seconds(10))
+        // Set last_seen to 3 seconds ago so it remains inside the tighter failover window.
+        let recent_timestamp = (OffsetDateTime::now_utc() - time::Duration::seconds(3))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
 

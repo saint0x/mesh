@@ -181,6 +181,8 @@ impl Database {
             tx.commit()?;
         }
 
+        backfill_explicit_shard_identity(&conn)?;
+
         tracing::info!("Migrations completed successfully");
         Ok(())
     }
@@ -379,8 +381,47 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
                 && !column_exists(conn, "inference_sessions", "kv_checkpoint_created_at")?
                 && !column_exists(conn, "inference_session_replicas", "checkpoint_created_at")?
         }
+        "036_add_explicit_shard_identity.sql" => {
+            column_exists(conn, "devices", "shard_worker_position")?
+                && column_exists(conn, "devices", "shard_total_workers")?
+        }
         _ => false,
     })
+}
+
+fn backfill_explicit_shard_identity(conn: &rusqlite::Connection) -> Result<()> {
+    if !table_exists(conn, "devices")?
+        || !column_exists(conn, "devices", "ring_position")?
+        || !column_exists(conn, "devices", "shard_model_id")?
+        || !column_exists(conn, "devices", "shard_worker_position")?
+        || !column_exists(conn, "devices", "shard_total_workers")?
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        UPDATE devices
+        SET shard_worker_position = ring_position
+        WHERE ring_position IS NOT NULL
+          AND shard_model_id IS NOT NULL
+          AND shard_worker_position IS NULL;
+
+        UPDATE devices
+        SET shard_total_workers = (
+            SELECT COUNT(*)
+            FROM devices grouped
+            WHERE grouped.network_id = devices.network_id
+              AND grouped.shard_model_id = devices.shard_model_id
+              AND grouped.ring_position IS NOT NULL
+        )
+        WHERE ring_position IS NOT NULL
+          AND shard_model_id IS NOT NULL
+          AND shard_total_workers IS NULL;
+        "#,
+    )?;
+
+    Ok(())
 }
 
 fn table_exists(conn: &rusqlite::Connection, table_name: &str) -> Result<bool> {

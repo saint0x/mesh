@@ -954,6 +954,7 @@ pub(crate) fn collective_buffer_from_candle_2d(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn candle_2d_from_collective_buffer(
     tensor: &crate::executor::ring_allreduce::CollectiveMatrix,
 ) -> Result<CandleTensor> {

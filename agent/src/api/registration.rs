@@ -21,6 +21,15 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+fn heartbeat_interval() -> Duration {
+    std::env::var("MESHNET_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(2))
+}
+
 /// Client for registering and maintaining connection with control plane
 #[derive(Clone)]
 pub struct RegistrationClient {
@@ -233,11 +242,11 @@ impl RegistrationClient {
 
     /// Run heartbeat loop indefinitely
     ///
-    /// Sends heartbeats every 5 seconds. Does not fail on errors, just logs warnings.
+    /// Sends heartbeats on a short interval so serving-group failover can converge quickly.
     pub async fn heartbeat_loop(self, config: DeviceConfig) {
         info!(device_id = %config.device_id, "Starting heartbeat loop");
 
-        let mut tick = interval(Duration::from_secs(5));
+        let mut tick = interval(heartbeat_interval());
 
         loop {
             tick.tick().await;

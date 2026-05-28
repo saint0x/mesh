@@ -36,12 +36,11 @@ impl ExecutionPlanner {
             ));
         }
 
-        let shard_total_workers = topology.workers.len() as u32;
         let available_members = topology
             .workers
             .iter()
             .zip(device_metadata.iter())
-            .map(|(worker, metadata)| build_member(worker, metadata, shard_total_workers))
+            .map(|(worker, metadata)| build_member(worker, metadata))
             .collect::<Vec<_>>();
         let runtime_mode = derive_runtime_mode(scheduling_policy, &available_members);
         let prefill_members = select_execution_members(
@@ -160,12 +159,11 @@ impl ExecutionPlanner {
             ));
         }
 
-        let shard_total_workers = topology.workers.len() as u32;
         let available_members = topology
             .workers
             .iter()
             .zip(device_metadata.iter())
-            .map(|(worker, metadata)| build_member(worker, metadata, shard_total_workers))
+            .map(|(worker, metadata)| build_member(worker, metadata))
             .collect::<Vec<_>>();
         let runtime_mode = derive_runtime_mode(scheduling_policy, &available_members);
         let model_id = phase_model_id(plan, ExecutionPhase::Decode).ok_or_else(|| {
@@ -267,7 +265,6 @@ pub fn validate_serving_group_legality(
 fn build_member(
     worker: &WorkerTopologyInfo,
     metadata: &PlannerDeviceMetadata,
-    shard_total_workers: u32,
 ) -> ExecutionGroupMember {
     ExecutionGroupMember {
         device_id: worker.device_id.clone(),
@@ -281,8 +278,8 @@ fn build_member(
             column_end: worker.shard.column_range.1,
             estimated_memory: worker.shard.estimated_memory,
         },
-        shard_worker_position: worker.position,
-        shard_total_workers,
+        shard_worker_position: worker.shard_worker_position,
+        shard_total_workers: worker.shard_total_workers,
         left_neighbor: worker.left_neighbor.clone(),
         right_neighbor: worker.right_neighbor.clone(),
         connectivity_state: worker.connectivity_state.clone(),
@@ -779,6 +776,8 @@ mod tests {
                 column_range: (start, end),
                 estimated_memory: 1024,
             },
+            shard_worker_position: pos,
+            shard_total_workers: 4,
             left_neighbor: "a".to_string(),
             right_neighbor: "b".to_string(),
             connectivity_state: Some(DeviceConnectivityState {

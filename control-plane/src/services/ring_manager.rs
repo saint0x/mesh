@@ -74,6 +74,8 @@ pub struct WorkerTopologyInfo {
     pub status: String,
     pub contributed_memory: u64,
     pub shard: ModelShard,
+    pub shard_worker_position: u32,
+    pub shard_total_workers: u32,
     pub left_neighbor: DeviceId,
     pub right_neighbor: DeviceId,
     pub connectivity_state: Option<DeviceConnectivityState>,
@@ -344,6 +346,8 @@ impl RingTopologyManager {
                 shard_model_id = ?,
                 shard_column_start = 0,
                 shard_column_end = 0,
+                shard_worker_position = ?,
+                shard_total_workers = ?,
                 contributed_memory = ?,
                 left_neighbor_id = NULL,
                 right_neighbor_id = NULL
@@ -352,6 +356,8 @@ impl RingTopologyManager {
             params![
                 new_position,
                 &worker.model_id,
+                new_position,
+                total_workers,
                 worker.contributed_memory as i64,
                 &worker.device_id
             ],
@@ -605,6 +611,8 @@ impl RingTopologyManager {
                     shard_model_id = ?,
                     shard_column_start = ?,
                     shard_column_end = ?,
+                    shard_worker_position = ?,
+                    shard_total_workers = ?,
                     left_neighbor_id = ?,
                     right_neighbor_id = ?
                 WHERE device_id = ?
@@ -614,6 +622,8 @@ impl RingTopologyManager {
                     &shard.model_id,
                     shard.column_range.0,
                     shard.column_range.1,
+                    position,
+                    total_workers,
                     &left_neighbor,
                     &right_neighbor,
                     device_id
@@ -692,6 +702,8 @@ impl RingTopologyManager {
                 shard_model_id = NULL,
                 left_neighbor_id = NULL,
                 right_neighbor_id = NULL,
+                shard_worker_position = NULL,
+                shard_total_workers = NULL,
                 shard_column_start = NULL,
                 shard_column_end = NULL
             WHERE device_id = ?
@@ -743,8 +755,8 @@ impl RingTopologyManager {
             .prepare(
                 r#"
                 SELECT device_id, ring_position, shard_model_id, shard_column_start, shard_column_end,
-                       left_neighbor_id, right_neighbor_id, status, contributed_memory, connectivity_state,
-                       peer_id, listen_addrs, direct_candidates
+                       shard_worker_position, shard_total_workers, left_neighbor_id, right_neighbor_id,
+                       status, contributed_memory, connectivity_state, peer_id, listen_addrs, direct_candidates
                 FROM devices
                 WHERE network_id = ? AND ring_position IS NOT NULL
                 ORDER BY ring_position
@@ -759,23 +771,13 @@ impl RingTopologyManager {
                 let shard_model_id = row.get::<_, String>(2)?;
                 let shard_start: u32 = row.get(3)?;
                 let shard_end: u32 = row.get(4)?;
-                let left_neighbor: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
-                let right_neighbor: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
-                let status: String = row.get(7)?;
-                let contributed_memory = row.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64;
+                let shard_worker_position: u32 = row.get(5)?;
+                let shard_total_workers: u32 = row.get(6)?;
+                let left_neighbor: String = row.get::<_, Option<String>>(7)?.unwrap_or_default();
+                let right_neighbor: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+                let status: String = row.get(9)?;
+                let contributed_memory = row.get::<_, Option<i64>>(10)?.unwrap_or(0) as u64;
                 let connectivity_state = row
-                    .get::<_, Option<String>>(9)?
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            9,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                let peer_id: String = row.get(10)?;
-                let listen_addrs = row
                     .get::<_, Option<String>>(11)?
                     .map(|json| serde_json::from_str(&json))
                     .transpose()
@@ -785,15 +787,27 @@ impl RingTopologyManager {
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
-                    })?
-                    .unwrap_or_default();
-                let direct_candidates = row
-                    .get::<_, Option<String>>(12)?
+                    })?;
+                let peer_id: String = row.get(12)?;
+                let listen_addrs = row
+                    .get::<_, Option<String>>(13)?
                     .map(|json| serde_json::from_str(&json))
                     .transpose()
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            12,
+                            13,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .unwrap_or_default();
+                let direct_candidates = row
+                    .get::<_, Option<String>>(14)?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            14,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -811,6 +825,8 @@ impl RingTopologyManager {
                         column_range: (shard_start, shard_end),
                         estimated_memory: contributed_memory,
                     },
+                    shard_worker_position,
+                    shard_total_workers,
                     left_neighbor,
                     right_neighbor,
                     connectivity_state,
