@@ -1,10 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -244,7 +245,7 @@ impl ServingFrameBytes {
     }
 
     pub fn decode_payload_vec(&self) -> Vec<f32> {
-        decode_f32_slice_be(&self.payload_bytes)
+        decode_f32_slice_wire(&self.payload_bytes)
     }
 
     pub fn first_f32(&self) -> Result<f32> {
@@ -253,7 +254,7 @@ impl ServingFrameBytes {
                 "Serving frame payload missing first f32 value".to_string(),
             ));
         }
-        Ok(f32::from_bits(u32::from_be_bytes([
+        Ok(f32::from_bits(u32::from_le_bytes([
             self.payload_bytes[0],
             self.payload_bytes[1],
             self.payload_bytes[2],
@@ -273,7 +274,7 @@ impl ServingFrameBytes {
             .iter_mut()
             .zip(self.payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
         {
-            *slot += f32::from_bits(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(())
     }
@@ -290,7 +291,7 @@ impl ServingFrameBytes {
             .iter_mut()
             .zip(self.payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
         {
-            *slot = f32::from_bits(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            *slot = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(())
     }
@@ -1798,16 +1799,22 @@ fn encode_serving_frame_binary(header: ServingFrameHeader, chunk_data: &[f32]) -
     let payload_bytes = chunk_data.len() * std::mem::size_of::<f32>();
     let mut buf = BytesMut::with_capacity(header_bytes.len() + payload_bytes);
     buf.extend_from_slice(&header_bytes);
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let raw_payload = slice::from_raw_parts(chunk_data.as_ptr() as *const u8, payload_bytes);
+        buf.extend_from_slice(raw_payload);
+    }
+    #[cfg(target_endian = "big")]
     for value in chunk_data {
-        buf.put_u32(value.to_bits());
+        buf.extend_from_slice(&value.to_bits().to_le_bytes());
     }
     buf
 }
 
-fn decode_f32_slice_be(buf: &[u8]) -> Vec<f32> {
+fn decode_f32_slice_wire(buf: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(buf.len() / std::mem::size_of::<f32>());
     for chunk in buf.chunks_exact(std::mem::size_of::<f32>()) {
-        out.push(f32::from_bits(u32::from_be_bytes([
+        out.push(f32::from_bits(u32::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
         ])));
     }
@@ -2059,7 +2066,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(frame.header, header);
-        assert_eq!(decode_f32_slice_be(&frame.payload_bytes), chunk_data);
+        assert_eq!(decode_f32_slice_wire(&frame.payload_bytes), chunk_data);
     }
 
     #[tokio::test]

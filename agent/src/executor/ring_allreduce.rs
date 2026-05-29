@@ -187,7 +187,7 @@ impl CollectiveMatrix {
         }
     }
 
-    pub fn accumulate_range_from_be_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
+    pub fn accumulate_range_from_wire_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
         let expected_bytes = range.len().saturating_mul(std::mem::size_of::<f32>());
         assert_eq!(
             payload_bytes.len(),
@@ -202,7 +202,7 @@ impl CollectiveMatrix {
                     .iter_mut()
                     .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
                 {
-                    *dst += f32::from_bits(u32::from_be_bytes([
+                    *dst += f32::from_bits(u32::from_le_bytes([
                         chunk[0], chunk[1], chunk[2], chunk[3],
                     ]));
                 }
@@ -217,7 +217,7 @@ impl CollectiveMatrix {
                     .iter_mut()
                     .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
                 {
-                    *slot += f32::from_bits(u32::from_be_bytes([
+                    *slot += f32::from_bits(u32::from_le_bytes([
                         chunk[0], chunk[1], chunk[2], chunk[3],
                     ]));
                 }
@@ -239,7 +239,7 @@ impl CollectiveMatrix {
         }
     }
 
-    pub fn copy_range_from_be_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
+    pub fn copy_range_from_wire_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
         let expected_bytes = range.len().saturating_mul(std::mem::size_of::<f32>());
         assert_eq!(
             payload_bytes.len(),
@@ -254,7 +254,7 @@ impl CollectiveMatrix {
                     .iter_mut()
                     .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
                 {
-                    *dst = f32::from_bits(u32::from_be_bytes([
+                    *dst = f32::from_bits(u32::from_le_bytes([
                         chunk[0], chunk[1], chunk[2], chunk[3],
                     ]));
                 }
@@ -269,7 +269,7 @@ impl CollectiveMatrix {
                     .iter_mut()
                     .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
                 {
-                    *slot = f32::from_bits(u32::from_be_bytes([
+                    *slot = f32::from_bits(u32::from_le_bytes([
                         chunk[0], chunk[1], chunk[2], chunk[3],
                     ]));
                 }
@@ -770,8 +770,10 @@ impl<'a> WorkerRing<'a> {
                     partial_result.len()
                 )));
             }
-            partial_result
-                .accumulate_range_from_be_bytes(0..partial_result.len(), recv_msg.payload_bytes());
+            partial_result.accumulate_range_from_wire_bytes(
+                0..partial_result.len(),
+                recv_msg.payload_bytes(),
+            );
             self.last_run_metrics = run_metrics;
             return Ok(partial_result);
         }
@@ -804,7 +806,7 @@ impl<'a> WorkerRing<'a> {
                     step_plan.recv_range.len()
                 )));
             }
-            partial_result.accumulate_range_from_be_bytes(
+            partial_result.accumulate_range_from_wire_bytes(
                 step_plan.recv_range.clone(),
                 recv_msg.payload_bytes(),
             );
@@ -836,7 +838,7 @@ impl<'a> WorkerRing<'a> {
                 )));
             }
             partial_result
-                .copy_range_from_be_bytes(step_plan.recv_range.clone(), recv_msg.payload_bytes());
+                .copy_range_from_wire_bytes(step_plan.recv_range.clone(), recv_msg.payload_bytes());
         }
 
         self.last_run_metrics = run_metrics;
