@@ -372,7 +372,16 @@ pub struct WorkerRing<'a> {
 struct CachedChunkLayout {
     len: usize,
     total_workers: u32,
-    ranges: Vec<Range<usize>>,
+    my_position: u32,
+    reduce_scatter_steps: Vec<CachedCollectiveStep>,
+    all_gather_steps: Vec<CachedCollectiveStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedCollectiveStep {
+    recv_slot: u32,
+    send_range: Range<usize>,
+    recv_range: Range<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,17 +553,16 @@ impl<'a> WorkerRing<'a> {
             return Ok(Tensor::new(work_buffer, original_shape));
         }
         let n = self.total_workers as usize;
-        let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
         let mut run_metrics = RingAllReduceMetrics::default();
-        let chunk_ranges = self.cached_chunk_ranges_for_len(partial_result.data.len());
+        let plan = self.cached_collective_plan_for_len(partial_result.data.len());
         let mut work_buffer = partial_result.data;
 
         info!(
             "Starting ring all-reduce: n={}, my_pos={}, chunks={}",
             n,
-            my_pos,
-            chunk_ranges.len()
+            self.my_position,
+            plan.reduce_scatter_steps.len() + 1
         );
 
         // PHASE 1: Reduce-Scatter (n-1 steps)
@@ -563,19 +571,8 @@ impl<'a> WorkerRing<'a> {
             // In step k, worker i:
             // - Sends chunk[(i - k) % n] to right neighbor
             // - Receives from left neighbor into chunk[(i - k - 1) % n]
-            let send_idx = (my_pos + n - step) % n;
-            let recv_idx = (my_pos + n - step - 1) % n;
-
-            debug!(
-                "Reduce-scatter step {}/{}: send_idx={}, recv_idx={}",
-                step + 1,
-                n - 1,
-                send_idx,
-                recv_idx
-            );
-
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.reduce_scatter_steps[step];
+            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -584,8 +581,8 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    &work_buffer[send_range.start..send_range.end],
+                    step_plan.recv_slot,
+                    &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
                     &send_shape,
                 )
                 .await?;
@@ -593,15 +590,14 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received reduce-scatter chunk len {} but expected {}",
                     recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    step_plan.recv_range.len()
                 )));
             }
-            for (dst, src) in work_buffer[recv_range.start..recv_range.end]
+            for (dst, src) in work_buffer[step_plan.recv_range.start..step_plan.recv_range.end]
                 .iter_mut()
                 .zip(recv_msg.chunk_data.iter())
             {
@@ -617,19 +613,8 @@ impl<'a> WorkerRing<'a> {
             // In step k, worker i:
             // - Sends the chunk that was accumulated in the previous all-gather step
             // - Or in step 0, sends the chunk accumulated in reduce-scatter
-            let send_idx = (my_pos + n - step + 1) % n;
-            let recv_idx = (my_pos + n - step) % n;
-
-            debug!(
-                "All-gather step {}/{}: send_idx={}, recv_idx={}",
-                step + 1,
-                n - 1,
-                send_idx,
-                recv_idx
-            );
-
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.all_gather_steps[step];
+            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -638,8 +623,8 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    &work_buffer[send_range.start..send_range.end],
+                    step_plan.recv_slot,
+                    &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
                     &send_shape,
                 )
                 .await?;
@@ -647,15 +632,15 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received all-gather chunk len {} but expected {}",
                     recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    step_plan.recv_range.len()
                 )));
             }
-            work_buffer[recv_range.start..recv_range.end].copy_from_slice(&recv_msg.chunk_data);
+            work_buffer[step_plan.recv_range.start..step_plan.recv_range.end]
+                .copy_from_slice(&recv_msg.chunk_data);
         }
 
         info!("All-gather complete");
@@ -725,15 +710,12 @@ impl<'a> WorkerRing<'a> {
             return Ok(partial_result);
         }
         let n = self.total_workers as usize;
-        let my_pos = self.my_position as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
-        let chunk_ranges = self.cached_chunk_ranges_for_len(partial_result.len());
+        let plan = self.cached_collective_plan_for_len(partial_result.len());
 
         for step in 0..(n - 1) {
-            let send_idx = (my_pos + n - step) % n;
-            let recv_idx = (my_pos + n - step - 1) % n;
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.reduce_scatter_steps[step];
+            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -742,8 +724,8 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    partial_result.host_range(send_range.clone()),
+                    step_plan.recv_slot,
+                    partial_result.host_range(step_plan.send_range.clone()),
                     &send_shape,
                 )
                 .await?;
@@ -751,22 +733,19 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received reduce-scatter chunk len {} but expected {}",
                     recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    step_plan.recv_range.len()
                 )));
             }
-            partial_result.accumulate_range(recv_range.clone(), &recv_msg.chunk_data);
+            partial_result.accumulate_range(step_plan.recv_range.clone(), &recv_msg.chunk_data);
         }
 
         for step in 0..(n - 1) {
-            let send_idx = (my_pos + n - step + 1) % n;
-            let recv_idx = (my_pos + n - step) % n;
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.all_gather_steps[step];
+            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -775,8 +754,8 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    partial_result.host_range(send_range.clone()),
+                    step_plan.recv_slot,
+                    partial_result.host_range(step_plan.send_range.clone()),
                     &send_shape,
                 )
                 .await?;
@@ -784,15 +763,15 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received all-gather chunk len {} but expected {}",
                     recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    step_plan.recv_range.len()
                 )));
             }
-            partial_result.copy_range_from_slice(recv_range.clone(), &recv_msg.chunk_data);
+            partial_result
+                .copy_range_from_slice(step_plan.recv_range.clone(), &recv_msg.chunk_data);
         }
 
         self.last_run_metrics = run_metrics;
@@ -1058,20 +1037,48 @@ impl<'a> WorkerRing<'a> {
         self.collective_profile
     }
 
-    fn cached_chunk_ranges_for_len(&mut self, len: usize) -> Vec<Range<usize>> {
+    fn cached_collective_plan_for_len(&mut self, len: usize) -> CachedChunkLayout {
         if let Some(cached) = self.cached_chunk_layout.as_ref() {
-            if cached.len == len && cached.total_workers == self.total_workers {
-                return cached.ranges.clone();
+            if cached.len == len
+                && cached.total_workers == self.total_workers
+                && cached.my_position == self.my_position
+            {
+                return cached.clone();
             }
         }
 
-        let ranges = chunk_ranges_for_len(len, self.total_workers as usize);
-        self.cached_chunk_layout = Some(CachedChunkLayout {
+        let n = self.total_workers as usize;
+        let my_pos = self.my_position as usize;
+        let ranges = chunk_ranges_for_len(len, n);
+        let mut reduce_scatter_steps = Vec::with_capacity(n.saturating_sub(1));
+        let mut all_gather_steps = Vec::with_capacity(n.saturating_sub(1));
+        for step in 0..(n - 1) {
+            let rs_send_idx = (my_pos + n - step) % n;
+            let rs_recv_idx = (my_pos + n - step - 1) % n;
+            reduce_scatter_steps.push(CachedCollectiveStep {
+                recv_slot: rs_recv_idx as u32,
+                send_range: ranges[rs_send_idx].clone(),
+                recv_range: ranges[rs_recv_idx].clone(),
+            });
+
+            let ag_send_idx = (my_pos + n - step + 1) % n;
+            let ag_recv_idx = (my_pos + n - step) % n;
+            all_gather_steps.push(CachedCollectiveStep {
+                recv_slot: ag_recv_idx as u32,
+                send_range: ranges[ag_send_idx].clone(),
+                recv_range: ranges[ag_recv_idx].clone(),
+            });
+        }
+
+        let plan = CachedChunkLayout {
             len,
             total_workers: self.total_workers,
-            ranges: ranges.clone(),
-        });
-        ranges
+            my_position: self.my_position,
+            reduce_scatter_steps,
+            all_gather_steps,
+        };
+        self.cached_chunk_layout = Some(plan.clone());
+        plan
     }
 
     async fn send_background_eligible_lane(
@@ -1464,6 +1471,62 @@ mod tests {
         assert_eq!(result_b.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
         assert_eq!(ring_a.last_run_metrics().all_gather_step_time_ms, 0);
         assert_eq!(ring_b.last_run_metrics().all_gather_step_time_ms, 0);
+    }
+
+    #[test]
+    fn test_cached_collective_step_supports_equality_for_regressions() {
+        let step = CachedCollectiveStep {
+            recv_slot: 2,
+            send_range: 8..12,
+            recv_range: 4..8,
+        };
+        assert_eq!(step, step.clone());
+    }
+
+    #[tokio::test]
+    async fn test_cached_collective_plan_is_reused_for_matching_three_worker_collectives() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let addr = plane.local_addr();
+        let mut ring = WorkerRing::new(
+            0,
+            3,
+            peer_id,
+            peer_id,
+            addr,
+            addr,
+            InferenceRuntimeMode::LatencyFirst,
+            ExecutionProviderKind::Metal,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Metal),
+            None,
+            &mut plane,
+        );
+
+        let first = ring.cached_collective_plan_for_len(12);
+        assert_eq!(first.reduce_scatter_steps.len(), 2);
+        assert_eq!(first.all_gather_steps.len(), 2);
+        assert_eq!(
+            first.reduce_scatter_steps[0],
+            CachedCollectiveStep {
+                recv_slot: 2,
+                send_range: 0..4,
+                recv_range: 8..12,
+            }
+        );
+        assert_eq!(
+            first.all_gather_steps[0],
+            CachedCollectiveStep {
+                recv_slot: 0,
+                send_range: 4..8,
+                recv_range: 0..4,
+            }
+        );
+
+        let second = ring.cached_collective_plan_for_len(12);
+        assert_eq!(first.reduce_scatter_steps, second.reduce_scatter_steps);
+        assert_eq!(first.all_gather_steps, second.all_gather_steps);
     }
 
     // ============== Ring All-Reduce Logic Tests ==============
