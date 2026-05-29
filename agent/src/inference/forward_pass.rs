@@ -1481,7 +1481,7 @@ impl ForwardPass {
                 template.allreduce_timeout,
             )
         };
-        let batch_job_id = job_ids[0];
+        let batch_job_id = collective_batch_job_id(job_ids);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let mut batch_collective_scratch = ReusableMetalCollectiveScratchPool::default();
 
@@ -2084,6 +2084,16 @@ fn build_local_kv_head_indices(
         indices.push((global_kv_head - kv_head_start) as u32);
     }
     Ok(indices)
+}
+
+fn collective_batch_job_id(job_ids: &[Uuid]) -> Uuid {
+    let mut batch_seed = [0u8; 16];
+    for job_id in job_ids {
+        for (slot, byte) in batch_seed.iter_mut().zip(job_id.as_bytes().iter()) {
+            *slot ^= *byte;
+        }
+    }
+    Uuid::from_bytes(batch_seed)
 }
 
 fn causal_attention_mask(
