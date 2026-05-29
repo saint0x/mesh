@@ -332,7 +332,6 @@ struct OutboundPeerChannels {
 #[derive(Debug)]
 struct LanePeerChannels {
     streams: Vec<Arc<Mutex<TcpStream>>>,
-    next_stream_index: usize,
     pinned_for_serving: bool,
 }
 
@@ -1104,8 +1103,16 @@ impl TensorPlane {
         );
         for &peer in peers {
             for plan in hot_lane_plans {
-                self.ensure_connection_pool(peer, plan.lane, plan.desired_stream_count, true)
+                for stream_id in 0..plan.desired_stream_count as u32 {
+                    self.ensure_connection_pool(
+                        peer,
+                        plan.lane,
+                        plan.desired_stream_count,
+                        stream_id,
+                        true,
+                    )
                     .await?;
+                }
             }
         }
         Ok(())
@@ -1164,6 +1171,7 @@ impl TensorPlane {
         target: SocketAddr,
         lane: CollectiveLane,
         desired_stream_count: usize,
+        selected_stream_id: u32,
         mark_persistent: bool,
     ) -> Result<Arc<Mutex<TcpStream>>> {
         ensure_connection_pool(
@@ -1171,6 +1179,7 @@ impl TensorPlane {
             target,
             lane,
             desired_stream_count,
+            selected_stream_id,
             mark_persistent,
         )
         .await
@@ -1298,8 +1307,15 @@ async fn send_serving_frame_bytes_on_plan(
 
     let class_permit =
         acquire_lane_budget(state, target, plan.traffic_class, message_bytes).await?;
-    let stream =
-        ensure_connection_pool(state, target, plan.lane, plan.desired_stream_count, true).await?;
+    let stream = ensure_connection_pool(
+        state,
+        target,
+        plan.lane,
+        plan.desired_stream_count,
+        header.stream_id,
+        true,
+    )
+    .await?;
     let send_result = {
         let mut stream_guard = stream.lock().await;
         tokio::time::timeout(
@@ -1404,11 +1420,17 @@ async fn ensure_connection_pool(
     target: SocketAddr,
     lane: CollectiveLane,
     desired_stream_count: usize,
+    selected_stream_id: u32,
     mark_persistent: bool,
 ) -> Result<Arc<Mutex<TcpStream>>> {
     let desired_stream_count = desired_stream_count
         .max(1)
         .min(state.max_concurrent_outbound_streams_per_peer);
+    let selected_stream_index = if desired_stream_count == 1 {
+        0
+    } else {
+        selected_stream_id as usize % desired_stream_count
+    };
 
     loop {
         {
@@ -1416,17 +1438,13 @@ async fn ensure_connection_pool(
             if let Some(pool) = connections.get_mut(&target) {
                 let lane_pool = pool.lanes.entry(lane).or_insert_with(|| LanePeerChannels {
                     streams: Vec::new(),
-                    next_stream_index: 0,
                     pinned_for_serving: false,
                 });
                 if mark_persistent {
                     lane_pool.pinned_for_serving = true;
                 }
-                if lane_pool.streams.len() >= desired_stream_count {
-                    let idx = lane_pool.next_stream_index % lane_pool.streams.len();
-                    lane_pool.next_stream_index =
-                        (lane_pool.next_stream_index + 1) % lane_pool.streams.len();
-                    return Ok(Arc::clone(&lane_pool.streams[idx]));
+                if lane_pool.streams.len() > selected_stream_index {
+                    return Ok(Arc::clone(&lane_pool.streams[selected_stream_index]));
                 }
             }
         }
@@ -1440,7 +1458,6 @@ async fn ensure_connection_pool(
             });
         let lane_pool = pool.lanes.entry(lane).or_insert_with(|| LanePeerChannels {
             streams: Vec::new(),
-            next_stream_index: 0,
             pinned_for_serving: false,
         });
         if mark_persistent {
@@ -2055,6 +2072,39 @@ mod tests {
         assert_eq!(session.stream_id_for(CollectiveLane::AllGather, 1, 0), 1);
         assert_eq!(session.stream_id_for(CollectiveLane::BulkTransfer, 1, 0), 1);
         assert_eq!(session.stream_id_for(CollectiveLane::Checkpoint, 2, 1), 1);
+    }
+
+    #[tokio::test]
+    async fn test_logical_serving_stream_ids_bind_to_stable_underlying_channels() {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
+            max_concurrent_outbound_streams_per_peer: 3,
+            ..TensorPlaneConfig::default()
+        })
+        .await
+        .unwrap();
+        let target = plane.local_addr();
+
+        let stream_zero = plane
+            .ensure_connection_pool(target, CollectiveLane::ReduceScatter, 3, 0, true)
+            .await
+            .unwrap();
+        let stream_one = plane
+            .ensure_connection_pool(target, CollectiveLane::ReduceScatter, 3, 1, true)
+            .await
+            .unwrap();
+        let stream_zero_again = plane
+            .ensure_connection_pool(target, CollectiveLane::ReduceScatter, 3, 0, true)
+            .await
+            .unwrap();
+
+        assert!(
+            Arc::ptr_eq(&stream_zero, &stream_zero_again),
+            "same logical stream id should reuse the same channel"
+        );
+        assert!(
+            !Arc::ptr_eq(&stream_zero, &stream_one),
+            "different logical stream ids should use different channels when available"
+        );
     }
 
     #[tokio::test]
