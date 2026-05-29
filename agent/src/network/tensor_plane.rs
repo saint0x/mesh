@@ -413,6 +413,10 @@ impl ServingBackgroundTransfer {
         self.stream_id
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.join_handle.is_finished()
+    }
+
     pub async fn wait(self) -> Result<()> {
         self.join_handle.await.map_err(|error| {
             AgentError::Execution(format!(

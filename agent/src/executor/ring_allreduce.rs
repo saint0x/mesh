@@ -1003,6 +1003,27 @@ impl<'a> WorkerRing<'a> {
         Ok(())
     }
 
+    async fn reap_completed_background_transfers(&mut self) -> Result<()> {
+        let mut idx = 0usize;
+        while idx < self.background_transfers.len() {
+            if self.background_transfers[idx].is_finished() {
+                let transfer = self.background_transfers.swap_remove(idx);
+                debug!(
+                    lane = ?transfer.lane(),
+                    collective_id = %transfer.collective_id(),
+                    step = transfer.step(),
+                    slot = transfer.slot(),
+                    stream_id = transfer.stream_id(),
+                    "reaping completed background serving-lane transfer"
+                );
+                transfer.wait().await?;
+            } else {
+                idx += 1;
+            }
+        }
+        Ok(())
+    }
+
     fn serving_transport(&self) -> Result<&ServingSessionTransport> {
         self.serving_transport.as_ref().ok_or_else(|| {
             AgentError::Execution(
@@ -1156,6 +1177,7 @@ impl<'a> WorkerRing<'a> {
         slot: u32,
         chunk_data: Vec<f32>,
     ) -> Result<()> {
+        self.reap_completed_background_transfers().await?;
         let plan = self.collective_overlap_plan(lane);
         let stream_id = self.serving_transport()?.stream_id_for(lane, step, slot);
         let transport = self.serving_transport()?.clone();
@@ -1456,6 +1478,38 @@ mod tests {
         assert_eq!(ring.background_transfer_count(), 1);
 
         ring.drain_background_transfers().await.unwrap();
+        assert_eq!(ring.background_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_completed_background_checkpoint_transfers_are_reaped_without_full_drain() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let addr = plane.local_addr();
+        let mut ring = WorkerRing::new(
+            0,
+            2,
+            peer_id,
+            peer_id,
+            addr,
+            addr,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane,
+        );
+        ring.prepare_serving_group_channels().await.unwrap();
+
+        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0])
+            .await
+            .unwrap();
+        assert_eq!(ring.background_transfer_count(), 1);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        ring.reap_completed_background_transfers().await.unwrap();
         assert_eq!(ring.background_transfer_count(), 0);
     }
 
