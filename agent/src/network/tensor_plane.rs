@@ -322,7 +322,6 @@ struct TensorPlaneState {
     metrics: TensorPlaneMetrics,
     outbound_connections: Mutex<HashMap<SocketAddr, OutboundPeerChannels>>,
     peer_bulk_outbound_bytes: Mutex<HashMap<SocketAddr, Arc<Semaphore>>>,
-    serving_sessions: Mutex<HashMap<ServingSessionKey, Arc<ServingSessionState>>>,
 }
 
 #[derive(Debug)]
@@ -337,24 +336,11 @@ struct LanePeerChannels {
     pinned_for_serving: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ServingSessionKey {
-    left_peer: SocketAddr,
-    right_peer: SocketAddr,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ServingLanePlan {
     lane: CollectiveLane,
     traffic_class: TensorTrafficClass,
     desired_stream_count: usize,
-}
-
-#[derive(Debug)]
-struct ServingSessionState {
-    session_id: Uuid,
-    left_peer: SocketAddr,
-    right_peer: SocketAddr,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -373,7 +359,8 @@ pub struct ServingSessionTransport {
     state: Arc<TensorPlaneState>,
     inbound: Arc<Mutex<ServingInboundState>>,
     inbound_notify: Arc<Notify>,
-    session: Arc<ServingSessionState>,
+    left_peer: SocketAddr,
+    right_peer: SocketAddr,
     reduce_scatter_plan: ServingLanePlan,
     all_gather_plan: ServingLanePlan,
     control_plan: ServingLanePlan,
@@ -429,18 +416,13 @@ impl ServingBackgroundTransfer {
 impl std::fmt::Debug for ServingSessionTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServingSessionTransport")
-            .field("session_id", &self.session.session_id)
-            .field("left_peer", &self.session.left_peer)
-            .field("right_peer", &self.session.right_peer)
+            .field("left_peer", &self.left_peer)
+            .field("right_peer", &self.right_peer)
             .finish()
     }
 }
 
 impl ServingSessionTransport {
-    pub fn session_id(&self) -> Uuid {
-        self.session.session_id
-    }
-
     pub fn stream_id_for(&self, lane: CollectiveLane, step: u32, slot: u32) -> u32 {
         let plan = match lane {
             CollectiveLane::ReduceScatter => self.reduce_scatter_plan,
@@ -468,7 +450,7 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.session.right_peer,
+            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -496,7 +478,7 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.session.right_peer,
+            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -524,7 +506,7 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.session.right_peer,
+            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -552,7 +534,7 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.session.right_peer,
+            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -580,7 +562,7 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.session.right_peer,
+            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -675,7 +657,7 @@ impl ServingSessionTransport {
         chunk_data: Vec<f32>,
         plan: ServingLanePlan,
     ) -> ServingBackgroundTransfer {
-        let target = self.session.right_peer;
+        let target = self.right_peer;
         let state = Arc::clone(&self.state);
         let join_handle = tokio::spawn(async move {
             let payload_bytes = wire_bytes_for_f32_slice(&chunk_data);
@@ -785,7 +767,6 @@ impl TensorPlane {
             metrics: TensorPlaneMetrics::new(),
             outbound_connections: Mutex::new(HashMap::new()),
             peer_bulk_outbound_bytes: Mutex::new(HashMap::new()),
-            serving_sessions: Mutex::new(HashMap::new()),
         });
         let inbound = Arc::new(Mutex::new(ServingInboundState::default()));
         let inbound_notify = Arc::new(Notify::new());
@@ -1139,12 +1120,12 @@ impl TensorPlane {
     ) -> Result<ServingSessionTransport> {
         self.prepare_serving_peer_channels(&[left_peer, right_peer], runtime_mode, provider)
             .await?;
-        let session = self.durable_serving_session(left_peer, right_peer).await;
         Ok(ServingSessionTransport {
             state: Arc::clone(&self.state),
             inbound: Arc::clone(&self.inbound),
             inbound_notify: Arc::clone(&self.inbound_notify),
-            session,
+            left_peer,
+            right_peer,
             reduce_scatter_plan: lane_plan(
                 CollectiveLane::ReduceScatter,
                 runtime_mode,
@@ -1193,25 +1174,6 @@ impl TensorPlane {
             mark_persistent,
         )
         .await
-    }
-
-    async fn durable_serving_session(
-        &self,
-        left_peer: SocketAddr,
-        right_peer: SocketAddr,
-    ) -> Arc<ServingSessionState> {
-        let key = ServingSessionKey {
-            left_peer,
-            right_peer,
-        };
-        let mut sessions = self.state.serving_sessions.lock().await;
-        Arc::clone(sessions.entry(key).or_insert_with(|| {
-            Arc::new(ServingSessionState {
-                session_id: Uuid::new_v4(),
-                left_peer,
-                right_peer,
-            })
-        }))
     }
 }
 
@@ -2093,33 +2055,6 @@ mod tests {
         assert_eq!(session.stream_id_for(CollectiveLane::AllGather, 1, 0), 1);
         assert_eq!(session.stream_id_for(CollectiveLane::BulkTransfer, 1, 0), 1);
         assert_eq!(session.stream_id_for(CollectiveLane::Checkpoint, 2, 1), 1);
-    }
-
-    #[tokio::test]
-    async fn test_serving_transport_reuses_durable_neighbor_pair_session() {
-        let plane = TensorPlane::bind(TensorPlaneConfig::default())
-            .await
-            .unwrap();
-        let first = plane
-            .serving_transport_for_neighbors(
-                plane.local_addr(),
-                plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
-                ExecutionProviderKind::Cpu,
-            )
-            .await
-            .unwrap();
-        let second = plane
-            .serving_transport_for_neighbors(
-                plane.local_addr(),
-                plane.local_addr(),
-                InferenceRuntimeMode::LatencyFirst,
-                ExecutionProviderKind::Cpu,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(first.session_id(), second.session_id());
     }
 
     #[tokio::test]

@@ -2543,10 +2543,10 @@ mod tests {
             position_a.right_neighbor_tensor_addr
         );
         assert_eq!(
-            first_cached.transport.session_id(),
-            first.session_id(),
-            "cache should retain the prepared serving session transport"
+            first_cached.key.runtime_mode,
+            InferenceRuntimeMode::ThroughputFirst
         );
+        assert_eq!(first_cached.key.provider, ExecutionProviderKind::Cuda);
 
         let second = coordinator
             .prepared_serving_transport(
@@ -2557,9 +2557,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            second.session_id(),
-            first.session_id(),
-            "identical ring topology should reuse the same serving session"
+            second.stream_id_for(crate::network::CollectiveLane::ReduceScatter, 3, 2),
+            first.stream_id_for(crate::network::CollectiveLane::ReduceScatter, 3, 2),
+            "identical ring topology should reuse the same serving lane plan"
         );
 
         coordinator
