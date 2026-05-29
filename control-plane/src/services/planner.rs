@@ -374,6 +374,15 @@ fn candidate_groups(
         }
     }
 
+    if matches!(phase, ExecutionPhase::Decode)
+        && matches!(runtime_mode, InferenceRuntimeMode::ThroughputFirst)
+    {
+        candidates.sort_by(|left, right| {
+            candidate_topology_order_key(phase, runtime_mode, right)
+                .cmp(&candidate_topology_order_key(phase, runtime_mode, left))
+        });
+    }
+
     candidates
 }
 
@@ -698,6 +707,135 @@ pub fn adjusted_capacity_units(base_units: u32, throughput_multiplier: f64) -> u
             MAX_RUNTIME_CAPACITY_MULTIPLIER,
         );
     adjusted.round().max(1.0) as u32
+}
+
+pub fn topology_efficiency_score(
+    members: &[ExecutionGroupMember],
+    runtime_mode: InferenceRuntimeMode,
+) -> i64 {
+    if members.is_empty() {
+        return i64::MIN / 4;
+    }
+
+    let width = members.len() as i64;
+    let total_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1) as i64)
+        .sum::<i64>();
+    let min_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1) as i64)
+        .min()
+        .unwrap_or(1);
+    let max_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1) as i64)
+        .max()
+        .unwrap_or(min_capacity);
+    let aligned_capacity = min_capacity * width;
+    let excess_capacity = total_capacity.saturating_sub(aligned_capacity);
+    let transport_tier = classify_transport_tier(members);
+    let risk = collective_scale_risk_score(members, transport_tier);
+    let excess_divisor = if width <= 2 {
+        2
+    } else {
+        4 + i64::from(risk / 25)
+    };
+    let effective_capacity = aligned_capacity + (excess_capacity / excess_divisor.max(1));
+    let transport_bonus = match transport_tier {
+        TransportCapabilityTier::DirectPreferred => 160,
+        TransportCapabilityTier::DirectTcp => 80,
+        TransportCapabilityTier::RelayFallback => 0,
+    };
+    let balance_pct = ((min_capacity * 100) / max_capacity.max(1)).clamp(1, 100);
+    let width_penalty = match runtime_mode {
+        InferenceRuntimeMode::ThroughputFirst => {
+            if width <= 2 {
+                0
+            } else {
+                (width - 2) * 35
+            }
+        }
+        InferenceRuntimeMode::LatencyFirst => (width - 1).max(0) * 70,
+        InferenceRuntimeMode::FitFirst => (width - 1).max(0) * 45,
+        InferenceRuntimeMode::ResilientEdge => (width - 1).max(0) * 20,
+    };
+
+    effective_capacity * 100 + transport_bonus + balance_pct - i64::from(risk) - width_penalty
+}
+
+fn candidate_topology_order_key(
+    _phase: ExecutionPhase,
+    runtime_mode: InferenceRuntimeMode,
+    members: &[ExecutionGroupMember],
+) -> (i64, u32, i64, i64) {
+    let score = topology_efficiency_score(members, runtime_mode);
+    let total_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1))
+        .sum::<u32>();
+    let width_bias = -(members.len() as i64);
+    let transport_bias = match classify_transport_tier(members) {
+        TransportCapabilityTier::DirectPreferred => 2,
+        TransportCapabilityTier::DirectTcp => 1,
+        TransportCapabilityTier::RelayFallback => 0,
+    };
+    (score, transport_bias, total_capacity as i64, width_bias)
+}
+
+fn collective_scale_risk_score(
+    members: &[ExecutionGroupMember],
+    transport_tier: TransportCapabilityTier,
+) -> u32 {
+    if members.is_empty() {
+        return 100;
+    }
+
+    let width = members.len() as u32;
+    let min_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1))
+        .min()
+        .unwrap_or(1);
+    let max_capacity = members
+        .iter()
+        .map(|member| member.assigned_capacity_units.max(1))
+        .max()
+        .unwrap_or(min_capacity);
+    let degraded_members = members
+        .iter()
+        .filter(|member| {
+            member
+                .connectivity_state
+                .as_ref()
+                .map(is_relay_or_degraded)
+                .unwrap_or(true)
+        })
+        .count() as u32;
+    let mut providers = members
+        .iter()
+        .map(|member| member.execution_provider.as_str())
+        .collect::<Vec<_>>();
+    providers.sort_unstable();
+    providers.dedup();
+    let provider_mix_penalty = providers.len().saturating_sub(1) as u32 * 15;
+    let transport_penalty = match transport_tier {
+        TransportCapabilityTier::DirectPreferred => 0,
+        TransportCapabilityTier::DirectTcp => 15,
+        TransportCapabilityTier::RelayFallback => 40,
+    };
+    let width_penalty = width.saturating_sub(2) * 12;
+    let balance_penalty = if max_capacity == 0 {
+        0
+    } else {
+        100u32.saturating_sub((min_capacity.saturating_mul(100) / max_capacity).max(1))
+    };
+
+    width_penalty
+        .saturating_add(balance_penalty)
+        .saturating_add(degraded_members.saturating_mul(25))
+        .saturating_add(provider_mix_penalty)
+        .saturating_add(transport_penalty)
 }
 
 fn map_peer_punch_plan(
@@ -1365,5 +1503,64 @@ mod tests {
             }
             other => panic!("expected conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn topology_efficiency_penalizes_broad_imbalanced_decode_groups() {
+        let narrow_members = vec![
+            build_member(
+                &worker_with_model_range("planner-topology-score", "a", 0, 0, 20),
+                &PlannerDeviceMetadata {
+                    assigned_capacity_units: 16,
+                    execution_provider: "cuda".to_string(),
+                },
+            ),
+            build_member(
+                &worker_with_model_range("planner-topology-score", "b", 1, 0, 20),
+                &PlannerDeviceMetadata {
+                    assigned_capacity_units: 16,
+                    execution_provider: "cuda".to_string(),
+                },
+            ),
+        ];
+        let broad_members = vec![
+            build_member(
+                &worker_with_model_range("planner-topology-score", "a", 0, 0, 20),
+                &PlannerDeviceMetadata {
+                    assigned_capacity_units: 32,
+                    execution_provider: "cuda".to_string(),
+                },
+            ),
+            build_member(
+                &worker_with_model_range("planner-topology-score", "b", 1, 0, 20),
+                &PlannerDeviceMetadata {
+                    assigned_capacity_units: 8,
+                    execution_provider: "cuda".to_string(),
+                },
+            ),
+            build_member(
+                &worker_with_model_range("planner-topology-score", "c", 2, 0, 20),
+                &PlannerDeviceMetadata {
+                    assigned_capacity_units: 8,
+                    execution_provider: "metal".to_string(),
+                },
+            ),
+            build_member(
+                &worker_with_model_range("planner-topology-score", "d", 3, 0, 20),
+                &PlannerDeviceMetadata {
+                    assigned_capacity_units: 4,
+                    execution_provider: "metal".to_string(),
+                },
+            ),
+        ];
+
+        let narrow_score =
+            topology_efficiency_score(&narrow_members, InferenceRuntimeMode::ThroughputFirst);
+        let broad_score =
+            topology_efficiency_score(&broad_members, InferenceRuntimeMode::ThroughputFirst);
+        assert!(
+            narrow_score > broad_score,
+            "expected narrow balanced topology score {narrow_score} to beat broad imbalanced score {broad_score}"
+        );
     }
 }

@@ -4,13 +4,14 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    ClaimInferenceAssignmentRequest, InferenceExecutionPlan, InferenceRuntimeMode, WorkClaimMode,
+    ClaimInferenceAssignmentRequest, ExecutionPhase as ApiExecutionPhase, InferenceExecutionPlan,
+    InferenceRuntimeMode, WorkClaimMode,
 };
 use crate::connectivity::{DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::DeviceCapabilities;
 use crate::services::planner::{
-    adjusted_capacity_units, device_metadata_from_capabilities, ExecutionPlanner,
-    PlannerDeviceMetadata,
+    adjusted_capacity_units, device_metadata_from_capabilities, topology_efficiency_score,
+    ExecutionPlanner, PlannerDeviceMetadata,
 };
 use crate::services::ring_manager::{ModelShard, RingTopology, WorkerTopologyInfo};
 
@@ -76,6 +77,7 @@ struct SchedulerCandidate {
     decode_cohort_oldest_ready_at: Option<String>,
     decode_cohort_leased_sessions: u32,
     decode_cohort_active_sessions: u32,
+    decode_topology_rank: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -356,11 +358,7 @@ fn rank_candidate(
     u8,
     u32,
     u8,
-    String,
-    u32,
-    u32,
-    String,
-    String,
+    (String, u32, u32, String, String, u32),
 ) {
     let submitter_active_jobs = active_jobs_by_submitter
         .get(&candidate.candidate.submitted_by_device_id)
@@ -389,6 +387,7 @@ fn rank_candidate(
         u8::from(model_active_capacity >= capacity_soft_cap),
     );
     let runtime_mode_priority = runtime_mode_priority(candidate.candidate.runtime_mode);
+    let topology_rank = scheduler_topology_rank(mode, candidate);
     let policy_rank = mode_rank(
         mode,
         candidate,
@@ -409,12 +408,28 @@ fn rank_candidate(
         policy_rank.0,
         policy_rank.1,
         policy_rank.2,
-        policy_rank.3,
-        policy_rank.4,
-        policy_rank.5,
-        policy_rank.6,
-        session_order_key,
+        (
+            policy_rank.3,
+            policy_rank.4,
+            policy_rank.5,
+            policy_rank.6,
+            session_order_key,
+            topology_rank,
+        ),
     )
+}
+
+fn scheduler_topology_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandidate) -> u32 {
+    if !matches!(candidate.candidate.phase, SchedulerPhase::Decode) {
+        return 0;
+    }
+
+    match mode {
+        SchedulerPolicyMode::ThroughputFirst => candidate.candidate.decode_topology_rank,
+        SchedulerPolicyMode::LatencyFirst
+        | SchedulerPolicyMode::FitFirst
+        | SchedulerPolicyMode::ResilientEdge => 0,
+    }
 }
 
 fn runtime_mode_priority(mode: SchedulerPolicyMode) -> u8 {
@@ -780,6 +795,7 @@ fn load_scheduler_candidates(
                 decode_cohort_oldest_ready_at: row.get(22)?,
                 decode_cohort_leased_sessions: row.get::<_, i64>(23)? as u32,
                 decode_cohort_active_sessions: row.get::<_, i64>(24)? as u32,
+                decode_topology_rank: u32::MAX,
             },
         ))
     });
@@ -787,27 +803,29 @@ fn load_scheduler_candidates(
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    let mut runtime_mode_cache = std::collections::HashMap::new();
+    let mut plan_cache = std::collections::HashMap::new();
     let candidates = rows
         .into_iter()
         .map(|(execution_plan_json, mut candidate)| {
-            let runtime_mode =
-                if let Some(runtime_mode) = runtime_mode_cache.get(&execution_plan_json) {
-                    *runtime_mode
+            let (runtime_mode, decode_topology_rank) =
+                if let Some(parsed) = plan_cache.get(&execution_plan_json) {
+                    *parsed
                 } else {
-                    let runtime_mode = parse_runtime_mode(
-                        serde_json::from_str::<InferenceExecutionPlan>(&execution_plan_json)
-                            .map_err(|err| {
-                                ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
-                                    to_from_sql_error(err.to_string()),
-                                )))
-                            })?
-                            .runtime_mode,
+                    let plan = serde_json::from_str::<InferenceExecutionPlan>(&execution_plan_json)
+                        .map_err(|err| {
+                            ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
+                                to_from_sql_error(err.to_string()),
+                            )))
+                        })?;
+                    let parsed = (
+                        parse_runtime_mode(plan.runtime_mode),
+                        decode_topology_rank(&plan),
                     );
-                    runtime_mode_cache.insert(execution_plan_json, runtime_mode);
-                    runtime_mode
+                    plan_cache.insert(execution_plan_json, parsed);
+                    parsed
                 };
             candidate.runtime_mode = runtime_mode;
+            candidate.decode_topology_rank = decode_topology_rank;
             Ok(candidate)
         })
         .collect::<ApiResult<Vec<_>>>()?;
@@ -840,6 +858,19 @@ fn parse_runtime_mode(value: InferenceRuntimeMode) -> SchedulerPolicyMode {
         InferenceRuntimeMode::LatencyFirst => SchedulerPolicyMode::LatencyFirst,
         InferenceRuntimeMode::ResilientEdge => SchedulerPolicyMode::ResilientEdge,
     }
+}
+
+fn decode_topology_rank(plan: &InferenceExecutionPlan) -> u32 {
+    let Some(group) = plan
+        .execution_groups
+        .iter()
+        .find(|group| matches!(group.phase, ApiExecutionPhase::Decode))
+    else {
+        return u32::MAX;
+    };
+    let score = topology_efficiency_score(&group.members, plan.runtime_mode);
+    let clamped = score.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    i32::MAX.saturating_sub(clamped as i32) as u32
 }
 
 fn to_from_sql_error(message: String) -> rusqlite::Error {
@@ -1386,6 +1417,7 @@ mod tests {
             decode_cohort_oldest_ready_at: None,
             decode_cohort_leased_sessions: 0,
             decode_cohort_active_sessions: 0,
+            decode_topology_rank: u32::MAX,
         }
     }
 
@@ -1473,6 +1505,36 @@ mod tests {
             &HashMap::new(),
         );
         assert!(left < right);
+    }
+
+    #[test]
+    fn throughput_ranking_prefers_better_decode_topology_when_queue_state_ties() {
+        let mut efficient = base_candidate(SchedulerPhase::Decode);
+        efficient.assignment_id = "efficient".into();
+        efficient.group_status = "decode_ready".into();
+        efficient.decode_queue_status = Some("ready".into());
+        efficient.decode_ready_at = Some("2026-01-01T00:00:00Z".into());
+        efficient.decode_topology_rank = 100;
+        efficient.decode_cohort_ready_sessions = 4;
+        efficient.decode_lease_target_session_count = Some(4);
+
+        let mut broad = efficient.clone();
+        broad.assignment_id = "broad".into();
+        broad.decode_topology_rank = 10_000;
+
+        let efficient = RunnableCandidate {
+            ready_at: efficient.decode_ready_at.clone().unwrap(),
+            candidate: efficient,
+        };
+        let broad = RunnableCandidate {
+            ready_at: broad.decode_ready_at.clone().unwrap(),
+            candidate: broad,
+        };
+
+        assert!(
+            scheduler_topology_rank(SchedulerPolicyMode::ThroughputFirst, &efficient)
+                < scheduler_topology_rank(SchedulerPolicyMode::ThroughputFirst, &broad)
+        );
     }
 
     #[test]
