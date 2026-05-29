@@ -1024,11 +1024,10 @@ impl<'a> WorkerRing<'a> {
             (self.my_position + self.total_workers - 1) % self.total_workers;
         let transport = self.serving_transport()?.clone();
         let stream_id = transport.stream_id_for(lane, step, slot);
-        let send_started = std::time::Instant::now();
-        let recv_started = std::time::Instant::now();
-        let (send_result, inbound) = tokio::join!(
+        let io_started = std::time::Instant::now();
+        let ((send_result, send_wait_ms), (inbound, receive_wait_ms)) = tokio::join!(
             async {
-                match lane {
+                let result = match lane {
                     CollectiveLane::ReduceScatter => {
                         transport
                             .send_reduce_scatter_chunk(
@@ -1072,26 +1071,28 @@ impl<'a> WorkerRing<'a> {
                         "Unsupported ring collective lane {:?}",
                         other
                     ))),
-                }
+                };
+                (result, io_started.elapsed().as_millis() as u64)
             },
-            transport.recv_frame_bytes(ServingReceiveSpec {
-                collective_id,
-                lane,
-                layer_idx,
-                step,
-                slot,
-                stream_id,
-                expected_sender_position,
-            })
+            async {
+                let result = transport
+                    .recv_frame_bytes(ServingReceiveSpec {
+                        collective_id,
+                        lane,
+                        layer_idx,
+                        step,
+                        slot,
+                        stream_id,
+                        expected_sender_position,
+                    })
+                    .await;
+                (result, io_started.elapsed().as_millis() as u64)
+            }
         );
         send_result?;
         let inbound = inbound?;
 
-        Ok((
-            inbound,
-            send_started.elapsed().as_millis() as u64,
-            recv_started.elapsed().as_millis() as u64,
-        ))
+        Ok((inbound, send_wait_ms, receive_wait_ms))
     }
 
     pub fn last_run_metrics(&self) -> RingAllReduceMetrics {
