@@ -1482,6 +1482,8 @@ impl ForwardPass {
             )
         };
         let batch_job_id = job_ids[0];
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mut batch_collective_scratch = ReusableMetalCollectiveScratchPool::default();
 
         let mut positions = Vec::with_capacity(backends.len());
         for backend in backends.iter() {
@@ -1538,7 +1540,7 @@ impl ForwardPass {
             let o_full = Self::ring_allreduce_candle_batch(
                 &o_partial,
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                Some(&mut backends[0].forward_pass.collective_scratch),
+                Some(&mut batch_collective_scratch),
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 None,
                 worker_ring,
@@ -1565,7 +1567,7 @@ impl ForwardPass {
             let down_full = Self::ring_allreduce_candle_batch(
                 &down_partial,
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                Some(&mut backends[0].forward_pass.collective_scratch),
+                Some(&mut batch_collective_scratch),
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 None,
                 worker_ring,
