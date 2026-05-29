@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::slice;
@@ -5,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -668,7 +668,8 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
         plan: ServingLanePlan,
     ) -> Result<()> {
-        send_serving_frame_on_plan(&self.state, target, header, chunk_data, plan).await
+        let payload_bytes = wire_bytes_for_f32_slice(chunk_data);
+        send_serving_frame_bytes_on_plan(&self.state, target, header, &payload_bytes, plan).await
     }
 
     fn spawn_background_frame(
@@ -686,7 +687,8 @@ impl ServingSessionTransport {
         let session_id = self.session.session_id;
         let state = Arc::clone(&self.state);
         let join_handle = tokio::spawn(async move {
-            send_serving_frame_on_plan(
+            let payload_bytes = wire_bytes_for_f32_slice(&chunk_data);
+            send_serving_frame_bytes_on_plan(
                 &state,
                 target,
                 ServingFrameHeader::new(
@@ -700,7 +702,7 @@ impl ServingSessionTransport {
                     plan.lane,
                     chunk_data.len() as u32,
                 ),
-                &chunk_data,
+                &payload_bytes,
                 plan,
             )
             .await
@@ -1285,11 +1287,11 @@ fn sanitized_config(config: TensorPlaneConfig) -> TensorPlaneConfig {
     }
 }
 
-async fn send_serving_frame_on_plan(
+async fn send_serving_frame_bytes_on_plan(
     state: &Arc<TensorPlaneState>,
     target: SocketAddr,
     header: ServingFrameHeader,
-    chunk_data: &[f32],
+    payload_bytes: &[u8],
     plan: ServingLanePlan,
 ) -> Result<()> {
     let message_bytes = header.size_bytes().max(1);
@@ -1351,7 +1353,7 @@ async fn send_serving_frame_on_plan(
         let mut stream_guard = stream.lock().await;
         tokio::time::timeout(
             state.io_timeout,
-            write_serving_frame(&mut *stream_guard, header, chunk_data),
+            write_serving_frame_bytes(&mut *stream_guard, header, payload_bytes),
         )
         .await
     };
@@ -1747,6 +1749,7 @@ fn record_traffic_class_send(metrics: &TensorPlaneMetrics, traffic_class: Tensor
     };
 }
 
+#[cfg(test)]
 async fn write_serving_frame<W>(
     writer: &mut W,
     header: ServingFrameHeader,
@@ -1755,9 +1758,21 @@ async fn write_serving_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let encoded = encode_serving_frame_binary(header, chunk_data);
-    writer.write_all(encoded.as_ref()).await?;
-    Ok(())
+    let payload_bytes = wire_bytes_for_f32_slice(chunk_data);
+    write_serving_frame_bytes(writer, header, &payload_bytes).await
+}
+
+async fn write_serving_frame_bytes<W>(
+    writer: &mut W,
+    header: ServingFrameHeader,
+    payload_bytes: &[u8],
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let header_bytes = header.encode_binary();
+    writer.write_all(&header_bytes).await?;
+    writer.write_all(payload_bytes).await
 }
 
 async fn read_serving_frame<R>(
@@ -1789,21 +1804,22 @@ where
     })
 }
 
-fn encode_serving_frame_binary(header: ServingFrameHeader, chunk_data: &[f32]) -> BytesMut {
-    let header_bytes = header.encode_binary();
-    let payload_bytes = chunk_data.len() * std::mem::size_of::<f32>();
-    let mut buf = BytesMut::with_capacity(header_bytes.len() + payload_bytes);
-    buf.extend_from_slice(&header_bytes);
+fn wire_bytes_for_f32_slice(chunk_data: &[f32]) -> Cow<'_, [u8]> {
     #[cfg(target_endian = "little")]
     unsafe {
-        let raw_payload = slice::from_raw_parts(chunk_data.as_ptr() as *const u8, payload_bytes);
-        buf.extend_from_slice(raw_payload);
+        Cow::Borrowed(slice::from_raw_parts(
+            chunk_data.as_ptr() as *const u8,
+            std::mem::size_of_val(chunk_data),
+        ))
     }
     #[cfg(target_endian = "big")]
-    for value in chunk_data {
-        buf.extend_from_slice(&value.to_bits().to_le_bytes());
+    {
+        let mut payload = Vec::with_capacity(std::mem::size_of_val(chunk_data));
+        for value in chunk_data {
+            payload.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        Cow::Owned(payload)
     }
-    buf
 }
 
 fn decode_f32_slice_wire(buf: &[u8]) -> Vec<f32> {
