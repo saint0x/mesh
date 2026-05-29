@@ -54,9 +54,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::tensor_ops::ReusableMetalCollectiveScratch;
 use super::tensor_ops::{
     apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
-    collective_buffer_from_candle_2d, embed_tokens, from_candle_2d, matmul, rms_norm,
+    collective_buffer_from_candle_2d_with_scratch, embed_tokens, from_candle_2d, matmul, rms_norm,
     rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
@@ -1101,6 +1103,8 @@ pub struct ForwardPass {
     config: ModelConfig,
     allreduce_timeout: std::time::Duration,
     local_kv_head_indices: CandleTensor,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    collective_scratch: ReusableMetalCollectiveScratch,
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
@@ -1161,6 +1165,8 @@ impl ForwardPass {
             config,
             allreduce_timeout,
             local_kv_head_indices,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            collective_scratch: ReusableMetalCollectiveScratch::default(),
             device_kv_cache: DeviceKVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -1266,6 +1272,7 @@ impl ForwardPass {
         let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
+        drop(o_full);
 
         // 8. MLP with SwiGLU
         let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
@@ -1291,6 +1298,7 @@ impl ForwardPass {
         let output = post_attn.broadcast_add(&down_full).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
+        drop(down_full);
 
         debug!(
             "Layer {} forward complete in {:?}",
@@ -1529,6 +1537,10 @@ impl ForwardPass {
             })?;
             let o_full = Self::ring_allreduce_candle_batch(
                 &o_partial,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                Some(&mut backends[0].forward_pass.collective_scratch),
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                None,
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
@@ -1539,6 +1551,7 @@ impl ForwardPass {
             let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
+            drop(o_full);
 
             let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
             let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
@@ -1551,6 +1564,10 @@ impl ForwardPass {
             })?;
             let down_full = Self::ring_allreduce_candle_batch(
                 &down_partial,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                Some(&mut backends[0].forward_pass.collective_scratch),
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                None,
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
@@ -1561,6 +1578,7 @@ impl ForwardPass {
             hidden = post_attn.broadcast_add(&down_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
+            drop(down_full);
         }
 
         hidden = rms_norm_candle(&hidden, &device_weights.final_norm, config.rms_norm_eps)?;
@@ -1586,7 +1604,13 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = collective_buffer_from_candle_2d(tensor)?;
+        let flat = collective_buffer_from_candle_2d_with_scratch(
+            tensor,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Some(&mut self.collective_scratch),
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            None,
+        )?;
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
             .await?;
@@ -1597,6 +1621,10 @@ impl ForwardPass {
 
     async fn ring_allreduce_candle_batch(
         tensor: &CandleTensor,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
+            &mut ReusableMetalCollectiveScratch,
+        >,
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] scratch: Option<&mut ()>,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
@@ -1606,7 +1634,7 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = collective_buffer_from_candle_2d(tensor)?;
+        let flat = collective_buffer_from_candle_2d_with_scratch(tensor, scratch)?;
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, allreduce_timeout)
             .await?;

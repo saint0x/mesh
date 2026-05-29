@@ -922,8 +922,26 @@ pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
     Tensor2D::new(data, dims[0], dims[1])
 }
 
+#[cfg(test)]
 pub(crate) fn collective_buffer_from_candle_2d(
     tensor: &CandleTensor,
+) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
+    collective_buffer_from_candle_2d_with_scratch(tensor, None)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+pub(crate) struct ReusableMetalCollectiveScratch {
+    storage: Option<MetalStorage>,
+    capacity_elements: usize,
+}
+
+pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
+    tensor: &CandleTensor,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
+        &mut ReusableMetalCollectiveScratch,
+    >,
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] _scratch: Option<&mut ()>,
 ) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
     let dims = tensor.dims();
     if dims.len() != 2 {
@@ -940,22 +958,41 @@ pub(crate) fn collective_buffer_from_candle_2d(
             if tensor.dtype() == DType::F32 && layout.is_contiguous() {
                 let device = storage.device().clone();
                 let element_count = dims[0] * dims[1];
-                let shared_buffer = device
-                    .allocate_buffer(element_count * std::mem::size_of::<f32>())
-                    .map_err(candle_error)?;
+                let shared_storage = if let Some(scratch) = scratch {
+                    if scratch.capacity_elements < element_count || scratch.storage.is_none() {
+                        let shared_buffer = device
+                            .allocate_buffer(element_count * std::mem::size_of::<f32>())
+                            .map_err(candle_error)?;
+                        scratch.storage = Some(MetalStorage::new(
+                            shared_buffer,
+                            device.clone(),
+                            element_count,
+                            DType::F32,
+                        ));
+                        scratch.capacity_elements = element_count;
+                    }
+                    scratch
+                        .storage
+                        .as_ref()
+                        .expect("metal collective scratch must be initialized")
+                        .clone()
+                } else {
+                    let shared_buffer = device
+                        .allocate_buffer(element_count * std::mem::size_of::<f32>())
+                        .map_err(candle_error)?;
+                    MetalStorage::new(shared_buffer, device.clone(), element_count, DType::F32)
+                };
                 {
                     let blit = device.blit_command_encoder().map_err(candle_error)?;
                     blit.copy_from_buffer(
                         storage.buffer(),
                         layout.start_offset() * std::mem::size_of::<f32>(),
-                        &shared_buffer,
+                        shared_storage.buffer(),
                         0,
                         element_count * std::mem::size_of::<f32>(),
                     );
                 }
                 device.wait_until_completed().map_err(candle_error)?;
-                let shared_storage =
-                    MetalStorage::new(shared_buffer, device, element_count, DType::F32);
                 return Ok(
                     crate::executor::ring_allreduce::CollectiveMatrix::from_shared_metal(
                         shared_storage,
