@@ -394,7 +394,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
     ) -> Result<()> {
         self.send_frame(
             self.session.right_peer,
@@ -408,10 +407,8 @@ impl ServingSessionTransport {
                 stream_id,
                 CollectiveLane::ReduceScatter,
                 chunk_data.len() as u32,
-                chunk_shape.len() as u32,
             ),
             chunk_data,
-            chunk_shape,
             self.reduce_scatter_plan,
         )
         .await
@@ -426,7 +423,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
     ) -> Result<()> {
         self.send_frame(
             self.session.right_peer,
@@ -440,10 +436,8 @@ impl ServingSessionTransport {
                 stream_id,
                 CollectiveLane::AllGather,
                 chunk_data.len() as u32,
-                chunk_shape.len() as u32,
             ),
             chunk_data,
-            chunk_shape,
             self.all_gather_plan,
         )
         .await
@@ -458,7 +452,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
     ) -> Result<()> {
         self.send_frame(
             self.session.right_peer,
@@ -472,10 +465,8 @@ impl ServingSessionTransport {
                 stream_id,
                 CollectiveLane::Control,
                 chunk_data.len() as u32,
-                chunk_shape.len() as u32,
             ),
             chunk_data,
-            chunk_shape,
             self.control_plan,
         )
         .await
@@ -490,7 +481,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
     ) -> Result<()> {
         self.send_frame(
             self.session.right_peer,
@@ -504,10 +494,8 @@ impl ServingSessionTransport {
                 stream_id,
                 CollectiveLane::BulkTransfer,
                 chunk_data.len() as u32,
-                chunk_shape.len() as u32,
             ),
             chunk_data,
-            chunk_shape,
             self.bulk_transfer_plan,
         )
         .await
@@ -522,7 +510,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
     ) -> Result<()> {
         self.send_frame(
             self.session.right_peer,
@@ -536,10 +523,8 @@ impl ServingSessionTransport {
                 stream_id,
                 CollectiveLane::Checkpoint,
                 chunk_data.len() as u32,
-                chunk_shape.len() as u32,
             ),
             chunk_data,
-            chunk_shape,
             self.checkpoint_plan,
         )
         .await
@@ -554,7 +539,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> ServingBackgroundTransfer {
         self.spawn_background_frame(
             collective_id,
@@ -564,7 +548,6 @@ impl ServingSessionTransport {
             stream_id,
             sender_position,
             chunk_data,
-            chunk_shape,
             self.bulk_transfer_plan,
         )
     }
@@ -578,7 +561,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> ServingBackgroundTransfer {
         self.spawn_background_frame(
             collective_id,
@@ -588,7 +570,6 @@ impl ServingSessionTransport {
             stream_id,
             sender_position,
             chunk_data,
-            chunk_shape,
             self.checkpoint_plan,
         )
     }
@@ -609,10 +590,9 @@ impl ServingSessionTransport {
         target: SocketAddr,
         header: ServingFrameHeader,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
         plan: ServingLanePlan,
     ) -> Result<()> {
-        send_serving_frame_on_plan(&self.state, target, header, chunk_data, chunk_shape, plan).await
+        send_serving_frame_on_plan(&self.state, target, header, chunk_data, plan).await
     }
 
     fn spawn_background_frame(
@@ -624,7 +604,6 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
         plan: ServingLanePlan,
     ) -> ServingBackgroundTransfer {
         let target = self.session.right_peer;
@@ -644,10 +623,8 @@ impl ServingSessionTransport {
                     stream_id,
                     plan.lane,
                     chunk_data.len() as u32,
-                    chunk_shape.len() as u32,
                 ),
                 &chunk_data,
-                &chunk_shape,
                 plan,
             )
             .await
@@ -1237,7 +1214,6 @@ async fn send_serving_frame_on_plan(
     target: SocketAddr,
     header: ServingFrameHeader,
     chunk_data: &[f32],
-    chunk_shape: &[usize],
     plan: ServingLanePlan,
 ) -> Result<()> {
     let message_bytes = header.size_bytes().max(1);
@@ -1299,7 +1275,7 @@ async fn send_serving_frame_on_plan(
         let mut stream_guard = stream.lock().await;
         tokio::time::timeout(
             state.io_timeout,
-            write_serving_frame(&mut *stream_guard, header, chunk_data, chunk_shape),
+            write_serving_frame(&mut *stream_guard, header, chunk_data),
         )
         .await
     };
@@ -1699,12 +1675,11 @@ async fn write_serving_frame<W>(
     writer: &mut W,
     header: ServingFrameHeader,
     chunk_data: &[f32],
-    chunk_shape: &[usize],
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let encoded = encode_serving_frame_binary(header, chunk_data, chunk_shape);
+    let encoded = encode_serving_frame_binary(header, chunk_data);
     writer.write_all(encoded.as_ref()).await?;
     Ok(())
 }
@@ -1730,34 +1705,19 @@ where
         ));
     }
     let payload_bytes = header.element_count as usize * std::mem::size_of::<f32>();
-    let shape_bytes = header.shape_len as usize * std::mem::size_of::<u64>();
-    let mut buf = vec![0u8; payload_bytes + shape_bytes];
+    let mut buf = vec![0u8; payload_bytes];
     reader.read_exact(&mut buf).await?;
-    let (payload_buf, shape_buf) = buf.split_at(payload_bytes);
-    let chunk_data = decode_f32_slice_be(payload_buf);
-    let chunk_shape = decode_usize_slice_be(shape_buf);
-    Ok(ServingFrame {
-        header,
-        chunk_data,
-        chunk_shape,
-    })
+    let chunk_data = decode_f32_slice_be(&buf);
+    Ok(ServingFrame { header, chunk_data })
 }
 
-fn encode_serving_frame_binary(
-    header: ServingFrameHeader,
-    chunk_data: &[f32],
-    chunk_shape: &[usize],
-) -> BytesMut {
+fn encode_serving_frame_binary(header: ServingFrameHeader, chunk_data: &[f32]) -> BytesMut {
     let header_bytes = header.encode_binary();
     let payload_bytes = chunk_data.len() * std::mem::size_of::<f32>();
-    let shape_bytes = chunk_shape.len() * std::mem::size_of::<u64>();
-    let mut buf = BytesMut::with_capacity(header_bytes.len() + payload_bytes + shape_bytes);
+    let mut buf = BytesMut::with_capacity(header_bytes.len() + payload_bytes);
     buf.extend_from_slice(&header_bytes);
     for value in chunk_data {
         buf.put_u32(value.to_bits());
-    }
-    for value in chunk_shape {
-        buf.put_u64(*value as u64);
     }
     buf
 }
@@ -1768,16 +1728,6 @@ fn decode_f32_slice_be(buf: &[u8]) -> Vec<f32> {
         out.push(f32::from_bits(u32::from_be_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
         ])));
-    }
-    out
-}
-
-fn decode_usize_slice_be(buf: &[u8]) -> Vec<usize> {
-    let mut out = Vec::with_capacity(buf.len() / std::mem::size_of::<u64>());
-    for chunk in buf.chunks_exact(std::mem::size_of::<u64>()) {
-        out.push(u64::from_be_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]) as usize);
     }
     out
 }
@@ -1825,12 +1775,12 @@ mod tests {
             .unwrap();
 
         session_a
-            .send_reduce_scatter_chunk(Uuid::new_v4(), 1, 0, 0, 0, 9, &[1.0, 2.0], &[2])
+            .send_reduce_scatter_chunk(Uuid::new_v4(), 1, 0, 0, 0, 9, &[1.0, 2.0])
             .await
             .unwrap();
         let collective_b = Uuid::new_v4();
         session_b
-            .send_reduce_scatter_chunk(collective_b, 1, 0, 0, 0, 7, &[3.0, 4.0], &[2])
+            .send_reduce_scatter_chunk(collective_b, 1, 0, 0, 0, 7, &[3.0, 4.0])
             .await
             .unwrap();
 
@@ -1907,11 +1857,11 @@ mod tests {
         };
 
         session
-            .send_reduce_scatter_chunk(collective_id, 3, 1, 2, 0, 12, &[6.0], &[1])
+            .send_reduce_scatter_chunk(collective_id, 3, 1, 2, 0, 12, &[6.0])
             .await
             .unwrap();
         session
-            .send_reduce_scatter_chunk(collective_id, 3, 1, 1, 0, 11, &[5.0], &[1])
+            .send_reduce_scatter_chunk(collective_id, 3, 1, 1, 0, 11, &[5.0])
             .await
             .unwrap();
 
@@ -2015,13 +1965,11 @@ mod tests {
             0,
             CollectiveLane::AllGather,
             3,
-            2,
         );
         let chunk_data = [1.5_f32, -2.25, 8.0];
-        let chunk_shape = [1_usize, 3];
         let (mut writer, mut reader) = tokio::io::duplex(1024);
 
-        write_serving_frame(&mut writer, header, &chunk_data, &chunk_shape)
+        write_serving_frame(&mut writer, header, &chunk_data)
             .await
             .unwrap();
         let frame = read_serving_frame(&mut reader, DEFAULT_MAX_MESSAGE_BYTES)
@@ -2030,7 +1978,6 @@ mod tests {
 
         assert_eq!(frame.header, header);
         assert_eq!(frame.chunk_data, chunk_data);
-        assert_eq!(frame.chunk_shape, chunk_shape);
     }
 
     #[tokio::test]
@@ -2051,11 +1998,11 @@ mod tests {
         let bulk_collective = Uuid::new_v4();
 
         session
-            .send_bulk_transfer(bulk_collective, 4, 0, 0, 0, 2, &[1.0, 2.0, 3.0], &[3])
+            .send_bulk_transfer(bulk_collective, 4, 0, 0, 0, 2, &[1.0, 2.0, 3.0])
             .await
             .unwrap();
         session
-            .send_checkpoint(checkpoint_collective, 4, 1, 0, 0, 2, &[9.0], &[1])
+            .send_checkpoint(checkpoint_collective, 4, 1, 0, 0, 2, &[9.0])
             .await
             .unwrap();
 
@@ -2110,7 +2057,7 @@ mod tests {
         let collective_id = Uuid::new_v4();
 
         session
-            .send_control(collective_id, 7, 0, 0, 0, 3, &[3.0], &[1])
+            .send_control(collective_id, 7, 0, 0, 0, 3, &[3.0])
             .await
             .unwrap();
         let _ = session

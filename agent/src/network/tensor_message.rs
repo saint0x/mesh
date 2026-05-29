@@ -78,7 +78,6 @@ pub struct ServingFrameHeader {
     pub slot: u32,
     pub stream_id: u32,
     pub element_count: u32,
-    pub shape_len: u32,
     pub lane: CollectiveLane,
 }
 
@@ -93,7 +92,6 @@ impl ServingFrameHeader {
         stream_id: u32,
         lane: CollectiveLane,
         element_count: u32,
-        shape_len: u32,
     ) -> Self {
         Self {
             session_id,
@@ -104,7 +102,6 @@ impl ServingFrameHeader {
             slot,
             stream_id,
             element_count,
-            shape_len,
             lane,
         }
     }
@@ -126,9 +123,7 @@ impl ServingFrameHeader {
     }
 
     pub fn size_bytes(&self) -> usize {
-        Self::fixed_size()
-            + self.element_count as usize * std::mem::size_of::<f32>()
-            + self.shape_len as usize * std::mem::size_of::<u64>()
+        Self::fixed_size() + self.element_count as usize * std::mem::size_of::<f32>()
     }
 
     pub fn encode_binary(&self) -> [u8; Self::fixed_size()] {
@@ -148,7 +143,6 @@ impl ServingFrameHeader {
         put(&mut bytes, &mut offset, &self.slot.to_be_bytes());
         put(&mut bytes, &mut offset, &self.stream_id.to_be_bytes());
         put(&mut bytes, &mut offset, &self.element_count.to_be_bytes());
-        put(&mut bytes, &mut offset, &self.shape_len.to_be_bytes());
         bytes[offset] = match self.lane {
             CollectiveLane::ReduceScatter => 0,
             CollectiveLane::AllGather => 1,
@@ -193,7 +187,6 @@ impl ServingFrameHeader {
         let slot = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
         let stream_id = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
         let element_count = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
-        let shape_len = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
         let lane = match take::<1>(bytes, &mut offset)?[0] {
             0 => CollectiveLane::ReduceScatter,
             1 => CollectiveLane::AllGather,
@@ -218,7 +211,6 @@ impl ServingFrameHeader {
             slot,
             stream_id,
             element_count,
-            shape_len,
             lane,
         })
     }
@@ -228,7 +220,6 @@ impl ServingFrameHeader {
 pub struct ServingFrame {
     pub header: ServingFrameHeader,
     pub chunk_data: Vec<f32>,
-    pub chunk_shape: Vec<usize>,
 }
 
 impl ServingFrame {

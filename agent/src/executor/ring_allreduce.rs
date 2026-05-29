@@ -524,7 +524,6 @@ impl<'a> WorkerRing<'a> {
             let mut run_metrics = RingAllReduceMetrics::default();
             let original_shape = partial_result.shape.clone();
             let mut work_buffer = partial_result.data;
-            let send_shape = [work_buffer.len()];
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
                 .send_chunk_to_right_recv_from_left(
@@ -534,7 +533,6 @@ impl<'a> WorkerRing<'a> {
                     0,
                     0,
                     &work_buffer,
-                    &send_shape,
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -573,7 +571,6 @@ impl<'a> WorkerRing<'a> {
             // - Sends chunk[(i - k) % n] to right neighbor
             // - Receives from left neighbor into chunk[(i - k - 1) % n]
             let step_plan = &plan.reduce_scatter_steps[step];
-            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -584,7 +581,6 @@ impl<'a> WorkerRing<'a> {
                     step as u32,
                     step_plan.recv_slot,
                     &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
-                    &send_shape,
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -615,7 +611,6 @@ impl<'a> WorkerRing<'a> {
             // - Sends the chunk that was accumulated in the previous all-gather step
             // - Or in step 0, sends the chunk accumulated in reduce-scatter
             let step_plan = &plan.all_gather_steps[step];
-            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -626,7 +621,6 @@ impl<'a> WorkerRing<'a> {
                     step as u32,
                     step_plan.recv_slot,
                     &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
-                    &send_shape,
                 )
                 .await?;
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -683,7 +677,6 @@ impl<'a> WorkerRing<'a> {
         }
         if self.total_workers == 2 {
             let mut run_metrics = RingAllReduceMetrics::default();
-            let send_shape = [partial_result.len()];
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
                 .send_chunk_to_right_recv_from_left(
@@ -693,7 +686,6 @@ impl<'a> WorkerRing<'a> {
                     0,
                     0,
                     partial_result.host_range(0..partial_result.len()),
-                    &send_shape,
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -716,7 +708,6 @@ impl<'a> WorkerRing<'a> {
 
         for step in 0..(n - 1) {
             let step_plan = &plan.reduce_scatter_steps[step];
-            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -727,7 +718,6 @@ impl<'a> WorkerRing<'a> {
                     step as u32,
                     step_plan.recv_slot,
                     partial_result.host_range(step_plan.send_range.clone()),
-                    &send_shape,
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -746,7 +736,6 @@ impl<'a> WorkerRing<'a> {
 
         for step in 0..(n - 1) {
             let step_plan = &plan.all_gather_steps[step];
-            let send_shape = [step_plan.send_range.len()];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -757,7 +746,6 @@ impl<'a> WorkerRing<'a> {
                     step as u32,
                     step_plan.recv_slot,
                     partial_result.host_range(step_plan.send_range.clone()),
-                    &send_shape,
                 )
                 .await?;
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -816,7 +804,6 @@ impl<'a> WorkerRing<'a> {
                 0,
                 0,
                 &[self.my_position as f32],
-                &[1],
             )
             .await?;
 
@@ -877,7 +864,6 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> Result<()> {
         self.send_background_eligible_lane(
             CollectiveLane::BulkTransfer,
@@ -886,7 +872,6 @@ impl<'a> WorkerRing<'a> {
             step,
             slot,
             chunk_data,
-            chunk_shape,
         )
         .await
     }
@@ -898,7 +883,6 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> Result<()> {
         self.send_background_eligible_lane(
             CollectiveLane::Checkpoint,
@@ -907,7 +891,6 @@ impl<'a> WorkerRing<'a> {
             step,
             slot,
             chunk_data,
-            chunk_shape,
         )
         .await
     }
@@ -951,7 +934,6 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
     ) -> Result<(ServingFrame, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
@@ -972,7 +954,6 @@ impl<'a> WorkerRing<'a> {
                                 stream_id,
                                 self.my_position,
                                 chunk_data,
-                                chunk_shape,
                             )
                             .await
                     }
@@ -986,7 +967,6 @@ impl<'a> WorkerRing<'a> {
                                 stream_id,
                                 self.my_position,
                                 chunk_data,
-                                chunk_shape,
                             )
                             .await
                     }
@@ -1000,7 +980,6 @@ impl<'a> WorkerRing<'a> {
                                 stream_id,
                                 self.my_position,
                                 chunk_data,
-                                chunk_shape,
                             )
                             .await
                     }
@@ -1090,7 +1069,6 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> Result<()> {
         let plan = self.collective_overlap_plan(lane);
         let stream_id = self.serving_transport()?.stream_id_for(lane, step, slot);
@@ -1114,7 +1092,6 @@ impl<'a> WorkerRing<'a> {
                         stream_id,
                         self.my_position,
                         chunk_data,
-                        chunk_shape,
                     ));
                 Ok(())
             }
@@ -1135,7 +1112,6 @@ impl<'a> WorkerRing<'a> {
                     stream_id,
                     self.my_position,
                     chunk_data,
-                    chunk_shape,
                 ));
                 Ok(())
             }
@@ -1149,7 +1125,6 @@ impl<'a> WorkerRing<'a> {
                         stream_id,
                         self.my_position,
                         &chunk_data,
-                        &chunk_shape,
                     )
                     .await
             }
@@ -1163,7 +1138,6 @@ impl<'a> WorkerRing<'a> {
                         stream_id,
                         self.my_position,
                         &chunk_data,
-                        &chunk_shape,
                     )
                     .await
             }
@@ -1390,7 +1364,7 @@ mod tests {
         );
         ring.prepare_serving_group_channels().await.unwrap();
 
-        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0], vec![1])
+        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0])
             .await
             .unwrap();
         assert_eq!(ring.background_transfer_count(), 1);
