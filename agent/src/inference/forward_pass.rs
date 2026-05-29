@@ -884,9 +884,11 @@ struct DeviceLayerWeights {
     w_q: CandleTensor,
     w_k: CandleTensor,
     w_v: CandleTensor,
+    w_qkv: CandleTensor,
     w_o: CandleTensor,
     w_up: CandleTensor,
     w_gate: CandleTensor,
+    w_gate_up: CandleTensor,
     w_down: CandleTensor,
     attn_norm: CandleTensor,
     mlp_norm: CandleTensor,
@@ -914,9 +916,11 @@ impl DeviceLayerWeights {
         candle_tensor_memory_usage_bytes(&self.w_q)
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_k))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_v))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_qkv))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_o))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_up))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate_up))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_down))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.attn_norm))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.mlp_norm))
@@ -930,13 +934,20 @@ impl DeviceModelWeights {
         let lm_head = to_candle_2d(&weights.lm_head)?;
         let mut layers = Vec::with_capacity(weights.layers.len());
         for layer in &weights.layers {
+            let w_q = to_candle_2d(&layer.w_q)?;
+            let w_k = to_candle_2d(&layer.w_k)?;
+            let w_v = to_candle_2d(&layer.w_v)?;
+            let w_up = to_candle_2d(&layer.w_up)?;
+            let w_gate = to_candle_2d(&layer.w_gate)?;
             layers.push(DeviceLayerWeights {
-                w_q: to_candle_2d(&layer.w_q)?,
-                w_k: to_candle_2d(&layer.w_k)?,
-                w_v: to_candle_2d(&layer.w_v)?,
+                w_qkv: concat_projection_tensors(&[&w_q, &w_k, &w_v])?,
+                w_gate_up: concat_projection_tensors(&[&w_gate, &w_up])?,
+                w_q,
+                w_k,
+                w_v,
                 w_o: to_candle_2d(&layer.w_o)?,
-                w_up: to_candle_2d(&layer.w_up)?,
-                w_gate: to_candle_2d(&layer.w_gate)?,
+                w_up,
+                w_gate,
                 w_down: to_candle_2d(&layer.w_down)?,
                 attn_norm: to_candle_1d(&layer.attn_norm)?,
                 mlp_norm: to_candle_1d(&layer.mlp_norm)?,
@@ -961,6 +972,102 @@ impl DeviceModelWeights {
             .saturating_add(candle_tensor_memory_usage_bytes(&self.final_norm))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.lm_head))
     }
+}
+
+fn concat_projection_tensors(tensors: &[&CandleTensor]) -> Result<CandleTensor> {
+    let first = tensors.first().ok_or_else(|| {
+        AgentError::Execution("cannot concatenate an empty projection set".to_string())
+    })?;
+    let dims = first.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "projection concatenation expects rank-2 tensors, got {:?}",
+            dims
+        )));
+    }
+    let rows = dims[0];
+    for tensor in tensors {
+        let tensor_dims = tensor.dims();
+        if tensor_dims.len() != 2 || tensor_dims[0] != rows {
+            return Err(AgentError::Execution(format!(
+                "projection concatenation shape mismatch: expected [{} x _], got {:?}",
+                rows, tensor_dims
+            )));
+        }
+    }
+
+    CandleTensor::cat(tensors, 1).map_err(|e| {
+        AgentError::Execution(format!(
+            "GPU tensor backend error while concatenating projections: {}",
+            e
+        ))
+    })
+}
+
+fn split_projection_tensor(tensor: &CandleTensor, widths: &[usize]) -> Result<Vec<CandleTensor>> {
+    let dims = tensor.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "projection split expects rank-2 tensor, got {:?}",
+            dims
+        )));
+    }
+    let total_width: usize = widths.iter().sum();
+    if dims[1] != total_width {
+        return Err(AgentError::Execution(format!(
+            "projection split width mismatch: tensor cols {} vs expected {}",
+            dims[1], total_width
+        )));
+    }
+
+    let mut outputs = Vec::with_capacity(widths.len());
+    let mut start = 0usize;
+    for width in widths {
+        outputs.push(
+            tensor
+                .narrow(1, start, *width)
+                .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?,
+        );
+        start = start.saturating_add(*width);
+    }
+    Ok(outputs)
+}
+
+fn qkv_partials_from_combined(
+    normed: &CandleTensor,
+    layer: &DeviceLayerWeights,
+) -> Result<(CandleTensor, CandleTensor, CandleTensor)> {
+    let combined = normed
+        .matmul(&layer.w_qkv)
+        .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+    let widths = [
+        layer.w_q.dims()[1],
+        layer.w_k.dims()[1],
+        layer.w_v.dims()[1],
+    ];
+    let parts = split_projection_tensor(&combined, &widths)?;
+    let mut iter = parts.into_iter();
+    Ok((
+        iter.next().expect("q projection"),
+        iter.next().expect("k projection"),
+        iter.next().expect("v projection"),
+    ))
+}
+
+fn gate_up_partials_from_combined(
+    mlp_normed: &CandleTensor,
+    layer: &DeviceLayerWeights,
+) -> Result<(CandleTensor, CandleTensor)> {
+    let combined = mlp_normed
+        .matmul(&layer.w_gate_up)
+        .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+    let widths = [layer.w_gate.dims()[1], layer.w_up.dims()[1]];
+    let parts = split_projection_tensor(&combined, &widths)?;
+    let mut iter = parts.into_iter();
+    Ok((
+        iter.next().expect("gate projection"),
+        iter.next().expect("up projection"),
+    ))
 }
 
 #[derive(Clone)]
@@ -1112,15 +1219,7 @@ impl ForwardPass {
         let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
 
         // 2. Compute partial QKV projections (my columns only)
-        let q_partial = normed.matmul(&layer.w_q).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        let k_partial = normed.matmul(&layer.w_k).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        let v_partial = normed.matmul(&layer.w_v).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
+        let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
         debug!(
             "Layer {} QKV partial computed: {}x{} -> {}x{}",
@@ -1161,12 +1260,7 @@ impl ForwardPass {
         let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
 
         // Gate and up projections are column-parallel and stay local
-        let gate_partial = mlp_normed.matmul(&layer.w_gate).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        let up_partial = mlp_normed.matmul(&layer.w_up).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
+        let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
 
         // SwiGLU: silu(gate) * up
         let gate_activated = silu_candle(&gate_partial)?;
@@ -1335,9 +1429,11 @@ impl ForwardPass {
         tokens: &[u32],
         job_ids: &[Uuid],
         worker_ring: &mut WorkerRing<'_>,
-    ) -> Result<Vec<BackendLogits>> {
+    ) -> Result<CandleTensor> {
         if backends.is_empty() || tokens.is_empty() {
-            return Ok(Vec::new());
+            return Err(crate::errors::AgentError::Execution(
+                "Decode microbatch requires at least one backend and token".to_string(),
+            ));
         }
         if backends.len() != tokens.len() || backends.len() != job_ids.len() {
             return Err(crate::errors::AgentError::Execution(format!(
@@ -1394,15 +1490,7 @@ impl ForwardPass {
         for layer_idx in 0..config.num_layers {
             let layer = device_weights.layers[layer_idx].clone();
             let normed = rms_norm_candle(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
-            let q_partial = normed.matmul(&layer.w_q).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let k_partial = normed.matmul(&layer.w_k).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let v_partial = normed.matmul(&layer.w_v).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
+            let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
             let mut kv_caches = backends
                 .iter_mut()
@@ -1437,12 +1525,7 @@ impl ForwardPass {
             })?;
 
             let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
-            let gate_partial = mlp_normed.matmul(&layer.w_gate).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let up_partial = mlp_normed.matmul(&layer.w_up).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
+            let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
             let gate_activated = silu_candle(&gate_partial)?;
             let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
@@ -1468,19 +1551,11 @@ impl ForwardPass {
         let logits_2d = hidden.matmul(&device_weights.lm_head).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
-        let dims = logits_2d.dims();
-        let mut logits = Vec::with_capacity(dims[0]);
-        for row_idx in 0..dims[0] {
-            let row = logits_2d.narrow(0, row_idx, 1).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            logits.push(BackendLogits::Device(row));
-        }
         for backend in backends.iter_mut() {
             backend.forward_pass.position += 1;
             backend.forward_pass.last_allreduce_metrics = metrics;
         }
-        Ok(logits)
+        Ok(logits_2d)
     }
 
     /// Materialize a single collective buffer from a device tensor and restore
@@ -2509,6 +2584,7 @@ mod tests {
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             crate::inference::LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
+            None,
             &mut tensor_plane,
         );
 
@@ -2538,7 +2614,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(logits.len(), 2);
+        assert_eq!(logits.dims(), &[2, config.vocab_size]);
         assert_eq!(backend_a.forward_pass.position, 4);
         assert_eq!(backend_b.forward_pass.position, 4);
         assert_eq!(backend_a.forward_pass.device_kv_cache.seq_len(), 2);

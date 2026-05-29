@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::any::Any;
 use std::time::Instant;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::errors::Result;
@@ -85,12 +86,16 @@ pub struct DecodeMicrobatchRequest<'a> {
     pub session_id: Uuid,
     pub job_id: Uuid,
     pub token: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub sampling_seed: u64,
     pub backend: &'a mut dyn ExecutionBackend,
 }
 
 pub struct DecodeMicrobatchOutput {
     pub session_id: Uuid,
-    pub logits: BackendLogits,
+    pub logits: Option<BackendLogits>,
+    pub sampled_token: Option<u32>,
     pub execution_time_ms: u64,
 }
 
@@ -167,7 +172,8 @@ impl BackendMicrobatchExecutor {
                 .await?;
             outputs.push(DecodeMicrobatchOutput {
                 session_id: request.session_id,
-                logits,
+                logits: Some(logits),
+                sampled_token: None,
                 execution_time_ms: step_start.elapsed().as_millis() as u64,
             });
         }
@@ -284,23 +290,100 @@ impl CandleExecutionBackend {
         }
 
         let step_start = Instant::now();
-        let logits =
+        let logits_2d =
             ForwardPass::fast_path_decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring)
                 .await?;
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
+        if let Ok(sampled_tokens) = Self::sample_fast_path_logits_batch(&logits_2d, requests) {
+            return Ok(Some(
+                requests
+                    .iter()
+                    .map(|request| request.session_id)
+                    .zip(sampled_tokens)
+                    .map(|(session_id, sampled_token)| DecodeMicrobatchOutput {
+                        session_id,
+                        logits: None,
+                        sampled_token: Some(sampled_token),
+                        execution_time_ms,
+                    })
+                    .collect(),
+            ));
+        }
+
+        warn!("batched device sampling failed, falling back to per-session logits sampling");
+
         Ok(Some(
-            requests
-                .iter()
-                .map(|request| request.session_id)
-                .zip(logits)
-                .map(|(session_id, logits)| DecodeMicrobatchOutput {
+            Self::split_logits_rows(&logits_2d)?
+                .into_iter()
+                .zip(requests.iter().map(|request| request.session_id))
+                .map(|(logits, session_id)| DecodeMicrobatchOutput {
                     session_id,
-                    logits,
+                    logits: Some(logits),
+                    sampled_token: None,
                     execution_time_ms,
                 })
                 .collect(),
         ))
+    }
+
+    fn split_logits_rows(logits_2d: &CandleTensor) -> Result<Vec<BackendLogits>> {
+        let dims = logits_2d.dims();
+        let mut logits = Vec::with_capacity(dims.first().copied().unwrap_or(0));
+        for row_idx in 0..dims.first().copied().unwrap_or(0) {
+            let row = logits_2d.narrow(0, row_idx, 1).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            logits.push(BackendLogits::Device(row));
+        }
+        Ok(logits)
+    }
+
+    fn sample_fast_path_logits_batch(
+        logits_2d: &CandleTensor,
+        requests: &[DecodeMicrobatchRequest<'_>],
+    ) -> Result<Vec<u32>> {
+        let dims = logits_2d.dims();
+        if dims.len() != 2 || dims[0] != requests.len() {
+            return Err(crate::errors::AgentError::Execution(format!(
+                "Fast-path decode logits shape {:?} does not match {} requests",
+                dims,
+                requests.len()
+            )));
+        }
+
+        let mut sampled_tokens = vec![0u32; requests.len()];
+        let mut start = 0usize;
+        while start < requests.len() {
+            let temperature = requests[start].temperature;
+            let top_p = requests[start].top_p;
+            let mut end = start + 1;
+            while end < requests.len()
+                && requests[end].temperature.to_bits() == temperature.to_bits()
+                && requests[end].top_p.to_bits() == top_p.to_bits()
+            {
+                end += 1;
+            }
+
+            let row_count = end - start;
+            let row_logits = logits_2d.narrow(0, start, row_count).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let seeds = requests[start..end]
+                .iter()
+                .map(|request| request.sampling_seed)
+                .collect::<Vec<_>>();
+            let group_tokens = super::tensor_ops::sample_tokens_device_with_seeds(
+                &row_logits,
+                temperature,
+                top_p,
+                &seeds,
+            )?;
+            sampled_tokens[start..end].copy_from_slice(&group_tokens);
+            start = end;
+        }
+
+        Ok(sampled_tokens)
     }
 }
 
@@ -557,12 +640,18 @@ mod tests {
                 session_id: Uuid::nil(),
                 job_id: Uuid::nil(),
                 token: 1,
+                temperature: 0.7,
+                top_p: 0.9,
+                sampling_seed: 1,
                 backend: &mut metal_a,
             },
             DecodeMicrobatchRequest {
                 session_id: Uuid::new_v4(),
                 job_id: Uuid::new_v4(),
                 token: 2,
+                temperature: 0.7,
+                top_p: 0.9,
+                sampling_seed: 2,
                 backend: &mut metal_b,
             },
         ];
@@ -575,12 +664,18 @@ mod tests {
                 session_id: Uuid::nil(),
                 job_id: Uuid::nil(),
                 token: 1,
+                temperature: 0.7,
+                top_p: 0.9,
+                sampling_seed: 1,
                 backend: &mut metal_a,
             },
             DecodeMicrobatchRequest {
                 session_id: Uuid::new_v4(),
                 job_id: Uuid::new_v4(),
                 token: 2,
+                temperature: 0.7,
+                top_p: 0.9,
+                sampling_seed: 2,
                 backend: &mut cpu,
             },
         ];

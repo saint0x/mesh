@@ -144,6 +144,18 @@ impl CollectiveMatrix {
         }
     }
 
+    pub fn into_host_vec(self) -> Vec<f32> {
+        let len = self.rows.saturating_mul(self.cols);
+        match self.backing {
+            CollectiveMatrixBacking::Host(data) => data,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => {
+                unsafe { slice::from_raw_parts(storage.buffer().contents() as *const f32, len) }
+                    .to_vec()
+            }
+        }
+    }
+
     pub fn host_range(&self, range: Range<usize>) -> &[f32] {
         match &self.backing {
             CollectiveMatrixBacking::Host(data) => &data[range],
@@ -420,6 +432,7 @@ impl<'a> WorkerRing<'a> {
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
         executor_contract: LocalExecutorContract,
+        serving_transport: Option<ServingSessionTransport>,
         tensor_plane: &'a mut TensorPlane,
     ) -> Self {
         let collective_profile =
@@ -432,7 +445,7 @@ impl<'a> WorkerRing<'a> {
             left_tensor_addr,
             right_tensor_addr,
             tensor_plane,
-            serving_transport: None,
+            serving_transport,
             runtime_mode,
             provider,
             executor_contract,
@@ -444,6 +457,9 @@ impl<'a> WorkerRing<'a> {
 
     pub async fn prepare_serving_group_channels(&mut self) -> Result<()> {
         if self.total_workers <= 1 {
+            return Ok(());
+        }
+        if self.serving_transport.is_some() {
             return Ok(());
         }
         self.serving_transport = Some(
@@ -1217,6 +1233,7 @@ mod tests {
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
             &mut plane,
         );
         cuda_ring.prepare_serving_group_channels().await.unwrap();
@@ -1255,6 +1272,7 @@ mod tests {
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
             &mut plane,
         );
         ring.prepare_serving_group_channels().await.unwrap();

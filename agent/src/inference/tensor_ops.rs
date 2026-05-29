@@ -565,9 +565,10 @@ fn deterministic_sample_threshold(rng_seed: u64) -> f32 {
     ((rng_state >> 33) as f32) / (u32::MAX as f32)
 }
 
-fn deterministic_sample_thresholds(rng_seed: u64, batch_size: usize) -> Vec<f32> {
-    (0..batch_size)
-        .map(|idx| deterministic_sample_threshold(rng_seed.wrapping_add(idx as u64)))
+fn deterministic_sample_thresholds_for_seeds(rng_seeds: &[u64]) -> Vec<f32> {
+    rng_seeds
+        .iter()
+        .map(|seed| deterministic_sample_threshold(*seed))
         .collect()
 }
 
@@ -594,11 +595,11 @@ fn apply_top_p_device(sorted_probs: &CandleTensor, top_p: f32) -> Result<CandleT
         .map_err(candle_error)
 }
 
-pub(crate) fn sample_tokens_device(
+pub(crate) fn sample_tokens_device_with_seeds(
     logits: &CandleTensor,
     temperature: f32,
     top_p: f32,
-    rng_seed: u64,
+    rng_seeds: &[u64],
 ) -> Result<Vec<u32>> {
     let dims = logits.dims();
     if dims.len() != 2 {
@@ -611,6 +612,13 @@ pub(crate) fn sample_tokens_device(
         return Err(AgentError::Execution(
             "Device sampling received an empty logits tensor".to_string(),
         ));
+    }
+    if dims[0] != rng_seeds.len() {
+        return Err(AgentError::Execution(format!(
+            "Device sampling received {} rows but {} seeds",
+            dims[0],
+            rng_seeds.len()
+        )));
     }
 
     if temperature <= 0.0 || top_p <= 0.0 {
@@ -641,7 +649,7 @@ pub(crate) fn sample_tokens_device(
         .broadcast_mul(&denom.recip().map_err(candle_error)?)
         .map_err(candle_error)?;
     let cdf = renormalized.cumsum(D::Minus1).map_err(candle_error)?;
-    let thresholds = deterministic_sample_thresholds(rng_seed, dims[0]);
+    let thresholds = deterministic_sample_thresholds_for_seeds(rng_seeds);
     let threshold = CandleTensor::from_vec(thresholds, (dims[0], 1), &device)
         .map_err(candle_error)?
         .broadcast_as((dims[0], dims[1]))
@@ -658,6 +666,25 @@ pub(crate) fn sample_tokens_device(
         .and_then(|ids| ids.to_vec1::<u32>())
         .map_err(candle_error)?;
     Ok(sampled_token_ids)
+}
+
+pub(crate) fn sample_tokens_device(
+    logits: &CandleTensor,
+    temperature: f32,
+    top_p: f32,
+    rng_seed: u64,
+) -> Result<Vec<u32>> {
+    let dims = logits.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Device sampling expects rank-2 logits, got {:?}",
+            dims
+        )));
+    }
+    let seeds = (0..dims[0])
+        .map(|idx| rng_seed.wrapping_add(idx as u64))
+        .collect::<Vec<_>>();
+    sample_tokens_device_with_seeds(logits, temperature, top_p, &seeds)
 }
 
 pub(crate) fn sample_token_device(
@@ -970,18 +997,16 @@ pub(crate) fn candle_2d_from_collective_buffer_owned_like(
     tensor: crate::executor::ring_allreduce::CollectiveMatrix,
     template: &CandleTensor,
 ) -> Result<CandleTensor> {
+    let rows = tensor.rows;
+    let cols = tensor.cols;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(storage) = tensor.metal_shared_storage() {
-        return restore_shared_metal_collective(storage, tensor.rows, tensor.cols, template)
+        return restore_shared_metal_collective(storage, rows, cols, template)
             .map_err(candle_error);
     }
 
-    CandleTensor::from_vec(
-        tensor.to_host_vec(),
-        (tensor.rows, tensor.cols),
-        template.device(),
-    )
-    .map_err(candle_error)
+    CandleTensor::from_vec(tensor.into_host_vec(), (rows, cols), template.device())
+        .map_err(candle_error)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -285,6 +285,15 @@ impl FastPathPlanner {
         ))
     }
 
+    pub fn decode_token_ceiling_for_context(context: &FastPathBackendContext) -> Option<usize> {
+        Self::supported_decode_buckets(context.provider, context.optimization_profile)
+            .into_iter()
+            .filter(|bucket| bucket.batch_size_ceiling >= 1)
+            .map(|bucket| bucket.token_ceiling)
+            .filter(|token_ceiling| context.logical_kv_tokens <= *token_ceiling)
+            .min()
+    }
+
     pub fn plan_prefill(
         context: &FastPathBackendContext,
         prompt_tokens: usize,

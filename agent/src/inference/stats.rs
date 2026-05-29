@@ -56,6 +56,9 @@ pub struct InferenceStats {
     /// Number of decode sessions deferred because the KV-token budget would be exceeded.
     pub decode_batch_kv_budget_deferrals: AtomicU64,
 
+    /// Number of decode sessions deferred to preserve fast-path bucket or cohort cohesion.
+    pub decode_batch_guardrail_deferrals: AtomicU64,
+
     /// Number of prefill executions that resolved an explicit fast-path bucket plan.
     pub prefill_fast_path_plans: AtomicU64,
 
@@ -194,6 +197,7 @@ impl InferenceStats {
             decode_batch_deferred_sessions: AtomicU64::new(0),
             decode_batch_capacity_deferrals: AtomicU64::new(0),
             decode_batch_kv_budget_deferrals: AtomicU64::new(0),
+            decode_batch_guardrail_deferrals: AtomicU64::new(0),
             prefill_fast_path_plans: AtomicU64::new(0),
             decode_fast_path_plans: AtomicU64::new(0),
             fast_path_arena_reuses: AtomicU64::new(0),
@@ -284,6 +288,7 @@ impl InferenceStats {
         deferred_sessions: usize,
         deferred_for_capacity: usize,
         deferred_for_kv_budget: usize,
+        deferred_for_guardrail: usize,
     ) {
         let batch_size = batch_size as u64;
         self.decode_microbatches_executed
@@ -302,6 +307,8 @@ impl InferenceStats {
             .fetch_add(deferred_for_capacity as u64, Ordering::Relaxed);
         self.decode_batch_kv_budget_deferrals
             .fetch_add(deferred_for_kv_budget as u64, Ordering::Relaxed);
+        self.decode_batch_guardrail_deferrals
+            .fetch_add(deferred_for_guardrail as u64, Ordering::Relaxed);
 
         let mut current_peak = self.decode_batch_size_peak.load(Ordering::Relaxed);
         while batch_size > current_peak {
@@ -683,6 +690,9 @@ impl InferenceStats {
             decode_batch_kv_budget_deferrals = self
                 .decode_batch_kv_budget_deferrals
                 .load(Ordering::Relaxed),
+            decode_batch_guardrail_deferrals = self
+                .decode_batch_guardrail_deferrals
+                .load(Ordering::Relaxed),
             prefill_fast_path_plans = self.prefill_fast_path_plans.load(Ordering::Relaxed),
             decode_fast_path_plans = self.decode_fast_path_plans.load(Ordering::Relaxed),
             fast_path_arena_reuses = self.fast_path_arena_reuses.load(Ordering::Relaxed),
@@ -1021,6 +1031,12 @@ impl InferenceStats {
             &mut map,
             "decode_batch_kv_budget_deferrals",
             self.decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "decode_batch_guardrail_deferrals",
+            self.decode_batch_guardrail_deferrals
                 .load(Ordering::Relaxed),
         );
         insert_u64(
@@ -1434,8 +1450,8 @@ mod tests {
     fn test_stats_decode_microbatch_metrics() {
         let stats = InferenceStats::new();
 
-        stats.record_decode_microbatch(1, 128, 0, 0, 0);
-        stats.record_decode_microbatch(3, 512, 2, 1, 1);
+        stats.record_decode_microbatch(1, 128, 0, 0, 0, 0);
+        stats.record_decode_microbatch(3, 512, 2, 1, 1, 1);
 
         assert_eq!(
             stats.decode_microbatches_executed.load(Ordering::Relaxed),
@@ -1466,6 +1482,12 @@ mod tests {
         assert_eq!(
             stats
                 .decode_batch_kv_budget_deferrals
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .decode_batch_guardrail_deferrals
                 .load(Ordering::Relaxed),
             1
         );

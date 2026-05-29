@@ -15,7 +15,7 @@ use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::WorkerRing;
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
-use crate::network::{MeshSwarm, TensorPlane};
+use crate::network::{MeshSwarm, ServingSessionTransport, TensorPlane};
 use libp2p::PeerId;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -262,6 +262,9 @@ pub struct InferenceCoordinator {
     /// Governs checkpoint recovery cadence and node-level recovery load.
     #[allow(dead_code)]
     recovery_governor: RecoveryGovernor,
+
+    /// Reused serving-session transport for the current ring topology and backend class.
+    serving_transport_cache: Option<ServingTransportCacheEntry>,
 }
 
 struct ActiveSession {
@@ -271,6 +274,22 @@ struct ActiveSession {
     queued_for_decode: bool,
     decode_steps_served: u64,
     last_active_at: Instant,
+}
+
+#[derive(Clone)]
+struct ServingTransportCacheEntry {
+    key: ServingTransportCacheKey,
+    transport: ServingSessionTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServingTransportCacheKey {
+    my_position: u32,
+    total_workers: u32,
+    left_peer: SocketAddr,
+    right_peer: SocketAddr,
+    runtime_mode: InferenceRuntimeMode,
+    provider: crate::provider::ExecutionProviderKind,
 }
 
 struct DecodeStepOutcome {
@@ -344,7 +363,45 @@ impl InferenceCoordinator {
             decode_queue_index: HashMap::new(),
             next_decode_fairness_epoch: 0,
             recovery_governor: RecoveryGovernor::default(),
+            serving_transport_cache: None,
         }
+    }
+
+    async fn prepared_serving_transport(
+        &mut self,
+        position: &WorkerPosition,
+        runtime_mode: InferenceRuntimeMode,
+        provider: crate::provider::ExecutionProviderKind,
+    ) -> Result<ServingSessionTransport> {
+        let key = ServingTransportCacheKey {
+            my_position: position.position,
+            total_workers: position.total_workers,
+            left_peer: position.left_neighbor_tensor_addr,
+            right_peer: position.right_neighbor_tensor_addr,
+            runtime_mode,
+            provider,
+        };
+
+        if let Some(cache) = self.serving_transport_cache.as_ref() {
+            if cache.key == key {
+                return Ok(cache.transport.clone());
+            }
+        }
+
+        let transport = self
+            .tensor_plane
+            .serving_transport_for_neighbors(
+                position.left_neighbor_tensor_addr,
+                position.right_neighbor_tensor_addr,
+                runtime_mode,
+                provider,
+            )
+            .await?;
+        self.serving_transport_cache = Some(ServingTransportCacheEntry {
+            key,
+            transport: transport.clone(),
+        });
+        Ok(transport)
     }
 
     fn build_session_state(
@@ -760,6 +817,8 @@ impl InferenceCoordinator {
         let mut deferred_for_capacity = 0_usize;
         let mut deferred_for_kv_budget = 0_usize;
         let mut deferred_for_guardrail = 0_usize;
+        let mut batch_min_kv_tokens = None::<usize>;
+        let mut batch_max_kv_tokens = None::<usize>;
         let primary_task = self.decode_queue_index.get(&primary_session_id).copied();
         let ordered_tasks = self.decode_queue.iter().copied().collect::<Vec<_>>();
         let mut primary_batch_class = None::<(
@@ -768,6 +827,7 @@ impl InferenceCoordinator {
             super::engine::BackendOptimizationProfile,
             super::engine::LocalExecutorContract,
         )>;
+        let mut primary_decode_token_ceiling = None::<usize>;
 
         if let Some(task) = primary_task {
             let mut should_defer = false;
@@ -780,11 +840,19 @@ impl InferenceCoordinator {
                         session.backend.optimization_profile(),
                         session.backend.executor_contract().clone(),
                     ));
+                    if session.backend.is_fast_path_backend() {
+                        primary_decode_token_ceiling =
+                            FastPathPlanner::decode_token_ceiling_for_context(
+                                &session.backend.fast_path_context(),
+                            );
+                    }
                     slots.push(DecodeBatchSlot {
                         session_id: task.session_id,
                         fairness_epoch: task.fairness_epoch,
                         kv_tokens,
                     });
+                    batch_min_kv_tokens = Some(kv_tokens);
+                    batch_max_kv_tokens = Some(kv_tokens);
                     total_kv_tokens = total_kv_tokens.saturating_add(kv_tokens);
                     self.remove_decode_task(task.session_id);
                 } else {
@@ -849,9 +917,53 @@ impl InferenceCoordinator {
                     session.backend.optimization_profile(),
                     session.backend.executor_contract().clone(),
                 ));
+                if session.backend.is_fast_path_backend() {
+                    primary_decode_token_ceiling =
+                        FastPathPlanner::decode_token_ceiling_for_context(
+                            &session.backend.fast_path_context(),
+                        );
+                }
             }
 
             let kv_tokens = Self::session_decode_kv_tokens(session);
+            if let Some((runtime_mode, _, _, _)) = primary_batch_class.as_ref() {
+                if Self::requires_fast_path_bucket_cohesion(*runtime_mode) {
+                    if let Some(expected_token_ceiling) = primary_decode_token_ceiling {
+                        let observed_token_ceiling =
+                            FastPathPlanner::decode_token_ceiling_for_context(
+                                &session.backend.fast_path_context(),
+                            );
+                        if observed_token_ceiling != Some(expected_token_ceiling) {
+                            deferred_for_guardrail = deferred_for_guardrail.saturating_add(1);
+                            deferred.push(DecodeTask {
+                                session_id: task.session_id,
+                                fairness_epoch: task.fairness_epoch,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Some((runtime_mode, _, _, _)) = primary_batch_class.as_ref() {
+                let prospective_min = batch_min_kv_tokens
+                    .map(|current| current.min(kv_tokens))
+                    .unwrap_or(kv_tokens);
+                let prospective_max = batch_max_kv_tokens
+                    .map(|current| current.max(kv_tokens))
+                    .unwrap_or(kv_tokens);
+                if !Self::allows_batch_sequence_skew(
+                    *runtime_mode,
+                    prospective_min,
+                    prospective_max,
+                ) {
+                    deferred_for_guardrail = deferred_for_guardrail.saturating_add(1);
+                    deferred.push(DecodeTask {
+                        session_id: task.session_id,
+                        fairness_epoch: task.fairness_epoch,
+                    });
+                    continue;
+                }
+            }
             let batch_full = slots.len() >= policy.max_batch_size;
             let kv_exhausted = !slots.is_empty()
                 && total_kv_tokens.saturating_add(kv_tokens) > policy.max_total_kv_tokens;
@@ -873,6 +985,16 @@ impl InferenceCoordinator {
                 fairness_epoch: task.fairness_epoch,
                 kv_tokens,
             });
+            batch_min_kv_tokens = Some(
+                batch_min_kv_tokens
+                    .map(|current| current.min(kv_tokens))
+                    .unwrap_or(kv_tokens),
+            );
+            batch_max_kv_tokens = Some(
+                batch_max_kv_tokens
+                    .map(|current| current.max(kv_tokens))
+                    .unwrap_or(kv_tokens),
+            );
             total_kv_tokens = total_kv_tokens.saturating_add(kv_tokens);
             self.remove_decode_task(task.session_id);
         }
@@ -929,6 +1051,37 @@ impl InferenceCoordinator {
             deferred_for_guardrail,
             fast_path,
         }
+    }
+
+    fn allows_batch_sequence_skew(
+        runtime_mode: InferenceRuntimeMode,
+        min_kv_tokens: usize,
+        max_kv_tokens: usize,
+    ) -> bool {
+        if min_kv_tokens == 0 || max_kv_tokens <= min_kv_tokens {
+            return true;
+        }
+
+        match runtime_mode {
+            InferenceRuntimeMode::ThroughputFirst => {
+                max_kv_tokens <= min_kv_tokens.saturating_mul(2).max(min_kv_tokens + 512)
+            }
+            InferenceRuntimeMode::LatencyFirst => {
+                max_kv_tokens
+                    <= min_kv_tokens
+                        .saturating_mul(3)
+                        .div_ceil(2)
+                        .max(min_kv_tokens + 256)
+            }
+            InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
+        }
+    }
+
+    fn requires_fast_path_bucket_cohesion(runtime_mode: InferenceRuntimeMode) -> bool {
+        matches!(
+            runtime_mode,
+            InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst
+        )
     }
 
     fn active_decode_session_count(&self) -> usize {
@@ -1463,6 +1616,13 @@ impl InferenceCoordinator {
                     "session backend missing at prefill execution time".to_string(),
                 )
             })?;
+            let serving_transport = self
+                .prepared_serving_transport(
+                    position,
+                    session.job.request.runtime_mode,
+                    session.backend.provider_kind(),
+                )
+                .await?;
             if session.backend.is_fast_path_backend() {
                 let prefill_plan = FastPathPlanner::plan_prefill(
                     &session.backend.fast_path_context(),
@@ -1484,6 +1644,7 @@ impl InferenceCoordinator {
                 session.job.request.runtime_mode,
                 session.backend.provider_kind(),
                 session.backend.executor_contract().clone(),
+                Some(serving_transport),
                 self.tensor_plane_mut(),
             );
             worker_ring.prepare_serving_group_channels().await?;
@@ -1595,6 +1756,17 @@ impl InferenceCoordinator {
             batch_sessions.push((slot.session_id, session, decode_token));
         }
 
+        let runtime_mode = batch_sessions
+            .first()
+            .map(|(_, session, _)| session.job.request.runtime_mode)
+            .unwrap_or_default();
+        let provider = batch_sessions
+            .first()
+            .map(|(_, session, _)| session.backend.provider_kind())
+            .unwrap_or(crate::provider::ExecutionProviderKind::Cpu);
+        let serving_transport = self
+            .prepared_serving_transport(position, runtime_mode, provider)
+            .await?;
         let mut worker_ring = WorkerRing::new(
             position.position,
             position.total_workers,
@@ -1602,14 +1774,8 @@ impl InferenceCoordinator {
             position.right_neighbor,
             position.left_neighbor_tensor_addr,
             position.right_neighbor_tensor_addr,
-            batch_sessions
-                .first()
-                .map(|(_, session, _)| session.job.request.runtime_mode)
-                .unwrap_or_default(),
-            batch_sessions
-                .first()
-                .map(|(_, session, _)| session.backend.provider_kind())
-                .unwrap_or(crate::provider::ExecutionProviderKind::Cpu),
+            runtime_mode,
+            provider,
             batch_sessions
                 .first()
                 .map(|(_, session, _)| session.backend.executor_contract().clone())
@@ -1618,6 +1784,7 @@ impl InferenceCoordinator {
                         crate::provider::ExecutionProviderKind::Cpu,
                     )
                 }),
+            Some(serving_transport),
             self.tensor_plane_mut(),
         );
         worker_ring.prepare_serving_group_channels().await?;
@@ -1628,6 +1795,10 @@ impl InferenceCoordinator {
                     session_id: *session_id,
                     job_id: session.job.request.job_id,
                     token: *decode_token,
+                    temperature: session.job.request.config.temperature,
+                    top_p: session.job.request.config.top_p,
+                    sampling_seed: session.job.request.job_id.as_u128() as u64
+                        ^ session.backend.sequence_position() as u64,
                     backend: session.backend.as_mut(),
                 },
             )
@@ -1644,14 +1815,25 @@ impl InferenceCoordinator {
 
         for ((session_id, mut session, _), output) in batch_sessions.into_iter().zip(outputs) {
             debug_assert_eq!(session_id, output.session_id);
-            let seed = session.job.request.job_id.as_u128() as u64
-                ^ session.backend.sequence_position() as u64;
-            let sampled_token = session.backend.sample(
-                &output.logits,
-                session.job.request.config.temperature,
-                session.job.request.config.top_p,
-                seed,
-            )?;
+            let sampled_token = match (output.sampled_token, output.logits.as_ref()) {
+                (Some(sampled_token), _) => sampled_token,
+                (None, Some(logits)) => {
+                    let seed = session.job.request.job_id.as_u128() as u64
+                        ^ session.backend.sequence_position() as u64;
+                    session.backend.sample(
+                        logits,
+                        session.job.request.config.temperature,
+                        session.job.request.config.top_p,
+                        seed,
+                    )?
+                }
+                (None, None) => {
+                    return Err(AgentError::Execution(format!(
+                        "Decode microbatch output for session {} contained neither logits nor sampled token",
+                        session_id
+                    )))
+                }
+            };
             session.job.add_token(sampled_token);
             session.job.current_layer = self.config.total_layers;
             session.decode_steps_served = session.decode_steps_served.saturating_add(1);
@@ -1752,6 +1934,7 @@ impl InferenceCoordinator {
                 batch.deferred.len(),
                 batch.deferred_for_capacity,
                 batch.deferred_for_kv_budget,
+                batch.deferred_for_guardrail,
             );
             let batch_size = u32::try_from(batch.slots.len()).unwrap_or(u32::MAX);
             let batch_kv_tokens = u32::try_from(batch.total_kv_tokens).unwrap_or(u32::MAX);
@@ -2296,6 +2479,108 @@ mod tests {
         assert_eq!(position.shard_total_workers, 10);
     }
 
+    #[tokio::test]
+    async fn test_prepared_serving_transport_cache_tracks_ring_topology_and_backend_class() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = MeshSwarm::builder(keypair).build().expect("test swarm");
+        let tensor_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .expect("tensor plane");
+        let left_plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .expect("left plane a");
+        let right_plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .expect("right plane a");
+        let left_plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .expect("left plane b");
+        let right_plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .expect("right plane b");
+        let mut coordinator =
+            InferenceCoordinator::new(swarm, tensor_plane, InferenceConfig::default());
+        let position_a = WorkerPosition {
+            position: 0,
+            total_workers: 2,
+            left_neighbor: PeerId::random(),
+            left_neighbor_addrs: vec![],
+            left_neighbor_punch_plan: None,
+            left_neighbor_tensor_addr: left_plane_a.local_addr(),
+            right_neighbor: PeerId::random(),
+            right_neighbor_addrs: vec![],
+            right_neighbor_punch_plan: None,
+            right_neighbor_tensor_addr: right_plane_a.local_addr(),
+            shard_column_range: (0, 1024),
+            shard_worker_position: 0,
+            shard_total_workers: 2,
+            shard_memory_bytes: 1024,
+        };
+        let position_b = WorkerPosition {
+            left_neighbor_tensor_addr: left_plane_b.local_addr(),
+            right_neighbor_tensor_addr: right_plane_b.local_addr(),
+            ..position_a.clone()
+        };
+
+        let first = coordinator
+            .prepared_serving_transport(
+                &position_a,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        let first_cached = coordinator
+            .serving_transport_cache
+            .as_ref()
+            .expect("transport cache after first prepare");
+        assert_eq!(
+            first_cached.key.left_peer,
+            position_a.left_neighbor_tensor_addr
+        );
+        assert_eq!(
+            first_cached.key.right_peer,
+            position_a.right_neighbor_tensor_addr
+        );
+        assert_eq!(
+            first_cached.transport.session_id(),
+            first.session_id(),
+            "cache should retain the prepared serving session transport"
+        );
+
+        let second = coordinator
+            .prepared_serving_transport(
+                &position_a,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.session_id(),
+            first.session_id(),
+            "identical ring topology should reuse the same serving session"
+        );
+
+        coordinator
+            .prepared_serving_transport(
+                &position_b,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        let updated = coordinator
+            .serving_transport_cache
+            .as_ref()
+            .expect("transport cache after topology change");
+        assert_eq!(updated.key.left_peer, position_b.left_neighbor_tensor_addr);
+        assert_eq!(
+            updated.key.right_peer,
+            position_b.right_neighbor_tensor_addr
+        );
+    }
+
     #[test]
     fn test_recovery_governor_rejects_attempts_inside_cooldown() {
         let mut governor = RecoveryGovernor::default();
@@ -2535,6 +2820,129 @@ mod tests {
         assert_eq!(batch.slots[0].session_id, session_a);
         assert_eq!(batch.deferred.len(), 1);
         assert_eq!(batch.deferred_for_capacity, 1);
+    }
+
+    #[test]
+    fn test_throughput_batch_guardrail_defers_extreme_kv_skew() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 16_384,
+            ..InferenceConfig::default()
+        });
+        let short_session = Uuid::new_v4();
+        let long_session = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            short_session,
+            128,
+            128 * 1024,
+            128,
+            11,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+        );
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            long_session,
+            4096,
+            4096 * 1024,
+            4096,
+            22,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+        );
+
+        coordinator.enqueue_decode_task(short_session).unwrap();
+        coordinator.enqueue_decode_task(long_session).unwrap();
+
+        let batch =
+            coordinator.build_next_decode_batch(short_session, DecodeBatchTargets::default());
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, short_session);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred[0].session_id, long_session);
+        assert_eq!(batch.deferred_for_guardrail, 1);
+    }
+
+    #[test]
+    fn test_throughput_batch_guardrail_defers_cross_bucket_fast_path_sessions() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 16_384,
+            ..InferenceConfig::default()
+        });
+        let lower_bucket = Uuid::new_v4();
+        let higher_bucket = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            lower_bucket,
+            1800,
+            1800 * 1024,
+            1800,
+            11,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+        );
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            higher_bucket,
+            2500,
+            2500 * 1024,
+            2500,
+            22,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+        );
+
+        coordinator.enqueue_decode_task(lower_bucket).unwrap();
+        coordinator.enqueue_decode_task(higher_bucket).unwrap();
+
+        let batch =
+            coordinator.build_next_decode_batch(lower_bucket, DecodeBatchTargets::default());
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, lower_bucket);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred[0].session_id, higher_bucket);
+        assert_eq!(batch.deferred_for_guardrail, 1);
+    }
+
+    #[test]
+    fn test_fit_first_batch_allows_extreme_kv_skew_for_capacity_admission() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 16_384,
+            ..InferenceConfig::default()
+        });
+        let short_session = Uuid::new_v4();
+        let long_session = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            short_session,
+            128,
+            128 * 1024,
+            128,
+            11,
+            InferenceRuntimeMode::FitFirst,
+            ExecutionProviderKind::Cuda,
+        );
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            long_session,
+            4096,
+            4096 * 1024,
+            4096,
+            22,
+            InferenceRuntimeMode::FitFirst,
+            ExecutionProviderKind::Cuda,
+        );
+
+        coordinator.enqueue_decode_task(short_session).unwrap();
+        coordinator.enqueue_decode_task(long_session).unwrap();
+
+        let batch =
+            coordinator.build_next_decode_batch(short_session, DecodeBatchTargets::default());
+        assert_eq!(batch.slots.len(), 2);
+        assert_eq!(batch.deferred_for_guardrail, 0);
     }
 
     #[test]
