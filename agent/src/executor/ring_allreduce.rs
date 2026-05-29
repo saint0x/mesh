@@ -24,7 +24,6 @@ use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::ops::Range;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
@@ -250,14 +249,7 @@ impl CollectiveMatrix {
         );
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => {
-                for (dst, chunk) in data[range]
-                    .iter_mut()
-                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
-                {
-                    *dst = f32::from_bits(u32::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
-                }
+                copy_wire_f32_bytes_into_slice(&mut data[range], payload_bytes);
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
@@ -265,14 +257,7 @@ impl CollectiveMatrix {
                     storage.buffer().contents() as *mut f32,
                     self.len(),
                 )[range];
-                for (slot, chunk) in dst
-                    .iter_mut()
-                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
-                {
-                    *slot = f32::from_bits(u32::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
-                }
+                copy_wire_f32_bytes_into_slice(dst, payload_bytes);
             },
         }
     }
@@ -283,6 +268,29 @@ impl CollectiveMatrix {
             CollectiveMatrixBacking::MetalShared(storage) => Some(storage.clone()),
             _ => None,
         }
+    }
+}
+
+fn copy_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
+    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
+    assert_eq!(
+        src.len(),
+        expected_bytes,
+        "wire payload byte length {} did not match destination byte length {}",
+        src.len(),
+        expected_bytes
+    );
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let dst_bytes = slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, expected_bytes);
+        dst_bytes.copy_from_slice(src);
+    }
+    #[cfg(target_endian = "big")]
+    for (slot, chunk) in dst
+        .iter_mut()
+        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
+    {
+        *slot = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
 }
 
