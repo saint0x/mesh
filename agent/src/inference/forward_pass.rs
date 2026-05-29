@@ -1100,6 +1100,7 @@ pub struct ForwardPass {
     device_weights: Arc<DeviceModelWeights>,
     config: ModelConfig,
     allreduce_timeout: std::time::Duration,
+    local_kv_head_indices: CandleTensor,
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
@@ -1137,11 +1138,29 @@ impl ForwardPass {
             head_dim: config.hidden_dim / config.num_heads,
             max_seq_len: 4096,
         };
+        let head_dim = config.hidden_dim / config.num_heads;
+        let local_q_heads =
+            partition_columns(config.hidden_dim, worker_position, total_workers) / head_dim;
+        let q_head_start =
+            partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
+        let local_kv_head_indices = CandleTensor::from_vec(
+            build_local_kv_head_indices(
+                &config,
+                worker_position,
+                total_workers,
+                local_q_heads,
+                q_head_start,
+            )?,
+            local_q_heads,
+            residency.device_weights.embedding.device(),
+        )
+        .map_err(device_error)?;
 
         Ok(Self {
             device_weights: Arc::clone(&residency.device_weights),
             config,
             allreduce_timeout,
+            local_kv_head_indices,
             device_kv_cache: DeviceKVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -1229,6 +1248,7 @@ impl ForwardPass {
             self.total_workers,
             layer_idx,
             absolute_positions,
+            &self.local_kv_head_indices,
             q_partial,
             k_partial,
             v_partial,
@@ -1435,11 +1455,19 @@ impl ForwardPass {
             )));
         }
 
-        let (config, device_weights, worker_position, total_workers, allreduce_timeout) = {
+        let (
+            config,
+            device_weights,
+            local_kv_head_indices,
+            worker_position,
+            total_workers,
+            allreduce_timeout,
+        ) = {
             let template = &backends[0].forward_pass;
             (
                 template.config.clone(),
                 template.device_weights.clone(),
+                template.local_kv_head_indices.clone(),
                 template.worker_position,
                 template.total_workers,
                 template.allreduce_timeout,
@@ -1490,6 +1518,7 @@ impl ForwardPass {
                 total_workers,
                 layer_idx,
                 &positions,
+                &local_kv_head_indices,
                 q_partial,
                 k_partial,
                 v_partial,
@@ -1685,6 +1714,7 @@ fn attention_output_device(
     total_workers: u32,
     layer_idx: usize,
     absolute_positions: &[u32],
+    local_kv_head_indices: &CandleTensor,
     q_local: CandleTensor,
     k_local: CandleTensor,
     v_local: CandleTensor,
@@ -1769,6 +1799,7 @@ fn attention_output_device(
         total_workers,
         layer_idx,
         cache_prefix_len,
+        local_kv_head_indices,
         &q_rope,
     )
 }
@@ -1780,6 +1811,7 @@ fn attention_output_device_batch_from_backends(
     total_workers: u32,
     layer_idx: usize,
     absolute_positions: &[u32],
+    local_kv_head_indices: &CandleTensor,
     q_local: CandleTensor,
     k_local: CandleTensor,
     v_local: CandleTensor,
@@ -1888,6 +1920,7 @@ fn attention_output_device_batch_from_backends(
             total_workers,
             layer_idx,
             prefix_len,
+            local_kv_head_indices,
             &q_row,
         )?);
     }
@@ -1899,10 +1932,11 @@ fn attention_output_device_batch_from_backends(
 fn attention_output_device_cached(
     kv_cache: &DeviceKVCache,
     config: &ModelConfig,
-    worker_position: u32,
-    total_workers: u32,
+    _worker_position: u32,
+    _total_workers: u32,
     layer_idx: usize,
     cache_prefix_len: usize,
+    local_kv_head_indices: &CandleTensor,
     q_rope: &CandleTensor,
 ) -> Result<CandleTensor> {
     let q_dims = q_rope.dims();
@@ -1916,15 +1950,13 @@ fn attention_output_device_cached(
     let q_cols = q_dims[1];
     let head_dim = config.hidden_dim / config.num_heads;
     let local_q_heads = q_cols / head_dim;
-    let q_head_start =
-        partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
-    let local_kv_indices = build_local_kv_head_indices(
-        config,
-        worker_position,
-        total_workers,
-        local_q_heads,
-        q_head_start,
-    )?;
+    if local_kv_head_indices.dims() != [local_q_heads] {
+        return Err(AgentError::Execution(format!(
+            "Local KV head index tensor mismatch: expected [{}], got {:?}",
+            local_q_heads,
+            local_kv_head_indices.dims()
+        )));
+    }
 
     let (cached_k, cached_v, cached_seq_len) = kv_cache.get_layer_active_kv(layer_idx)?;
     let k_dims = cached_k.dims();
@@ -1958,15 +1990,13 @@ fn attention_output_device_cached(
         .contiguous()
         .map_err(device_error)?;
 
-    let kv_indices = CandleTensor::from_vec(local_kv_indices, local_q_heads, q_rope.device())
-        .map_err(device_error)?;
     let selected_k = k_heads
-        .index_select(&kv_indices, 0)
+        .index_select(local_kv_head_indices, 0)
         .map_err(device_error)?
         .contiguous()
         .map_err(device_error)?;
     let selected_v = v_heads
-        .index_select(&kv_indices, 0)
+        .index_select(local_kv_head_indices, 0)
         .map_err(device_error)?
         .contiguous()
         .map_err(device_error)?;
