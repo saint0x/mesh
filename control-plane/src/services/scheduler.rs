@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use rusqlite::{params, OptionalExtension, Transaction};
+use time::OffsetDateTime;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
@@ -97,6 +98,14 @@ struct SchedulerSnapshot {
     leased_assignments_by_job: HashMap<String, u32>,
     online_worker_count: u32,
     online_capacity_units: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeviceRuntimeTelemetry {
+    observed_tokens_per_second: Option<f64>,
+    observed_deferred_ratio: Option<f64>,
+    observed_fill_ratio: Option<f64>,
+    instability_score: u32,
 }
 
 pub fn select_claim_assignment_id(
@@ -1264,11 +1273,29 @@ fn load_device_assignment_metadata(
     model_id: &str,
     scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<PlannerDeviceMetadata> {
-    let capabilities_json: String = conn
+    let (capabilities_json, status, last_seen, connectivity_state_json, listen_addrs_json): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT capabilities FROM devices WHERE network_id = ? AND device_id = ?",
+            r#"
+            SELECT capabilities, status, last_seen, connectivity_state, listen_addrs
+            FROM devices
+            WHERE network_id = ? AND device_id = ?
+            "#,
             params![network_id, device_id],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
@@ -1281,13 +1308,196 @@ fn load_device_assignment_metadata(
     let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
         .map_err(|e| ApiError::Internal(format!("Failed to parse device capabilities: {}", e)))?;
     let mut metadata = device_metadata_from_capabilities(scheduling_policy, &capabilities);
+    let telemetry = load_device_runtime_telemetry(
+        conn,
+        network_id,
+        device_id,
+        model_id,
+        &status,
+        last_seen.as_deref(),
+        connectivity_state_json.as_deref(),
+        listen_addrs_json.as_deref(),
+    )?;
     if !model_id.is_empty() {
         let multiplier =
             load_recent_device_throughput_multiplier(conn, network_id, device_id, model_id)?;
+        metadata.throughput_multiplier = multiplier;
         metadata.assigned_capacity_units =
             adjusted_capacity_units(metadata.assigned_capacity_units, multiplier);
     }
+    metadata.observed_tokens_per_second = telemetry.observed_tokens_per_second;
+    metadata.observed_deferred_ratio = telemetry.observed_deferred_ratio;
+    metadata.observed_fill_ratio = telemetry.observed_fill_ratio;
+    metadata.instability_score = telemetry.instability_score;
     Ok(metadata)
+}
+
+fn load_device_runtime_telemetry(
+    conn: &Transaction<'_>,
+    network_id: &str,
+    device_id: &str,
+    model_id: &str,
+    status: &str,
+    last_seen: Option<&str>,
+    connectivity_state_json: Option<&str>,
+    listen_addrs_json: Option<&str>,
+) -> ApiResult<DeviceRuntimeTelemetry> {
+    let mut telemetry = DeviceRuntimeTelemetry {
+        instability_score: instability_score(
+            status,
+            last_seen,
+            connectivity_state_json,
+            listen_addrs_json,
+        ),
+        ..DeviceRuntimeTelemetry::default()
+    };
+
+    if model_id.is_empty() {
+        return Ok(telemetry);
+    }
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT events.completion_tokens, events.execution_time_ms, events.batch_size,
+                   events.target_batch_size, events.active_decode_sessions,
+                   events.target_session_count, events.deferred_decode_sessions
+            FROM inference_decode_batch_events events
+            INNER JOIN inference_jobs jobs ON jobs.job_id = events.job_id
+            WHERE events.network_id = ?
+              AND events.device_id = ?
+              AND jobs.model_id = ?
+            ORDER BY events.observed_at DESC, events.event_id DESC
+            LIMIT 64
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let rows = stmt
+        .query_map(params![network_id, device_id, model_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?.max(0) as f64,
+                row.get::<_, i64>(1)?.max(1) as f64,
+                row.get::<_, Option<i64>>(2)?
+                    .map(|value| value.max(0) as f64),
+                row.get::<_, Option<i64>>(3)?
+                    .map(|value| value.max(0) as f64),
+                row.get::<_, Option<i64>>(4)?
+                    .map(|value| value.max(0) as f64),
+                row.get::<_, Option<i64>>(5)?
+                    .map(|value| value.max(0) as f64),
+                row.get::<_, Option<i64>>(6)?
+                    .map(|value| value.max(0) as f64),
+            ))
+        })
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    if rows.is_empty() {
+        return Ok(telemetry);
+    }
+
+    let mut tokens_per_second_total = 0.0;
+    let mut tokens_per_second_count = 0u32;
+    let mut deferred_ratio_total = 0.0;
+    let mut deferred_ratio_count = 0u32;
+    let mut fill_ratio_total = 0.0;
+    let mut fill_ratio_count = 0u32;
+    for (
+        completion_tokens,
+        execution_time_ms,
+        batch_size,
+        target_batch_size,
+        active_decode_sessions,
+        target_session_count,
+        deferred_decode_sessions,
+    ) in rows
+    {
+        tokens_per_second_total += completion_tokens / (execution_time_ms / 1000.0).max(0.001);
+        tokens_per_second_count = tokens_per_second_count.saturating_add(1);
+
+        if let (Some(active), Some(deferred)) = (active_decode_sessions, deferred_decode_sessions) {
+            let denominator = active.max(1.0);
+            deferred_ratio_total += (deferred / denominator).clamp(0.0, 1.0);
+            deferred_ratio_count = deferred_ratio_count.saturating_add(1);
+        }
+
+        let fill = target_batch_size
+            .zip(batch_size)
+            .map(|(target, batch)| batch / target.max(1.0))
+            .or_else(|| {
+                target_session_count
+                    .zip(active_decode_sessions)
+                    .map(|(target, active)| active / target.max(1.0))
+            });
+        if let Some(fill_ratio) = fill {
+            fill_ratio_total += fill_ratio.clamp(0.0, 1.0);
+            fill_ratio_count = fill_ratio_count.saturating_add(1);
+        }
+    }
+
+    telemetry.observed_tokens_per_second =
+        Some(tokens_per_second_total / tokens_per_second_count.max(1) as f64);
+    if deferred_ratio_count > 0 {
+        telemetry.observed_deferred_ratio =
+            Some(deferred_ratio_total / deferred_ratio_count as f64);
+    }
+    if fill_ratio_count > 0 {
+        telemetry.observed_fill_ratio = Some(fill_ratio_total / fill_ratio_count as f64);
+    }
+
+    Ok(telemetry)
+}
+
+fn instability_score(
+    status: &str,
+    last_seen: Option<&str>,
+    connectivity_state_json: Option<&str>,
+    listen_addrs_json: Option<&str>,
+) -> u32 {
+    let mut score = 0u32;
+    if status != "online" {
+        score = score.saturating_add(60);
+    }
+
+    if let Some(json) = connectivity_state_json {
+        if let Ok(state) = serde_json::from_str::<DeviceConnectivityState>(json) {
+            if state.status != crate::connectivity::ConnectivityStatus::Connected {
+                score = score.saturating_add(30);
+            }
+            if matches!(
+                state.active_path,
+                crate::connectivity::ConnectivityPath::Relayed
+            ) {
+                score = score.saturating_add(15);
+            }
+        }
+    }
+
+    let has_dataplane = listen_addrs_json
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .map(|addrs| addrs.iter().any(|addr| addr.starts_with("dataplane://")))
+        .unwrap_or(false);
+    if !has_dataplane {
+        score = score.saturating_add(10);
+    }
+
+    if let Some(last_seen) = last_seen {
+        if let Ok(parsed) =
+            OffsetDateTime::parse(last_seen, &time::format_description::well_known::Rfc3339)
+        {
+            let age = (OffsetDateTime::now_utc() - parsed).whole_milliseconds();
+            if age > 1_500 {
+                score = score.saturating_add(15);
+            }
+            if age > 5_000 {
+                score = score.saturating_add(15);
+            }
+        }
+    }
+
+    score
 }
 
 fn load_recent_device_throughput_multiplier(

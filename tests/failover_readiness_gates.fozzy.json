@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "name": "observability-operations",
+  "name": "failover-readiness-gates",
   "steps": [
     {
-      "name": "network scheduler status exposes kv transfer regroup and recovery metrics",
+      "name": "network scheduler status reports readiness blockers and throughput impact",
       "type": "proc_when",
       "cmd": "cargo",
       "args": [
@@ -19,23 +19,7 @@
       "times": 1
     },
     {
-      "name": "job scheduler status exposes lease and observability metrics",
-      "type": "proc_when",
-      "cmd": "cargo",
-      "args": [
-        "test",
-        "-p",
-        "control-plane",
-        "db::tests::test_job_scheduler_status_tracks_regroup_and_leases",
-        "--",
-        "--nocapture"
-      ],
-      "exit_code": 0,
-      "stdout": "test result: ok.\n",
-      "times": 1
-    },
-    {
-      "name": "scheduler readiness gates expose blockers and healthy release state",
+      "name": "healthy failover profile turns scheduler readiness green",
       "type": "proc_when",
       "cmd": "cargo",
       "args": [
@@ -45,6 +29,23 @@
         "db::tests::test_scheduler_status_readiness_turns_green_for_healthy_failover_profile",
         "--",
         "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "active decode can shrink from four workers to three and resume immediately",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "services::failover::tests::reconcile_failover_state_shrinks_four_worker_decode_ring_to_three_and_resumes_ready",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
       ],
       "exit_code": 0,
       "stdout": "test result: ok.\n",

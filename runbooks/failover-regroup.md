@@ -6,11 +6,30 @@
 2. Inspect:
    - `regroup_events`
    - `scheduler_events`
+   - `readiness.ready`
+   - `readiness.blockers`
    - `recent_regroup_event_count`
    - `recent_regroup_failure_count`
+   - `recent_regroup_transfer_count`
+   - `checkpoint_handoff_transfer_count`
+   - `live_kv_handoff_transfer_count`
    - `recent_avg_recovery_latency_ms`
    - `recent_peak_recovery_latency_ms`
+   - `recent_avg_degraded_duration_ms`
+   - `recent_peak_degraded_duration_ms`
+   - `recent_avg_post_failover_throughput_loss_pct`
 3. Inspect serving-group membership and decode-queue state for the session.
+
+## Readiness Gates
+
+The scheduler status readiness surface should stay green only when all of the following are true:
+
+- checkpoint fallback rate stays at or below the production threshold
+- recent regroup failures stay at zero
+- peak recovery latency stays within the allowed window
+- average post-failover throughput loss stays within the allowed bound
+
+If `readiness.ready` is `false`, use the returned `readiness.blockers` list as the first operator triage queue before debugging internals.
 
 ## Expected Event Shapes
 

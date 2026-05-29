@@ -3186,6 +3186,15 @@ async fn cmd_inference_stats() -> Result<()> {
     if let Some(open_connections) = stats.get("tensor_current_outbound_connections") {
         println!("  Open Connections:  {}", open_connections);
     }
+    if let Some(refreshes) = stats.get("tensor_connection_refresh_attempt_count") {
+        println!("  Conn Refreshes:   {}", refreshes);
+    }
+    if let Some(refresh_ok) = stats.get("tensor_connection_refresh_success_count") {
+        println!("  Conn Refresh OK:  {}", refresh_ok);
+    }
+    if let Some(evictions) = stats.get("tensor_connection_evict_count") {
+        println!("  Conn Evictions:   {}", evictions);
+    }
     if let Some(queue_drops) = stats.get("tensor_inbound_queue_full_rejections") {
         println!("  Queue Drops:       {}", queue_drops);
     }
@@ -3210,6 +3219,30 @@ async fn cmd_inference_stats() -> Result<()> {
     if let Some(share) = stats.get("collective_transport_share_of_runtime") {
         println!(
             "  Collective Runtime:{:.1}%",
+            share.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(avg_workers) = stats.get("avg_collective_workers") {
+        println!(
+            "  Avg Coll Workers: {:.2}",
+            avg_workers.as_f64().unwrap_or(0.0)
+        );
+    }
+    if let Some(rate) = stats.get("larger_ring_collective_rate") {
+        println!(
+            "  Larger-Ring Rate: {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("pairwise_fast_path_collective_rate") {
+        println!(
+            "  Pairwise FastPath:{:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(share) = stats.get("collective_wait_share_of_collective_runtime") {
+        println!(
+            "  Coll Wait Share:  {:.1}%",
             share.as_f64().unwrap_or(0.0) * 100.0
         );
     }

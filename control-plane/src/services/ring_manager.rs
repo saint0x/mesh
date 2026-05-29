@@ -134,6 +134,7 @@ struct WorkerCapacityProfile {
     contributed_memory: u64,
     fallback_memory_mb: u64,
     throughput_multiplier: f64,
+    stability_multiplier: f64,
 }
 
 fn tier_capacity_units(policy: &InferenceSchedulingPolicy, tier: Tier) -> u32 {
@@ -161,7 +162,9 @@ fn effective_capacity_weight(
         * profile
             .throughput_multiplier
             .clamp(MIN_RUNTIME_WEIGHT_MULTIPLIER, MAX_RUNTIME_WEIGHT_MULTIPLIER);
-    scaled.round().max(1.0) as u128
+    (scaled * profile.stability_multiplier.clamp(0.5, 1.0))
+        .round()
+        .max(1.0) as u128
 }
 
 fn allocate_weighted_column_ranges(
@@ -453,11 +456,20 @@ impl RingTopologyManager {
         )?;
         let mut profiles = Vec::with_capacity(ring_seq.len());
         for device_id in ring_seq {
-            let (capabilities_json, contributed_memory): (String, Option<i64>) = conn
+            let (
+                capabilities_json,
+                contributed_memory,
+                connectivity_state_json,
+                listen_addrs_json,
+            ): (String, Option<i64>, Option<String>, Option<String>) = conn
                 .query_row(
-                    "SELECT capabilities, contributed_memory FROM devices WHERE device_id = ?",
+                    r#"
+                    SELECT capabilities, contributed_memory, connectivity_state, listen_addrs
+                    FROM devices
+                    WHERE device_id = ?
+                    "#,
                     params![device_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
@@ -470,6 +482,10 @@ impl RingTopologyManager {
                 fallback_memory_mb: capabilities.ram_mb as u64
                     + capabilities.gpu_vram_mb.unwrap_or_default() as u64,
                 throughput_multiplier: throughput_multiplier_for_device(&service_rows, device_id),
+                stability_multiplier: stability_multiplier(
+                    connectivity_state_json.as_deref(),
+                    listen_addrs_json.as_deref(),
+                ),
             });
         }
         Ok(profiles)
@@ -547,6 +563,7 @@ impl RingTopologyManager {
                 contributed_memory: 1,
                 fallback_memory_mb: 1,
                 throughput_multiplier: 1.0,
+                stability_multiplier: 1.0,
             })
             .collect::<Vec<_>>();
         let ranges = allocate_weighted_column_ranges(
@@ -1074,6 +1091,31 @@ fn throughput_multiplier_for_device(rows: &[(String, f64)], device_id: &str) -> 
         .unwrap_or(1.0)
 }
 
+fn stability_multiplier(
+    connectivity_state_json: Option<&str>,
+    listen_addrs_json: Option<&str>,
+) -> f64 {
+    let mut multiplier: f64 = 1.0;
+    if let Some(json) = connectivity_state_json {
+        if let Ok(state) = serde_json::from_str::<DeviceConnectivityState>(json) {
+            if state.status != ConnectivityStatus::Connected {
+                multiplier -= 0.2;
+            }
+            if matches!(state.active_path, ConnectivityPath::Relayed) {
+                multiplier -= 0.1;
+            }
+        }
+    }
+    let has_dataplane = listen_addrs_json
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .map(|addrs| addrs.iter().any(|addr| addr.starts_with("dataplane://")))
+        .unwrap_or(false);
+    if !has_dataplane {
+        multiplier -= 0.1;
+    }
+    multiplier.clamp(0.5, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1255,12 +1297,14 @@ mod tests {
                     contributed_memory: 16 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 16384,
                     throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
                 },
                 WorkerCapacityProfile {
                     tier: Tier::Tier0,
                     contributed_memory: 2 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 2048,
                     throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
                 },
             ],
             &InferenceSchedulingPolicy::default(),
@@ -1286,18 +1330,21 @@ mod tests {
                     contributed_memory: 12 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 12288,
                     throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
                 },
                 WorkerCapacityProfile {
                     tier: Tier::Tier2,
                     contributed_memory: 8 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 8192,
                     throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
                 },
                 WorkerCapacityProfile {
                     tier: Tier::Tier1,
                     contributed_memory: 4 * 1024 * 1024 * 1024,
                     fallback_memory_mb: 4096,
                     throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
                 },
             ],
             &InferenceSchedulingPolicy::default(),

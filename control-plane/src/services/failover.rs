@@ -2767,6 +2767,100 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_failover_state_shrinks_four_worker_decode_ring_to_three_and_resumes_ready() {
+        let db = create_test_db();
+        register_fixture_devices(&db, &["worker-1", "worker-2", "worker-3", "worker-4"]);
+        let (plan, session, replicas, groups, queue) = decode_fixture(
+            KvTransferPolicy::CoLocated,
+            vec![
+                member("worker-1", 0, 49),
+                member("worker-2", 50, 99),
+                member("worker-3", 0, 49),
+                member("worker-4", 50, 99),
+            ],
+            vec![
+                "worker-1".into(),
+                "worker-2".into(),
+                "worker-3".into(),
+                "worker-4".into(),
+            ],
+            "worker-1",
+            Some("2026-04-25T12:00:00Z"),
+        );
+        persist_session_fixture(
+            &db,
+            &plan,
+            &session,
+            &replicas,
+            &groups,
+            Some(&queue),
+            "running",
+        );
+        mark_device_status(&db, "worker-2", "offline");
+
+        let reconciled = reconcile_failover_state(&db, &["worker-2".to_string()]).unwrap();
+        assert_eq!(reconciled, 1);
+
+        let conn = db.get_conn().unwrap();
+        let queue_state: String = conn
+            .query_row(
+                "SELECT status FROM inference_decode_queue WHERE session_id = 'session-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue_state, "ready");
+
+        let plan_json: String = conn
+            .query_row(
+                "SELECT execution_plan_json FROM inference_jobs WHERE job_id = 'job-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let regrouped_plan: InferenceExecutionPlan = serde_json::from_str(&plan_json).unwrap();
+        let decode_segment = regrouped_plan
+            .segments
+            .iter()
+            .find(|segment| segment.segment_id == "segment-decode")
+            .unwrap();
+        assert_eq!(
+            decode_segment.participant_device_ids,
+            vec![
+                "worker-1".to_string(),
+                "worker-3".to_string(),
+                "worker-4".to_string()
+            ]
+        );
+        let decode_group = regrouped_plan
+            .execution_groups
+            .iter()
+            .find(|group| group.group_id == "group-decode")
+            .unwrap();
+        assert_eq!(decode_group.members.len(), 3);
+        assert_eq!(
+            decode_group
+                .members
+                .iter()
+                .map(|member| member.device_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "worker-1".to_string(),
+                "worker-3".to_string(),
+                "worker-4".to_string()
+            ]
+        );
+        assert_eq!(
+            decode_group
+                .members
+                .iter()
+                .map(|member| member.ring_position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
     fn reconcile_failover_state_pauses_decode_until_checkpoint_transfer_for_replacement() {
         let db = create_test_db();
         register_fixture_devices(&db, &["worker-1", "worker-2", "worker-3"]);
@@ -3256,6 +3350,11 @@ mod tests {
             direct_candidates: Vec::new(),
             assigned_capacity_units: 1,
             execution_provider: "cpu".into(),
+            throughput_multiplier: None,
+            observed_tokens_per_second: None,
+            observed_deferred_ratio: None,
+            observed_fill_ratio: None,
+            instability_score: None,
         }
     }
 

@@ -22,7 +22,7 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-time = { version = "0.3", features = ["serde", "formatting"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 dirs = "5.0"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 ciborium = "0.2"

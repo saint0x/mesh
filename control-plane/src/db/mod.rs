@@ -13,7 +13,8 @@ use crate::api::types::{
     JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencyKind, KvResidencySliceStatus,
     KvResidencySummary, KvTransferPolicy, KvTransferStatus, NetworkSchedulerStatusResponse,
     PromptCacheEntryStatus, RegroupEventStatus, SchedulerBatchMetrics, SchedulerEventStatus,
-    SchedulerJobSummary, ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
+    SchedulerJobSummary, SchedulerReadinessStatus, SchedulerReadinessThresholds,
+    ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
     ServingGroupWorkloadStatus,
 };
 
@@ -575,12 +576,14 @@ impl Database {
             &regroup_events,
             &scheduler_events,
         )?;
+        let readiness = compute_scheduler_readiness(&metrics);
 
         Ok(NetworkSchedulerStatusResponse {
             success: true,
             network_id: network_id.to_string(),
             jobs: load_scheduler_job_summaries(&conn, network_id, None)?,
             metrics,
+            readiness,
             decode_queue,
             serving_groups: load_serving_group_snapshots(&conn, network_id, None)?,
             kv_residency,
@@ -626,6 +629,7 @@ impl Database {
             &regroup_events,
             &scheduler_events,
         )?;
+        let readiness = compute_scheduler_readiness(&metrics);
 
         Ok(JobSchedulerStatusResponse {
             success: true,
@@ -637,6 +641,7 @@ impl Database {
             completion_tokens,
             updated_at,
             metrics,
+            readiness,
             decode_queue,
             serving_groups: load_serving_group_snapshots(&conn, &network_id, Some(job_id))?,
             kv_residency,
@@ -1284,6 +1289,8 @@ fn load_scheduler_batch_metrics(
     let mut kv_transfer_bytes_total = 0_u64;
     let mut kv_transfer_bytes_transferred = 0_u64;
     let mut checkpoint_fallback_transfer_count = 0_u32;
+    let mut checkpoint_handoff_transfer_count = 0_u32;
+    let mut live_kv_handoff_transfer_count = 0_u32;
 
     for summary in kv_residency {
         for slice in &summary.residency_slices {
@@ -1313,6 +1320,12 @@ fn load_scheduler_batch_metrics(
             if transfer.transfer_kind.contains("checkpoint") {
                 checkpoint_fallback_transfer_count += 1;
             }
+            if transfer.transfer_kind == "checkpoint_handoff" {
+                checkpoint_handoff_transfer_count += 1;
+            }
+            if transfer.transfer_kind == "live_kv_handoff" {
+                live_kv_handoff_transfer_count += 1;
+            }
         }
     }
 
@@ -1322,6 +1335,18 @@ fn load_scheduler_batch_metrics(
         checkpoint_fallback_transfer_count as f64 / kv_transfer_count as f64
     };
 
+    let recent_regroup_transfer_count = scheduler_events
+        .iter()
+        .filter(|event| event.event_kind == "decode_regroup_transfer")
+        .count() as u32;
+    let recent_regroup_shrink_count = scheduler_events
+        .iter()
+        .filter(|event| event.event_kind == "decode_regroup_shrink")
+        .count() as u32;
+    let recent_regroup_replace_count = scheduler_events
+        .iter()
+        .filter(|event| event.event_kind == "decode_regroup_replace")
+        .count() as u32;
     let recent_regroup_event_count = scheduler_events
         .iter()
         .filter(|event| event.event_kind.starts_with("decode_regroup_"))
@@ -1335,6 +1360,11 @@ fn load_scheduler_batch_metrics(
         recent_avg_recovery_latency_ms,
         recent_peak_recovery_latency_ms,
     ) = compute_recent_recovery_latency_metrics(conn, network_id, job_id)?;
+    let (
+        recent_post_failover_sample_count,
+        recent_avg_post_failover_throughput_loss_pct,
+        recent_peak_post_failover_throughput_loss_pct,
+    ) = compute_post_failover_throughput_metrics(conn, network_id, job_id)?;
 
     Ok(SchedulerBatchMetrics {
         decode_queue_depth: decode_queue.len() as u32,
@@ -1361,12 +1391,74 @@ fn load_scheduler_batch_metrics(
         kv_transfer_bytes_transferred,
         checkpoint_fallback_transfer_count,
         checkpoint_fallback_rate,
+        checkpoint_handoff_transfer_count,
+        live_kv_handoff_transfer_count,
+        recent_regroup_transfer_count,
+        recent_regroup_shrink_count,
+        recent_regroup_replace_count,
         recent_regroup_event_count,
         recent_regroup_failure_count,
         recent_recovery_sample_count,
         recent_avg_recovery_latency_ms,
         recent_peak_recovery_latency_ms,
+        recent_degraded_session_count: recent_recovery_sample_count,
+        recent_avg_degraded_duration_ms: recent_avg_recovery_latency_ms,
+        recent_peak_degraded_duration_ms: recent_peak_recovery_latency_ms,
+        recent_post_failover_sample_count,
+        recent_avg_post_failover_throughput_loss_pct,
+        recent_peak_post_failover_throughput_loss_pct,
     })
+}
+
+fn compute_scheduler_readiness(metrics: &SchedulerBatchMetrics) -> SchedulerReadinessStatus {
+    let thresholds = SchedulerReadinessThresholds {
+        max_checkpoint_fallback_rate: 0.60,
+        max_recent_regroup_failures: 0,
+        max_peak_recovery_latency_ms: 10_000,
+        max_avg_post_failover_throughput_loss_pct: 25.0,
+    };
+    let mut blockers = Vec::new();
+
+    if metrics.checkpoint_fallback_rate > thresholds.max_checkpoint_fallback_rate {
+        blockers.push(format!(
+            "checkpoint fallback rate {:.2} exceeds {:.2}",
+            metrics.checkpoint_fallback_rate, thresholds.max_checkpoint_fallback_rate
+        ));
+    }
+    if metrics.recent_regroup_failure_count > thresholds.max_recent_regroup_failures {
+        blockers.push(format!(
+            "recent regroup failures {} exceeds {}",
+            metrics.recent_regroup_failure_count, thresholds.max_recent_regroup_failures
+        ));
+    }
+    if metrics.recent_peak_recovery_latency_ms.unwrap_or(0)
+        > thresholds.max_peak_recovery_latency_ms
+    {
+        blockers.push(format!(
+            "peak recovery latency {}ms exceeds {}ms",
+            metrics.recent_peak_recovery_latency_ms.unwrap_or(0),
+            thresholds.max_peak_recovery_latency_ms
+        ));
+    }
+    if metrics
+        .recent_avg_post_failover_throughput_loss_pct
+        .unwrap_or(0.0)
+        > thresholds.max_avg_post_failover_throughput_loss_pct
+    {
+        blockers.push(format!(
+            "post-failover throughput loss {:.2}% exceeds {:.2}%",
+            metrics
+                .recent_avg_post_failover_throughput_loss_pct
+                .unwrap_or(0.0),
+            thresholds.max_avg_post_failover_throughput_loss_pct
+        ));
+    }
+
+    SchedulerReadinessStatus {
+        ready: blockers.is_empty(),
+        blockers,
+        thresholds,
+    }
 }
 
 fn compute_recent_recovery_latency_metrics(
@@ -1464,6 +1556,222 @@ fn compute_recent_recovery_latency_metrics(
             },
         )
         .map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryWindow {
+    session_id: String,
+    started_at: String,
+    recovered_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct DecodeBatchThroughputSample {
+    session_id: String,
+    observed_at: String,
+    throughput_tokens_per_second: f64,
+}
+
+fn compute_post_failover_throughput_metrics(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<(u32, Option<f64>, Option<f64>)> {
+    let recovery_windows = load_recovery_windows(conn, network_id, job_id)?;
+    if recovery_windows.is_empty() {
+        return Ok((0, None, None));
+    }
+
+    let throughput_samples = load_decode_batch_throughput_samples(conn, network_id, job_id)?;
+    let mut losses = Vec::new();
+
+    for window in recovery_windows {
+        let pre = throughput_samples
+            .iter()
+            .filter(|sample| {
+                sample.session_id == window.session_id && sample.observed_at < window.started_at
+            })
+            .max_by(|left, right| left.observed_at.cmp(&right.observed_at));
+        let post = throughput_samples
+            .iter()
+            .filter(|sample| {
+                sample.session_id == window.session_id && sample.observed_at >= window.recovered_at
+            })
+            .min_by(|left, right| left.observed_at.cmp(&right.observed_at));
+
+        let (Some(pre), Some(post)) = (pre, post) else {
+            continue;
+        };
+        if pre.throughput_tokens_per_second <= f64::EPSILON {
+            continue;
+        }
+
+        let loss_pct = ((pre.throughput_tokens_per_second - post.throughput_tokens_per_second)
+            / pre.throughput_tokens_per_second
+            * 100.0)
+            .max(0.0);
+        losses.push(loss_pct);
+    }
+
+    if losses.is_empty() {
+        return Ok((0, None, None));
+    }
+
+    let avg = losses.iter().sum::<f64>() / losses.len() as f64;
+    let peak = losses
+        .iter()
+        .copied()
+        .fold(0.0_f64, |current, value| current.max(value));
+    Ok((losses.len() as u32, Some(avg), Some(peak)))
+}
+
+fn load_recovery_windows(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<RecoveryWindow>> {
+    if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            WITH regroup_starts AS (
+                SELECT session_id, created_at
+                FROM inference_scheduler_events
+                WHERE network_id = ?1
+                  AND job_id = ?2
+                  AND event_kind LIKE 'decode_regroup_%'
+                  AND event_kind != 'decode_regroup_failed'
+                  AND session_id IS NOT NULL
+            ),
+            recoveries AS (
+                SELECT
+                    starts.session_id,
+                    starts.created_at AS started_at,
+                    MIN(events.created_at) AS recovered_at
+                FROM regroup_starts starts
+                JOIN inference_scheduler_events events
+                  ON events.network_id = ?1
+                 AND events.job_id = ?2
+                 AND events.session_id = starts.session_id
+                 AND events.created_at > starts.created_at
+                 AND (
+                        events.event_kind IN ('decode_queue_ready', 'decode_queue_unblocked', 'decode_claimed')
+                     OR events.queue_status IN ('ready', 'leased', 'active')
+                 )
+                GROUP BY starts.session_id, starts.created_at
+            )
+            SELECT session_id, started_at, recovered_at
+            FROM recoveries
+            WHERE recovered_at IS NOT NULL
+            ORDER BY started_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            Ok(RecoveryWindow {
+                session_id: row.get(0)?,
+                started_at: row.get(1)?,
+                recovered_at: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            WITH regroup_starts AS (
+                SELECT session_id, created_at
+                FROM inference_scheduler_events
+                WHERE network_id = ?1
+                  AND event_kind LIKE 'decode_regroup_%'
+                  AND event_kind != 'decode_regroup_failed'
+                  AND session_id IS NOT NULL
+            ),
+            recoveries AS (
+                SELECT
+                    starts.session_id,
+                    starts.created_at AS started_at,
+                    MIN(events.created_at) AS recovered_at
+                FROM regroup_starts starts
+                JOIN inference_scheduler_events events
+                  ON events.network_id = ?1
+                 AND events.session_id = starts.session_id
+                 AND events.created_at > starts.created_at
+                 AND (
+                        events.event_kind IN ('decode_queue_ready', 'decode_queue_unblocked', 'decode_claimed')
+                     OR events.queue_status IN ('ready', 'leased', 'active')
+                 )
+                GROUP BY starts.session_id, starts.created_at
+            )
+            SELECT session_id, started_at, recovered_at
+            FROM recoveries
+            WHERE recovered_at IS NOT NULL
+            ORDER BY started_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            Ok(RecoveryWindow {
+                session_id: row.get(0)?,
+                started_at: row.get(1)?,
+                recovered_at: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
+fn load_decode_batch_throughput_samples(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+    job_id: Option<&str>,
+) -> Result<Vec<DecodeBatchThroughputSample>> {
+    if let Some(job_id) = job_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT session_id, observed_at, completion_tokens, execution_time_ms
+            FROM inference_decode_batch_events
+            WHERE network_id = ?1
+              AND job_id = ?2
+            ORDER BY observed_at ASC, event_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id, job_id], |row| {
+            let completion_tokens = row.get::<_, i64>(2)? as f64;
+            let execution_time_ms = row.get::<_, i64>(3)? as f64;
+            let throughput_tokens_per_second = if execution_time_ms <= f64::EPSILON {
+                0.0
+            } else {
+                completion_tokens / (execution_time_ms / 1000.0)
+            };
+            Ok(DecodeBatchThroughputSample {
+                session_id: row.get(0)?,
+                observed_at: row.get(1)?,
+                throughput_tokens_per_second,
+            })
+        })?;
+        collect_rows(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT session_id, observed_at, completion_tokens, execution_time_ms
+            FROM inference_decode_batch_events
+            WHERE network_id = ?1
+            ORDER BY observed_at ASC, event_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([network_id], |row| {
+            let completion_tokens = row.get::<_, i64>(2)? as f64;
+            let execution_time_ms = row.get::<_, i64>(3)? as f64;
+            let throughput_tokens_per_second = if execution_time_ms <= f64::EPSILON {
+                0.0
+            } else {
+                completion_tokens / (execution_time_ms / 1000.0)
+            };
+            Ok(DecodeBatchThroughputSample {
+                session_id: row.get(0)?,
+                observed_at: row.get(1)?,
+                throughput_tokens_per_second,
+            })
+        })?;
+        collect_rows(rows)
     }
 }
 
@@ -2287,6 +2595,26 @@ mod tests {
             [],
         )
         .expect("Failed to insert scheduler events");
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_decode_batch_events (
+                session_id, job_id, network_id, device_id, segment_id, completion_tokens,
+                execution_time_ms, batch_size, active_decode_sessions, batch_kv_tokens,
+                deferred_decode_sessions, kv_cache_seq_len, observed_at
+            ) VALUES
+            (
+                'session-1', 'job-1', 'net-1', 'worker-a', 'segment-decode', 12,
+                100, 2, 3, 11, 0, 12, '2026-04-25T12:00:06Z'
+            ),
+            (
+                'session-1', 'job-1', 'net-1', 'worker-a', 'segment-decode', 8,
+                100, 1, 1, 8, 0, 8, '2026-04-25T12:00:12Z'
+            )
+            "#,
+            [],
+        )
+        .expect("Failed to insert decode batch throughput samples");
     }
 
     #[test]
@@ -2684,11 +3012,44 @@ mod tests {
         assert_eq!(status.metrics.kv_transfer_bytes_transferred, 7);
         assert_eq!(status.metrics.checkpoint_fallback_transfer_count, 2);
         assert!((status.metrics.checkpoint_fallback_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(status.metrics.checkpoint_handoff_transfer_count, 2);
+        assert_eq!(status.metrics.live_kv_handoff_transfer_count, 0);
+        assert_eq!(status.metrics.recent_regroup_transfer_count, 1);
+        assert_eq!(status.metrics.recent_regroup_shrink_count, 0);
+        assert_eq!(status.metrics.recent_regroup_replace_count, 0);
         assert_eq!(status.metrics.recent_regroup_event_count, 2);
         assert_eq!(status.metrics.recent_regroup_failure_count, 1);
         assert_eq!(status.metrics.recent_recovery_sample_count, 1);
         assert_eq!(status.metrics.recent_avg_recovery_latency_ms, Some(4_000));
         assert_eq!(status.metrics.recent_peak_recovery_latency_ms, Some(4_000));
+        assert_eq!(status.metrics.recent_degraded_session_count, 1);
+        assert_eq!(status.metrics.recent_avg_degraded_duration_ms, Some(4_000));
+        assert_eq!(status.metrics.recent_peak_degraded_duration_ms, Some(4_000));
+        assert_eq!(status.metrics.recent_post_failover_sample_count, 1);
+        assert_eq!(
+            status.metrics.recent_avg_post_failover_throughput_loss_pct,
+            Some(33.33333333333333)
+        );
+        assert_eq!(
+            status.metrics.recent_peak_post_failover_throughput_loss_pct,
+            Some(33.33333333333333)
+        );
+        assert!(!status.readiness.ready);
+        assert!(status
+            .readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("checkpoint fallback rate")));
+        assert!(status
+            .readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("recent regroup failures")));
+        assert!(status
+            .readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("post-failover throughput loss")));
         assert_eq!(
             status.decode_queue[0].blocked_reason.as_deref(),
             Some("prefill_incomplete")
@@ -2777,6 +3138,8 @@ mod tests {
         assert_eq!(status.metrics.active_kv_transfer_count, 1);
         assert_eq!(status.metrics.recent_regroup_event_count, 2);
         assert_eq!(status.metrics.recent_recovery_sample_count, 1);
+        assert_eq!(status.metrics.recent_post_failover_sample_count, 1);
+        assert!(!status.readiness.ready);
         assert_eq!(
             status.serving_groups[0]
                 .workload
@@ -2806,6 +3169,53 @@ mod tests {
             .regroup_events
             .iter()
             .any(|event| event.event_kind == "queue_lease_changed"));
+    }
+
+    #[test]
+    fn test_scheduler_status_readiness_turns_green_for_healthy_failover_profile() {
+        let db = create_test_db();
+        seed_scheduler_visibility_fixture(&db);
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute(
+            "DELETE FROM inference_scheduler_events WHERE event_kind = 'decode_regroup_failed'",
+            [],
+        )
+        .expect("Failed to drop failing regroup event");
+        conn.execute(
+            r#"
+            UPDATE inference_session_kv_transfers
+            SET transfer_kind = 'live_kv_handoff'
+            WHERE transfer_id = 'transfer-2'
+            "#,
+            [],
+        )
+        .expect("Failed to rebalance transfer mix");
+        conn.execute(
+            r#"
+            UPDATE inference_decode_batch_events
+            SET completion_tokens = 10
+            WHERE session_id = 'session-1' AND observed_at = '2026-04-25T12:00:12Z'
+            "#,
+            [],
+        )
+        .expect("Failed to improve post-failover throughput sample");
+        drop(conn);
+
+        let status = db
+            .load_network_scheduler_status("net-1")
+            .expect("Failed to load network scheduler status");
+
+        assert!(status.readiness.ready);
+        assert!(status.readiness.blockers.is_empty());
+        assert_eq!(status.metrics.checkpoint_fallback_transfer_count, 1);
+        assert!((status.metrics.checkpoint_fallback_rate - 0.5).abs() < f64::EPSILON);
+        assert_eq!(status.metrics.live_kv_handoff_transfer_count, 1);
+        assert_eq!(status.metrics.recent_regroup_failure_count, 0);
+        assert_eq!(
+            status.metrics.recent_avg_post_failover_throughput_loss_pct,
+            Some(16.666666666666664)
+        );
     }
 
     #[test]

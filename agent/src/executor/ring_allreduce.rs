@@ -36,6 +36,12 @@ pub struct RingAllReduceMetrics {
     pub all_gather_step_time_ms: u64,
     pub send_wait_time_ms: u64,
     pub receive_wait_time_ms: u64,
+    pub collective_operations: u64,
+    pub collective_worker_participants: u64,
+    pub pairwise_fast_path_operations: u64,
+    pub larger_ring_operations: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 impl RingAllReduceMetrics {
@@ -44,6 +50,12 @@ impl RingAllReduceMetrics {
         self.all_gather_step_time_ms += other.all_gather_step_time_ms;
         self.send_wait_time_ms += other.send_wait_time_ms;
         self.receive_wait_time_ms += other.receive_wait_time_ms;
+        self.collective_operations += other.collective_operations;
+        self.collective_worker_participants += other.collective_worker_participants;
+        self.pairwise_fast_path_operations += other.pairwise_fast_path_operations;
+        self.larger_ring_operations += other.larger_ring_operations;
+        self.bytes_sent += other.bytes_sent;
+        self.bytes_received += other.bytes_received;
     }
 }
 
@@ -624,6 +636,9 @@ impl<'a> WorkerRing<'a> {
         }
         if self.total_workers == 2 {
             let mut run_metrics = RingAllReduceMetrics::default();
+            run_metrics.collective_operations = 1;
+            run_metrics.collective_worker_participants = 2;
+            run_metrics.pairwise_fast_path_operations = 1;
             let original_shape = partial_result.shape.clone();
             let mut work_buffer = partial_result.data;
             let step_started = std::time::Instant::now();
@@ -641,6 +656,8 @@ impl<'a> WorkerRing<'a> {
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent += (work_buffer.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
             if recv_msg.element_count() != work_buffer.len() {
                 return Err(AgentError::Execution(format!(
                     "Received pairwise all-reduce chunk len {} but expected {}",
@@ -655,6 +672,9 @@ impl<'a> WorkerRing<'a> {
         let n = self.total_workers as usize;
         let original_shape = partial_result.shape.clone();
         let mut run_metrics = RingAllReduceMetrics::default();
+        run_metrics.collective_operations = 1;
+        run_metrics.collective_worker_participants = self.total_workers as u64;
+        run_metrics.larger_ring_operations = 1;
         let plan = self.cached_collective_plan_for_len(partial_result.data.len());
         let mut work_buffer = partial_result.data;
 
@@ -688,6 +708,9 @@ impl<'a> WorkerRing<'a> {
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
             if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
@@ -727,6 +750,9 @@ impl<'a> WorkerRing<'a> {
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
             if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
@@ -780,6 +806,9 @@ impl<'a> WorkerRing<'a> {
         }
         if self.total_workers == 2 {
             let mut run_metrics = RingAllReduceMetrics::default();
+            run_metrics.collective_operations = 1;
+            run_metrics.collective_worker_participants = 2;
+            run_metrics.pairwise_fast_path_operations = 1;
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
                 .send_chunk_to_right_recv_from_left(
@@ -795,6 +824,8 @@ impl<'a> WorkerRing<'a> {
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent += (partial_result.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
             if recv_msg.element_count() != partial_result.len() {
                 return Err(AgentError::Execution(format!(
                     "Received pairwise all-reduce matrix chunk len {} but expected {}",
@@ -811,6 +842,9 @@ impl<'a> WorkerRing<'a> {
         }
         let n = self.total_workers as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
+        run_metrics.collective_operations = 1;
+        run_metrics.collective_worker_participants = self.total_workers as u64;
+        run_metrics.larger_ring_operations = 1;
         let plan = self.cached_collective_plan_for_len(partial_result.len());
 
         for step in 0..(n - 1) {
@@ -831,6 +865,9 @@ impl<'a> WorkerRing<'a> {
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
             if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
@@ -863,6 +900,9 @@ impl<'a> WorkerRing<'a> {
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
             if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(

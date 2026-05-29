@@ -118,6 +118,9 @@ pub struct TensorPlaneMetricsSnapshot {
     pub current_outbound_inflight_bytes: u64,
     pub peak_outbound_inflight_bytes: u64,
     pub current_outbound_connections: u64,
+    pub connection_refresh_attempt_count: u64,
+    pub connection_refresh_success_count: u64,
+    pub connection_evict_count: u64,
     pub latency_critical_send_count: u64,
     pub interactive_send_count: u64,
     pub bulk_send_count: u64,
@@ -174,6 +177,9 @@ struct TensorPlaneMetrics {
     peak_inbound_queued_bytes: AtomicU64,
     peak_outbound_inflight_bytes: AtomicU64,
     current_outbound_connections: AtomicU64,
+    connection_refresh_attempt_count: AtomicU64,
+    connection_refresh_success_count: AtomicU64,
+    connection_evict_count: AtomicU64,
     latency_critical_send_count: AtomicU64,
     interactive_send_count: AtomicU64,
     bulk_send_count: AtomicU64,
@@ -211,6 +217,9 @@ impl TensorPlaneMetrics {
             peak_inbound_queued_bytes: AtomicU64::new(0),
             peak_outbound_inflight_bytes: AtomicU64::new(0),
             current_outbound_connections: AtomicU64::new(0),
+            connection_refresh_attempt_count: AtomicU64::new(0),
+            connection_refresh_success_count: AtomicU64::new(0),
+            connection_evict_count: AtomicU64::new(0),
             latency_critical_send_count: AtomicU64::new(0),
             interactive_send_count: AtomicU64::new(0),
             bulk_send_count: AtomicU64::new(0),
@@ -1124,6 +1133,21 @@ impl TensorPlane {
                 .metrics
                 .current_outbound_connections
                 .load(Ordering::Relaxed),
+            connection_refresh_attempt_count: self
+                .state
+                .metrics
+                .connection_refresh_attempt_count
+                .load(Ordering::Relaxed),
+            connection_refresh_success_count: self
+                .state
+                .metrics
+                .connection_refresh_success_count
+                .load(Ordering::Relaxed),
+            connection_evict_count: self
+                .state
+                .metrics
+                .connection_evict_count
+                .load(Ordering::Relaxed),
             latency_critical_send_count: self
                 .state
                 .metrics
@@ -1145,6 +1169,7 @@ impl TensorPlane {
         provider: ExecutionProviderKind,
     ) -> Result<()> {
         let hot_lane_plans = serving_lane_plans(
+            self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
@@ -1177,30 +1202,35 @@ impl TensorPlane {
             .await?;
         let reduce_scatter_plan = lane_plan(
             CollectiveLane::ReduceScatter,
+            self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let all_gather_plan = lane_plan(
             CollectiveLane::AllGather,
+            self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let control_plan = lane_plan(
             CollectiveLane::Control,
+            self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let bulk_transfer_plan = lane_plan(
             CollectiveLane::BulkTransfer,
+            self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let checkpoint_plan = lane_plan(
             CollectiveLane::Checkpoint,
+            self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
@@ -1421,6 +1451,10 @@ async fn send_serving_frame_bytes_with_refresh(
     match first_result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) | Err(_) => {
+            state
+                .metrics
+                .connection_refresh_attempt_count
+                .fetch_add(1, Ordering::Relaxed);
             evict_connection(state, lane.target, lane.plan.lane).await;
             let refreshed_stream = ensure_connection_pool(
                 state,
@@ -1442,7 +1476,13 @@ async fn send_serving_frame_bytes_with_refresh(
             )
             .await
             {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(())) => {
+                    state
+                        .metrics
+                        .connection_refresh_success_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
                 Ok(Err(error)) => Err(AgentError::Network(format!(
                     "Failed to send serving frame to {}: {}",
                     lane.target, error
@@ -1665,6 +1705,10 @@ async fn evict_connection(state: &Arc<TensorPlaneState>, target: SocketAddr, lan
                 .metrics
                 .current_outbound_connections
                 .fetch_sub(lane_pool.streams.len() as u64, Ordering::Relaxed);
+            state
+                .metrics
+                .connection_evict_count
+                .fetch_add(1, Ordering::Relaxed);
         }
         if pool.lanes.is_empty() {
             connections.remove(&target);
@@ -1683,32 +1727,72 @@ fn update_peak(metric: &AtomicU64, value: u64) {
 }
 
 fn preferred_serving_stream_count(
+    profile: TensorPlaneProfile,
     runtime_mode: InferenceRuntimeMode,
     provider: ExecutionProviderKind,
     max_streams: usize,
 ) -> usize {
     let max_streams = max_streams.max(1);
-    match (provider, runtime_mode) {
-        (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => max_streams,
-        (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => 2.min(max_streams),
-        (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst) => 2.min(max_streams),
-        (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => 1,
-        _ => 1.max(max_streams / 2),
+    match profile {
+        TensorPlaneProfile::Conservative => match (provider, runtime_mode) {
+            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => max_streams,
+            (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
+                2.min(max_streams)
+            }
+            (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst) => {
+                2.min(max_streams)
+            }
+            (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => 1,
+            _ => 1.max(max_streams / 2),
+        },
+        TensorPlaneProfile::Lan => match (provider, runtime_mode) {
+            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => max_streams,
+            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::LatencyFirst) => {
+                max_streams.min(3).max(2)
+            }
+            (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
+                max_streams.min(3).max(2)
+            }
+            (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst) => {
+                2.min(max_streams)
+            }
+            (ExecutionProviderKind::Cpu, InferenceRuntimeMode::ThroughputFirst) => {
+                2.min(max_streams)
+            }
+            (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => 1,
+            _ => 1.max(max_streams / 2),
+        },
     }
 }
 
 fn lane_plan(
     lane: CollectiveLane,
+    profile: TensorPlaneProfile,
     runtime_mode: InferenceRuntimeMode,
     provider: ExecutionProviderKind,
     max_streams: usize,
 ) -> ServingLanePlan {
-    let bulk_streams = preferred_serving_stream_count(runtime_mode, provider, max_streams);
-    let interactive_streams = bulk_streams.min(2).max(1);
+    let bulk_streams = preferred_serving_stream_count(profile, runtime_mode, provider, max_streams);
+    let interactive_streams = match profile {
+        TensorPlaneProfile::Conservative => bulk_streams.min(2).max(1),
+        TensorPlaneProfile::Lan => bulk_streams.min(3).max(1),
+    };
     let control_streams = 1;
-    let checkpoint_streams = match (provider, runtime_mode) {
-        (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => interactive_streams,
-        (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
+    let checkpoint_streams = match (profile, provider, runtime_mode) {
+        (
+            TensorPlaneProfile::Lan,
+            ExecutionProviderKind::Cuda,
+            InferenceRuntimeMode::ThroughputFirst,
+        ) => bulk_streams.min(3).max(1),
+        (
+            TensorPlaneProfile::Lan,
+            ExecutionProviderKind::Metal,
+            InferenceRuntimeMode::ThroughputFirst,
+        ) => interactive_streams,
+        (_, ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => {
+            interactive_streams
+        }
+        (_, ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
             interactive_streams
         }
         _ => 1,
@@ -1728,6 +1812,7 @@ fn lane_plan(
 }
 
 fn serving_lane_plans(
+    profile: TensorPlaneProfile,
     runtime_mode: InferenceRuntimeMode,
     provider: ExecutionProviderKind,
     max_streams: usize,
@@ -1735,25 +1820,35 @@ fn serving_lane_plans(
     [
         lane_plan(
             CollectiveLane::ReduceScatter,
+            profile,
             runtime_mode,
             provider,
             max_streams,
         ),
         lane_plan(
             CollectiveLane::AllGather,
+            profile,
             runtime_mode,
             provider,
             max_streams,
         ),
-        lane_plan(CollectiveLane::Control, runtime_mode, provider, max_streams),
+        lane_plan(
+            CollectiveLane::Control,
+            profile,
+            runtime_mode,
+            provider,
+            max_streams,
+        ),
         lane_plan(
             CollectiveLane::BulkTransfer,
+            profile,
             runtime_mode,
             provider,
             max_streams,
         ),
         lane_plan(
             CollectiveLane::Checkpoint,
+            profile,
             runtime_mode,
             provider,
             max_streams,
@@ -2334,6 +2429,80 @@ mod tests {
             !Arc::ptr_eq(&stream_zero, &stream_one),
             "different logical stream ids should use different channels when available"
         );
+    }
+
+    #[tokio::test]
+    async fn test_lan_profile_opens_more_cuda_latency_streams() {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
+            profile: TensorPlaneProfile::Lan,
+            max_concurrent_outbound_streams_per_peer: 4,
+            ..TensorPlaneConfig::default()
+        })
+        .await
+        .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::LatencyFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.stream_id_for(CollectiveLane::ReduceScatter, 2, 0),
+            2
+        );
+        assert_eq!(session.stream_id_for(CollectiveLane::AllGather, 2, 0), 2);
+    }
+
+    #[tokio::test]
+    async fn test_closed_lane_connection_refreshes_on_next_send() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let collective_id = Uuid::new_v4();
+        let stale_stream = {
+            let streams = session.reduce_scatter_lane.streams.lock().await;
+            Arc::clone(&streams[0])
+        };
+        {
+            let mut guard = stale_stream.lock().await;
+            guard.shutdown().await.unwrap();
+        }
+
+        session
+            .send_reduce_scatter_chunk(collective_id, 2, 0, 0, 0, 7, &[4.0, 5.0])
+            .await
+            .unwrap();
+        let frame = session
+            .recv_frame(ServingReceiveSpec {
+                collective_id,
+                lane: CollectiveLane::ReduceScatter,
+                layer_idx: 2,
+                step: 0,
+                slot: 0,
+                stream_id: 0,
+                expected_sender_position: 7,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(frame.chunk_data, vec![4.0, 5.0]);
+        let snapshot = plane.metrics_snapshot();
+        assert_eq!(snapshot.connection_refresh_attempt_count, 1);
+        assert_eq!(snapshot.connection_refresh_success_count, 1);
+        assert_eq!(snapshot.connection_evict_count, 1);
     }
 
     #[tokio::test]

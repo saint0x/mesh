@@ -166,11 +166,20 @@ pub struct InferenceStats {
 
     pub tensor_peak_outbound_inflight_bytes: AtomicU64,
     pub tensor_current_outbound_connections: AtomicU64,
+    pub tensor_connection_refresh_attempt_count: AtomicU64,
+    pub tensor_connection_refresh_success_count: AtomicU64,
+    pub tensor_connection_evict_count: AtomicU64,
 
     pub total_reduce_scatter_time_ms: AtomicU64,
     pub total_all_gather_time_ms: AtomicU64,
     pub total_allreduce_send_wait_ms: AtomicU64,
     pub total_allreduce_receive_wait_ms: AtomicU64,
+    pub total_collective_operations: AtomicU64,
+    pub total_collective_worker_participants: AtomicU64,
+    pub total_pairwise_fast_path_operations: AtomicU64,
+    pub total_larger_ring_operations: AtomicU64,
+    pub total_collective_bytes_sent: AtomicU64,
+    pub total_collective_bytes_received: AtomicU64,
 }
 
 impl Default for InferenceStats {
@@ -246,10 +255,19 @@ impl InferenceStats {
             tensor_peak_inbound_queued_bytes: AtomicU64::new(0),
             tensor_peak_outbound_inflight_bytes: AtomicU64::new(0),
             tensor_current_outbound_connections: AtomicU64::new(0),
+            tensor_connection_refresh_attempt_count: AtomicU64::new(0),
+            tensor_connection_refresh_success_count: AtomicU64::new(0),
+            tensor_connection_evict_count: AtomicU64::new(0),
             total_reduce_scatter_time_ms: AtomicU64::new(0),
             total_all_gather_time_ms: AtomicU64::new(0),
             total_allreduce_send_wait_ms: AtomicU64::new(0),
             total_allreduce_receive_wait_ms: AtomicU64::new(0),
+            total_collective_operations: AtomicU64::new(0),
+            total_collective_worker_participants: AtomicU64::new(0),
+            total_pairwise_fast_path_operations: AtomicU64::new(0),
+            total_larger_ring_operations: AtomicU64::new(0),
+            total_collective_bytes_sent: AtomicU64::new(0),
+            total_collective_bytes_received: AtomicU64::new(0),
         }
     }
 
@@ -374,6 +392,18 @@ impl InferenceStats {
             .fetch_add(metrics.send_wait_time_ms, Ordering::Relaxed);
         self.total_allreduce_receive_wait_ms
             .fetch_add(metrics.receive_wait_time_ms, Ordering::Relaxed);
+        self.total_collective_operations
+            .fetch_add(metrics.collective_operations, Ordering::Relaxed);
+        self.total_collective_worker_participants
+            .fetch_add(metrics.collective_worker_participants, Ordering::Relaxed);
+        self.total_pairwise_fast_path_operations
+            .fetch_add(metrics.pairwise_fast_path_operations, Ordering::Relaxed);
+        self.total_larger_ring_operations
+            .fetch_add(metrics.larger_ring_operations, Ordering::Relaxed);
+        self.total_collective_bytes_sent
+            .fetch_add(metrics.bytes_sent, Ordering::Relaxed);
+        self.total_collective_bytes_received
+            .fetch_add(metrics.bytes_received, Ordering::Relaxed);
     }
 
     /// Record a checkpoint creation
@@ -496,6 +526,12 @@ impl InferenceStats {
             .store(snapshot.peak_outbound_inflight_bytes, Ordering::Relaxed);
         self.tensor_current_outbound_connections
             .store(snapshot.current_outbound_connections, Ordering::Relaxed);
+        self.tensor_connection_refresh_attempt_count
+            .store(snapshot.connection_refresh_attempt_count, Ordering::Relaxed);
+        self.tensor_connection_refresh_success_count
+            .store(snapshot.connection_refresh_success_count, Ordering::Relaxed);
+        self.tensor_connection_evict_count
+            .store(snapshot.connection_evict_count, Ordering::Relaxed);
     }
 
     /// Get total jobs (completed + failed)
@@ -592,6 +628,63 @@ impl InferenceStats {
         collective_ms as f64 / total_runtime as f64
     }
 
+    pub fn avg_collective_workers(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_collective_worker_participants
+            .load(Ordering::Relaxed) as f64
+            / operations as f64
+    }
+
+    pub fn larger_ring_collective_rate(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_larger_ring_operations.load(Ordering::Relaxed) as f64 / operations as f64
+    }
+
+    pub fn pairwise_fast_path_collective_rate(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_pairwise_fast_path_operations
+            .load(Ordering::Relaxed) as f64
+            / operations as f64
+    }
+
+    pub fn avg_collective_send_bytes(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_collective_bytes_sent.load(Ordering::Relaxed) as f64 / operations as f64
+    }
+
+    pub fn avg_collective_receive_bytes(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_collective_bytes_received.load(Ordering::Relaxed) as f64 / operations as f64
+    }
+
+    pub fn collective_wait_share_of_collective_runtime(&self) -> f64 {
+        let total_collective = self.total_reduce_scatter_time_ms.load(Ordering::Relaxed)
+            + self.total_all_gather_time_ms.load(Ordering::Relaxed)
+            + self.total_allreduce_send_wait_ms.load(Ordering::Relaxed)
+            + self.total_allreduce_receive_wait_ms.load(Ordering::Relaxed);
+        if total_collective == 0 {
+            return 0.0;
+        }
+        let total_wait = self.total_allreduce_send_wait_ms.load(Ordering::Relaxed)
+            + self.total_allreduce_receive_wait_ms.load(Ordering::Relaxed);
+        total_wait as f64 / total_collective as f64
+    }
+
     pub fn recovery_success_rate(&self) -> f64 {
         let attempts = self.recovery_attempts.load(Ordering::Relaxed);
         if attempts == 0 {
@@ -670,9 +763,19 @@ impl InferenceStats {
             ),
             allreduce_send_wait_share = format!("{:.3}", self.allreduce_send_wait_share()),
             allreduce_receive_wait_share = format!("{:.3}", self.allreduce_receive_wait_share()),
+            collective_wait_share_of_collective_runtime = format!(
+                "{:.3}",
+                self.collective_wait_share_of_collective_runtime()
+            ),
             collective_transport_share_of_runtime = format!(
                 "{:.3}",
                 self.collective_transport_share_of_runtime()
+            ),
+            avg_collective_workers = format!("{:.2}", self.avg_collective_workers()),
+            larger_ring_collective_rate = format!("{:.3}", self.larger_ring_collective_rate()),
+            pairwise_fast_path_collective_rate = format!(
+                "{:.3}",
+                self.pairwise_fast_path_collective_rate()
             ),
             decode_multi_session_microbatches = self
                 .decode_multi_session_microbatches
@@ -735,6 +838,15 @@ impl InferenceStats {
                 .load(Ordering::Relaxed),
             tensor_byte_budget_rejections = self
                 .tensor_inbound_byte_budget_rejections
+                .load(Ordering::Relaxed),
+            tensor_connection_refresh_attempts = self
+                .tensor_connection_refresh_attempt_count
+                .load(Ordering::Relaxed),
+            tensor_connection_refresh_successes = self
+                .tensor_connection_refresh_success_count
+                .load(Ordering::Relaxed),
+            tensor_connection_evicts = self
+                .tensor_connection_evict_count
                 .load(Ordering::Relaxed),
             uptime = %self.uptime_string(),
             "Inference statistics"
@@ -833,6 +945,36 @@ impl InferenceStats {
             "  Open Connections:    {}",
             self.tensor_current_outbound_connections
                 .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Conn Refreshes:      {}",
+            self.tensor_connection_refresh_attempt_count
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Conn Refresh OK:     {}",
+            self.tensor_connection_refresh_success_count
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Conn Evictions:      {}",
+            self.tensor_connection_evict_count.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Avg Coll Workers:    {:.2}",
+            self.avg_collective_workers()
+        );
+        println!(
+            "  Larger-Ring Rate:    {:.1}%",
+            self.larger_ring_collective_rate() * 100.0
+        );
+        println!(
+            "  Pairwise Fast-Path:  {:.1}%",
+            self.pairwise_fast_path_collective_rate() * 100.0
+        );
+        println!(
+            "  Coll Wait Share:     {:.1}%",
+            self.collective_wait_share_of_collective_runtime() * 100.0
         );
 
         println!("\n{}", "Decode Batching:".bold());
@@ -1298,6 +1440,23 @@ impl InferenceStats {
         );
         insert_u64(
             &mut map,
+            "tensor_connection_refresh_attempt_count",
+            self.tensor_connection_refresh_attempt_count
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_connection_refresh_success_count",
+            self.tensor_connection_refresh_success_count
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "tensor_connection_evict_count",
+            self.tensor_connection_evict_count.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
             "total_reduce_scatter_time_ms",
             self.total_reduce_scatter_time_ms.load(Ordering::Relaxed),
         );
@@ -1315,6 +1474,38 @@ impl InferenceStats {
             &mut map,
             "total_allreduce_receive_wait_ms",
             self.total_allreduce_receive_wait_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_collective_operations",
+            self.total_collective_operations.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_collective_worker_participants",
+            self.total_collective_worker_participants
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_pairwise_fast_path_operations",
+            self.total_pairwise_fast_path_operations
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_larger_ring_operations",
+            self.total_larger_ring_operations.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_collective_bytes_sent",
+            self.total_collective_bytes_sent.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_collective_bytes_received",
+            self.total_collective_bytes_received.load(Ordering::Relaxed),
         );
 
         map.insert(
@@ -1356,6 +1547,30 @@ impl InferenceStats {
         map.insert(
             "collective_transport_share_of_runtime".to_string(),
             serde_json::Value::from(self.collective_transport_share_of_runtime()),
+        );
+        map.insert(
+            "avg_collective_workers".to_string(),
+            serde_json::Value::from(self.avg_collective_workers()),
+        );
+        map.insert(
+            "larger_ring_collective_rate".to_string(),
+            serde_json::Value::from(self.larger_ring_collective_rate()),
+        );
+        map.insert(
+            "pairwise_fast_path_collective_rate".to_string(),
+            serde_json::Value::from(self.pairwise_fast_path_collective_rate()),
+        );
+        map.insert(
+            "avg_collective_send_bytes".to_string(),
+            serde_json::Value::from(self.avg_collective_send_bytes()),
+        );
+        map.insert(
+            "avg_collective_receive_bytes".to_string(),
+            serde_json::Value::from(self.avg_collective_receive_bytes()),
+        );
+        map.insert(
+            "collective_wait_share_of_collective_runtime".to_string(),
+            serde_json::Value::from(self.collective_wait_share_of_collective_runtime()),
         );
         map.insert(
             "recovery_success_rate".to_string(),
@@ -1595,11 +1810,26 @@ mod tests {
             all_gather_step_time_ms: 12,
             send_wait_time_ms: 4,
             receive_wait_time_ms: 6,
+            collective_operations: 2,
+            collective_worker_participants: 5,
+            pairwise_fast_path_operations: 1,
+            larger_ring_operations: 1,
+            bytes_sent: 128,
+            bytes_received: 160,
         });
 
         assert!((stats.allreduce_send_wait_share() - 0.1).abs() < f64::EPSILON);
         assert!((stats.allreduce_receive_wait_share() - 0.15).abs() < f64::EPSILON);
         assert!((stats.collective_transport_share_of_runtime() - 0.32).abs() < f64::EPSILON);
+        assert!((stats.avg_collective_workers() - 2.5).abs() < f64::EPSILON);
+        assert!((stats.larger_ring_collective_rate() - 0.5).abs() < f64::EPSILON);
+        assert!((stats.pairwise_fast_path_collective_rate() - 0.5).abs() < f64::EPSILON);
+        assert!((stats.avg_collective_send_bytes() - 64.0).abs() < f64::EPSILON);
+        assert!((stats.avg_collective_receive_bytes() - 80.0).abs() < f64::EPSILON);
+        assert!(
+            (stats.collective_wait_share_of_collective_runtime() - (10.0 / 32.0)).abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -1637,6 +1867,9 @@ mod tests {
             current_outbound_inflight_bytes: 17,
             peak_outbound_inflight_bytes: 23,
             current_outbound_connections: 2,
+            connection_refresh_attempt_count: 29,
+            connection_refresh_success_count: 31,
+            connection_evict_count: 37,
             latency_critical_send_count: 1,
             interactive_send_count: 2,
             bulk_send_count: 3,
@@ -1679,6 +1912,22 @@ mod tests {
                 .tensor_inbound_byte_budget_rejections
                 .load(Ordering::Relaxed),
             7
+        );
+        assert_eq!(
+            stats
+                .tensor_connection_refresh_attempt_count
+                .load(Ordering::Relaxed),
+            29
+        );
+        assert_eq!(
+            stats
+                .tensor_connection_refresh_success_count
+                .load(Ordering::Relaxed),
+            31
+        );
+        assert_eq!(
+            stats.tensor_connection_evict_count.load(Ordering::Relaxed),
+            37
         );
     }
 }

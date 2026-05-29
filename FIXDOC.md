@@ -219,16 +219,18 @@ Agent 3 owns production resilience and proof, not scheduler policy internals or 
 
 ✅ Real deterministic Fozzy coverage has been exercised repeatedly across failover regroup, runtime serving, integrated serving, trace verify, replay, CI validation, and host-backed execution paths.
 
+✅ Scheduler/operator status now exposes regroup-cause counts, transfer-cause counts, degraded recovery duration, post-failover throughput-loss metrics, and explicit readiness blockers.
+
+✅ Deterministic failover proof now includes an active 4-worker to 3-worker shrink drill during decode plus dedicated Fozzy readiness gates.
+
 ### Agent 3 Remaining Work
 
 - Define and land a full chaos matrix for mid-decode worker loss, slow-worker degradation, lane stalls, reconnect churn, and mixed failure-plus-recovery traffic.
-- Add deterministic failover drills that explicitly verify instant regroup behavior when a ring shrinks from 4 workers to 3 during active decode.
 - Expand checkpoint and KV recovery from correctness-first behavior to efficiency-first behavior, including delta-aware or paged KV movement where feasible.
 - Add explicit recovery backpressure rules so checkpoint or KV repair traffic cannot silently starve live decode under pressure.
 - Build production scaling benchmark suites across 1, 2, 3, and 4-plus workers with tok/s, per-node memory pressure, regroup latency, checkpoint recovery time, and collective-wait share as first-class outputs.
 - Turn scaling benchmarks into release gates so widening a decode topology cannot ship without measured evidence that scaling is neutral-to-positive for the targeted shapes.
 - Add mixed-backend benchmark coverage so CUDA, Metal, and heterogeneous rings are evaluated separately instead of relying on one aggregate scaling story.
-- Expand observability with production-grade counters and summaries for regroup cause, checkpoint transfer cause, recovery duration, degraded-topology duration, and post-failover throughput impact.
 - Define readiness thresholds for acceptable failover recovery time, acceptable degraded-mode throughput loss, and acceptable checkpoint or KV transfer overhead.
 - Verify accounting and credit-system correctness across regroup, replacement, degraded execution, checkpoint transfer, and resumed execution flows.
 

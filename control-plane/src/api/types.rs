@@ -430,6 +430,16 @@ pub struct ExecutionGroupMember {
     pub direct_candidates: Vec<DirectPeerCandidate>,
     pub assigned_capacity_units: u32,
     pub execution_provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_tokens_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_deferred_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_fill_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instability_score: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1317,6 +1327,11 @@ pub struct SchedulerBatchMetrics {
     pub kv_transfer_bytes_transferred: u64,
     pub checkpoint_fallback_transfer_count: u32,
     pub checkpoint_fallback_rate: f64,
+    pub checkpoint_handoff_transfer_count: u32,
+    pub live_kv_handoff_transfer_count: u32,
+    pub recent_regroup_transfer_count: u32,
+    pub recent_regroup_shrink_count: u32,
+    pub recent_regroup_replace_count: u32,
     pub recent_regroup_event_count: u32,
     pub recent_regroup_failure_count: u32,
     pub recent_recovery_sample_count: u32,
@@ -1324,6 +1339,31 @@ pub struct SchedulerBatchMetrics {
     pub recent_avg_recovery_latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recent_peak_recovery_latency_ms: Option<u64>,
+    pub recent_degraded_session_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_avg_degraded_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_peak_degraded_duration_ms: Option<u64>,
+    pub recent_post_failover_sample_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_avg_post_failover_throughput_loss_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_peak_post_failover_throughput_loss_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerReadinessThresholds {
+    pub max_checkpoint_fallback_rate: f64,
+    pub max_recent_regroup_failures: u32,
+    pub max_peak_recovery_latency_ms: u64,
+    pub max_avg_post_failover_throughput_loss_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerReadinessStatus {
+    pub ready: bool,
+    pub blockers: Vec<String>,
+    pub thresholds: SchedulerReadinessThresholds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1361,6 +1401,7 @@ pub struct NetworkSchedulerStatusResponse {
     pub network_id: String,
     pub jobs: Vec<SchedulerJobSummary>,
     pub metrics: SchedulerBatchMetrics,
+    pub readiness: SchedulerReadinessStatus,
     pub decode_queue: Vec<DecodeQueueEntryStatus>,
     pub serving_groups: Vec<ServingGroupStatus>,
     pub kv_residency: Vec<KvResidencySummary>,
@@ -1381,6 +1422,7 @@ pub struct JobSchedulerStatusResponse {
     pub completion_tokens: u32,
     pub updated_at: String,
     pub metrics: SchedulerBatchMetrics,
+    pub readiness: SchedulerReadinessStatus,
     pub decode_queue: Vec<DecodeQueueEntryStatus>,
     pub serving_groups: Vec<ServingGroupStatus>,
     pub kv_residency: Vec<KvResidencySummary>,

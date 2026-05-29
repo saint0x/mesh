@@ -16,11 +16,19 @@ use crate::services::ring_manager::{RingTopology, WorkerTopologyInfo};
 
 const MIN_RUNTIME_CAPACITY_MULTIPLIER: f64 = 0.5;
 const MAX_RUNTIME_CAPACITY_MULTIPLIER: f64 = 2.0;
+const SMALL_MODEL_EXPANSION_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const EXPANSION_SCORE_MARGIN: i64 = 180;
+const SMALL_MODEL_EXPANSION_SCORE_MARGIN: i64 = 320;
 
 #[derive(Debug, Clone)]
 pub struct PlannerDeviceMetadata {
     pub assigned_capacity_units: u32,
     pub execution_provider: String,
+    pub throughput_multiplier: f64,
+    pub observed_tokens_per_second: Option<f64>,
+    pub observed_deferred_ratio: Option<f64>,
+    pub observed_fill_ratio: Option<f64>,
+    pub instability_score: u32,
 }
 
 pub struct ExecutionPlanner;
@@ -175,7 +183,7 @@ impl ExecutionPlanner {
                 plan.plan_id
             ))
         })?;
-        let decode_members = select_execution_members(
+        let mut decode_members = select_execution_members(
             &model_id,
             ExecutionPhase::Decode,
             &available_members,
@@ -187,6 +195,48 @@ impl ExecutionPlanner {
                 err
             ))
         })?;
+        if let Some(current_decode_members) =
+            current_valid_decode_members(plan, &model_id, &available_members)?
+        {
+            if decode_members.len() > current_decode_members.len()
+                && is_full_replica_group(&current_decode_members)
+            {
+                decode_members = current_decode_members;
+            } else {
+                let manifest = model_assets::load_model_manifest(&model_id)?;
+                let selected_score = scored_candidate_topology(
+                    &manifest,
+                    ExecutionPhase::Decode,
+                    runtime_mode,
+                    &available_members,
+                    &[decode_members.clone(), current_decode_members.clone()],
+                    &decode_members,
+                );
+                let current_score = scored_candidate_topology(
+                    &manifest,
+                    ExecutionPhase::Decode,
+                    runtime_mode,
+                    &available_members,
+                    &[decode_members.clone(), current_decode_members.clone()],
+                    &current_decode_members,
+                );
+                let selected_is_expansion = decode_members.len() > current_decode_members.len();
+                let required_margin =
+                    if manifest.total_model_bytes <= SMALL_MODEL_EXPANSION_THRESHOLD_BYTES {
+                        SMALL_MODEL_EXPANSION_SCORE_MARGIN
+                    } else {
+                        EXPANSION_SCORE_MARGIN
+                    };
+                let materially_better =
+                    selected_score >= current_score.saturating_add(required_margin);
+                if (selected_is_expansion
+                    || !same_participants(&decode_members, &current_decode_members))
+                    && !materially_better
+                {
+                    decode_members = current_decode_members;
+                }
+            }
+        }
         let prefill_members = plan
             .execution_groups
             .iter()
@@ -290,6 +340,11 @@ fn build_member(
         direct_candidates: worker.direct_candidates.clone(),
         assigned_capacity_units: metadata.assigned_capacity_units,
         execution_provider: metadata.execution_provider.clone(),
+        throughput_multiplier: Some(metadata.throughput_multiplier),
+        observed_tokens_per_second: metadata.observed_tokens_per_second,
+        observed_deferred_ratio: metadata.observed_deferred_ratio,
+        observed_fill_ratio: metadata.observed_fill_ratio,
+        instability_score: Some(metadata.instability_score),
     }
 }
 
@@ -343,14 +398,26 @@ fn select_execution_members(
 ) -> ApiResult<Vec<ExecutionGroupMember>> {
     let manifest = model_assets::load_model_manifest(model_id)?;
     let candidates = candidate_groups(&manifest, phase, members, runtime_mode);
+    let all_members = members.to_vec();
     let mut errors = Vec::new();
+    let mut valid_candidates = Vec::new();
 
     for candidate in candidates {
         match validate_serving_group_legality(model_id, phase, &candidate) {
-            Ok(_) => return Ok(candidate),
+            Ok(_) => valid_candidates.push(candidate),
             Err(ApiError::Conflict(err)) => errors.push(err),
             Err(err) => return Err(err),
         }
+    }
+
+    if let Some(best) = select_best_valid_candidate(
+        &manifest,
+        phase,
+        runtime_mode,
+        &all_members,
+        &valid_candidates,
+    ) {
+        return Ok(best);
     }
 
     Err(ApiError::Conflict(format!(
@@ -359,6 +426,28 @@ fn select_execution_members(
         model_id,
         errors.join("; ")
     )))
+}
+
+fn select_best_valid_candidate(
+    manifest: &ModelManifest,
+    phase: ExecutionPhase,
+    runtime_mode: InferenceRuntimeMode,
+    all_members: &[ExecutionGroupMember],
+    valid_candidates: &[Vec<ExecutionGroupMember>],
+) -> Option<Vec<ExecutionGroupMember>> {
+    valid_candidates
+        .iter()
+        .max_by_key(|candidate| {
+            scored_candidate_topology(
+                manifest,
+                phase,
+                runtime_mode,
+                all_members,
+                valid_candidates,
+                candidate,
+            )
+        })
+        .cloned()
 }
 
 fn candidate_groups(
@@ -666,6 +755,47 @@ fn same_participants(left: &[ExecutionGroupMember], right: &[ExecutionGroupMembe
     left_ids == right_ids
 }
 
+fn is_full_replica_group(members: &[ExecutionGroupMember]) -> bool {
+    let Some(max_column_end) = members.iter().map(|member| member.shard.column_end).max() else {
+        return false;
+    };
+    members
+        .iter()
+        .all(|member| member.shard.column_start == 0 && member.shard.column_end == max_column_end)
+}
+
+fn current_valid_decode_members(
+    plan: &InferenceExecutionPlan,
+    model_id: &str,
+    available_members: &[ExecutionGroupMember],
+) -> ApiResult<Option<Vec<ExecutionGroupMember>>> {
+    let Some(existing_decode_group) = plan
+        .execution_groups
+        .iter()
+        .find(|group| matches!(group.phase, ExecutionPhase::Decode))
+    else {
+        return Ok(None);
+    };
+    let current_members = existing_decode_group
+        .members
+        .iter()
+        .map(|member| {
+            available_members
+                .iter()
+                .find(|candidate| candidate.device_id == member.device_id)
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(current_members) = current_members else {
+        return Ok(None);
+    };
+    if validate_serving_group_legality(model_id, ExecutionPhase::Decode, &current_members).is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(current_members))
+}
+
 fn derive_runtime_mode(
     _scheduling_policy: &InferenceSchedulingPolicy,
     members: &[ExecutionGroupMember],
@@ -764,6 +894,120 @@ pub fn topology_efficiency_score(
     effective_capacity * 100 + transport_bonus + balance_pct - i64::from(risk) - width_penalty
 }
 
+fn scored_candidate_topology(
+    manifest: &ModelManifest,
+    phase: ExecutionPhase,
+    runtime_mode: InferenceRuntimeMode,
+    all_members: &[ExecutionGroupMember],
+    valid_candidates: &[Vec<ExecutionGroupMember>],
+    candidate: &[ExecutionGroupMember],
+) -> i64 {
+    let mut score = topology_efficiency_score(candidate, runtime_mode);
+    if !matches!(phase, ExecutionPhase::Decode) {
+        return score;
+    }
+
+    let width = candidate.len();
+    let narrower_candidates = valid_candidates
+        .iter()
+        .filter(|other| other.len() < width)
+        .collect::<Vec<_>>();
+    let best_narrower_score = narrower_candidates
+        .iter()
+        .map(|other| topology_efficiency_score(other, runtime_mode))
+        .max();
+    let best_homogeneous_score = valid_candidates
+        .iter()
+        .filter(|other| is_homogeneous_provider_group(other))
+        .map(|other| topology_efficiency_score(other, runtime_mode))
+        .max();
+    let small_model = manifest.total_model_bytes <= SMALL_MODEL_EXPANSION_THRESHOLD_BYTES;
+    let wider_than_needed = narrower_candidates.iter().any(|other| {
+        other.len() < width && covers_same_decode_shape(other, candidate, all_members)
+    });
+
+    if small_model && width > 2 && wider_than_needed {
+        score -= ((width as i64) - 2) * 180;
+    }
+
+    if let Some(narrower_score) = best_narrower_score {
+        let required_margin = if small_model {
+            SMALL_MODEL_EXPANSION_SCORE_MARGIN
+        } else {
+            EXPANSION_SCORE_MARGIN
+        };
+        if width > 1 && wider_than_needed && score < narrower_score.saturating_add(required_margin)
+        {
+            score -= 5_000;
+        }
+    }
+
+    if !is_homogeneous_provider_group(candidate)
+        && wider_than_needed
+        && best_homogeneous_score
+            .map(|best| best.saturating_add(120) >= score)
+            .unwrap_or(false)
+    {
+        score -= 2_000;
+    }
+
+    score
+}
+
+fn covers_same_decode_shape(
+    candidate: &[ExecutionGroupMember],
+    reference: &[ExecutionGroupMember],
+    all_members: &[ExecutionGroupMember],
+) -> bool {
+    let candidate_full_replica = candidate.iter().all(|member| {
+        member.shard.column_start == 0
+            && member.shard.column_end
+                == candidate
+                    .iter()
+                    .map(|item| item.shard.column_end)
+                    .max()
+                    .unwrap_or_default()
+    });
+    let reference_full_replica = reference.iter().all(|member| {
+        member.shard.column_start == 0
+            && member.shard.column_end
+                == reference
+                    .iter()
+                    .map(|item| item.shard.column_end)
+                    .max()
+                    .unwrap_or_default()
+    });
+    if candidate_full_replica && reference_full_replica {
+        return true;
+    }
+
+    let candidate_total = candidate
+        .iter()
+        .map(|member| {
+            member
+                .shard
+                .column_end
+                .saturating_sub(member.shard.column_start)
+        })
+        .sum::<u32>();
+    let reference_total = reference
+        .iter()
+        .map(|member| {
+            member
+                .shard
+                .column_end
+                .saturating_sub(member.shard.column_start)
+        })
+        .sum::<u32>();
+    let full_span = all_members
+        .iter()
+        .map(|member| member.shard.column_end)
+        .max()
+        .unwrap_or_default();
+
+    candidate_total >= full_span && reference_total >= full_span
+}
+
 fn candidate_topology_order_key(
     _phase: ExecutionPhase,
     runtime_mode: InferenceRuntimeMode,
@@ -830,12 +1074,84 @@ fn collective_scale_risk_score(
     } else {
         100u32.saturating_sub((min_capacity.saturating_mul(100) / max_capacity).max(1))
     };
+    let instability_penalty = members
+        .iter()
+        .map(|member| member.instability_score.unwrap_or_default())
+        .sum::<u32>();
+    let throughput_penalty = throughput_spread_penalty(members);
+    let deferral_penalty = average_ratio_penalty(
+        members
+            .iter()
+            .filter_map(|member| member.observed_deferred_ratio)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        120.0,
+    );
+    let fill_penalty = if width > 2 {
+        average_fill_penalty(
+            &members
+                .iter()
+                .filter_map(|member| member.observed_fill_ratio)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        0
+    };
 
     width_penalty
         .saturating_add(balance_penalty)
         .saturating_add(degraded_members.saturating_mul(25))
         .saturating_add(provider_mix_penalty)
         .saturating_add(transport_penalty)
+        .saturating_add(instability_penalty)
+        .saturating_add(throughput_penalty)
+        .saturating_add(deferral_penalty)
+        .saturating_add(fill_penalty)
+}
+
+fn throughput_spread_penalty(members: &[ExecutionGroupMember]) -> u32 {
+    let mut multipliers = members
+        .iter()
+        .filter_map(|member| member.throughput_multiplier)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if multipliers.len() < 2 {
+        return 0;
+    }
+    multipliers.sort_by(|left, right| left.total_cmp(right));
+    let min = multipliers[0];
+    let max = *multipliers.last().unwrap_or(&min);
+    if max <= f64::EPSILON {
+        return 0;
+    }
+    (((1.0 - (min / max).clamp(0.0, 1.0)) * 90.0).round() as i64).max(0) as u32
+}
+
+fn average_ratio_penalty(values: &[f64], scale: f64) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    let average = values.iter().copied().sum::<f64>() / values.len() as f64;
+    (average.clamp(0.0, 1.0) * scale).round().max(0.0) as u32
+}
+
+fn average_fill_penalty(values: &[f64]) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    let average = values.iter().copied().sum::<f64>() / values.len() as f64;
+    ((1.0 - average.clamp(0.0, 1.0)) * 140.0).round().max(0.0) as u32
+}
+
+fn is_homogeneous_provider_group(members: &[ExecutionGroupMember]) -> bool {
+    members
+        .first()
+        .map(|first| {
+            members
+                .iter()
+                .all(|member| member.execution_provider == first.execution_provider)
+        })
+        .unwrap_or(true)
 }
 
 fn map_peer_punch_plan(
@@ -897,6 +1213,11 @@ pub fn device_metadata_from_capabilities(
         assigned_capacity_units: capacity_units_for_tier(policy, capabilities.tier),
         execution_provider: execution_provider_label(capabilities.default_execution_provider)
             .to_string(),
+        throughput_multiplier: 1.0,
+        observed_tokens_per_second: None,
+        observed_deferred_ratio: None,
+        observed_fill_ratio: None,
+        instability_score: 0,
     }
 }
 
@@ -953,6 +1274,18 @@ mod tests {
         }
     }
 
+    fn planner_metadata(units: u32, provider: &str) -> PlannerDeviceMetadata {
+        PlannerDeviceMetadata {
+            assigned_capacity_units: units,
+            execution_provider: provider.to_string(),
+            throughput_multiplier: 1.0,
+            observed_tokens_per_second: None,
+            observed_deferred_ratio: None,
+            observed_fill_ratio: None,
+            instability_score: 0,
+        }
+    }
+
     #[test]
     fn planner_builds_authoritative_group() {
         model_assets::testsupport::ensure_test_model("planner-authoritative", 20);
@@ -988,16 +1321,7 @@ mod tests {
                 }],
             },
             &InferenceSchedulingPolicy::default(),
-            &[
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 8,
-                    execution_provider: "cuda".to_string(),
-                },
-            ],
+            &[planner_metadata(4, "metal"), planner_metadata(8, "cuda")],
         )
         .unwrap();
 
@@ -1038,18 +1362,9 @@ mod tests {
             },
             &InferenceSchedulingPolicy::default(),
             &[
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "cuda".to_string(),
-                },
+                planner_metadata(4, "metal"),
+                planner_metadata(4, "metal"),
+                planner_metadata(16, "cuda"),
             ],
         )
         .unwrap();
@@ -1148,18 +1463,9 @@ mod tests {
             },
             &InferenceSchedulingPolicy::default(),
             &[
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "metal".to_string(),
-                },
+                planner_metadata(4, "metal"),
+                planner_metadata(4, "metal"),
+                planner_metadata(16, "metal"),
             ],
         )
         .unwrap_err();
@@ -1253,30 +1559,12 @@ mod tests {
             },
             &InferenceSchedulingPolicy::default(),
             &[
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 8,
-                    execution_provider: "cuda".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 8,
-                    execution_provider: "cuda".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "cuda".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "cuda".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 24,
-                    execution_provider: "cuda".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 20,
-                    execution_provider: "cuda".to_string(),
-                },
+                planner_metadata(8, "cuda"),
+                planner_metadata(8, "cuda"),
+                planner_metadata(16, "cuda"),
+                planner_metadata(16, "cuda"),
+                planner_metadata(24, "cuda"),
+                planner_metadata(20, "cuda"),
             ],
         )
         .unwrap();
@@ -1368,18 +1656,9 @@ mod tests {
             },
             &InferenceSchedulingPolicy::default(),
             &[
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "metal".to_string(),
-                },
+                planner_metadata(4, "metal"),
+                planner_metadata(4, "metal"),
+                planner_metadata(16, "metal"),
             ],
         )
         .unwrap();
@@ -1469,16 +1748,7 @@ mod tests {
                 peer_punch_plans: vec![],
             },
             &InferenceSchedulingPolicy::default(),
-            &[
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-                PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
-            ],
+            &[planner_metadata(4, "metal"), planner_metadata(4, "metal")],
         )
         .unwrap();
 
@@ -1490,10 +1760,7 @@ mod tests {
                 peer_punch_plans: vec![],
             },
             &InferenceSchedulingPolicy::default(),
-            &[PlannerDeviceMetadata {
-                assigned_capacity_units: 4,
-                execution_provider: "metal".to_string(),
-            }],
+            &[planner_metadata(4, "metal")],
         )
         .unwrap_err();
 
@@ -1510,47 +1777,29 @@ mod tests {
         let narrow_members = vec![
             build_member(
                 &worker_with_model_range("planner-topology-score", "a", 0, 0, 20),
-                &PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "cuda".to_string(),
-                },
+                &planner_metadata(16, "cuda"),
             ),
             build_member(
                 &worker_with_model_range("planner-topology-score", "b", 1, 0, 20),
-                &PlannerDeviceMetadata {
-                    assigned_capacity_units: 16,
-                    execution_provider: "cuda".to_string(),
-                },
+                &planner_metadata(16, "cuda"),
             ),
         ];
         let broad_members = vec![
             build_member(
                 &worker_with_model_range("planner-topology-score", "a", 0, 0, 20),
-                &PlannerDeviceMetadata {
-                    assigned_capacity_units: 32,
-                    execution_provider: "cuda".to_string(),
-                },
+                &planner_metadata(32, "cuda"),
             ),
             build_member(
                 &worker_with_model_range("planner-topology-score", "b", 1, 0, 20),
-                &PlannerDeviceMetadata {
-                    assigned_capacity_units: 8,
-                    execution_provider: "cuda".to_string(),
-                },
+                &planner_metadata(8, "cuda"),
             ),
             build_member(
                 &worker_with_model_range("planner-topology-score", "c", 2, 0, 20),
-                &PlannerDeviceMetadata {
-                    assigned_capacity_units: 8,
-                    execution_provider: "metal".to_string(),
-                },
+                &planner_metadata(8, "metal"),
             ),
             build_member(
                 &worker_with_model_range("planner-topology-score", "d", 3, 0, 20),
-                &PlannerDeviceMetadata {
-                    assigned_capacity_units: 4,
-                    execution_provider: "metal".to_string(),
-                },
+                &planner_metadata(4, "metal"),
             ),
         ];
 
