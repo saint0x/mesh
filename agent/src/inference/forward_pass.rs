@@ -881,13 +881,13 @@ fn attention_output(
 /// Forward pass state for tensor-parallel inference
 #[derive(Clone)]
 struct DeviceLayerWeights {
-    w_q: CandleTensor,
-    w_k: CandleTensor,
-    w_v: CandleTensor,
+    q_width: usize,
+    k_width: usize,
+    v_width: usize,
     w_qkv: CandleTensor,
     w_o: CandleTensor,
-    w_up: CandleTensor,
-    w_gate: CandleTensor,
+    gate_width: usize,
+    up_width: usize,
     w_gate_up: CandleTensor,
     w_down: CandleTensor,
     attn_norm: CandleTensor,
@@ -913,13 +913,8 @@ fn candle_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
 
 impl DeviceLayerWeights {
     fn memory_usage_bytes(&self) -> usize {
-        candle_tensor_memory_usage_bytes(&self.w_q)
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_k))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_v))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_qkv))
+        candle_tensor_memory_usage_bytes(&self.w_qkv)
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_o))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_up))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate_up))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_down))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.attn_norm))
@@ -940,14 +935,14 @@ impl DeviceModelWeights {
             let w_up = to_candle_2d(&layer.w_up)?;
             let w_gate = to_candle_2d(&layer.w_gate)?;
             layers.push(DeviceLayerWeights {
+                q_width: layer.w_q.cols,
+                k_width: layer.w_k.cols,
+                v_width: layer.w_v.cols,
                 w_qkv: concat_projection_tensors(&[&w_q, &w_k, &w_v])?,
+                gate_width: layer.w_gate.cols,
+                up_width: layer.w_up.cols,
                 w_gate_up: concat_projection_tensors(&[&w_gate, &w_up])?,
-                w_q,
-                w_k,
-                w_v,
                 w_o: to_candle_2d(&layer.w_o)?,
-                w_up,
-                w_gate,
                 w_down: to_candle_2d(&layer.w_down)?,
                 attn_norm: to_candle_1d(&layer.attn_norm)?,
                 mlp_norm: to_candle_1d(&layer.mlp_norm)?,
@@ -1040,11 +1035,7 @@ fn qkv_partials_from_combined(
     let combined = normed
         .matmul(&layer.w_qkv)
         .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
-    let widths = [
-        layer.w_q.dims()[1],
-        layer.w_k.dims()[1],
-        layer.w_v.dims()[1],
-    ];
+    let widths = [layer.q_width, layer.k_width, layer.v_width];
     let parts = split_projection_tensor(&combined, &widths)?;
     let mut iter = parts.into_iter();
     Ok((
@@ -1061,7 +1052,7 @@ fn gate_up_partials_from_combined(
     let combined = mlp_normed
         .matmul(&layer.w_gate_up)
         .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
-    let widths = [layer.w_gate.dims()[1], layer.w_up.dims()[1]];
+    let widths = [layer.gate_width, layer.up_width];
     let parts = split_projection_tensor(&combined, &widths)?;
     let mut iter = parts.into_iter();
     Ok((
