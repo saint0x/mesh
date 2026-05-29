@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::slice;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -365,7 +366,7 @@ pub struct WorkerRing<'a> {
     /// Timings captured during the most recent all-reduce call.
     last_run_metrics: RingAllReduceMetrics,
     /// Cached chunk layout for repeated collectives of the same flattened size.
-    cached_chunk_layout: Option<CachedChunkLayout>,
+    cached_chunk_layout: Option<Arc<CachedChunkLayout>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1037,13 +1038,13 @@ impl<'a> WorkerRing<'a> {
         self.collective_profile
     }
 
-    fn cached_collective_plan_for_len(&mut self, len: usize) -> CachedChunkLayout {
+    fn cached_collective_plan_for_len(&mut self, len: usize) -> Arc<CachedChunkLayout> {
         if let Some(cached) = self.cached_chunk_layout.as_ref() {
             if cached.len == len
                 && cached.total_workers == self.total_workers
                 && cached.my_position == self.my_position
             {
-                return cached.clone();
+                return Arc::clone(cached);
             }
         }
 
@@ -1070,14 +1071,14 @@ impl<'a> WorkerRing<'a> {
             });
         }
 
-        let plan = CachedChunkLayout {
+        let plan = Arc::new(CachedChunkLayout {
             len,
             total_workers: self.total_workers,
             my_position: self.my_position,
             reduce_scatter_steps,
             all_gather_steps,
-        };
-        self.cached_chunk_layout = Some(plan.clone());
+        });
+        self.cached_chunk_layout = Some(Arc::clone(&plan));
         plan
     }
 
