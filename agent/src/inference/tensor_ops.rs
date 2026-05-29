@@ -952,6 +952,17 @@ impl Default for ReusableMetalCollectiveScratchPool {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ReusableMetalCollectiveScratchPool {
+    pub(crate) fn clear(&mut self) {
+        for slot in &mut self.slots {
+            slot.storage = None;
+            slot.capacity_elements = 0;
+        }
+        self.next_slot = 0;
+    }
+}
+
 pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
     tensor: &CandleTensor,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<

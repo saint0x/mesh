@@ -1646,6 +1646,8 @@ impl ForwardPass {
     pub fn clear_cache(&mut self) {
         self.device_kv_cache.clear();
         self.position = 0;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.collective_scratch.clear();
     }
 
     /// Get current KV cache memory usage
