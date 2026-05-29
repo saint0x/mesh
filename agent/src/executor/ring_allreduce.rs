@@ -14,7 +14,7 @@
 use crate::errors::{AgentError, Result};
 use crate::inference::{InferenceRuntimeMode, LocalExecutorContract};
 use crate::network::{
-    CollectiveLane, ServingBackgroundTransfer, ServingFrame, ServingReceiveSpec,
+    CollectiveLane, ServingBackgroundTransfer, ServingFrameBytes, ServingReceiveSpec,
     ServingSessionTransport, TensorPlane,
 };
 use crate::provider::ExecutionProviderKind;
@@ -538,16 +538,14 @@ impl<'a> WorkerRing<'a> {
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
-            if recv_msg.chunk_data.len() != work_buffer.len() {
+            if recv_msg.element_count() != work_buffer.len() {
                 return Err(AgentError::Execution(format!(
                     "Received pairwise all-reduce chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
+                    recv_msg.element_count(),
                     work_buffer.len()
                 )));
             }
-            for (dst, src) in work_buffer.iter_mut().zip(recv_msg.chunk_data.iter()) {
-                *dst += *src;
-            }
+            recv_msg.accumulate_into(&mut work_buffer)?;
             self.last_run_metrics = run_metrics;
             return Ok(Tensor::new(work_buffer, original_shape));
         }
@@ -587,19 +585,16 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received reduce-scatter chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
+                    recv_msg.element_count(),
                     step_plan.recv_range.len()
                 )));
             }
-            for (dst, src) in work_buffer[step_plan.recv_range.start..step_plan.recv_range.end]
-                .iter_mut()
-                .zip(recv_msg.chunk_data.iter())
-            {
-                *dst += *src;
-            }
+            recv_msg.accumulate_into(
+                &mut work_buffer[step_plan.recv_range.start..step_plan.recv_range.end],
+            )?;
         }
 
         info!("Reduce-scatter complete");
@@ -627,15 +622,16 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received all-gather chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
+                    recv_msg.element_count(),
                     step_plan.recv_range.len()
                 )));
             }
-            work_buffer[step_plan.recv_range.start..step_plan.recv_range.end]
-                .copy_from_slice(&recv_msg.chunk_data);
+            recv_msg.copy_into(
+                &mut work_buffer[step_plan.recv_range.start..step_plan.recv_range.end],
+            )?;
         }
 
         info!("All-gather complete");
@@ -691,14 +687,15 @@ impl<'a> WorkerRing<'a> {
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
-            if recv_msg.chunk_data.len() != partial_result.len() {
+            if recv_msg.element_count() != partial_result.len() {
                 return Err(AgentError::Execution(format!(
                     "Received pairwise all-reduce matrix chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
+                    recv_msg.element_count(),
                     partial_result.len()
                 )));
             }
-            partial_result.accumulate_range(0..partial_result.len(), &recv_msg.chunk_data);
+            partial_result
+                .accumulate_range(0..partial_result.len(), &recv_msg.decode_payload_vec());
             self.last_run_metrics = run_metrics;
             return Ok(partial_result);
         }
@@ -724,14 +721,15 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received reduce-scatter chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
+                    recv_msg.element_count(),
                     step_plan.recv_range.len()
                 )));
             }
-            partial_result.accumulate_range(step_plan.recv_range.clone(), &recv_msg.chunk_data);
+            partial_result
+                .accumulate_range(step_plan.recv_range.clone(), &recv_msg.decode_payload_vec());
         }
 
         for step in 0..(n - 1) {
@@ -752,15 +750,17 @@ impl<'a> WorkerRing<'a> {
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
 
-            if recv_msg.chunk_data.len() != step_plan.recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received all-gather chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
+                    recv_msg.element_count(),
                     step_plan.recv_range.len()
                 )));
             }
-            partial_result
-                .copy_range_from_slice(step_plan.recv_range.clone(), &recv_msg.chunk_data);
+            partial_result.copy_range_from_slice(
+                step_plan.recv_range.clone(),
+                &recv_msg.decode_payload_vec(),
+            );
         }
 
         self.last_run_metrics = run_metrics;
@@ -809,10 +809,11 @@ impl<'a> WorkerRing<'a> {
 
         // Verify received from left neighbor
         let expected_pos = (self.my_position + self.total_workers - 1) % self.total_workers;
-        if received.chunk_data[0] as u32 != expected_pos {
+        let received_value = received.decode_payload_vec()[0] as u32;
+        if received_value != expected_pos {
             warn!(
                 "Barrier sync received from unexpected peer: got {}, expected {}",
-                received.chunk_data[0] as u32, expected_pos
+                received_value, expected_pos
             );
         }
 
@@ -934,7 +935,7 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: &[f32],
-    ) -> Result<(ServingFrame, u64, u64)> {
+    ) -> Result<(ServingFrameBytes, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
         let transport = self.serving_transport()?.clone();
@@ -989,7 +990,7 @@ impl<'a> WorkerRing<'a> {
                     ))),
                 }
             },
-            transport.recv_frame(ServingReceiveSpec {
+            transport.recv_frame_bytes(ServingReceiveSpec {
                 collective_id,
                 lane,
                 layer_idx,

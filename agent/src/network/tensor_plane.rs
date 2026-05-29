@@ -218,16 +218,64 @@ impl TensorPlaneMetrics {
 
 #[derive(Debug)]
 struct InboundServingFrame {
-    frame: EncodedServingFrame,
+    frame: ServingFrameBytes,
     remote_addr: SocketAddr,
     queued_at: Instant,
     _queued_bytes_permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug)]
-struct EncodedServingFrame {
+pub struct ServingFrameBytes {
     header: ServingFrameHeader,
     payload_bytes: Vec<u8>,
+}
+
+impl ServingFrameBytes {
+    pub fn header(&self) -> ServingFrameHeader {
+        self.header
+    }
+
+    pub fn element_count(&self) -> usize {
+        self.header.element_count as usize
+    }
+
+    pub fn decode_payload_vec(&self) -> Vec<f32> {
+        decode_f32_slice_be(&self.payload_bytes)
+    }
+
+    pub fn accumulate_into(&self, dst: &mut [f32]) -> Result<()> {
+        if dst.len() != self.element_count() {
+            return Err(AgentError::Network(format!(
+                "Serving frame payload len {} did not match destination len {}",
+                self.element_count(),
+                dst.len()
+            )));
+        }
+        for (slot, chunk) in dst
+            .iter_mut()
+            .zip(self.payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+        {
+            *slot += f32::from_bits(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(())
+    }
+
+    pub fn copy_into(&self, dst: &mut [f32]) -> Result<()> {
+        if dst.len() != self.element_count() {
+            return Err(AgentError::Network(format!(
+                "Serving frame payload len {} did not match destination len {}",
+                self.element_count(),
+                dst.len()
+            )));
+        }
+        for (slot, chunk) in dst
+            .iter_mut()
+            .zip(self.payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+        {
+            *slot = f32::from_bits(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -581,6 +629,14 @@ impl ServingSessionTransport {
     }
 
     pub async fn recv_frame(&self, spec: ServingReceiveSpec) -> Result<ServingFrame> {
+        let frame = self.recv_frame_bytes(spec).await?;
+        Ok(ServingFrame {
+            header: frame.header(),
+            chunk_data: frame.decode_payload_vec(),
+        })
+    }
+
+    pub async fn recv_frame_bytes(&self, spec: ServingReceiveSpec) -> Result<ServingFrameBytes> {
         recv_slot(
             &self.state,
             &self.inbound,
@@ -1334,7 +1390,7 @@ async fn recv_slot(
     notify: &Arc<Notify>,
     session_id: Uuid,
     spec: ServingReceiveSpec,
-) -> Result<ServingFrame> {
+) -> Result<ServingFrameBytes> {
     let slot_key = ServingSlotKey {
         session_id,
         collective_id: spec.collective_id,
@@ -1381,10 +1437,7 @@ async fn recv_slot(
                         .metrics
                         .receive_queue_wait_ms
                         .fetch_add(wait_ms, Ordering::Relaxed);
-                    return Ok(ServingFrame {
-                        header: message.frame.header,
-                        chunk_data: decode_f32_slice_be(&message.frame.payload_bytes),
-                    });
+                    return Ok(message.frame);
                 }
             }
         }
@@ -1696,7 +1749,7 @@ where
 async fn read_serving_frame<R>(
     reader: &mut R,
     max_message_bytes: usize,
-) -> std::io::Result<EncodedServingFrame>
+) -> std::io::Result<ServingFrameBytes>
 where
     R: AsyncRead + Unpin,
 {
@@ -1716,7 +1769,7 @@ where
     let payload_bytes = header.element_count as usize * std::mem::size_of::<f32>();
     let mut payload_buf = vec![0u8; payload_bytes];
     reader.read_exact(&mut payload_buf).await?;
-    Ok(EncodedServingFrame {
+    Ok(ServingFrameBytes {
         header,
         payload_bytes: payload_buf,
     })
