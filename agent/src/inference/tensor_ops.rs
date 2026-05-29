@@ -933,19 +933,11 @@ pub(crate) fn collective_buffer_from_candle_2d(
         )));
     }
 
-    let flattened = tensor
-        .flatten_all()
-        .map_err(candle_error)?
-        .to_dtype(DType::F32)
-        .map_err(candle_error)?
-        .contiguous()
-        .map_err(candle_error)?;
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let (storage, layout) = flattened.storage_and_layout();
+        let (storage, layout) = tensor.storage_and_layout();
         if let Storage::Metal(storage) = &*storage {
-            if layout.is_contiguous() {
+            if tensor.dtype() == DType::F32 && layout.is_contiguous() {
                 let device = storage.device().clone();
                 let element_count = dims[0] * dims[1];
                 let shared_buffer = device
@@ -974,6 +966,14 @@ pub(crate) fn collective_buffer_from_candle_2d(
             }
         }
     }
+
+    let flattened = tensor
+        .flatten_all()
+        .map_err(candle_error)?
+        .to_dtype(DType::F32)
+        .map_err(candle_error)?
+        .contiguous()
+        .map_err(candle_error)?;
 
     let data = flattened.to_vec1::<f32>().map_err(candle_error)?;
     Ok(crate::executor::ring_allreduce::CollectiveMatrix::new(

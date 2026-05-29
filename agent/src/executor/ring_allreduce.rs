@@ -364,6 +364,15 @@ pub struct WorkerRing<'a> {
     background_transfers: Vec<ServingBackgroundTransfer>,
     /// Timings captured during the most recent all-reduce call.
     last_run_metrics: RingAllReduceMetrics,
+    /// Cached chunk layout for repeated collectives of the same flattened size.
+    cached_chunk_layout: Option<CachedChunkLayout>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedChunkLayout {
+    len: usize,
+    total_workers: u32,
+    ranges: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +461,7 @@ impl<'a> WorkerRing<'a> {
             collective_profile,
             background_transfers: Vec::new(),
             last_run_metrics: RingAllReduceMetrics::default(),
+            cached_chunk_layout: None,
         }
     }
 
@@ -504,7 +514,7 @@ impl<'a> WorkerRing<'a> {
         let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
         let mut run_metrics = RingAllReduceMetrics::default();
-        let chunk_ranges = partial_result.chunk_ranges(n);
+        let chunk_ranges = self.cached_chunk_ranges_for_len(partial_result.data.len());
         let mut work_buffer = partial_result.data;
 
         info!(
@@ -655,7 +665,7 @@ impl<'a> WorkerRing<'a> {
         let n = self.total_workers as usize;
         let my_pos = self.my_position as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
-        let chunk_ranges = partial_result.chunk_ranges(n);
+        let chunk_ranges = self.cached_chunk_ranges_for_len(partial_result.len());
 
         for step in 0..(n - 1) {
             let send_idx = (my_pos + n - step) % n;
@@ -986,6 +996,22 @@ impl<'a> WorkerRing<'a> {
         self.collective_profile
     }
 
+    fn cached_chunk_ranges_for_len(&mut self, len: usize) -> Vec<Range<usize>> {
+        if let Some(cached) = self.cached_chunk_layout.as_ref() {
+            if cached.len == len && cached.total_workers == self.total_workers {
+                return cached.ranges.clone();
+            }
+        }
+
+        let ranges = chunk_ranges_for_len(len, self.total_workers as usize);
+        self.cached_chunk_layout = Some(CachedChunkLayout {
+            len,
+            total_workers: self.total_workers,
+            ranges: ranges.clone(),
+        });
+        ranges
+    }
+
     async fn send_background_eligible_lane(
         &mut self,
         lane: CollectiveLane,
@@ -1077,6 +1103,23 @@ impl<'a> WorkerRing<'a> {
             ))),
         }
     }
+}
+
+fn chunk_ranges_for_len(len: usize, n: usize) -> Vec<Range<usize>> {
+    assert!(n > 0, "Number of chunks must be positive");
+    let chunk_size = len.div_ceil(n);
+    let mut ranges = Vec::with_capacity(n);
+    let mut start = 0usize;
+    for _ in 0..n {
+        let end = if chunk_size == 0 {
+            start
+        } else {
+            (start + chunk_size).min(len)
+        };
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
 }
 
 #[cfg(test)]
