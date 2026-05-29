@@ -464,6 +464,7 @@ struct CachedChunkLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedCollectiveStep {
+    send_slot: u32,
     recv_slot: u32,
     send_range: Range<usize>,
     recv_range: Range<usize>,
@@ -616,6 +617,7 @@ impl<'a> WorkerRing<'a> {
                     layer_idx,
                     0,
                     0,
+                    0,
                     &work_buffer,
                 )
                 .await?;
@@ -661,6 +663,7 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
+                    step_plan.send_slot,
                     step_plan.recv_slot,
                     &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
                 )
@@ -698,6 +701,7 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
+                    step_plan.send_slot,
                     step_plan.recv_slot,
                     &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
                 )
@@ -765,6 +769,7 @@ impl<'a> WorkerRing<'a> {
                     layer_idx,
                     0,
                     0,
+                    0,
                     partial_result.host_range(0..partial_result.len()),
                 )
                 .await?;
@@ -799,6 +804,7 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
+                    step_plan.send_slot,
                     step_plan.recv_slot,
                     partial_result.host_range(step_plan.send_range.clone()),
                 )
@@ -830,6 +836,7 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
+                    step_plan.send_slot,
                     step_plan.recv_slot,
                     partial_result.host_range(step_plan.send_range.clone()),
                 )
@@ -888,6 +895,7 @@ impl<'a> WorkerRing<'a> {
                 CollectiveLane::Control,
                 job_id,
                 layer_idx,
+                0,
                 0,
                 0,
                 &[self.my_position as f32],
@@ -1041,13 +1049,15 @@ impl<'a> WorkerRing<'a> {
         collective_id: Uuid,
         layer_idx: u32,
         step: u32,
-        slot: u32,
+        send_slot: u32,
+        recv_slot: u32,
         chunk_data: &[f32],
     ) -> Result<(ServingFrameBytes, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
         let transport = self.serving_transport()?.clone();
-        let stream_id = transport.stream_id_for(lane, step, slot);
+        let send_stream_id = transport.stream_id_for(lane, step, send_slot);
+        let recv_stream_id = transport.stream_id_for(lane, step, recv_slot);
         let io_started = std::time::Instant::now();
         let ((send_result, send_wait_ms), (inbound, receive_wait_ms)) = tokio::join!(
             async {
@@ -1058,8 +1068,8 @@ impl<'a> WorkerRing<'a> {
                                 collective_id,
                                 layer_idx,
                                 step,
-                                slot,
-                                stream_id,
+                                send_slot,
+                                send_stream_id,
                                 self.my_position,
                                 chunk_data,
                             )
@@ -1071,8 +1081,8 @@ impl<'a> WorkerRing<'a> {
                                 collective_id,
                                 layer_idx,
                                 step,
-                                slot,
-                                stream_id,
+                                send_slot,
+                                send_stream_id,
                                 self.my_position,
                                 chunk_data,
                             )
@@ -1084,8 +1094,8 @@ impl<'a> WorkerRing<'a> {
                                 collective_id,
                                 layer_idx,
                                 step,
-                                slot,
-                                stream_id,
+                                send_slot,
+                                send_stream_id,
                                 self.my_position,
                                 chunk_data,
                             )
@@ -1105,8 +1115,8 @@ impl<'a> WorkerRing<'a> {
                         lane,
                         layer_idx,
                         step,
-                        slot,
-                        stream_id,
+                        slot: recv_slot,
+                        stream_id: recv_stream_id,
                         expected_sender_position,
                     })
                     .await;
@@ -1146,6 +1156,7 @@ impl<'a> WorkerRing<'a> {
             let rs_send_idx = (my_pos + n - step) % n;
             let rs_recv_idx = (my_pos + n - step - 1) % n;
             reduce_scatter_steps.push(CachedCollectiveStep {
+                send_slot: rs_send_idx as u32,
                 recv_slot: rs_recv_idx as u32,
                 send_range: ranges[rs_send_idx].clone(),
                 recv_range: ranges[rs_recv_idx].clone(),
@@ -1154,6 +1165,7 @@ impl<'a> WorkerRing<'a> {
             let ag_send_idx = (my_pos + n - step + 1) % n;
             let ag_recv_idx = (my_pos + n - step) % n;
             all_gather_steps.push(CachedCollectiveStep {
+                send_slot: ag_send_idx as u32,
                 recv_slot: ag_recv_idx as u32,
                 send_range: ranges[ag_send_idx].clone(),
                 recv_range: ranges[ag_recv_idx].clone(),
@@ -1674,6 +1686,7 @@ mod tests {
     #[test]
     fn test_cached_collective_step_supports_equality_for_regressions() {
         let step = CachedCollectiveStep {
+            send_slot: 0,
             recv_slot: 2,
             send_range: 8..12,
             recv_range: 4..8,
@@ -1708,6 +1721,7 @@ mod tests {
         assert_eq!(
             first.reduce_scatter_steps[0],
             CachedCollectiveStep {
+                send_slot: 0,
                 recv_slot: 2,
                 send_range: 0..4,
                 recv_range: 8..12,
@@ -1716,6 +1730,7 @@ mod tests {
         assert_eq!(
             first.all_gather_steps[0],
             CachedCollectiveStep {
+                send_slot: 1,
                 recv_slot: 0,
                 send_range: 4..8,
                 recv_range: 0..4,
@@ -1725,6 +1740,100 @@ mod tests {
         let second = ring.cached_collective_plan_for_len(12);
         assert_eq!(first.reduce_scatter_steps, second.reduce_scatter_steps);
         assert_eq!(first.all_gather_steps, second.all_gather_steps);
+    }
+
+    #[tokio::test]
+    async fn test_three_worker_matrix_allreduce_uses_correct_send_slots() {
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_c = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let addr_c = plane_c.local_addr();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let peer_c = PeerId::random();
+
+        let mut ring_a = WorkerRing::new(
+            0,
+            3,
+            peer_c,
+            peer_b,
+            addr_c,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            3,
+            peer_a,
+            peer_c,
+            addr_a,
+            addr_c,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_b,
+        );
+        let mut ring_c = WorkerRing::new(
+            2,
+            3,
+            peer_b,
+            peer_a,
+            addr_b,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_c,
+        );
+
+        ring_a.prepare_serving_group_channels().await.unwrap();
+        ring_b.prepare_serving_group_channels().await.unwrap();
+        ring_c.prepare_serving_group_channels().await.unwrap();
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b, result_c) = tokio::join!(
+            ring_a.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], 2, 3),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_c.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0], 2, 3),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+        let result_c = result_c.unwrap();
+        let expected = vec![111.0, 222.0, 333.0, 444.0, 555.0, 666.0];
+
+        assert_eq!(result_a.to_host_vec(), expected);
+        assert_eq!(result_b.to_host_vec(), expected);
+        assert_eq!(result_c.to_host_vec(), expected);
     }
 
     // ============== Ring All-Reduce Logic Tests ==============

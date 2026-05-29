@@ -471,7 +471,6 @@ impl ServingSessionTransport {
         self.send_frame(
             self.session.right_peer,
             ServingFrameHeader::new(
-                self.session.session_id,
                 collective_id,
                 sender_position,
                 layer_idx,
@@ -500,7 +499,6 @@ impl ServingSessionTransport {
         self.send_frame(
             self.session.right_peer,
             ServingFrameHeader::new(
-                self.session.session_id,
                 collective_id,
                 sender_position,
                 layer_idx,
@@ -529,7 +527,6 @@ impl ServingSessionTransport {
         self.send_frame(
             self.session.right_peer,
             ServingFrameHeader::new(
-                self.session.session_id,
                 collective_id,
                 sender_position,
                 layer_idx,
@@ -558,7 +555,6 @@ impl ServingSessionTransport {
         self.send_frame(
             self.session.right_peer,
             ServingFrameHeader::new(
-                self.session.session_id,
                 collective_id,
                 sender_position,
                 layer_idx,
@@ -587,7 +583,6 @@ impl ServingSessionTransport {
         self.send_frame(
             self.session.right_peer,
             ServingFrameHeader::new(
-                self.session.session_id,
                 collective_id,
                 sender_position,
                 layer_idx,
@@ -656,14 +651,7 @@ impl ServingSessionTransport {
     }
 
     pub async fn recv_frame_bytes(&self, spec: ServingReceiveSpec) -> Result<ServingFrameBytes> {
-        recv_slot(
-            &self.state,
-            &self.inbound,
-            &self.inbound_notify,
-            self.session.session_id,
-            spec,
-        )
-        .await
+        recv_slot(&self.state, &self.inbound, &self.inbound_notify, spec).await
     }
 
     async fn send_frame(
@@ -689,7 +677,6 @@ impl ServingSessionTransport {
         plan: ServingLanePlan,
     ) -> ServingBackgroundTransfer {
         let target = self.session.right_peer;
-        let session_id = self.session.session_id;
         let state = Arc::clone(&self.state);
         let join_handle = tokio::spawn(async move {
             let payload_bytes = wire_bytes_for_f32_slice(&chunk_data);
@@ -697,7 +684,6 @@ impl ServingSessionTransport {
                 &state,
                 target,
                 ServingFrameHeader::new(
-                    session_id,
                     collective_id,
                     sender_position,
                     layer_idx,
@@ -1409,11 +1395,9 @@ async fn recv_slot(
     state: &Arc<TensorPlaneState>,
     inbound: &Arc<Mutex<ServingInboundState>>,
     notify: &Arc<Notify>,
-    session_id: Uuid,
     spec: ServingReceiveSpec,
 ) -> Result<ServingFrameBytes> {
     let slot_key = ServingSlotKey {
-        session_id,
         collective_id: spec.collective_id,
         lane: spec.lane,
         layer_idx: spec.layer_idx,
@@ -1438,8 +1422,7 @@ async fn recv_slot(
 
                     if message.frame.header.sender_position != spec.expected_sender_position {
                         return Err(AgentError::Network(format!(
-                            "Serving frame sender mismatch for session {} lane {:?} step {}: got {}, expected {} from {}",
-                            session_id,
+                            "Serving frame sender mismatch for lane {:?} step {}: got {}, expected {} from {}",
                             spec.lane,
                             spec.step,
                             message.frame.header.sender_position,
@@ -2103,17 +2086,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_serving_frame_write_read_roundtrip_preserves_payload_and_shape() {
-        let header = ServingFrameHeader::new(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            3,
-            7,
-            2,
-            1,
-            0,
-            CollectiveLane::AllGather,
-            3,
-        );
+        let header =
+            ServingFrameHeader::new(Uuid::new_v4(), 3, 7, 2, 1, 0, CollectiveLane::AllGather, 3);
         let chunk_data = [1.5_f32, -2.25, 8.0];
         let (mut writer, mut reader) = tokio::io::duplex(1024);
 
