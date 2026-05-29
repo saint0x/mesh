@@ -80,7 +80,6 @@ pub struct ServingFrameHeader {
     pub element_count: u32,
     pub shape_len: u32,
     pub lane: CollectiveLane,
-    pub timestamp: u64,
 }
 
 impl ServingFrameHeader {
@@ -107,15 +106,11 @@ impl ServingFrameHeader {
             element_count,
             shape_len,
             lane,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
         }
     }
 
     pub const fn fixed_size() -> usize {
-        72
+        64
     }
 
     pub fn slot_key(&self) -> ServingSlotKey {
@@ -161,8 +156,6 @@ impl ServingFrameHeader {
             CollectiveLane::BulkTransfer => 3,
             CollectiveLane::Checkpoint => 4,
         };
-        offset += 4;
-        put(&mut bytes, &mut offset, &self.timestamp.to_be_bytes());
         bytes
     }
 
@@ -214,8 +207,7 @@ impl ServingFrameHeader {
                 ));
             }
         };
-        offset += 3;
-        let timestamp = u64::from_be_bytes(take::<8>(bytes, &mut offset)?);
+        let _reserved = take::<3>(bytes, &mut offset)?;
 
         Ok(Self {
             session_id,
@@ -228,7 +220,6 @@ impl ServingFrameHeader {
             element_count,
             shape_len,
             lane,
-            timestamp,
         })
     }
 }
