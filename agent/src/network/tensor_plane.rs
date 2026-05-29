@@ -218,10 +218,16 @@ impl TensorPlaneMetrics {
 
 #[derive(Debug)]
 struct InboundServingFrame {
-    frame: ServingFrame,
+    frame: EncodedServingFrame,
     remote_addr: SocketAddr,
     queued_at: Instant,
     _queued_bytes_permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
+struct EncodedServingFrame {
+    header: ServingFrameHeader,
+    payload_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -1375,7 +1381,10 @@ async fn recv_slot(
                         .metrics
                         .receive_queue_wait_ms
                         .fetch_add(wait_ms, Ordering::Relaxed);
-                    return Ok(message.frame);
+                    return Ok(ServingFrame {
+                        header: message.frame.header,
+                        chunk_data: decode_f32_slice_be(&message.frame.payload_bytes),
+                    });
                 }
             }
         }
@@ -1687,7 +1696,7 @@ where
 async fn read_serving_frame<R>(
     reader: &mut R,
     max_message_bytes: usize,
-) -> std::io::Result<ServingFrame>
+) -> std::io::Result<EncodedServingFrame>
 where
     R: AsyncRead + Unpin,
 {
@@ -1705,10 +1714,12 @@ where
         ));
     }
     let payload_bytes = header.element_count as usize * std::mem::size_of::<f32>();
-    let mut buf = vec![0u8; payload_bytes];
-    reader.read_exact(&mut buf).await?;
-    let chunk_data = decode_f32_slice_be(&buf);
-    Ok(ServingFrame { header, chunk_data })
+    let mut payload_buf = vec![0u8; payload_bytes];
+    reader.read_exact(&mut payload_buf).await?;
+    Ok(EncodedServingFrame {
+        header,
+        payload_bytes: payload_buf,
+    })
 }
 
 fn encode_serving_frame_binary(header: ServingFrameHeader, chunk_data: &[f32]) -> BytesMut {
@@ -1977,7 +1988,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(frame.header, header);
-        assert_eq!(frame.chunk_data, chunk_data);
+        assert_eq!(decode_f32_slice_be(&frame.payload_bytes), chunk_data);
     }
 
     #[tokio::test]
