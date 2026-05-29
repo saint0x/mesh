@@ -599,7 +599,6 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<Tensor> {
-        self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
@@ -750,7 +749,6 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<CollectiveMatrix> {
-        self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
@@ -1458,6 +1456,86 @@ mod tests {
 
         ring.drain_background_transfers().await.unwrap();
         assert_eq!(ring.background_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_decode_collectives_do_not_eagerly_drain_background_checkpoint_transfers() {
+        let transport_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = transport_plane
+            .serving_transport_for_neighbors(
+                transport_plane.local_addr(),
+                transport_plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let mut ring_a = WorkerRing::new(
+            0,
+            2,
+            peer_b,
+            peer_b,
+            addr_b,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session.clone()),
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            2,
+            peer_a,
+            peer_a,
+            addr_a,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session),
+            &mut plane_b,
+        );
+
+        ring_a
+            .send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0])
+            .await
+            .unwrap();
+        assert_eq!(ring_a.background_transfer_count(), 1);
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b) = tokio::join!(
+            ring_a.ring_all_reduce_with_timeout(
+                Tensor::new(vec![1.0, 2.0], vec![2]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_with_timeout(
+                Tensor::new(vec![10.0, 20.0], vec![2]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        assert_eq!(result_a.unwrap().data, vec![11.0, 22.0]);
+        assert_eq!(result_b.unwrap().data, vec![11.0, 22.0]);
+        assert_eq!(ring_a.background_transfer_count(), 1);
+
+        ring_a.drain_background_transfers().await.unwrap();
+        assert_eq!(ring_a.background_transfer_count(), 0);
     }
 
     #[tokio::test]
