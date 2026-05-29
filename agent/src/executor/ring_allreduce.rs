@@ -599,6 +599,7 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<Tensor> {
+        self.reap_completed_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
@@ -749,6 +750,7 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<CollectiveMatrix> {
+        self.reap_completed_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
@@ -876,6 +878,7 @@ impl<'a> WorkerRing<'a> {
     /// Uses a ring-based barrier where each worker sends a message to its
     /// right neighbor and waits for a message from its left neighbor.
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
+        self.reap_completed_background_transfers().await?;
         self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             return Ok(());
