@@ -294,6 +294,23 @@ fn copy_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
     }
 }
 
+fn accumulate_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
+    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
+    assert_eq!(
+        src.len(),
+        expected_bytes,
+        "wire payload byte length {} did not match destination byte length {}",
+        src.len(),
+        expected_bytes
+    );
+    for (slot, chunk) in dst
+        .iter_mut()
+        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
+    {
+        *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+}
+
 impl PartialEq for CollectiveMatrix {
     fn eq(&self, other: &Self) -> bool {
         self.rows == other.rows
@@ -631,7 +648,7 @@ impl<'a> WorkerRing<'a> {
                     work_buffer.len()
                 )));
             }
-            recv_msg.accumulate_into(&mut work_buffer)?;
+            accumulate_wire_f32_bytes_into_slice(&mut work_buffer, recv_msg.payload_bytes());
             self.last_run_metrics = run_metrics;
             return Ok(Tensor::new(work_buffer, original_shape));
         }
@@ -679,9 +696,10 @@ impl<'a> WorkerRing<'a> {
                     step_plan.recv_range.len()
                 )));
             }
-            recv_msg.accumulate_into(
+            accumulate_wire_f32_bytes_into_slice(
                 &mut work_buffer[step_plan.recv_range.start..step_plan.recv_range.end],
-            )?;
+                recv_msg.payload_bytes(),
+            );
         }
 
         info!("Reduce-scatter complete");
@@ -717,9 +735,10 @@ impl<'a> WorkerRing<'a> {
                     step_plan.recv_range.len()
                 )));
             }
-            recv_msg.copy_into(
+            copy_wire_f32_bytes_into_slice(
                 &mut work_buffer[step_plan.recv_range.start..step_plan.recv_range.end],
-            )?;
+                recv_msg.payload_bytes(),
+            );
         }
 
         info!("All-gather complete");
@@ -1834,6 +1853,103 @@ mod tests {
         assert_eq!(result_a.to_host_vec(), expected);
         assert_eq!(result_b.to_host_vec(), expected);
         assert_eq!(result_c.to_host_vec(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_three_worker_tensor_allreduce_uses_live_transport_ring() {
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_c = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let addr_c = plane_c.local_addr();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let peer_c = PeerId::random();
+
+        let mut ring_a = WorkerRing::new(
+            0,
+            3,
+            peer_c,
+            peer_b,
+            addr_c,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            3,
+            peer_a,
+            peer_c,
+            addr_a,
+            addr_c,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_b,
+        );
+        let mut ring_c = WorkerRing::new(
+            2,
+            3,
+            peer_b,
+            peer_a,
+            addr_b,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_c,
+        );
+
+        ring_a.prepare_serving_group_channels().await.unwrap();
+        ring_b.prepare_serving_group_channels().await.unwrap();
+        ring_c.prepare_serving_group_channels().await.unwrap();
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b, result_c) = tokio::join!(
+            ring_a.ring_all_reduce_with_timeout(
+                Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_with_timeout(
+                Tensor::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], vec![6]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_c.ring_all_reduce_with_timeout(
+                Tensor::new(vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0], vec![6]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+        let result_c = result_c.unwrap();
+        let expected = vec![111.0, 222.0, 333.0, 444.0, 555.0, 666.0];
+
+        assert_eq!(result_a.data, expected);
+        assert_eq!(result_b.data, expected);
+        assert_eq!(result_c.data, expected);
+        assert_eq!(result_a.shape, vec![6]);
+        assert_eq!(result_b.shape, vec![6]);
+        assert_eq!(result_c.shape, vec![6]);
     }
 
     // ============== Ring All-Reduce Logic Tests ==============
