@@ -107,7 +107,7 @@ impl ServingFrameHeader {
     }
 
     pub const fn fixed_size() -> usize {
-        64
+        61
     }
 
     pub fn slot_key(&self) -> ServingSlotKey {
@@ -200,7 +200,6 @@ impl ServingFrameHeader {
                 ));
             }
         };
-        let _reserved = take::<3>(bytes, &mut offset)?;
 
         Ok(Self {
             session_id,
