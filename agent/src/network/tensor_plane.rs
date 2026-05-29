@@ -1704,11 +1704,8 @@ async fn write_serving_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    writer.write_all(&header.encode_binary()).await?;
-    let payload = encode_f32_slice_be(chunk_data);
-    let shape = encode_usize_slice_be(chunk_shape);
-    writer.write_all(payload.as_ref()).await?;
-    writer.write_all(shape.as_ref()).await?;
+    let encoded = encode_serving_frame_binary(header, chunk_data, chunk_shape);
+    writer.write_all(encoded.as_ref()).await?;
     Ok(())
 }
 
@@ -1741,17 +1738,20 @@ where
     })
 }
 
-fn encode_f32_slice_be(values: &[f32]) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(values.len() * std::mem::size_of::<f32>());
-    for value in values {
+fn encode_serving_frame_binary(
+    header: ServingFrameHeader,
+    chunk_data: &[f32],
+    chunk_shape: &[usize],
+) -> BytesMut {
+    let header_bytes = header.encode_binary();
+    let payload_bytes = chunk_data.len() * std::mem::size_of::<f32>();
+    let shape_bytes = chunk_shape.len() * std::mem::size_of::<u64>();
+    let mut buf = BytesMut::with_capacity(header_bytes.len() + payload_bytes + shape_bytes);
+    buf.extend_from_slice(&header_bytes);
+    for value in chunk_data {
         buf.put_u32(value.to_bits());
     }
-    buf
-}
-
-fn encode_usize_slice_be(values: &[usize]) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(values.len() * std::mem::size_of::<u64>());
-    for value in values {
+    for value in chunk_shape {
         buf.put_u64(*value as u64);
     }
     buf
@@ -2006,6 +2006,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(first.session_id(), second.session_id());
+    }
+
+    #[tokio::test]
+    async fn test_serving_frame_write_read_roundtrip_preserves_payload_and_shape() {
+        let header = ServingFrameHeader::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            3,
+            7,
+            2,
+            1,
+            0,
+            CollectiveLane::AllGather,
+            3,
+            2,
+        );
+        let chunk_data = [1.5_f32, -2.25, 8.0];
+        let chunk_shape = [1_usize, 3];
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+
+        write_serving_frame(&mut writer, header, &chunk_data, &chunk_shape)
+            .await
+            .unwrap();
+        let frame = read_serving_frame(&mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
+
+        assert_eq!(frame.header, header);
+        assert_eq!(frame.chunk_data, chunk_data);
+        assert_eq!(frame.chunk_shape, chunk_shape);
     }
 
     #[tokio::test]
