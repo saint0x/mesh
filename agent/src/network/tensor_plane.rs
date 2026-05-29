@@ -1729,8 +1729,13 @@ where
             ),
         ));
     }
-    let chunk_data = read_f32_vec_be(reader, header.element_count as usize).await?;
-    let chunk_shape = read_usize_vec_be(reader, header.shape_len as usize).await?;
+    let payload_bytes = header.element_count as usize * std::mem::size_of::<f32>();
+    let shape_bytes = header.shape_len as usize * std::mem::size_of::<u64>();
+    let mut buf = vec![0u8; payload_bytes + shape_bytes];
+    reader.read_exact(&mut buf).await?;
+    let (payload_buf, shape_buf) = buf.split_at(payload_bytes);
+    let chunk_data = decode_f32_slice_be(payload_buf);
+    let chunk_shape = decode_usize_slice_be(shape_buf);
     Ok(ServingFrame {
         header,
         chunk_data,
@@ -1757,34 +1762,24 @@ fn encode_serving_frame_binary(
     buf
 }
 
-async fn read_f32_vec_be<R>(reader: &mut R, len: usize) -> std::io::Result<Vec<f32>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = vec![0u8; len * std::mem::size_of::<f32>()];
-    reader.read_exact(&mut buf).await?;
-    let mut out = Vec::with_capacity(len);
+fn decode_f32_slice_be(buf: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(buf.len() / std::mem::size_of::<f32>());
     for chunk in buf.chunks_exact(std::mem::size_of::<f32>()) {
         out.push(f32::from_bits(u32::from_be_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
         ])));
     }
-    Ok(out)
+    out
 }
 
-async fn read_usize_vec_be<R>(reader: &mut R, len: usize) -> std::io::Result<Vec<usize>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = vec![0u8; len * std::mem::size_of::<u64>()];
-    reader.read_exact(&mut buf).await?;
-    let mut out = Vec::with_capacity(len);
+fn decode_usize_slice_be(buf: &[u8]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(buf.len() / std::mem::size_of::<u64>());
     for chunk in buf.chunks_exact(std::mem::size_of::<u64>()) {
         out.push(u64::from_be_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]) as usize);
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
