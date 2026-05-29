@@ -510,6 +510,39 @@ impl<'a> WorkerRing<'a> {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
         }
+        if self.total_workers == 2 {
+            let mut run_metrics = RingAllReduceMetrics::default();
+            let original_shape = partial_result.shape.clone();
+            let mut work_buffer = partial_result.data;
+            let send_shape = [work_buffer.len()];
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    layer_idx,
+                    0,
+                    0,
+                    &work_buffer,
+                    &send_shape,
+                )
+                .await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+            if recv_msg.chunk_data.len() != work_buffer.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received pairwise all-reduce chunk len {} but expected {}",
+                    recv_msg.chunk_data.len(),
+                    work_buffer.len()
+                )));
+            }
+            for (dst, src) in work_buffer.iter_mut().zip(recv_msg.chunk_data.iter()) {
+                *dst += *src;
+            }
+            self.last_run_metrics = run_metrics;
+            return Ok(Tensor::new(work_buffer, original_shape));
+        }
         let n = self.total_workers as usize;
         let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
@@ -660,6 +693,35 @@ impl<'a> WorkerRing<'a> {
         self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
+            return Ok(partial_result);
+        }
+        if self.total_workers == 2 {
+            let mut run_metrics = RingAllReduceMetrics::default();
+            let send_shape = [partial_result.len()];
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    layer_idx,
+                    0,
+                    0,
+                    partial_result.host_range(0..partial_result.len()),
+                    &send_shape,
+                )
+                .await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+            if recv_msg.chunk_data.len() != partial_result.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received pairwise all-reduce matrix chunk len {} but expected {}",
+                    recv_msg.chunk_data.len(),
+                    partial_result.len()
+                )));
+            }
+            partial_result.accumulate_range(0..partial_result.len(), &recv_msg.chunk_data);
+            self.last_run_metrics = run_metrics;
             return Ok(partial_result);
         }
         let n = self.total_workers as usize;
@@ -1327,6 +1389,81 @@ mod tests {
 
         ring.drain_background_transfers().await.unwrap();
         assert_eq!(ring.background_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_two_worker_matrix_allreduce_uses_single_exchange() {
+        let transport_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = transport_plane
+            .serving_transport_for_neighbors(
+                transport_plane.local_addr(),
+                transport_plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let mut ring_a = WorkerRing::new(
+            0,
+            2,
+            peer_b,
+            peer_b,
+            addr_b,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session.clone()),
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            2,
+            peer_a,
+            peer_a,
+            addr_a,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session),
+            &mut plane_b,
+        );
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b) = tokio::join!(
+            ring_a.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0], 2, 2),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+
+        assert_eq!(result_a.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(result_b.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(ring_a.last_run_metrics().all_gather_step_time_ms, 0);
+        assert_eq!(ring_b.last_run_metrics().all_gather_step_time_ms, 0);
     }
 
     // ============== Ring All-Reduce Logic Tests ==============
