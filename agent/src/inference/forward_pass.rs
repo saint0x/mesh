@@ -55,7 +55,7 @@ use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::tensor_ops::ReusableMetalCollectiveScratch;
+use super::tensor_ops::ReusableMetalCollectiveScratchPool;
 use super::tensor_ops::{
     apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
     collective_buffer_from_candle_2d_with_scratch, embed_tokens, from_candle_2d, matmul, rms_norm,
@@ -1104,7 +1104,7 @@ pub struct ForwardPass {
     allreduce_timeout: std::time::Duration,
     local_kv_head_indices: CandleTensor,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    collective_scratch: ReusableMetalCollectiveScratch,
+    collective_scratch: ReusableMetalCollectiveScratchPool,
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
@@ -1166,7 +1166,7 @@ impl ForwardPass {
             allreduce_timeout,
             local_kv_head_indices,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            collective_scratch: ReusableMetalCollectiveScratch::default(),
+            collective_scratch: ReusableMetalCollectiveScratchPool::default(),
             device_kv_cache: DeviceKVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -1622,7 +1622,7 @@ impl ForwardPass {
     async fn ring_allreduce_candle_batch(
         tensor: &CandleTensor,
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
-            &mut ReusableMetalCollectiveScratch,
+            &mut ReusableMetalCollectiveScratchPool,
         >,
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] scratch: Option<&mut ()>,
         worker_ring: &mut WorkerRing<'_>,

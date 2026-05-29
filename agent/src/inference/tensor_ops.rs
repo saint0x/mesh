@@ -931,15 +931,31 @@ pub(crate) fn collective_buffer_from_candle_2d(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Default)]
-pub(crate) struct ReusableMetalCollectiveScratch {
+struct ReusableMetalCollectiveScratchSlot {
     storage: Option<MetalStorage>,
     capacity_elements: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct ReusableMetalCollectiveScratchPool {
+    slots: [ReusableMetalCollectiveScratchSlot; 2],
+    next_slot: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for ReusableMetalCollectiveScratchPool {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ReusableMetalCollectiveScratchSlot::default()),
+            next_slot: 0,
+        }
+    }
 }
 
 pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
     tensor: &CandleTensor,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
-        &mut ReusableMetalCollectiveScratch,
+        &mut ReusableMetalCollectiveScratchPool,
     >,
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] _scratch: Option<&mut ()>,
 ) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
@@ -959,20 +975,22 @@ pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
                 let device = storage.device().clone();
                 let element_count = dims[0] * dims[1];
                 let shared_storage = if let Some(scratch) = scratch {
-                    if scratch.capacity_elements < element_count || scratch.storage.is_none() {
+                    let slot_idx = scratch.next_slot % scratch.slots.len();
+                    scratch.next_slot = (scratch.next_slot + 1) % scratch.slots.len();
+                    let slot = &mut scratch.slots[slot_idx];
+                    if slot.capacity_elements < element_count || slot.storage.is_none() {
                         let shared_buffer = device
                             .allocate_buffer(element_count * std::mem::size_of::<f32>())
                             .map_err(candle_error)?;
-                        scratch.storage = Some(MetalStorage::new(
+                        slot.storage = Some(MetalStorage::new(
                             shared_buffer,
                             device.clone(),
                             element_count,
                             DType::F32,
                         ));
-                        scratch.capacity_elements = element_count;
+                        slot.capacity_elements = element_count;
                     }
-                    scratch
-                        .storage
+                    slot.storage
                         .as_ref()
                         .expect("metal collective scratch must be initialized")
                         .clone()
