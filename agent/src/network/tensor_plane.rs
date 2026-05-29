@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::io::IoSlice;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1771,8 +1772,32 @@ where
     W: AsyncWrite + Unpin,
 {
     let header_bytes = header.encode_binary();
-    writer.write_all(&header_bytes).await?;
-    writer.write_all(payload_bytes).await
+    let mut header_offset = 0usize;
+    let mut payload_offset = 0usize;
+    while header_offset < header_bytes.len() || payload_offset < payload_bytes.len() {
+        let mut bufs = [IoSlice::new(&[]), IoSlice::new(&[])];
+        let mut count = 0usize;
+        if header_offset < header_bytes.len() {
+            bufs[count] = IoSlice::new(&header_bytes[header_offset..]);
+            count += 1;
+        }
+        if payload_offset < payload_bytes.len() {
+            bufs[count] = IoSlice::new(&payload_bytes[payload_offset..]);
+            count += 1;
+        }
+        let written = writer.write_vectored(&bufs[..count]).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write serving frame bytes",
+            ));
+        }
+        let remaining_header = header_bytes.len().saturating_sub(header_offset);
+        let consumed_header = written.min(remaining_header);
+        header_offset += consumed_header;
+        payload_offset += written.saturating_sub(consumed_header);
+    }
+    Ok(())
 }
 
 async fn read_serving_frame<R>(
