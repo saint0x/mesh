@@ -221,7 +221,6 @@ impl TensorPlaneMetrics {
 #[derive(Debug)]
 struct InboundServingFrame {
     frame: ServingFrameBytes,
-    remote_addr: SocketAddr,
     queued_at: Instant,
     _queued_bytes_permit: Option<OwnedSemaphorePermit>,
 }
@@ -852,7 +851,6 @@ impl TensorPlane {
                                             .or_default()
                                             .push_back(InboundServingFrame {
                                                 frame,
-                                                remote_addr,
                                                 queued_at: Instant::now(),
                                                 _queued_bytes_permit: Some(permit),
                                             });
@@ -1399,6 +1397,7 @@ async fn recv_slot(
 ) -> Result<ServingFrameBytes> {
     let slot_key = ServingSlotKey {
         collective_id: spec.collective_id,
+        sender_position: spec.expected_sender_position,
         lane: spec.lane,
         layer_idx: spec.layer_idx,
         step: spec.step,
@@ -1419,17 +1418,6 @@ async fn recv_slot(
                 if let Some(message) = message {
                     inbound_guard.queued_messages = inbound_guard.queued_messages.saturating_sub(1);
                     drop(inbound_guard);
-
-                    if message.frame.header.sender_position != spec.expected_sender_position {
-                        return Err(AgentError::Network(format!(
-                            "Serving frame sender mismatch for lane {:?} step {}: got {}, expected {} from {}",
-                            spec.lane,
-                            spec.step,
-                            message.frame.header.sender_position,
-                            spec.expected_sender_position,
-                            message.remote_addr
-                        )));
-                    }
 
                     state.metrics.receive_count.fetch_add(1, Ordering::Relaxed);
                     let wait_ms = message.queued_at.elapsed().as_millis() as u64;
@@ -2000,6 +1988,56 @@ mod tests {
         let two = waiter_two.await.unwrap();
         assert_eq!(one.chunk_data, vec![5.0]);
         assert_eq!(two.chunk_data, vec![6.0]);
+    }
+
+    #[tokio::test]
+    async fn test_serving_session_discriminates_waiters_by_expected_sender_position() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let collective_id = Uuid::new_v4();
+
+        let waiter = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .recv_frame(ServingReceiveSpec {
+                        collective_id,
+                        lane: CollectiveLane::ReduceScatter,
+                        layer_idx: 5,
+                        step: 2,
+                        slot: 0,
+                        stream_id: 0,
+                        expected_sender_position: 11,
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+
+        session
+            .send_reduce_scatter_chunk(collective_id, 5, 2, 0, 0, 12, &[9.0])
+            .await
+            .unwrap();
+        session
+            .send_reduce_scatter_chunk(collective_id, 5, 2, 0, 0, 11, &[7.0])
+            .await
+            .unwrap();
+
+        let frame = timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.chunk_data, vec![7.0]);
     }
 
     #[tokio::test]

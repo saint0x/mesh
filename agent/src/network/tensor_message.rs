@@ -59,6 +59,7 @@ impl CollectiveLane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServingSlotKey {
     pub collective_id: Uuid,
+    pub sender_position: u32,
     pub lane: CollectiveLane,
     pub layer_idx: u32,
     pub step: u32,
@@ -109,6 +110,7 @@ impl ServingFrameHeader {
     pub fn slot_key(&self) -> ServingSlotKey {
         ServingSlotKey {
             collective_id: self.collective_id,
+            sender_position: self.sender_position,
             lane: self.lane,
             layer_idx: self.layer_idx,
             step: self.step,
