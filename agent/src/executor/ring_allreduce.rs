@@ -187,6 +187,44 @@ impl CollectiveMatrix {
         }
     }
 
+    pub fn accumulate_range_from_be_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
+        let expected_bytes = range.len().saturating_mul(std::mem::size_of::<f32>());
+        assert_eq!(
+            payload_bytes.len(),
+            expected_bytes,
+            "Payload byte length {} did not match matrix range byte length {}",
+            payload_bytes.len(),
+            expected_bytes
+        );
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => {
+                for (dst, chunk) in data[range]
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *dst += f32::from_bits(u32::from_be_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                let dst = &mut slice::from_raw_parts_mut(
+                    storage.buffer().contents() as *mut f32,
+                    self.len(),
+                )[range];
+                for (slot, chunk) in dst
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *slot += f32::from_bits(u32::from_be_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
+            },
+        }
+    }
+
     pub fn copy_range_from_slice(&mut self, range: Range<usize>, values: &[f32]) {
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => data[range].copy_from_slice(values),
@@ -197,6 +235,44 @@ impl CollectiveMatrix {
                     self.len(),
                 )[range];
                 dst.copy_from_slice(values);
+            },
+        }
+    }
+
+    pub fn copy_range_from_be_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
+        let expected_bytes = range.len().saturating_mul(std::mem::size_of::<f32>());
+        assert_eq!(
+            payload_bytes.len(),
+            expected_bytes,
+            "Payload byte length {} did not match matrix range byte length {}",
+            payload_bytes.len(),
+            expected_bytes
+        );
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => {
+                for (dst, chunk) in data[range]
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *dst = f32::from_bits(u32::from_be_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                let dst = &mut slice::from_raw_parts_mut(
+                    storage.buffer().contents() as *mut f32,
+                    self.len(),
+                )[range];
+                for (slot, chunk) in dst
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *slot = f32::from_bits(u32::from_be_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
             },
         }
     }
@@ -695,7 +771,7 @@ impl<'a> WorkerRing<'a> {
                 )));
             }
             partial_result
-                .accumulate_range(0..partial_result.len(), &recv_msg.decode_payload_vec());
+                .accumulate_range_from_be_bytes(0..partial_result.len(), recv_msg.payload_bytes());
             self.last_run_metrics = run_metrics;
             return Ok(partial_result);
         }
@@ -728,8 +804,10 @@ impl<'a> WorkerRing<'a> {
                     step_plan.recv_range.len()
                 )));
             }
-            partial_result
-                .accumulate_range(step_plan.recv_range.clone(), &recv_msg.decode_payload_vec());
+            partial_result.accumulate_range_from_be_bytes(
+                step_plan.recv_range.clone(),
+                recv_msg.payload_bytes(),
+            );
         }
 
         for step in 0..(n - 1) {
@@ -757,10 +835,8 @@ impl<'a> WorkerRing<'a> {
                     step_plan.recv_range.len()
                 )));
             }
-            partial_result.copy_range_from_slice(
-                step_plan.recv_range.clone(),
-                &recv_msg.decode_payload_vec(),
-            );
+            partial_result
+                .copy_range_from_be_bytes(step_plan.recv_range.clone(), recv_msg.payload_bytes());
         }
 
         self.last_run_metrics = run_metrics;
@@ -809,7 +885,7 @@ impl<'a> WorkerRing<'a> {
 
         // Verify received from left neighbor
         let expected_pos = (self.my_position + self.total_workers - 1) % self.total_workers;
-        let received_value = received.decode_payload_vec()[0] as u32;
+        let received_value = received.first_f32()? as u32;
         if received_value != expected_pos {
             warn!(
                 "Barrier sync received from unexpected peer: got {}, expected {}",

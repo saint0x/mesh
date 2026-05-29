@@ -235,12 +235,30 @@ impl ServingFrameBytes {
         self.header
     }
 
+    pub fn payload_bytes(&self) -> &[u8] {
+        &self.payload_bytes
+    }
+
     pub fn element_count(&self) -> usize {
         self.header.element_count as usize
     }
 
     pub fn decode_payload_vec(&self) -> Vec<f32> {
         decode_f32_slice_be(&self.payload_bytes)
+    }
+
+    pub fn first_f32(&self) -> Result<f32> {
+        if self.payload_bytes.len() < std::mem::size_of::<f32>() {
+            return Err(AgentError::Network(
+                "Serving frame payload missing first f32 value".to_string(),
+            ));
+        }
+        Ok(f32::from_bits(u32::from_be_bytes([
+            self.payload_bytes[0],
+            self.payload_bytes[1],
+            self.payload_bytes[2],
+            self.payload_bytes[3],
+        ])))
     }
 
     pub fn accumulate_into(&self, dst: &mut [f32]) -> Result<()> {
