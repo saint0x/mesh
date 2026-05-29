@@ -1479,16 +1479,12 @@ impl ForwardPass {
         let mut metrics = RingAllReduceMetrics::default();
 
         for layer_idx in 0..config.num_layers {
-            let layer = device_weights.layers[layer_idx].clone();
+            let layer = &device_weights.layers[layer_idx];
             let normed = rms_norm_candle(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
             let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
-            let mut kv_caches = backends
-                .iter_mut()
-                .map(|backend| &mut backend.forward_pass.device_kv_cache)
-                .collect::<Vec<_>>();
-            let attn_output = attention_output_device_batch(
-                &mut kv_caches,
+            let attn_output = attention_output_device_batch_from_backends(
+                backends,
                 &config,
                 worker_position,
                 total_workers,
@@ -1777,8 +1773,8 @@ fn attention_output_device(
     )
 }
 
-fn attention_output_device_batch(
-    kv_caches: &mut [&mut DeviceKVCache],
+fn attention_output_device_batch_from_backends(
+    backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
     config: &ModelConfig,
     worker_position: u32,
     total_workers: u32,
@@ -1788,14 +1784,18 @@ fn attention_output_device_batch(
     k_local: CandleTensor,
     v_local: CandleTensor,
 ) -> Result<CandleTensor> {
-    let batch_size = q_local.dims()[0];
-    if kv_caches.len() != batch_size || absolute_positions.len() != batch_size {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Batched attention state mismatch: caches={} positions={} batch={}",
-            kv_caches.len(),
+    let batch_size = backends.len();
+    if absolute_positions.len() != batch_size {
+        return Err(AgentError::Execution(format!(
+            "Device batch attention position count {} does not match backend batch size {}",
             absolute_positions.len(),
             batch_size
         )));
+    }
+    if batch_size == 0 {
+        return Err(AgentError::Execution(
+            "Device batch attention requires at least one backend".to_string(),
+        ));
     }
     if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
@@ -1864,26 +1864,25 @@ fn attention_output_device_batch(
     )?;
 
     let mut outputs = Vec::with_capacity(batch_size);
-    for row_idx in 0..batch_size {
-        let current_layer_seq_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
-        let max_seq_len = kv_caches[row_idx].config.max_seq_len.max(1);
+    for (row_idx, backend) in backends.iter_mut().enumerate() {
+        let kv_cache = &mut backend.forward_pass.device_kv_cache;
+        let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
+        let max_seq_len = kv_cache.config.max_seq_len.max(1);
         if current_layer_seq_len.saturating_add(1) > max_seq_len {
             let drop_rows = current_layer_seq_len.saturating_add(1) - max_seq_len;
-            kv_caches[row_idx].retain_suffix(current_layer_seq_len.saturating_sub(drop_rows))?;
+            kv_cache.retain_suffix(current_layer_seq_len.saturating_sub(drop_rows))?;
         }
-        let prefix_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
+        let prefix_len = kv_cache.layer_seq_len(layer_idx)?;
         validate_positions(
             &[absolute_positions[row_idx]],
-            kv_caches[row_idx]
-                .base_position()
-                .saturating_add(prefix_len),
+            kv_cache.base_position().saturating_add(prefix_len),
         )?;
         let q_row = q_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let k_row = k_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let v_row = v_local.narrow(0, row_idx, 1).map_err(device_error)?;
-        kv_caches[row_idx].append_layer(layer_idx, &k_row, &v_row)?;
+        kv_cache.append_layer(layer_idx, &k_row, &v_row)?;
         outputs.push(attention_output_device_cached(
-            kv_caches[row_idx],
+            kv_cache,
             config,
             worker_position,
             total_workers,
