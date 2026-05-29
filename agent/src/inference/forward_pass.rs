@@ -2005,10 +2005,15 @@ fn attention_output_device_cached(
         .map_err(device_error)?
         .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
         .map_err(device_error)?;
-
-    let mask = causal_attention_mask(q_rows, cached_seq_len, cache_prefix_len, q_rope.device())?;
-    let masked = scores.broadcast_add(&mask).map_err(device_error)?;
-    let probs = candle_nn::ops::softmax(&masked, 2).map_err(device_error)?;
+    let full_prefix_visible = q_rows == 1 && cache_prefix_len + 1 == cached_seq_len;
+    let probs = if full_prefix_visible {
+        candle_nn::ops::softmax(&scores, 2).map_err(device_error)?
+    } else {
+        let mask =
+            causal_attention_mask(q_rows, cached_seq_len, cache_prefix_len, q_rope.device())?;
+        let masked = scores.broadcast_add(&mask).map_err(device_error)?;
+        candle_nn::ops::softmax(&masked, 2).map_err(device_error)?
+    };
     probs
         .matmul(&selected_v)
         .map_err(device_error)?
