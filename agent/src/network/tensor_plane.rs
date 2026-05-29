@@ -349,6 +349,13 @@ struct ServingLanePlan {
     desired_stream_count: usize,
 }
 
+#[derive(Debug, Clone)]
+struct BoundServingLane {
+    target: SocketAddr,
+    plan: ServingLanePlan,
+    streams: Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ServingReceiveSpec {
     pub collective_id: Uuid,
@@ -366,11 +373,11 @@ pub struct ServingSessionTransport {
     inbound: Arc<Mutex<ServingInboundState>>,
     left_peer: SocketAddr,
     right_peer: SocketAddr,
-    reduce_scatter_plan: ServingLanePlan,
-    all_gather_plan: ServingLanePlan,
-    control_plan: ServingLanePlan,
-    bulk_transfer_plan: ServingLanePlan,
-    checkpoint_plan: ServingLanePlan,
+    reduce_scatter_lane: BoundServingLane,
+    all_gather_lane: BoundServingLane,
+    control_lane: BoundServingLane,
+    bulk_transfer_lane: BoundServingLane,
+    checkpoint_lane: BoundServingLane,
 }
 
 #[derive(Debug)]
@@ -428,14 +435,18 @@ impl std::fmt::Debug for ServingSessionTransport {
 }
 
 impl ServingSessionTransport {
+    fn lane_binding(&self, lane: CollectiveLane) -> &BoundServingLane {
+        match lane {
+            CollectiveLane::ReduceScatter => &self.reduce_scatter_lane,
+            CollectiveLane::AllGather => &self.all_gather_lane,
+            CollectiveLane::Control => &self.control_lane,
+            CollectiveLane::BulkTransfer => &self.bulk_transfer_lane,
+            CollectiveLane::Checkpoint => &self.checkpoint_lane,
+        }
+    }
+
     pub fn stream_id_for(&self, lane: CollectiveLane, step: u32, slot: u32) -> u32 {
-        let plan = match lane {
-            CollectiveLane::ReduceScatter => self.reduce_scatter_plan,
-            CollectiveLane::AllGather => self.all_gather_plan,
-            CollectiveLane::Control => self.control_plan,
-            CollectiveLane::BulkTransfer => self.bulk_transfer_plan,
-            CollectiveLane::Checkpoint => self.checkpoint_plan,
-        };
+        let plan = self.lane_binding(lane).plan;
         let stream_count = plan.desired_stream_count.max(1) as u32;
         if stream_count == 1 {
             0
@@ -455,7 +466,6 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -467,7 +477,7 @@ impl ServingSessionTransport {
                 chunk_data.len() as u32,
             ),
             chunk_data,
-            self.reduce_scatter_plan,
+            &self.reduce_scatter_lane,
         )
         .await
     }
@@ -483,7 +493,6 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -495,7 +504,7 @@ impl ServingSessionTransport {
                 chunk_data.len() as u32,
             ),
             chunk_data,
-            self.all_gather_plan,
+            &self.all_gather_lane,
         )
         .await
     }
@@ -511,7 +520,6 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -523,7 +531,7 @@ impl ServingSessionTransport {
                 chunk_data.len() as u32,
             ),
             chunk_data,
-            self.control_plan,
+            &self.control_lane,
         )
         .await
     }
@@ -539,7 +547,6 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -551,7 +558,7 @@ impl ServingSessionTransport {
                 chunk_data.len() as u32,
             ),
             chunk_data,
-            self.bulk_transfer_plan,
+            &self.bulk_transfer_lane,
         )
         .await
     }
@@ -567,7 +574,6 @@ impl ServingSessionTransport {
         chunk_data: &[f32],
     ) -> Result<()> {
         self.send_frame(
-            self.right_peer,
             ServingFrameHeader::new(
                 collective_id,
                 sender_position,
@@ -579,7 +585,7 @@ impl ServingSessionTransport {
                 chunk_data.len() as u32,
             ),
             chunk_data,
-            self.checkpoint_plan,
+            &self.checkpoint_lane,
         )
         .await
     }
@@ -602,7 +608,7 @@ impl ServingSessionTransport {
             stream_id,
             sender_position,
             chunk_data,
-            self.bulk_transfer_plan,
+            self.bulk_transfer_lane.clone(),
         )
     }
 
@@ -624,7 +630,7 @@ impl ServingSessionTransport {
             stream_id,
             sender_position,
             chunk_data,
-            self.checkpoint_plan,
+            self.checkpoint_lane.clone(),
         )
     }
 
@@ -642,13 +648,12 @@ impl ServingSessionTransport {
 
     async fn send_frame(
         &self,
-        target: SocketAddr,
         header: ServingFrameHeader,
         chunk_data: &[f32],
-        plan: ServingLanePlan,
+        lane: &BoundServingLane,
     ) -> Result<()> {
         let payload_bytes = wire_bytes_for_f32_slice(chunk_data);
-        send_serving_frame_bytes_on_plan(&self.state, target, header, &payload_bytes, plan).await
+        send_serving_frame_bytes_on_bound_lane(&self.state, lane, header, &payload_bytes).await
     }
 
     fn spawn_background_frame(
@@ -660,15 +665,16 @@ impl ServingSessionTransport {
         stream_id: u32,
         sender_position: u32,
         chunk_data: Vec<f32>,
-        plan: ServingLanePlan,
+        lane: BoundServingLane,
     ) -> ServingBackgroundTransfer {
-        let target = self.right_peer;
         let state = Arc::clone(&self.state);
+        let transfer_lane = lane.plan.lane;
+        let lane_binding = lane.clone();
         let join_handle = tokio::spawn(async move {
             let payload_bytes = wire_bytes_for_f32_slice(&chunk_data);
-            send_serving_frame_bytes_on_plan(
+            send_serving_frame_bytes_on_bound_lane(
                 &state,
-                target,
+                &lane_binding,
                 ServingFrameHeader::new(
                     collective_id,
                     sender_position,
@@ -676,16 +682,15 @@ impl ServingSessionTransport {
                     step,
                     slot,
                     stream_id,
-                    plan.lane,
+                    transfer_lane,
                     chunk_data.len() as u32,
                 ),
                 &payload_bytes,
-                plan,
             )
             .await
         });
         ServingBackgroundTransfer {
-            lane: plan.lane,
+            lane: transfer_lane,
             collective_id,
             step,
             slot,
@@ -699,6 +704,32 @@ pub struct TensorPlane {
     state: Arc<TensorPlaneState>,
     inbound: Arc<Mutex<ServingInboundState>>,
     _accept_task: tokio::task::JoinHandle<()>,
+}
+
+async fn bind_serving_lane(
+    state: &Arc<TensorPlaneState>,
+    target: SocketAddr,
+    plan: ServingLanePlan,
+) -> Result<BoundServingLane> {
+    let mut streams = Vec::with_capacity(plan.desired_stream_count.max(1));
+    for stream_id in 0..plan.desired_stream_count.max(1) as u32 {
+        streams.push(
+            ensure_connection_pool(
+                state,
+                target,
+                plan.lane,
+                plan.desired_stream_count,
+                stream_id,
+                true,
+            )
+            .await?,
+        );
+    }
+    Ok(BoundServingLane {
+        target,
+        plan,
+        streams: Arc::new(Mutex::new(streams)),
+    })
 }
 
 impl TensorPlane {
@@ -1138,41 +1169,48 @@ impl TensorPlane {
     ) -> Result<ServingSessionTransport> {
         self.prepare_serving_peer_channels(&[left_peer, right_peer], runtime_mode, provider)
             .await?;
+        let reduce_scatter_plan = lane_plan(
+            CollectiveLane::ReduceScatter,
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
+        let all_gather_plan = lane_plan(
+            CollectiveLane::AllGather,
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
+        let control_plan = lane_plan(
+            CollectiveLane::Control,
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
+        let bulk_transfer_plan = lane_plan(
+            CollectiveLane::BulkTransfer,
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
+        let checkpoint_plan = lane_plan(
+            CollectiveLane::Checkpoint,
+            runtime_mode,
+            provider,
+            self.state.max_concurrent_outbound_streams_per_peer,
+        );
         Ok(ServingSessionTransport {
             state: Arc::clone(&self.state),
             inbound: Arc::clone(&self.inbound),
             left_peer,
             right_peer,
-            reduce_scatter_plan: lane_plan(
-                CollectiveLane::ReduceScatter,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-            all_gather_plan: lane_plan(
-                CollectiveLane::AllGather,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-            control_plan: lane_plan(
-                CollectiveLane::Control,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-            bulk_transfer_plan: lane_plan(
-                CollectiveLane::BulkTransfer,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
-            checkpoint_plan: lane_plan(
-                CollectiveLane::Checkpoint,
-                runtime_mode,
-                provider,
-                self.state.max_concurrent_outbound_streams_per_peer,
-            ),
+            reduce_scatter_lane: bind_serving_lane(&self.state, right_peer, reduce_scatter_plan)
+                .await?,
+            all_gather_lane: bind_serving_lane(&self.state, right_peer, all_gather_plan).await?,
+            control_lane: bind_serving_lane(&self.state, right_peer, control_plan).await?,
+            bulk_transfer_lane: bind_serving_lane(&self.state, right_peer, bulk_transfer_plan)
+                .await?,
+            checkpoint_lane: bind_serving_lane(&self.state, right_peer, checkpoint_plan).await?,
         })
     }
 
@@ -1257,12 +1295,11 @@ fn sanitized_config(config: TensorPlaneConfig) -> TensorPlaneConfig {
     }
 }
 
-async fn send_serving_frame_bytes_on_plan(
+async fn send_serving_frame_bytes_on_bound_lane(
     state: &Arc<TensorPlaneState>,
-    target: SocketAddr,
+    lane: &BoundServingLane,
     header: ServingFrameHeader,
     payload_bytes: &[u8],
-    plan: ServingLanePlan,
 ) -> Result<()> {
     let message_bytes = header.size_bytes().max(1);
     if message_bytes > state.max_message_bytes {
@@ -1316,27 +1353,23 @@ async fn send_serving_frame_bytes_on_plan(
     );
 
     let class_permit =
-        acquire_lane_budget(state, target, plan.traffic_class, message_bytes).await?;
-    let stream = ensure_connection_pool(
-        state,
-        target,
-        plan.lane,
-        plan.desired_stream_count,
-        header.stream_id,
-        true,
-    )
-    .await?;
-    let send_result = {
-        let mut stream_guard = stream.lock().await;
-        tokio::time::timeout(
-            state.io_timeout,
-            write_serving_frame_bytes(&mut *stream_guard, header, payload_bytes),
-        )
-        .await
+        acquire_lane_budget(state, lane.target, lane.plan.traffic_class, message_bytes).await?;
+    let selected_stream_index = if lane.plan.desired_stream_count <= 1 {
+        0
+    } else {
+        header.stream_id as usize % lane.plan.desired_stream_count
     };
+    let send_result = send_serving_frame_bytes_with_refresh(
+        state,
+        lane,
+        selected_stream_index,
+        header,
+        payload_bytes,
+    )
+    .await;
 
     match send_result {
-        Ok(Ok(())) => {
+        Ok(()) => {
             state
                 .metrics
                 .bytes_sent
@@ -1347,32 +1380,78 @@ async fn send_serving_frame_bytes_on_plan(
                 .metrics
                 .send_latency_ms
                 .fetch_add(send_started.elapsed().as_millis() as u64, Ordering::Relaxed);
-            record_traffic_class_send(&state.metrics, plan.traffic_class);
+            record_traffic_class_send(&state.metrics, lane.plan.traffic_class);
             drop(class_permit);
             drop(outbound_permit);
             Ok(())
         }
-        Ok(Err(error)) => {
-            evict_connection(state, target, plan.lane).await;
+        Err(error) => {
             drop(class_permit);
             drop(outbound_permit);
-            Err(AgentError::Network(format!(
-                "Failed to send serving frame to {}: {}",
-                target, error
-            )))
+            Err(error)
         }
-        Err(_) => {
-            state
-                .metrics
-                .send_timeout_count
-                .fetch_add(1, Ordering::Relaxed);
-            evict_connection(state, target, plan.lane).await;
-            drop(class_permit);
-            drop(outbound_permit);
-            Err(AgentError::Network(format!(
-                "Timed out sending serving frame to {}",
-                target
-            )))
+    }
+}
+
+async fn send_serving_frame_bytes_with_refresh(
+    state: &Arc<TensorPlaneState>,
+    lane: &BoundServingLane,
+    stream_index: usize,
+    header: ServingFrameHeader,
+    payload_bytes: &[u8],
+) -> Result<()> {
+    let initial_stream = {
+        let streams = lane.streams.lock().await;
+        Arc::clone(&streams[stream_index])
+    };
+    let first_result = {
+        let mut stream_guard = initial_stream.lock().await;
+        tokio::time::timeout(
+            state.io_timeout,
+            write_serving_frame_bytes(&mut *stream_guard, header, payload_bytes),
+        )
+        .await
+    };
+    match first_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => {
+            evict_connection(state, lane.target, lane.plan.lane).await;
+            let refreshed_stream = ensure_connection_pool(
+                state,
+                lane.target,
+                lane.plan.lane,
+                lane.plan.desired_stream_count,
+                header.stream_id,
+                true,
+            )
+            .await?;
+            {
+                let mut streams = lane.streams.lock().await;
+                streams[stream_index] = Arc::clone(&refreshed_stream);
+            }
+            let mut stream_guard = refreshed_stream.lock().await;
+            match tokio::time::timeout(
+                state.io_timeout,
+                write_serving_frame_bytes(&mut *stream_guard, header, payload_bytes),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(AgentError::Network(format!(
+                    "Failed to send serving frame to {}: {}",
+                    lane.target, error
+                ))),
+                Err(_) => {
+                    state
+                        .metrics
+                        .send_timeout_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(AgentError::Network(format!(
+                        "Timed out sending serving frame to {}",
+                        lane.target
+                    )))
+                }
+            }
         }
     }
 }
