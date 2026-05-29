@@ -226,6 +226,12 @@ struct InboundServingFrame {
 }
 
 #[derive(Debug)]
+struct SlotWaiters {
+    notify: Arc<Notify>,
+    waiter_count: usize,
+}
+
+#[derive(Debug)]
 pub struct ServingFrameBytes {
     header: ServingFrameHeader,
     payload_bytes: Vec<u8>,
@@ -295,6 +301,7 @@ impl ServingFrameBytes {
 #[derive(Debug, Default)]
 struct ServingInboundState {
     pending_slots: HashMap<ServingSlotKey, VecDeque<InboundServingFrame>>,
+    slot_waiters: HashMap<ServingSlotKey, SlotWaiters>,
     queued_messages: usize,
 }
 
@@ -357,7 +364,6 @@ pub struct ServingReceiveSpec {
 pub struct ServingSessionTransport {
     state: Arc<TensorPlaneState>,
     inbound: Arc<Mutex<ServingInboundState>>,
-    inbound_notify: Arc<Notify>,
     left_peer: SocketAddr,
     right_peer: SocketAddr,
     reduce_scatter_plan: ServingLanePlan,
@@ -631,7 +637,7 @@ impl ServingSessionTransport {
     }
 
     pub async fn recv_frame_bytes(&self, spec: ServingReceiveSpec) -> Result<ServingFrameBytes> {
-        recv_slot(&self.state, &self.inbound, &self.inbound_notify, spec).await
+        recv_slot(&self.state, &self.inbound, spec).await
     }
 
     async fn send_frame(
@@ -692,7 +698,6 @@ impl ServingSessionTransport {
 pub struct TensorPlane {
     state: Arc<TensorPlaneState>,
     inbound: Arc<Mutex<ServingInboundState>>,
-    inbound_notify: Arc<Notify>,
     _accept_task: tokio::task::JoinHandle<()>,
 }
 
@@ -768,17 +773,14 @@ impl TensorPlane {
             peer_bulk_outbound_bytes: Mutex::new(HashMap::new()),
         });
         let inbound = Arc::new(Mutex::new(ServingInboundState::default()));
-        let inbound_notify = Arc::new(Notify::new());
         let accept_state = Arc::clone(&state);
         let accept_inbound = Arc::clone(&inbound);
-        let accept_notify = Arc::clone(&inbound_notify);
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((mut stream, remote_addr)) => {
                         let state = Arc::clone(&accept_state);
                         let inbound = Arc::clone(&accept_inbound);
-                        let notify = Arc::clone(&accept_notify);
                         tokio::spawn(async move {
                             loop {
                                 match tokio::time::timeout(
@@ -835,6 +837,10 @@ impl TensorPlane {
                                                 _queued_bytes_permit: Some(permit),
                                             });
                                         inbound_guard.queued_messages += 1;
+                                        let waiter_notify = inbound_guard
+                                            .slot_waiters
+                                            .get(&slot)
+                                            .map(|waiters| Arc::clone(&waiters.notify));
                                         drop(inbound_guard);
 
                                         state
@@ -854,7 +860,9 @@ impl TensorPlane {
                                                     as usize)
                                                 as u64,
                                         );
-                                        notify.notify_waiters();
+                                        if let Some(notify) = waiter_notify {
+                                            notify.notify_one();
+                                        }
                                     }
                                     Ok(Err(error)) => {
                                         if !matches!(
@@ -898,7 +906,6 @@ impl TensorPlane {
         Ok(Self {
             state,
             inbound,
-            inbound_notify,
             _accept_task: accept_task,
         })
     }
@@ -1130,7 +1137,6 @@ impl TensorPlane {
         Ok(ServingSessionTransport {
             state: Arc::clone(&self.state),
             inbound: Arc::clone(&self.inbound),
-            inbound_notify: Arc::clone(&self.inbound_notify),
             left_peer,
             right_peer,
             reduce_scatter_plan: lane_plan(
@@ -1370,7 +1376,6 @@ async fn send_serving_frame_bytes_on_plan(
 async fn recv_slot(
     state: &Arc<TensorPlaneState>,
     inbound: &Arc<Mutex<ServingInboundState>>,
-    notify: &Arc<Notify>,
     spec: ServingReceiveSpec,
 ) -> Result<ServingFrameBytes> {
     let slot_key = ServingSlotKey {
@@ -1384,14 +1389,20 @@ async fn recv_slot(
     };
 
     loop {
-        let notified = notify.notified();
-        {
+        let slot_notify = {
             let mut inbound_guard = inbound.lock().await;
             if let Some(queue) = inbound_guard.pending_slots.get_mut(&slot_key) {
                 let message = queue.pop_front();
                 let queue_empty = queue.is_empty();
                 if queue_empty {
                     inbound_guard.pending_slots.remove(&slot_key);
+                    if inbound_guard
+                        .slot_waiters
+                        .get(&slot_key)
+                        .is_some_and(|waiters| waiters.waiter_count == 0)
+                    {
+                        inbound_guard.slot_waiters.remove(&slot_key);
+                    }
                 }
                 if let Some(message) = message {
                     inbound_guard.queued_messages = inbound_guard.queued_messages.saturating_sub(1);
@@ -1410,8 +1421,24 @@ async fn recv_slot(
                     return Ok(message.frame);
                 }
             }
+            let waiters = inbound_guard
+                .slot_waiters
+                .entry(slot_key)
+                .or_insert_with(|| SlotWaiters {
+                    notify: Arc::new(Notify::new()),
+                    waiter_count: 0,
+                });
+            waiters.waiter_count += 1;
+            Arc::clone(&waiters.notify)
+        };
+        slot_notify.notified().await;
+        let mut inbound_guard = inbound.lock().await;
+        if let Some(waiters) = inbound_guard.slot_waiters.get_mut(&slot_key) {
+            waiters.waiter_count = waiters.waiter_count.saturating_sub(1);
+            if waiters.waiter_count == 0 && !inbound_guard.pending_slots.contains_key(&slot_key) {
+                inbound_guard.slot_waiters.remove(&slot_key);
+            }
         }
-        notified.await;
     }
 }
 
@@ -1967,6 +1994,79 @@ mod tests {
         let two = waiter_two.await.unwrap();
         assert_eq!(one.chunk_data, vec![5.0]);
         assert_eq!(two.chunk_data, vec![6.0]);
+    }
+
+    #[tokio::test]
+    async fn test_serving_session_supports_multiple_waiters_on_same_slot() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let collective_id = Uuid::new_v4();
+
+        let waiter_one = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .recv_frame(ServingReceiveSpec {
+                        collective_id,
+                        lane: CollectiveLane::ReduceScatter,
+                        layer_idx: 6,
+                        step: 2,
+                        slot: 0,
+                        stream_id: 0,
+                        expected_sender_position: 11,
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        let waiter_two = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .recv_frame(ServingReceiveSpec {
+                        collective_id,
+                        lane: CollectiveLane::ReduceScatter,
+                        layer_idx: 6,
+                        step: 2,
+                        slot: 0,
+                        stream_id: 0,
+                        expected_sender_position: 11,
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+
+        session
+            .send_reduce_scatter_chunk(collective_id, 6, 2, 0, 0, 11, &[5.0])
+            .await
+            .unwrap();
+        session
+            .send_reduce_scatter_chunk(collective_id, 6, 2, 0, 0, 11, &[6.0])
+            .await
+            .unwrap();
+
+        let one = timeout(Duration::from_secs(1), waiter_one)
+            .await
+            .unwrap()
+            .unwrap();
+        let two = timeout(Duration::from_secs(1), waiter_two)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut payloads = vec![one.chunk_data, two.chunk_data];
+        payloads.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_eq!(payloads, vec![vec![5.0], vec![6.0]]);
     }
 
     #[tokio::test]
