@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
-    ClaimInferenceAssignmentResponse, DecodeLeaseStatus,
+    ClaimInferenceAssignmentResponse, DecodeLeaseStatus, DeviceMemoryTelemetry,
     DownloadInferenceSessionCheckpointResponse, InferenceExecutionLease, InferenceExecutionPlan,
     InferenceJobAssignmentStatus, InferenceJobStatusResponse, InferenceSchedulerQueueState,
     InferenceSessionCheckpointPayload, InferenceSessionCheckpointStatus, InferenceSessionLease,
@@ -30,7 +30,7 @@ use crate::credit_policy::{
 };
 use crate::device::DeviceCapabilities;
 use crate::model_assets;
-use crate::services::planner::adjusted_capacity_units;
+use crate::services::planner::{adjusted_capacity_units, pressure_adjusted_capacity_units};
 use crate::services::{
     device_metadata_from_capabilities, network_service, refresh_decode_plan_for_job,
     select_claim_assignment_id, ExecutionPlanner, PlannerDeviceMetadata,
@@ -140,6 +140,36 @@ struct PersistedCompletedAssignmentCreditInput {
     shard_column_start: u32,
     shard_column_end: u32,
     available_memory_bytes: u64,
+}
+
+fn parse_device_memory_telemetry(payload: Option<&str>) -> ApiResult<Option<DeviceMemoryTelemetry>> {
+    payload
+        .map(|json| {
+            serde_json::from_str::<DeviceMemoryTelemetry>(json).map_err(|error| {
+                ApiError::Internal(format!("Failed to parse device memory telemetry: {error}"))
+            })
+        })
+        .transpose()
+}
+
+fn effective_available_memory_bytes(
+    capabilities: &DeviceCapabilities,
+    contributed_memory: u64,
+    memory_telemetry: Option<&DeviceMemoryTelemetry>,
+) -> u64 {
+    if let Some(telemetry) = memory_telemetry {
+        if let Some(bytes) = telemetry.mesh_available_memory_bytes {
+            return bytes.max(1);
+        }
+        return telemetry.available_system_memory_bytes.max(1);
+    }
+
+    if contributed_memory > 0 {
+        contributed_memory.max(1)
+    } else {
+        ((capabilities.ram_mb + capabilities.gpu_vram_mb.unwrap_or_default()) as u64 * 1024 * 1024)
+            .max(1)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3259,16 +3289,24 @@ fn load_device_assignment_metadata_from_connection(
     model_id: &str,
     scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<PlannerDeviceMetadata> {
-    let (capabilities_json, status, last_seen, connectivity_state_json, listen_addrs_json): (
+    let (
+        capabilities_json,
+        status,
+        last_seen,
+        connectivity_state_json,
+        listen_addrs_json,
+        memory_telemetry_json,
+    ): (
         String,
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
     ) = conn
         .query_row(
             r#"
-            SELECT capabilities, status, last_seen, connectivity_state, listen_addrs
+            SELECT capabilities, status, last_seen, connectivity_state, listen_addrs, memory_telemetry
             FROM devices
             WHERE network_id = ? AND device_id = ?
             "#,
@@ -3280,6 +3318,7 @@ fn load_device_assignment_metadata_from_connection(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
@@ -3304,6 +3343,16 @@ fn load_device_assignment_metadata_from_connection(
         metadata.throughput_multiplier = multiplier;
         metadata.assigned_capacity_units =
             adjusted_capacity_units(metadata.assigned_capacity_units, multiplier);
+    }
+    if let Some(memory_telemetry) = parse_device_memory_telemetry(memory_telemetry_json.as_deref())?
+    {
+        metadata.mesh_available_memory_bytes = memory_telemetry.mesh_available_memory_bytes;
+        metadata.memory_pressure_score = Some(memory_telemetry.pressure_score);
+        metadata.memory_pressure_level = Some(memory_telemetry.pressure_level);
+        metadata.assigned_capacity_units = pressure_adjusted_capacity_units(
+            metadata.assigned_capacity_units,
+            metadata.memory_pressure_score,
+        );
     }
     metadata.observed_tokens_per_second = telemetry.observed_tokens_per_second;
     metadata.observed_deferred_ratio = telemetry.observed_deferred_ratio;
@@ -5670,7 +5719,8 @@ fn load_completed_assignment_credit_inputs(
                 a.shard_column_start,
                 a.shard_column_end,
                 d.capabilities,
-                d.contributed_memory
+                d.contributed_memory,
+                d.memory_telemetry
             FROM inference_job_assignments a
             INNER JOIN devices d
                 ON d.device_id = a.device_id
@@ -5695,14 +5745,20 @@ fn load_completed_assignment_credit_inputs(
                 })?;
             let contributed_memory =
                 row.get::<_, Option<i64>>(8)?.unwrap_or_default().max(0) as u64;
-            let available_memory_bytes = if contributed_memory > 0 {
-                contributed_memory.max(1)
-            } else {
-                ((capabilities.ram_mb + capabilities.gpu_vram_mb.unwrap_or_default()) as u64
-                    * 1024
-                    * 1024)
-                    .max(1)
-            };
+            let memory_telemetry_json: Option<String> = row.get(9)?;
+            let memory_telemetry = parse_device_memory_telemetry(memory_telemetry_json.as_deref())
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::other(error.to_string())),
+                    )
+                })?;
+            let available_memory_bytes = effective_available_memory_bytes(
+                &capabilities,
+                contributed_memory,
+                memory_telemetry.as_ref(),
+            );
 
             Ok(PersistedCompletedAssignmentCreditInput {
                 device_id: row.get(0)?,

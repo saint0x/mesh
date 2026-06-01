@@ -1119,6 +1119,7 @@ fn stability_multiplier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::{DeviceMemoryPressureLevel, DeviceMemoryTelemetry};
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
         InferenceSchedulingPolicy, NetworkConnectivity,
@@ -1178,6 +1179,30 @@ mod tests {
                 endpoint: "/dns4/relay.mesh.example/tcp/4001".to_string(),
                 priority: 0,
             }],
+        }
+    }
+
+    fn test_memory_telemetry() -> DeviceMemoryTelemetry {
+        DeviceMemoryTelemetry {
+            observed_at: "2026-06-01T12:00:00Z".into(),
+            total_system_memory_bytes: 8 * 1024 * 1024 * 1024,
+            available_system_memory_bytes: 6 * 1024 * 1024 * 1024,
+            used_system_memory_bytes: 2 * 1024 * 1024 * 1024,
+            process_resident_memory_bytes: Some(512 * 1024 * 1024),
+            process_virtual_memory_bytes: Some(1024 * 1024 * 1024),
+            mesh_committed_memory_bytes: Some(4 * 1024 * 1024 * 1024),
+            mesh_available_memory_bytes: Some(3 * 1024 * 1024 * 1024),
+            runtime_active_sessions: Some(1),
+            runtime_total_runtime_bytes: Some(512 * 1024 * 1024),
+            runtime_live_kv_cache_bytes: Some(128 * 1024 * 1024),
+            runtime_model_resident_bytes: Some(256 * 1024 * 1024),
+            runtime_logical_kv_tokens: Some(1024),
+            runtime_max_total_runtime_bytes: Some(2 * 1024 * 1024 * 1024),
+            runtime_max_total_kv_cache_bytes: Some(512 * 1024 * 1024),
+            tensor_inbound_queued_bytes: Some(0),
+            tensor_outbound_inflight_bytes: Some(0),
+            pressure_score: 0.4,
+            pressure_level: DeviceMemoryPressureLevel::Healthy,
         }
     }
 
@@ -1697,6 +1722,7 @@ mod tests {
                     priority: 21,
                     last_updated_ms: 1_700_000_000_000,
                 }],
+                test_memory_telemetry(),
             )
             .unwrap();
 

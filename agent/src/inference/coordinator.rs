@@ -20,6 +20,7 @@ use libp2p::PeerId;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -508,6 +509,59 @@ impl InferenceCoordinator {
             total_runtime_bytes: total_runtime_bytes.saturating_add(model_resident_bytes),
             total_live_kv_cache_bytes,
             total_logical_kv_tokens,
+        }
+    }
+
+    fn runtime_pressure_level(score: f64) -> crate::api::types::DeviceMemoryPressureLevel {
+        if score >= 0.92 {
+            crate::api::types::DeviceMemoryPressureLevel::Critical
+        } else if score >= 0.80 {
+            crate::api::types::DeviceMemoryPressureLevel::Hot
+        } else if score >= 0.65 {
+            crate::api::types::DeviceMemoryPressureLevel::Warm
+        } else {
+            crate::api::types::DeviceMemoryPressureLevel::Healthy
+        }
+    }
+
+    fn build_device_memory_telemetry_snapshot(&self) -> crate::api::types::DeviceMemoryTelemetry {
+        let snapshot = self.runtime_memory_snapshot();
+        let runtime_ratio = snapshot.total_runtime_bytes as f64
+            / self.config.max_total_runtime_bytes.max(1) as f64;
+        let kv_ratio = snapshot.total_live_kv_cache_bytes as f64
+            / self.config.max_total_kv_cache_bytes.max(1) as f64;
+        let session_ratio =
+            snapshot.active_sessions as f64 / self.config.max_active_sessions.max(1) as f64;
+        let pressure_score = runtime_ratio.max(kv_ratio).max(session_ratio).clamp(0.0, 1.0);
+
+        crate::api::types::DeviceMemoryTelemetry {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            total_system_memory_bytes: 0,
+            available_system_memory_bytes: 0,
+            used_system_memory_bytes: 0,
+            process_resident_memory_bytes: None,
+            process_virtual_memory_bytes: None,
+            mesh_committed_memory_bytes: None,
+            mesh_available_memory_bytes: None,
+            runtime_active_sessions: Some(snapshot.active_sessions as u32),
+            runtime_total_runtime_bytes: Some(snapshot.total_runtime_bytes as u64),
+            runtime_live_kv_cache_bytes: Some(snapshot.total_live_kv_cache_bytes as u64),
+            runtime_model_resident_bytes: Some(snapshot.model_resident_bytes as u64),
+            runtime_logical_kv_tokens: Some(snapshot.total_logical_kv_tokens as u64),
+            runtime_max_total_runtime_bytes: Some(self.config.max_total_runtime_bytes as u64),
+            runtime_max_total_kv_cache_bytes: Some(self.config.max_total_kv_cache_bytes as u64),
+            tensor_inbound_queued_bytes: Some(
+                self.stats
+                    .tensor_current_inbound_queued_bytes
+                    .load(Ordering::Relaxed),
+            ),
+            tensor_outbound_inflight_bytes: Some(
+                self.stats
+                    .tensor_current_outbound_inflight_bytes
+                    .load(Ordering::Relaxed),
+            ),
+            pressure_score,
+            pressure_level: Self::runtime_pressure_level(pressure_score),
         }
     }
 
@@ -2115,6 +2169,8 @@ impl InferenceCoordinator {
         // Periodic stats saver
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut memory_snapshot_interval = tokio::time::interval(Duration::from_secs(5));
+        memory_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -2139,6 +2195,14 @@ impl InferenceCoordinator {
                     }
                 }
 
+                _ = memory_snapshot_interval.tick() => {
+                    self.sync_tensor_plane_metrics();
+                    let snapshot = self.build_device_memory_telemetry_snapshot();
+                    if let Err(e) = crate::telemetry::persist_runtime_memory_telemetry(&snapshot) {
+                        warn!(error = %e, "Failed to save runtime memory telemetry snapshot");
+                    }
+                }
+
                 // Handle shutdown signal
                 _ = signal::ctrl_c() => {
                     info!("Received shutdown signal");
@@ -2150,6 +2214,9 @@ impl InferenceCoordinator {
         // Final cleanup
         self.leave_ring();
         self.sync_tensor_plane_metrics();
+        let _ = crate::telemetry::persist_runtime_memory_telemetry(
+            &self.build_device_memory_telemetry_snapshot(),
+        );
         self.stats.print_summary();
         let _ = self.stats.save_to_file();
 

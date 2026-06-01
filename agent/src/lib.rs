@@ -54,3 +54,6 @@ pub use provider::{
 };
 pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
 pub use telemetry::{LedgerClient, LedgerEvent};
+pub use telemetry::{
+    load_runtime_memory_telemetry, persist_runtime_memory_telemetry, sample_device_memory_telemetry,
+};

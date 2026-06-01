@@ -3355,6 +3355,9 @@ mod tests {
             observed_deferred_ratio: None,
             observed_fill_ratio: None,
             instability_score: None,
+            mesh_available_memory_bytes: None,
+            memory_pressure_score: None,
+            memory_pressure_level: None,
         }
     }
 

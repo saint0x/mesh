@@ -86,6 +86,51 @@ pub struct RingPositionInfo {
     pub right_neighbor: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceMemoryPressureLevel {
+    Healthy,
+    Warm,
+    Hot,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceMemoryTelemetry {
+    pub observed_at: String,
+    pub total_system_memory_bytes: u64,
+    pub available_system_memory_bytes: u64,
+    pub used_system_memory_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_resident_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_virtual_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_committed_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_available_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_active_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_total_runtime_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_live_kv_cache_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_model_resident_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_logical_kv_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_max_total_runtime_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_max_total_kv_cache_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tensor_inbound_queued_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tensor_outbound_inflight_bytes: Option<u64>,
+    pub pressure_score: f64,
+    pub pressure_level: DeviceMemoryPressureLevel,
+}
+
 /// Request to update device heartbeat
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
@@ -94,6 +139,7 @@ pub struct HeartbeatRequest {
     pub listen_addrs: Vec<String>,
     #[serde(default)]
     pub direct_candidates: Vec<DirectPeerCandidate>,
+    pub memory_telemetry: DeviceMemoryTelemetry,
 }
 
 /// Response to heartbeat update
@@ -110,6 +156,8 @@ pub struct HeartbeatResponse {
     /// Recorded direct-connect candidates
     #[serde(default)]
     pub direct_candidates: Vec<DirectPeerCandidate>,
+    /// Recorded live device memory telemetry
+    pub memory_telemetry: DeviceMemoryTelemetry,
 }
 
 /// Request to join the ring topology
@@ -440,6 +488,12 @@ pub struct ExecutionGroupMember {
     pub observed_fill_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instability_score: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_available_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_level: Option<DeviceMemoryPressureLevel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1329,6 +1383,14 @@ pub struct SchedulerBatchMetrics {
     pub checkpoint_fallback_rate: f64,
     pub checkpoint_handoff_transfer_count: u32,
     pub live_kv_handoff_transfer_count: u32,
+    pub devices_with_memory_telemetry: u32,
+    pub hot_memory_pressure_device_count: u32,
+    pub critical_memory_pressure_device_count: u32,
+    pub aggregate_mesh_committed_memory_bytes: u64,
+    pub aggregate_mesh_available_memory_bytes: u64,
+    pub aggregate_runtime_memory_bytes: u64,
+    pub aggregate_runtime_live_kv_cache_bytes: u64,
+    pub peak_device_memory_pressure_score: f64,
     pub recent_regroup_transfer_count: u32,
     pub recent_regroup_shrink_count: u32,
     pub recent_regroup_replace_count: u32,

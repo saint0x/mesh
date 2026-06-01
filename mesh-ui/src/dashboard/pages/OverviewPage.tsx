@@ -24,6 +24,10 @@ export function OverviewPage({ controller, onNavigateSection }: DashboardPagePro
       .filter((event) => (event.creditsAmount ?? 0) < 0)
       .reduce((total, event) => total + (event.creditsAmount ?? 0), 0),
   )
+  const hotMemoryDevices = controller.networkDevices.filter((device) => {
+    const level = device.memoryTelemetry?.pressureLevel
+    return level === 'hot' || level === 'critical'
+  }).length
 
   return (
     <div className="dashboard-stack">
@@ -99,6 +103,11 @@ export function OverviewPage({ controller, onNavigateSection }: DashboardPagePro
               <strong>{localDevice?.name ?? 'not present in selected network'}</strong>
               <small>{controller.state.settings.controlPlaneUrl ?? 'No control-plane URL configured'}</small>
             </article>
+            <article>
+              <span>Hot memory devices</span>
+              <strong>{hotMemoryDevices}</strong>
+              <small>Machines currently near runtime or mesh memory limits.</small>
+            </article>
           </div>
         </section>
 
@@ -146,8 +155,18 @@ export function OverviewPage({ controller, onNavigateSection }: DashboardPagePro
                 </article>
                 <article>
                   <span>Contributed memory</span>
-                  <strong>{localDevice.contributedMemoryBytes ? formatBytes(localDevice.contributedMemoryBytes) : 'n/a'}</strong>
-                  <small>{localDevice.capabilities.tier} capability tier.</small>
+                  <strong>
+                    {localDevice.memoryTelemetry?.meshAvailableMemoryBytes != null
+                      ? formatBytes(localDevice.memoryTelemetry.meshAvailableMemoryBytes)
+                      : localDevice.contributedMemoryBytes
+                        ? formatBytes(localDevice.contributedMemoryBytes)
+                        : 'n/a'}
+                  </strong>
+                  <small>
+                    {localDevice.memoryTelemetry
+                      ? `Pressure ${localDevice.memoryTelemetry.pressureLevel}`
+                      : `${localDevice.capabilities.tier} capability tier.`}
+                  </small>
                 </article>
                 <article>
                   <span>Ring position</span>

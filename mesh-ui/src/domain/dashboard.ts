@@ -86,6 +86,28 @@ export interface DirectCandidateRecord {
   lastUpdatedMs: number
 }
 
+export interface DeviceMemoryTelemetryRecord {
+  observedAt: string
+  totalSystemMemoryBytes: number
+  availableSystemMemoryBytes: number
+  usedSystemMemoryBytes: number
+  processResidentMemoryBytes?: number | null
+  processVirtualMemoryBytes?: number | null
+  meshCommittedMemoryBytes?: number | null
+  meshAvailableMemoryBytes?: number | null
+  runtimeActiveSessions?: number | null
+  runtimeTotalRuntimeBytes?: number | null
+  runtimeLiveKvCacheBytes?: number | null
+  runtimeModelResidentBytes?: number | null
+  runtimeLogicalKvTokens?: number | null
+  runtimeMaxTotalRuntimeBytes?: number | null
+  runtimeMaxTotalKvCacheBytes?: number | null
+  tensorInboundQueuedBytes?: number | null
+  tensorOutboundInflightBytes?: number | null
+  pressureScore: number
+  pressureLevel: string
+}
+
 export interface DeviceRecord {
   id: string
   networkId: string
@@ -101,6 +123,7 @@ export interface DeviceRecord {
   shardColumnStart?: number | null
   shardColumnEnd?: number | null
   contributedMemoryBytes?: number | null
+  memoryTelemetry?: DeviceMemoryTelemetryRecord | null
   connectivityState?: ConnectivityStateRecord | null
   listenAddrs: string[]
   tensorPlaneEndpoints: string[]

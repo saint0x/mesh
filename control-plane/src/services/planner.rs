@@ -2,9 +2,10 @@ use uuid::Uuid;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment, InferenceExecutionPlan,
-    InferenceRuntimeMode, KvTransferPolicy, PunchPathReason, PunchPathStrategy, ShardInfo,
-    SubmitInferenceRequest, TransportCapabilityTier,
+    DeviceMemoryPressureLevel, ExecutionGroup, ExecutionGroupMember, ExecutionPhase,
+    ExecutionSegment, InferenceExecutionPlan, InferenceRuntimeMode, KvTransferPolicy,
+    PunchPathReason, PunchPathStrategy, ShardInfo, SubmitInferenceRequest,
+    TransportCapabilityTier,
 };
 use crate::connectivity::{ConnectivityPath, DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::{DeviceCapabilities, Tier};
@@ -29,6 +30,9 @@ pub struct PlannerDeviceMetadata {
     pub observed_deferred_ratio: Option<f64>,
     pub observed_fill_ratio: Option<f64>,
     pub instability_score: u32,
+    pub mesh_available_memory_bytes: Option<u64>,
+    pub memory_pressure_score: Option<f64>,
+    pub memory_pressure_level: Option<DeviceMemoryPressureLevel>,
 }
 
 pub struct ExecutionPlanner;
@@ -345,6 +349,9 @@ fn build_member(
         observed_deferred_ratio: metadata.observed_deferred_ratio,
         observed_fill_ratio: metadata.observed_fill_ratio,
         instability_score: Some(metadata.instability_score),
+        mesh_available_memory_bytes: metadata.mesh_available_memory_bytes,
+        memory_pressure_score: metadata.memory_pressure_score,
+        memory_pressure_level: metadata.memory_pressure_level,
     }
 }
 
@@ -839,6 +846,15 @@ pub fn adjusted_capacity_units(base_units: u32, throughput_multiplier: f64) -> u
     adjusted.round().max(1.0) as u32
 }
 
+pub fn pressure_adjusted_capacity_units(base_units: u32, memory_pressure_score: Option<f64>) -> u32 {
+    let Some(score) = memory_pressure_score else {
+        return base_units.max(1);
+    };
+    let multiplier = (1.0 - (0.5 * score.clamp(0.0, 1.0)))
+        .clamp(MIN_RUNTIME_CAPACITY_MULTIPLIER, 1.0);
+    ((base_units.max(1) as f64) * multiplier).round().max(1.0) as u32
+}
+
 pub fn topology_efficiency_score(
     members: &[ExecutionGroupMember],
     runtime_mode: InferenceRuntimeMode,
@@ -1218,6 +1234,9 @@ pub fn device_metadata_from_capabilities(
         observed_deferred_ratio: None,
         observed_fill_ratio: None,
         instability_score: 0,
+        mesh_available_memory_bytes: None,
+        memory_pressure_score: None,
+        memory_pressure_level: None,
     }
 }
 
@@ -1283,6 +1302,9 @@ mod tests {
             observed_deferred_ratio: None,
             observed_fill_ratio: None,
             instability_score: 0,
+            mesh_available_memory_bytes: None,
+            memory_pressure_score: None,
+            memory_pressure_level: None,
         }
     }
 

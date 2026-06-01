@@ -9,13 +9,13 @@ use thiserror::Error;
 pub mod models;
 
 use crate::api::types::{
-    ComputeNearKvHint, DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
-    JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencyKind, KvResidencySliceStatus,
-    KvResidencySummary, KvTransferPolicy, KvTransferStatus, NetworkSchedulerStatusResponse,
-    PromptCacheEntryStatus, RegroupEventStatus, SchedulerBatchMetrics, SchedulerEventStatus,
-    SchedulerJobSummary, SchedulerReadinessStatus, SchedulerReadinessThresholds,
-    ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
-    ServingGroupWorkloadStatus,
+    ComputeNearKvHint, DecodeQueueEntryStatus, DeviceMemoryPressureLevel, DeviceMemoryTelemetry,
+    ExecutionPhase, InferenceSessionCheckpointStatus, JobSchedulerStatusResponse,
+    KvReplicaResidencyStatus, KvResidencyKind, KvResidencySliceStatus, KvResidencySummary,
+    KvTransferPolicy, KvTransferStatus, NetworkSchedulerStatusResponse, PromptCacheEntryStatus,
+    RegroupEventStatus, SchedulerBatchMetrics, SchedulerEventStatus, SchedulerJobSummary,
+    SchedulerReadinessStatus, SchedulerReadinessThresholds, ServingGroupLeaseStatus,
+    ServingGroupMemberStatus, ServingGroupStatus, ServingGroupWorkloadStatus,
 };
 
 /// Database-related errors
@@ -385,6 +385,9 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         "036_add_explicit_shard_identity.sql" => {
             column_exists(conn, "devices", "shard_worker_position")?
                 && column_exists(conn, "devices", "shard_total_workers")?
+        }
+        "037_add_device_memory_telemetry.sql" => {
+            column_exists(conn, "devices", "memory_telemetry")?
         }
         _ => false,
     })
@@ -1183,6 +1186,81 @@ fn max_opt(current: Option<u32>, next: Option<u32>) -> Option<u32> {
     }
 }
 
+#[derive(Default)]
+struct DeviceMemoryAggregates {
+    devices_with_memory_telemetry: u32,
+    hot_memory_pressure_device_count: u32,
+    critical_memory_pressure_device_count: u32,
+    aggregate_mesh_committed_memory_bytes: u64,
+    aggregate_mesh_available_memory_bytes: u64,
+    aggregate_runtime_memory_bytes: u64,
+    aggregate_runtime_live_kv_cache_bytes: u64,
+    peak_device_memory_pressure_score: f64,
+}
+
+fn load_device_memory_aggregates(
+    conn: &rusqlite::Connection,
+    network_id: &str,
+) -> Result<DeviceMemoryAggregates> {
+    if !column_exists(conn, "devices", "memory_telemetry")? {
+        return Ok(DeviceMemoryAggregates::default());
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT memory_telemetry
+        FROM devices
+        WHERE network_id = ?1
+          AND ring_position IS NOT NULL
+        "#,
+    )?;
+    let rows = stmt.query_map([network_id], |row| row.get::<_, Option<String>>(0))?;
+
+    let mut aggregates = DeviceMemoryAggregates::default();
+    for row in rows {
+        let Some(json) = row? else {
+            continue;
+        };
+        let telemetry: DeviceMemoryTelemetry = serde_json::from_str(&json).map_err(|error| {
+            DbError::Data(format!("Failed to parse device memory telemetry JSON: {error}"))
+        })?;
+        aggregates.devices_with_memory_telemetry =
+            aggregates.devices_with_memory_telemetry.saturating_add(1);
+        aggregates.aggregate_mesh_committed_memory_bytes = aggregates
+            .aggregate_mesh_committed_memory_bytes
+            .saturating_add(telemetry.mesh_committed_memory_bytes.unwrap_or(0));
+        aggregates.aggregate_mesh_available_memory_bytes = aggregates
+            .aggregate_mesh_available_memory_bytes
+            .saturating_add(telemetry.mesh_available_memory_bytes.unwrap_or(0));
+        aggregates.aggregate_runtime_memory_bytes = aggregates
+            .aggregate_runtime_memory_bytes
+            .saturating_add(telemetry.runtime_total_runtime_bytes.unwrap_or(0));
+        aggregates.aggregate_runtime_live_kv_cache_bytes = aggregates
+            .aggregate_runtime_live_kv_cache_bytes
+            .saturating_add(telemetry.runtime_live_kv_cache_bytes.unwrap_or(0));
+        aggregates.peak_device_memory_pressure_score = aggregates
+            .peak_device_memory_pressure_score
+            .max(telemetry.pressure_score);
+
+        match telemetry.pressure_level {
+            DeviceMemoryPressureLevel::Hot => {
+                aggregates.hot_memory_pressure_device_count =
+                    aggregates.hot_memory_pressure_device_count.saturating_add(1);
+            }
+            DeviceMemoryPressureLevel::Critical => {
+                aggregates.hot_memory_pressure_device_count =
+                    aggregates.hot_memory_pressure_device_count.saturating_add(1);
+                aggregates.critical_memory_pressure_device_count = aggregates
+                    .critical_memory_pressure_device_count
+                    .saturating_add(1);
+            }
+            DeviceMemoryPressureLevel::Healthy | DeviceMemoryPressureLevel::Warm => {}
+        }
+    }
+
+    Ok(aggregates)
+}
+
 fn load_scheduler_batch_metrics(
     conn: &rusqlite::Connection,
     network_id: &str,
@@ -1365,6 +1443,7 @@ fn load_scheduler_batch_metrics(
         recent_avg_post_failover_throughput_loss_pct,
         recent_peak_post_failover_throughput_loss_pct,
     ) = compute_post_failover_throughput_metrics(conn, network_id, job_id)?;
+    let device_memory = load_device_memory_aggregates(conn, network_id)?;
 
     Ok(SchedulerBatchMetrics {
         decode_queue_depth: decode_queue.len() as u32,
@@ -1393,6 +1472,15 @@ fn load_scheduler_batch_metrics(
         checkpoint_fallback_rate,
         checkpoint_handoff_transfer_count,
         live_kv_handoff_transfer_count,
+        devices_with_memory_telemetry: device_memory.devices_with_memory_telemetry,
+        hot_memory_pressure_device_count: device_memory.hot_memory_pressure_device_count,
+        critical_memory_pressure_device_count: device_memory.critical_memory_pressure_device_count,
+        aggregate_mesh_committed_memory_bytes: device_memory.aggregate_mesh_committed_memory_bytes,
+        aggregate_mesh_available_memory_bytes: device_memory.aggregate_mesh_available_memory_bytes,
+        aggregate_runtime_memory_bytes: device_memory.aggregate_runtime_memory_bytes,
+        aggregate_runtime_live_kv_cache_bytes: device_memory
+            .aggregate_runtime_live_kv_cache_bytes,
+        peak_device_memory_pressure_score: device_memory.peak_device_memory_pressure_score,
         recent_regroup_transfer_count,
         recent_regroup_shrink_count,
         recent_regroup_replace_count,
@@ -1451,6 +1539,12 @@ fn compute_scheduler_readiness(metrics: &SchedulerBatchMetrics) -> SchedulerRead
                 .recent_avg_post_failover_throughput_loss_pct
                 .unwrap_or(0.0),
             thresholds.max_avg_post_failover_throughput_loss_pct
+        ));
+    }
+    if metrics.critical_memory_pressure_device_count > 0 {
+        blockers.push(format!(
+            "{} device(s) report critical runtime memory pressure",
+            metrics.critical_memory_pressure_device_count
         ));
     }
 
@@ -2712,6 +2806,7 @@ mod tests {
                 shard_column_start INTEGER,
                 shard_column_end INTEGER,
                 contributed_memory INTEGER,
+                memory_telemetry TEXT,
                 lock_status TEXT DEFAULT 'unlocked',
                 lock_timestamp TEXT,
                 unlock_requested_at TEXT
@@ -2793,7 +2888,8 @@ mod tests {
             );
             CREATE TABLE devices (
                 device_id TEXT PRIMARY KEY,
-                network_id TEXT NOT NULL
+                network_id TEXT NOT NULL,
+                memory_telemetry TEXT
             );
             CREATE TABLE inference_jobs (
                 job_id TEXT PRIMARY KEY,

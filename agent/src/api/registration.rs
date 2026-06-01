@@ -13,6 +13,7 @@ use crate::connectivity::{
 };
 use crate::device::DeviceConfig;
 use crate::errors::{AgentError, Result};
+use crate::telemetry::sample_device_memory_telemetry;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
@@ -198,6 +199,7 @@ impl RegistrationClient {
                         peer_id,
                         &candidate_seed_records,
                     ),
+                    memory_telemetry: sample_device_memory_telemetry(),
                 }
             })
             .send()
@@ -234,6 +236,8 @@ impl RegistrationClient {
             connectivity_status = ?heartbeat_response.connectivity_state.status,
             listen_addr_count = heartbeat_response.listen_addrs.len(),
             direct_candidate_count = heartbeat_response.direct_candidates.len(),
+            memory_pressure = heartbeat_response.memory_telemetry.pressure_score,
+            memory_pressure_level = ?heartbeat_response.memory_telemetry.pressure_level,
             "Heartbeat sent successfully"
         );
 

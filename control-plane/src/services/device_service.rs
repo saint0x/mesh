@@ -1,4 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::types::DeviceMemoryTelemetry;
 use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate, NetworkConnectivity};
 use crate::db::Database;
 use crate::device::DeviceCapabilities;
@@ -116,11 +117,13 @@ pub fn update_heartbeat(
     connectivity_state: DeviceConnectivityState,
     listen_addrs: Vec<String>,
     direct_candidates: Vec<DirectPeerCandidate>,
+    memory_telemetry: DeviceMemoryTelemetry,
 ) -> ApiResult<(
     String,
     DeviceConnectivityState,
     Vec<String>,
     Vec<DirectPeerCandidate>,
+    DeviceMemoryTelemetry,
 )> {
     // Validate device_id
     if device_id.is_empty() {
@@ -143,6 +146,8 @@ pub fn update_heartbeat(
         .map_err(|e| ApiError::Internal(format!("Failed to serialize listen addresses: {}", e)))?;
     let direct_candidates_json = serde_json::to_string(&direct_candidates)
         .map_err(|e| ApiError::Internal(format!("Failed to serialize direct candidates: {}", e)))?;
+    let memory_telemetry_json = serde_json::to_string(&memory_telemetry)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize memory telemetry: {}", e)))?;
 
     let now = OffsetDateTime::now_utc();
     let now_str = now
@@ -156,7 +161,7 @@ pub fn update_heartbeat(
         .execute(
             r#"
         UPDATE devices
-        SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?, direct_candidates = ?
+        SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?, direct_candidates = ?, memory_telemetry = ?
         WHERE device_id = ?
         "#,
             params![
@@ -164,6 +169,7 @@ pub fn update_heartbeat(
                 &connectivity_state_json,
                 &listen_addrs_json,
                 &direct_candidates_json,
+                &memory_telemetry_json,
                 &device_id
             ],
         )
@@ -178,12 +184,19 @@ pub fn update_heartbeat(
 
     debug!(device_id = %device_id, last_seen = %now_str, "Heartbeat updated");
 
-    Ok((now_str, connectivity_state, listen_addrs, direct_candidates))
+    Ok((
+        now_str,
+        connectivity_state,
+        listen_addrs,
+        direct_candidates,
+        memory_telemetry,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::{DeviceMemoryPressureLevel, DeviceMemoryTelemetry};
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState, DirectCandidateScope, DirectCandidateTransport,
@@ -240,6 +253,30 @@ mod tests {
                 },
             ],
             default_execution_provider: ExecutionProviderKind::Metal,
+        }
+    }
+
+    fn test_memory_telemetry() -> DeviceMemoryTelemetry {
+        DeviceMemoryTelemetry {
+            observed_at: "2026-06-01T12:00:00Z".into(),
+            total_system_memory_bytes: 16 * 1024 * 1024 * 1024,
+            available_system_memory_bytes: 10 * 1024 * 1024 * 1024,
+            used_system_memory_bytes: 6 * 1024 * 1024 * 1024,
+            process_resident_memory_bytes: Some(2 * 1024 * 1024 * 1024),
+            process_virtual_memory_bytes: Some(3 * 1024 * 1024 * 1024),
+            mesh_committed_memory_bytes: Some(8 * 1024 * 1024 * 1024),
+            mesh_available_memory_bytes: Some(6 * 1024 * 1024 * 1024),
+            runtime_active_sessions: Some(2),
+            runtime_total_runtime_bytes: Some(2 * 1024 * 1024 * 1024),
+            runtime_live_kv_cache_bytes: Some(512 * 1024 * 1024),
+            runtime_model_resident_bytes: Some(1024 * 1024 * 1024),
+            runtime_logical_kv_tokens: Some(4096),
+            runtime_max_total_runtime_bytes: Some(4 * 1024 * 1024 * 1024),
+            runtime_max_total_kv_cache_bytes: Some(1024 * 1024 * 1024),
+            tensor_inbound_queued_bytes: Some(1024),
+            tensor_outbound_inflight_bytes: Some(2048),
+            pressure_score: 0.5,
+            pressure_level: DeviceMemoryPressureLevel::Healthy,
         }
     }
 
@@ -386,6 +423,7 @@ mod tests {
                 priority: 21,
                 last_updated_ms: 1_700_000_000_000,
             }],
+            test_memory_telemetry(),
         )
         .unwrap();
 
@@ -394,20 +432,22 @@ mod tests {
         assert_eq!(heartbeat.3.len(), 1);
         assert_eq!(heartbeat.3[0].scope, DirectCandidateScope::Private);
         assert_eq!(heartbeat.3[0].transport, DirectCandidateTransport::Tcp);
+        assert_eq!(heartbeat.4.mesh_available_memory_bytes, Some(6 * 1024 * 1024 * 1024));
 
         // Verify in database
         let conn = db.get_conn().unwrap();
-        let device: (String, String, String) = conn
+        let device: (String, String, String, String) = conn
             .query_row(
-                "SELECT last_seen, status, direct_candidates FROM devices WHERE device_id = ?",
+                "SELECT last_seen, status, direct_candidates, memory_telemetry FROM devices WHERE device_id = ?",
                 params![device_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
 
         assert_eq!(device.1, "online");
         assert_eq!(device.0, heartbeat.0);
         assert!(device.2.contains("192.168.1.2"));
+        assert!(device.3.contains("mesh_available_memory_bytes"));
     }
 
     #[test]
@@ -420,6 +460,7 @@ mod tests {
             test_connectivity_state(),
             vec![],
             vec![],
+            test_memory_telemetry(),
         );
 
         assert!(result.is_err());

@@ -1,4 +1,5 @@
 use agent::{
+    api::types::DeviceMemoryTelemetry,
     pki::{MembershipRole, PeerCache, PoolConfig, PoolId},
     resource_manager::ResourceManager,
     DeviceCapabilities, DeviceConfig, DeviceConnectivityState, DirectPeerCandidate,
@@ -139,6 +140,7 @@ struct UiDevice {
     shard_column_start: Option<u32>,
     shard_column_end: Option<u32>,
     contributed_memory_bytes: Option<u64>,
+    memory_telemetry: Option<UiDeviceMemoryTelemetry>,
     connectivity_state: Option<UiConnectivityState>,
     listen_addrs: Vec<String>,
     tensor_plane_endpoints: Vec<String>,
@@ -147,6 +149,30 @@ struct UiDevice {
     certificate_status: String,
     identity_status: String,
     local_device: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiDeviceMemoryTelemetry {
+    observed_at: String,
+    total_system_memory_bytes: u64,
+    available_system_memory_bytes: u64,
+    used_system_memory_bytes: u64,
+    process_resident_memory_bytes: Option<u64>,
+    process_virtual_memory_bytes: Option<u64>,
+    mesh_committed_memory_bytes: Option<u64>,
+    mesh_available_memory_bytes: Option<u64>,
+    runtime_active_sessions: Option<u32>,
+    runtime_total_runtime_bytes: Option<u64>,
+    runtime_live_kv_cache_bytes: Option<u64>,
+    runtime_model_resident_bytes: Option<u64>,
+    runtime_logical_kv_tokens: Option<u64>,
+    runtime_max_total_runtime_bytes: Option<u64>,
+    runtime_max_total_kv_cache_bytes: Option<u64>,
+    tensor_inbound_queued_bytes: Option<u64>,
+    tensor_outbound_inflight_bytes: Option<u64>,
+    pressure_score: f64,
+    pressure_level: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1327,6 +1353,7 @@ fn load_devices(
             shard_column_start,
             shard_column_end,
             contributed_memory,
+            memory_telemetry,
             connectivity_state,
             listen_addrs,
             direct_candidates,
@@ -1348,16 +1375,19 @@ fn load_devices(
                 )
             })?;
         let connectivity_state =
-            parse_optional_json::<DeviceConnectivityState>(row.get::<_, Option<String>>(13)?)
+            parse_optional_json::<DeviceConnectivityState>(row.get::<_, Option<String>>(14)?)
                 .map_err(to_sql_error)?;
-        let listen_addrs = parse_optional_json::<Vec<String>>(row.get::<_, Option<String>>(14)?)
+        let memory_telemetry =
+            parse_optional_json::<DeviceMemoryTelemetry>(row.get::<_, Option<String>>(13)?)
+                .map_err(to_sql_error)?;
+        let listen_addrs = parse_optional_json::<Vec<String>>(row.get::<_, Option<String>>(15)?)
             .map_err(to_sql_error)?
             .unwrap_or_default();
         let direct_candidates =
-            parse_optional_json::<Vec<DirectPeerCandidate>>(row.get::<_, Option<String>>(15)?)
+            parse_optional_json::<Vec<DirectPeerCandidate>>(row.get::<_, Option<String>>(16)?)
                 .map_err(to_sql_error)?
                 .unwrap_or_default();
-        let certificate: Option<Vec<u8>> = row.get(17)?;
+        let certificate: Option<Vec<u8>> = row.get(18)?;
         let device_id: String = row.get(0)?;
 
         Ok(UiDevice {
@@ -1378,6 +1408,27 @@ fn load_devices(
             shard_column_start: row.get::<_, Option<i64>>(10)?.map(|value| value as u32),
             shard_column_end: row.get::<_, Option<i64>>(11)?.map(|value| value as u32),
             contributed_memory_bytes: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+            memory_telemetry: memory_telemetry.map(|telemetry| UiDeviceMemoryTelemetry {
+                observed_at: telemetry.observed_at,
+                total_system_memory_bytes: telemetry.total_system_memory_bytes,
+                available_system_memory_bytes: telemetry.available_system_memory_bytes,
+                used_system_memory_bytes: telemetry.used_system_memory_bytes,
+                process_resident_memory_bytes: telemetry.process_resident_memory_bytes,
+                process_virtual_memory_bytes: telemetry.process_virtual_memory_bytes,
+                mesh_committed_memory_bytes: telemetry.mesh_committed_memory_bytes,
+                mesh_available_memory_bytes: telemetry.mesh_available_memory_bytes,
+                runtime_active_sessions: telemetry.runtime_active_sessions,
+                runtime_total_runtime_bytes: telemetry.runtime_total_runtime_bytes,
+                runtime_live_kv_cache_bytes: telemetry.runtime_live_kv_cache_bytes,
+                runtime_model_resident_bytes: telemetry.runtime_model_resident_bytes,
+                runtime_logical_kv_tokens: telemetry.runtime_logical_kv_tokens,
+                runtime_max_total_runtime_bytes: telemetry.runtime_max_total_runtime_bytes,
+                runtime_max_total_kv_cache_bytes: telemetry.runtime_max_total_kv_cache_bytes,
+                tensor_inbound_queued_bytes: telemetry.tensor_inbound_queued_bytes,
+                tensor_outbound_inflight_bytes: telemetry.tensor_outbound_inflight_bytes,
+                pressure_score: telemetry.pressure_score,
+                pressure_level: format!("{:?}", telemetry.pressure_level).to_ascii_lowercase(),
+            }),
             connectivity_state: connectivity_state.map(|state| UiConnectivityState {
                 active_path: format!("{:?}", state.active_path).to_ascii_lowercase(),
                 active_endpoint: state.active_endpoint,
@@ -2477,6 +2528,13 @@ fn load_json_vec(path: &Path) -> Option<Vec<String>> {
 }
 
 fn available_memory_bytes(device: &UiDevice) -> u64 {
+    if let Some(bytes) = device
+        .memory_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.mesh_available_memory_bytes)
+    {
+        return bytes.max(1);
+    }
     if let Some(bytes) = device.contributed_memory_bytes {
         return bytes.max(1);
     }

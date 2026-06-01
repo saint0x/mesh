@@ -26,6 +26,7 @@ pub struct Device {
     pub connectivity_state: Option<String>, // JSON string
     pub listen_addrs: Option<String>,       // JSON string
     pub direct_candidates: Option<String>,  // JSON string
+    pub memory_telemetry: Option<String>,   // JSON string
 }
 
 /// Device status enum

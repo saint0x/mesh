@@ -22,6 +22,38 @@ pub struct RegisterDeviceResponse {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceMemoryPressureLevel {
+    Healthy,
+    Warm,
+    Hot,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceMemoryTelemetry {
+    pub observed_at: String,
+    pub total_system_memory_bytes: u64,
+    pub available_system_memory_bytes: u64,
+    pub used_system_memory_bytes: u64,
+    pub process_resident_memory_bytes: Option<u64>,
+    pub process_virtual_memory_bytes: Option<u64>,
+    pub mesh_committed_memory_bytes: Option<u64>,
+    pub mesh_available_memory_bytes: Option<u64>,
+    pub runtime_active_sessions: Option<u32>,
+    pub runtime_total_runtime_bytes: Option<u64>,
+    pub runtime_live_kv_cache_bytes: Option<u64>,
+    pub runtime_model_resident_bytes: Option<u64>,
+    pub runtime_logical_kv_tokens: Option<u64>,
+    pub runtime_max_total_runtime_bytes: Option<u64>,
+    pub runtime_max_total_kv_cache_bytes: Option<u64>,
+    pub tensor_inbound_queued_bytes: Option<u64>,
+    pub tensor_outbound_inflight_bytes: Option<u64>,
+    pub pressure_score: f64,
+    pub pressure_level: DeviceMemoryPressureLevel,
+}
+
 /// Request to update device heartbeat
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
@@ -29,6 +61,7 @@ pub struct HeartbeatRequest {
     pub listen_addrs: Vec<String>,
     #[serde(default)]
     pub direct_candidates: Vec<DirectPeerCandidate>,
+    pub memory_telemetry: DeviceMemoryTelemetry,
 }
 
 /// Response to heartbeat update
@@ -40,6 +73,7 @@ pub struct HeartbeatResponse {
     pub listen_addrs: Vec<String>,
     #[serde(default)]
     pub direct_candidates: Vec<DirectPeerCandidate>,
+    pub memory_telemetry: DeviceMemoryTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

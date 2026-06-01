@@ -5,14 +5,14 @@ use time::OffsetDateTime;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    ClaimInferenceAssignmentRequest, ExecutionPhase as ApiExecutionPhase, InferenceExecutionPlan,
-    InferenceRuntimeMode, WorkClaimMode,
+    ClaimInferenceAssignmentRequest, DeviceMemoryTelemetry, ExecutionPhase as ApiExecutionPhase,
+    InferenceExecutionPlan, InferenceRuntimeMode, WorkClaimMode,
 };
 use crate::connectivity::{DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::DeviceCapabilities;
 use crate::services::planner::{
-    adjusted_capacity_units, device_metadata_from_capabilities, topology_efficiency_score,
-    ExecutionPlanner, PlannerDeviceMetadata,
+    adjusted_capacity_units, device_metadata_from_capabilities, pressure_adjusted_capacity_units,
+    topology_efficiency_score, ExecutionPlanner, PlannerDeviceMetadata,
 };
 use crate::services::ring_manager::{ModelShard, RingTopology, WorkerTopologyInfo};
 
@@ -1273,16 +1273,24 @@ fn load_device_assignment_metadata(
     model_id: &str,
     scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<PlannerDeviceMetadata> {
-    let (capabilities_json, status, last_seen, connectivity_state_json, listen_addrs_json): (
+    let (
+        capabilities_json,
+        status,
+        last_seen,
+        connectivity_state_json,
+        listen_addrs_json,
+        memory_telemetry_json,
+    ): (
         String,
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
     ) = conn
         .query_row(
             r#"
-            SELECT capabilities, status, last_seen, connectivity_state, listen_addrs
+            SELECT capabilities, status, last_seen, connectivity_state, listen_addrs, memory_telemetry
             FROM devices
             WHERE network_id = ? AND device_id = ?
             "#,
@@ -1294,6 +1302,7 @@ fn load_device_assignment_metadata(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
@@ -1325,11 +1334,30 @@ fn load_device_assignment_metadata(
         metadata.assigned_capacity_units =
             adjusted_capacity_units(metadata.assigned_capacity_units, multiplier);
     }
+    if let Some(memory_telemetry) = parse_memory_telemetry(memory_telemetry_json.as_deref())? {
+        metadata.mesh_available_memory_bytes = memory_telemetry.mesh_available_memory_bytes;
+        metadata.memory_pressure_score = Some(memory_telemetry.pressure_score);
+        metadata.memory_pressure_level = Some(memory_telemetry.pressure_level);
+        metadata.assigned_capacity_units = pressure_adjusted_capacity_units(
+            metadata.assigned_capacity_units,
+            metadata.memory_pressure_score,
+        );
+    }
     metadata.observed_tokens_per_second = telemetry.observed_tokens_per_second;
     metadata.observed_deferred_ratio = telemetry.observed_deferred_ratio;
     metadata.observed_fill_ratio = telemetry.observed_fill_ratio;
     metadata.instability_score = telemetry.instability_score;
     Ok(metadata)
+}
+
+fn parse_memory_telemetry(payload: Option<&str>) -> ApiResult<Option<DeviceMemoryTelemetry>> {
+    payload
+        .map(|json| {
+            serde_json::from_str::<DeviceMemoryTelemetry>(json).map_err(|error| {
+                ApiError::Internal(format!("Failed to parse device memory telemetry: {error}"))
+            })
+        })
+        .transpose()
 }
 
 fn load_device_runtime_telemetry(

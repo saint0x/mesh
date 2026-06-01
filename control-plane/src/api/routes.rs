@@ -109,6 +109,7 @@ pub async fn heartbeat(
             req.connectivity_state,
             req.listen_addrs,
             req.direct_candidates,
+            req.memory_telemetry,
         )
     })
     .await
@@ -120,12 +121,14 @@ pub async fn heartbeat(
         connectivity_state: last_seen.1,
         listen_addrs: last_seen.2,
         direct_candidates: last_seen.3,
+        memory_telemetry: last_seen.4,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::{DeviceMemoryPressureLevel, DeviceMemoryTelemetry};
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath, ConnectivityStatus,
         DeviceConnectivityState,
@@ -164,6 +167,30 @@ mod tests {
                 },
             ],
             default_execution_provider: ExecutionProviderKind::Metal,
+        }
+    }
+
+    fn test_memory_telemetry() -> DeviceMemoryTelemetry {
+        DeviceMemoryTelemetry {
+            observed_at: "2026-06-01T12:00:00Z".into(),
+            total_system_memory_bytes: 16 * 1024 * 1024 * 1024,
+            available_system_memory_bytes: 12 * 1024 * 1024 * 1024,
+            used_system_memory_bytes: 4 * 1024 * 1024 * 1024,
+            process_resident_memory_bytes: Some(1024 * 1024 * 1024),
+            process_virtual_memory_bytes: Some(2 * 1024 * 1024 * 1024),
+            mesh_committed_memory_bytes: Some(8 * 1024 * 1024 * 1024),
+            mesh_available_memory_bytes: Some(7 * 1024 * 1024 * 1024),
+            runtime_active_sessions: Some(1),
+            runtime_total_runtime_bytes: Some(1024 * 1024 * 1024),
+            runtime_live_kv_cache_bytes: Some(256 * 1024 * 1024),
+            runtime_model_resident_bytes: Some(768 * 1024 * 1024),
+            runtime_logical_kv_tokens: Some(2048),
+            runtime_max_total_runtime_bytes: Some(4 * 1024 * 1024 * 1024),
+            runtime_max_total_kv_cache_bytes: Some(1024 * 1024 * 1024),
+            tensor_inbound_queued_bytes: Some(0),
+            tensor_outbound_inflight_bytes: Some(0),
+            pressure_score: 0.25,
+            pressure_level: DeviceMemoryPressureLevel::Healthy,
         }
     }
 
@@ -266,6 +293,7 @@ mod tests {
                 connectivity_state: test_connectivity_state(),
                 listen_addrs: vec!["/ip4/192.168.1.2/tcp/4100/p2p/12D3KooWQ6routepeer222222222222222222222222222222".to_string()],
                 direct_candidates: vec![],
+                memory_telemetry: test_memory_telemetry(),
             }),
         )
         .await;
@@ -278,6 +306,7 @@ mod tests {
             response.connectivity_state.status,
             ConnectivityStatus::Connected
         );
+        assert_eq!(response.memory_telemetry.pressure_score, 0.25);
     }
 
     #[tokio::test]
@@ -294,6 +323,7 @@ mod tests {
                 connectivity_state: test_connectivity_state(),
                 listen_addrs: vec![],
                 direct_candidates: vec![],
+                memory_telemetry: test_memory_telemetry(),
             }),
         )
         .await;

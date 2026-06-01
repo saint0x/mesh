@@ -19,6 +19,10 @@ export function DevicesPage({ controller }: DashboardPageProps) {
   const totalDevices = controller.networkDevices.length
   const healthyDevices = controller.networkDevices.filter((device) => device.health === 'healthy').length
   const ringMembers = controller.networkDevices.filter((device) => device.ringPosition != null).length
+  const hotDevices = controller.networkDevices.filter((device) => {
+    const level = device.memoryTelemetry?.pressureLevel
+    return level === 'hot' || level === 'critical'
+  }).length
 
   return (
     <div className="dashboard-stack">
@@ -56,6 +60,12 @@ export function DevicesPage({ controller }: DashboardPageProps) {
           value={lock ? formatBytes(lock.lockedMemoryBytes) : '—'}
           accent={lock?.status === 'locked' ? 'warm' : 'neutral'}
           caption={lock ? `Status: ${lock.status}` : 'No memory committed.'}
+        />
+        <Stat
+          label="Hot memory"
+          value={hotDevices}
+          accent={hotDevices > 0 ? 'danger' : 'cool'}
+          caption="Ring members reporting hot or critical pressure."
         />
       </StatRow>
 
@@ -203,6 +213,7 @@ export function DevicesPage({ controller }: DashboardPageProps) {
                 <span>Provider</span>
                 <span>Tier</span>
                 <span>Memory</span>
+                <span>Pressure</span>
               </div>
               {controller.networkDevices.map((device) => (
                 <button
@@ -226,7 +237,14 @@ export function DevicesPage({ controller }: DashboardPageProps) {
                   <span>{device.capabilities.defaultExecutionProvider}</span>
                   <span>{device.capabilities.tier}</span>
                   <span>
-                    {device.contributedMemoryBytes ? formatBytes(device.contributedMemoryBytes) : '—'}
+                    {device.memoryTelemetry?.meshAvailableMemoryBytes != null
+                      ? formatBytes(device.memoryTelemetry.meshAvailableMemoryBytes)
+                      : device.contributedMemoryBytes
+                        ? formatBytes(device.contributedMemoryBytes)
+                        : '—'}
+                  </span>
+                  <span>
+                    <StatusBadge status={device.memoryTelemetry?.pressureLevel ?? 'unknown'} />
                   </span>
                 </button>
               ))}
@@ -272,6 +290,12 @@ export function DevicesPage({ controller }: DashboardPageProps) {
                   <strong style={{ fontSize: 12 }}>{selectedDevice.lastSeen ?? '—'}</strong>
                 </div>
                 <div className="cell">
+                  <span>Memory pressure</span>
+                  <strong>
+                    <StatusBadge status={selectedDevice.memoryTelemetry?.pressureLevel ?? 'unknown'} />
+                  </strong>
+                </div>
+                <div className="cell">
                   <span>Ring position</span>
                   <strong>{selectedDevice.ringPosition ?? '—'}</strong>
                 </div>
@@ -294,6 +318,43 @@ export function DevicesPage({ controller }: DashboardPageProps) {
                   </strong>
                 </div>
               </div>
+              {selectedDevice.memoryTelemetry ? (
+                <ProgressBar
+                  current={selectedDevice.memoryTelemetry.runtimeTotalRuntimeBytes ?? 0}
+                  total={
+                    Math.max(
+                      selectedDevice.memoryTelemetry.runtimeMaxTotalRuntimeBytes ??
+                        selectedDevice.memoryTelemetry.meshCommittedMemoryBytes ??
+                        1,
+                      1,
+                    )
+                  }
+                  color={
+                    selectedDevice.memoryTelemetry.pressureLevel === 'critical'
+                      ? chartColors.danger
+                      : selectedDevice.memoryTelemetry.pressureLevel === 'hot'
+                        ? chartColors.outstanding
+                        : chartColors.cool
+                  }
+                  label={
+                    <>
+                      <span>runtime memory</span>
+                      <span>
+                        {selectedDevice.memoryTelemetry.runtimeTotalRuntimeBytes != null
+                          ? formatBytes(selectedDevice.memoryTelemetry.runtimeTotalRuntimeBytes)
+                          : '—'}
+                        {' / '}
+                        {selectedDevice.memoryTelemetry.runtimeMaxTotalRuntimeBytes != null
+                          ? formatBytes(selectedDevice.memoryTelemetry.runtimeMaxTotalRuntimeBytes)
+                          : selectedDevice.memoryTelemetry.meshCommittedMemoryBytes != null
+                            ? formatBytes(selectedDevice.memoryTelemetry.meshCommittedMemoryBytes)
+                            : '—'}
+                      </span>
+                    </>
+                  }
+                  caption={`Mesh available ${selectedDevice.memoryTelemetry.meshAvailableMemoryBytes != null ? formatBytes(selectedDevice.memoryTelemetry.meshAvailableMemoryBytes) : '—'} • pressure score ${selectedDevice.memoryTelemetry.pressureScore.toFixed(2)}`}
+                />
+              ) : null}
             </>
           ) : (
             <EmptyState title="No device selected" hint="Click a device on the left to inspect it." />
