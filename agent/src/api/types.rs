@@ -1,5 +1,6 @@
 use crate::connectivity::{DeviceConnectivityState, DirectPeerCandidate, NetworkConnectivity};
 use crate::device::DeviceCapabilities;
+use crate::provider::{BackendContractDescriptor, ProviderCompatibilityClass};
 use serde::{Deserialize, Serialize};
 
 /// Request to register a new device
@@ -163,6 +164,14 @@ pub enum TransportCapabilityTier {
     DirectPreferred,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RingProtocolClass {
+    UniformModelRing,
+    ProviderHomogeneousFastRing,
+    ProviderHeterogeneousPortableRing,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionGroupMember {
     pub device_id: String,
@@ -180,14 +189,19 @@ pub struct ExecutionGroupMember {
     #[serde(default)]
     pub direct_candidates: Vec<DirectPeerCandidate>,
     pub assigned_capacity_units: u32,
-    pub execution_provider: String,
+    pub backend_contract: BackendContractDescriptor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionGroup {
     pub group_id: String,
+    pub execution_island_id: String,
     pub model_id: String,
     pub phase: ExecutionPhase,
+    pub compatibility_class: ProviderCompatibilityClass,
+    pub backend_contract_hash: Option<String>,
+    pub fast_path_eligible: bool,
+    pub protocol_class: RingProtocolClass,
     pub transport_tier: TransportCapabilityTier,
     pub kv_transfer_policy: KvTransferPolicy,
     pub total_capacity_units: u32,
@@ -201,6 +215,7 @@ pub struct ExecutionSegment {
     pub segment_id: String,
     pub session_id: String,
     pub execution_group_id: String,
+    pub execution_island_id: String,
     pub phase: ExecutionPhase,
     pub prompt_tokens: Vec<u32>,
     pub max_tokens: u32,
@@ -566,7 +581,8 @@ pub struct InferenceJobAssignmentStatus {
     pub shard_column_start: u32,
     pub shard_column_end: u32,
     pub assigned_capacity_units: u32,
-    pub execution_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_contract: Option<BackendContractDescriptor>,
     pub execution_time_ms: u64,
 }
 

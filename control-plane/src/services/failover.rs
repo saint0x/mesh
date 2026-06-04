@@ -1159,8 +1159,13 @@ fn rebuild_execution_group_for_regroup(
     let compacted = compact_serving_group_topology(&ordered, &status_overrides);
     Ok(ExecutionGroup {
         group_id: group.group_id.clone(),
+        execution_island_id: group.execution_island_id.clone(),
         model_id: group.model_id.clone(),
         phase: group.phase,
+        compatibility_class: group.compatibility_class,
+        backend_contract_hash: group.backend_contract_hash.clone(),
+        fast_path_eligible: group.fast_path_eligible,
+        protocol_class: group.protocol_class,
         transport_tier: classify_regroup_transport_tier(&compacted),
         kv_transfer_policy: group.kv_transfer_policy,
         total_capacity_units: compacted
@@ -1480,7 +1485,7 @@ fn apply_assignment_regroup_updates(
                     i64::from(member.shard.column_start),
                     i64::from(member.shard.column_end),
                     i64::from(member.assigned_capacity_units),
-                    &member.execution_provider,
+                    member.backend_contract.provider.as_str(),
                     if target_set.contains(&member.device_id) {
                         Some(target_segment_id)
                     } else {
@@ -1665,7 +1670,7 @@ fn apply_serving_group_regroup_updates(
                     i64::from(member.shard.column_start),
                     i64::from(member.shard.column_end),
                     i64::from(member.assigned_capacity_units),
-                    &member.execution_provider,
+                    member.backend_contract.provider.as_str(),
                     member.status.as_str(),
                     now
                 ],
@@ -1699,7 +1704,7 @@ fn apply_serving_group_regroup_updates(
                 member.map(|member| i64::from(member.shard.column_start)),
                 member.map(|member| i64::from(member.shard.column_end)),
                 member.map(|member| i64::from(member.assigned_capacity_units)),
-                member.map(|member| member.execution_provider.as_str()),
+                member.map(|member| member.backend_contract.provider.as_str()),
                 now,
                 update.last_error.as_deref(),
                 &context.session.session_id,
@@ -2493,7 +2498,10 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
-    use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
+    use crate::provider::{
+        BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
+        ProviderCompatibilityClass,
+    };
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::{device_service::register_device, network_service};
     use rusqlite::params;
@@ -3126,8 +3134,15 @@ mod tests {
         let members = vec![member("worker-1", 0, 49), member("worker-2", 50, 99)];
         let prefill_group = ExecutionGroup {
             group_id: "group-prefill".into(),
+            execution_island_id: "island-prefill".into(),
             model_id: "model-a".into(),
             phase: ExecutionPhase::Prefill,
+            compatibility_class: ProviderCompatibilityClass::CpuPortable,
+            backend_contract_hash: Some(
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu).contract_hash,
+            ),
+            fast_path_eligible: false,
+            protocol_class: crate::api::types::RingProtocolClass::UniformModelRing,
             transport_tier: TransportCapabilityTier::DirectPreferred,
             kv_transfer_policy: KvTransferPolicy::CoLocated,
             total_capacity_units: 2,
@@ -3138,6 +3153,7 @@ mod tests {
             segment_id: "segment-prefill".into(),
             session_id: "session-a".into(),
             execution_group_id: prefill_group.group_id.clone(),
+            execution_island_id: prefill_group.execution_island_id.clone(),
             phase: ExecutionPhase::Prefill,
             prompt_tokens: vec![1, 2, 3],
             max_tokens: 16,
@@ -3226,8 +3242,15 @@ mod tests {
     ) {
         let decode_group = ExecutionGroup {
             group_id: "group-decode".into(),
+            execution_island_id: "island-decode".into(),
             model_id: "model-a".into(),
             phase: ExecutionPhase::Decode,
+            compatibility_class: ProviderCompatibilityClass::CpuPortable,
+            backend_contract_hash: Some(
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu).contract_hash,
+            ),
+            fast_path_eligible: false,
+            protocol_class: crate::api::types::RingProtocolClass::UniformModelRing,
             transport_tier: TransportCapabilityTier::DirectPreferred,
             kv_transfer_policy,
             total_capacity_units: members.len() as u32,
@@ -3238,6 +3261,7 @@ mod tests {
             segment_id: "segment-decode".into(),
             session_id: "session-a".into(),
             execution_group_id: decode_group.group_id.clone(),
+            execution_island_id: decode_group.execution_island_id.clone(),
             phase: ExecutionPhase::Decode,
             prompt_tokens: Vec::new(),
             max_tokens: 16,
@@ -3349,7 +3373,7 @@ mod tests {
             listen_addrs: Vec::new(),
             direct_candidates: Vec::new(),
             assigned_capacity_units: 1,
-            execution_provider: "cpu".into(),
+            backend_contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
             throughput_multiplier: None,
             observed_tokens_per_second: None,
             observed_deferred_ratio: None,
@@ -3527,7 +3551,7 @@ mod tests {
                     i64::from(member.shard.column_start),
                     i64::from(member.shard.column_end),
                     i64::from(member.assigned_capacity_units),
-                    &member.execution_provider,
+                    member.backend_contract.provider.as_str(),
                     if active_participants.contains(&member.device_id) {
                         Some(active_segment.as_str())
                     } else {
@@ -3714,19 +3738,32 @@ mod tests {
                     kind: ExecutionProviderKind::Cpu,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Metal,
                     available: false,
                     reason: Some("metal provider is only available on macOS".into()),
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Cuda,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
                 },
             ],
             default_execution_provider: ExecutionProviderKind::Cuda,
+            provider_contracts: vec![
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
+            ],
+            default_provider_contract_hash: BackendContractDescriptor::for_provider(
+                ExecutionProviderKind::Cuda,
+            )
+            .contract_hash,
+            memory_model: MemoryModel::DiscreteVram,
         }
     }
 

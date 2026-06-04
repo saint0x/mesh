@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
+use crate::provider::{
+    BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
+};
 
 /// Device hardware capabilities and tier classification
 /// (Mirrors agent::device::DeviceCapabilities)
@@ -19,6 +21,20 @@ pub struct DeviceCapabilities {
     #[serde(default)]
     pub execution_providers: Vec<ExecutionProviderInfo>,
     pub default_execution_provider: ExecutionProviderKind,
+    #[serde(default)]
+    pub provider_contracts: Vec<BackendContractDescriptor>,
+    pub default_provider_contract_hash: String,
+    pub memory_model: MemoryModel,
+}
+
+impl DeviceCapabilities {
+    pub fn default_backend_contract(&self) -> BackendContractDescriptor {
+        self.provider_contracts
+            .iter()
+            .find(|contract| contract.contract_hash == self.default_provider_contract_hash)
+            .cloned()
+            .unwrap_or_else(|| BackendContractDescriptor::for_provider(self.default_execution_provider))
+    }
 }
 
 /// Device tier based on hardware capabilities

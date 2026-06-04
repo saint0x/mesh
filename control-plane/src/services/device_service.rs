@@ -191,7 +191,7 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::Tier;
-    use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
+    use crate::provider::{BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel};
     use crate::services::network_service;
 
     fn test_connectivity() -> NetworkConnectivity {
@@ -227,19 +227,32 @@ mod tests {
                     kind: ExecutionProviderKind::Cpu,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Metal,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Cuda,
                     available: false,
                     reason: Some("cuda provider is only available on Linux builds".into()),
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
                 },
             ],
             default_execution_provider: ExecutionProviderKind::Metal,
+            provider_contracts: vec![
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
+            ],
+            default_provider_contract_hash: BackendContractDescriptor::for_provider(
+                ExecutionProviderKind::Metal,
+            )
+            .contract_hash,
+            memory_model: MemoryModel::UnifiedMemory,
         }
     }
 

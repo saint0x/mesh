@@ -439,6 +439,12 @@ mod tests {
 
     #[test]
     fn test_load_config_defaults_governance() {
+        let cpu_contract =
+            crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu);
+        let metal_contract =
+            crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal);
+        let cuda_contract =
+            crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda);
         let keypair = keypair::generate_keypair();
         let encoded_keypair = multibase::encode(multibase::Base::Base58Btc, keypair.to_bytes());
         let config_toml = format!(
@@ -462,12 +468,23 @@ gpu_vram_mb = 0
 os = "linux"
 arch = "x86_64"
 execution_providers = [
-  {{ kind = "cpu", available = true }},
-  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS" }},
-  {{ kind = "cuda", available = true }},
+  {{ kind = "cpu", available = true, contract = {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = false, supports_paged_kv = false, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = false, memory_model = "system_ram", contract_hash = "{cpu_hash}" }} }},
+  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS", contract = {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", contract_hash = "{metal_hash}" }} }},
+  {{ kind = "cuda", available = true, contract = {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", contract_hash = "{cuda_hash}" }} }},
 ]
 default_execution_provider = "cuda"
+provider_contracts = [
+  {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = false, supports_paged_kv = false, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = false, memory_model = "system_ram", contract_hash = "{cpu_hash}" }},
+  {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", contract_hash = "{metal_hash}" }},
+  {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", contract_hash = "{cuda_hash}" }},
+]
+default_provider_contract_hash = "{cuda_hash}"
+memory_model = "discrete_vram"
 "#
+            ,
+            cpu_hash = cpu_contract.contract_hash,
+            metal_hash = metal_contract.contract_hash,
+            cuda_hash = cuda_contract.contract_hash
         );
 
         let loaded: DeviceConfig = toml::from_str(&config_toml).unwrap();

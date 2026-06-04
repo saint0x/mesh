@@ -615,12 +615,12 @@ fn validate_provider_constraints(
             if !constraints
                 .allowed_providers
                 .iter()
-                .any(|allowed| allowed == &member.execution_provider)
+                .any(|allowed| allowed == member.backend_contract.provider.as_str())
             {
                 return Err(format!(
                     "member {} uses provider {}, allowed providers are {}",
                     member.device_id,
-                    member.execution_provider,
+                    member.backend_contract.provider.as_str(),
                     constraints.allowed_providers.join(", ")
                 ));
             }
@@ -629,11 +629,11 @@ fn validate_provider_constraints(
     if constraints.requires_homogeneous {
         let first = members
             .first()
-            .map(|member| member.execution_provider.as_str())
+            .map(|member| member.backend_contract.contract_hash.as_str())
             .unwrap_or_default();
         if members
             .iter()
-            .any(|member| member.execution_provider.as_str() != first)
+            .any(|member| member.backend_contract.contract_hash.as_str() != first)
         {
             return Err("providers must be homogeneous across the group".to_string());
         }

@@ -418,6 +418,7 @@ impl CheckpointRecoveryPoint {
             phase: checkpoint.request.phase,
             decode_batch_targets: DecodeBatchTargets::default(),
             runtime_mode: InferenceRuntimeMode::default(),
+            fast_path_permitted: true,
             executor_id: checkpoint.request.executor_id.clone(),
             created_at: checkpoint.metadata.created_at,
         };

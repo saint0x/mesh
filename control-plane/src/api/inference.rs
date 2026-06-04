@@ -30,6 +30,7 @@ use crate::credit_policy::{
 };
 use crate::device::DeviceCapabilities;
 use crate::model_assets;
+use crate::provider::{BackendContractDescriptor, ExecutionProviderKind};
 use crate::services::planner::adjusted_capacity_units;
 use crate::services::{
     device_metadata_from_capabilities, network_service, refresh_decode_plan_for_job,
@@ -133,7 +134,7 @@ struct PersistedJobContext {
 #[derive(Clone)]
 struct PersistedCompletedAssignmentCreditInput {
     device_id: String,
-    execution_provider: String,
+    backend_contract: BackendContractDescriptor,
     execution_time_ms: u64,
     reported_completion_tokens: u32,
     assigned_capacity_units: u32,
@@ -142,6 +143,36 @@ struct PersistedCompletedAssignmentCreditInput {
     available_memory_bytes: u64,
 }
 
+fn parse_backend_contract_payload(
+    backend_contract_json: Option<&str>,
+    provider_label: Option<&str>,
+) -> ApiResult<BackendContractDescriptor> {
+    if let Some(json) = backend_contract_json {
+        return serde_json::from_str(json).map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed to parse persisted backend contract metadata: {}",
+                error
+            ))
+        });
+    }
+
+    let provider = provider_label
+        .and_then(ExecutionProviderKind::from_str)
+        .unwrap_or(ExecutionProviderKind::Cpu);
+    Ok(BackendContractDescriptor::for_provider(provider))
+}
+
+fn effective_available_memory_bytes(
+    capabilities: &DeviceCapabilities,
+    contributed_memory: u64,
+) -> u64 {
+    if contributed_memory > 0 {
+        contributed_memory.max(1)
+    } else {
+        ((capabilities.ram_mb + capabilities.gpu_vram_mb.unwrap_or_default()) as u64 * 1024 * 1024)
+            .max(1)
+    }
+}
 #[derive(Clone, Copy)]
 struct PersistedJobSettlementState {
     settled_credits: f64,
@@ -604,13 +635,20 @@ pub async fn submit_inference(
 
         for (worker, assignment_metadata) in workers.iter().zip(device_metadata.iter()) {
             let assignment_id = Uuid::new_v4().to_string();
+            let backend_contract_json = serde_json::to_string(&assignment_metadata.backend_contract)
+                .map_err(|e| {
+                    ApiError::Internal(format!(
+                        "Failed to serialize backend contract for assignment: {}",
+                        e
+                    ))
+                })?;
             tx.execute(
                 r#"
                 INSERT INTO inference_job_assignments (
                     assignment_id, job_id, network_id, device_id, ring_position, status, assigned_at,
                     shard_column_start, shard_column_end, assigned_capacity_units, execution_provider,
-                    active_segment_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    backend_contract_json, backend_contract_hash, active_segment_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 params![
                     &assignment_id,
@@ -627,7 +665,9 @@ pub async fn submit_inference(
                     worker.shard.column_range.0 as i64,
                     worker.shard.column_range.1 as i64,
                     assignment_metadata.assigned_capacity_units as i64,
-                    assignment_metadata.execution_provider,
+                    assignment_metadata.backend_contract.provider.as_str(),
+                    backend_contract_json,
+                    &assignment_metadata.backend_contract.contract_hash,
                     if initial_participants.contains(&worker.device_id) {
                         Some(execution_plan.initial_segment_id.as_str())
                     } else {
@@ -2163,6 +2203,14 @@ fn sync_serving_groups(
             })
             .unwrap_or_default();
         for member in &group.members {
+            let backend_contract_json = serde_json::to_string(&member.backend_contract).map_err(
+                |e| {
+                    ApiError::Internal(format!(
+                        "Failed to serialize serving-group backend contract: {}",
+                        e
+                    ))
+                },
+            )?;
             let status = match group.phase {
                 crate::api::types::ExecutionPhase::Prefill => {
                     if plan.initial_segment_id.contains("prefill") {
@@ -2184,14 +2232,22 @@ fn sync_serving_groups(
                 INSERT INTO inference_serving_groups (
                     group_id, session_id, job_id, network_id, model_id, phase, device_id,
                     ring_position, shard_column_start, shard_column_end, assigned_capacity_units,
-                    execution_provider, status, last_error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    execution_provider, execution_island_id, compatibility_class,
+                    backend_contract_hash, fast_path_eligible, protocol_class,
+                    backend_contract_json, status, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                 ON CONFLICT(group_id, device_id) DO UPDATE SET
                     ring_position = excluded.ring_position,
                     shard_column_start = excluded.shard_column_start,
                     shard_column_end = excluded.shard_column_end,
                     assigned_capacity_units = excluded.assigned_capacity_units,
                     execution_provider = excluded.execution_provider,
+                    execution_island_id = excluded.execution_island_id,
+                    compatibility_class = excluded.compatibility_class,
+                    backend_contract_hash = excluded.backend_contract_hash,
+                    fast_path_eligible = excluded.fast_path_eligible,
+                    protocol_class = excluded.protocol_class,
+                    backend_contract_json = excluded.backend_contract_json,
                     status = excluded.status,
                     last_error = NULL,
                     updated_at = excluded.updated_at
@@ -2212,7 +2268,23 @@ fn sync_serving_groups(
                     i64::from(member.shard.column_start),
                     i64::from(member.shard.column_end),
                     i64::from(member.assigned_capacity_units),
-                    &member.execution_provider,
+                    member.backend_contract.provider.as_str(),
+                    &group.execution_island_id,
+                    serde_json::to_string(&group.compatibility_class).map_err(|e| {
+                        ApiError::Internal(format!(
+                            "Failed to serialize serving-group compatibility class: {}",
+                            e
+                        ))
+                    })?,
+                    group.backend_contract_hash.clone(),
+                    if group.fast_path_eligible { 1_i64 } else { 0_i64 },
+                    serde_json::to_string(&group.protocol_class).map_err(|e| {
+                        ApiError::Internal(format!(
+                            "Failed to serialize serving-group protocol class: {}",
+                            e
+                        ))
+                    })?,
+                    backend_contract_json,
                     status,
                     now
                 ],
@@ -2671,13 +2743,7 @@ fn decode_batch_group_key(plan: &InferenceExecutionPlan, segment_id: &str) -> Ap
                 segment.execution_group_id, plan.plan_id
             ))
         })?;
-    let mut members = group
-        .members
-        .iter()
-        .map(|member| member.device_id.clone())
-        .collect::<Vec<_>>();
-    members.sort();
-    Ok(format!("decode:{}:{}", group.model_id, members.join(",")))
+    Ok(format!("decode:{}:{}", group.model_id, group.execution_island_id))
 }
 
 fn describe_decode_topology_change(
@@ -4982,13 +5048,21 @@ fn report_assignment_progress(
                             ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e)))
                         })?;
                     if assignment_exists.is_none() {
+                        let backend_contract_json =
+                            serde_json::to_string(&group_member.backend_contract).map_err(|e| {
+                                ApiError::Internal(format!(
+                                    "Failed to serialize regroup backend contract: {}",
+                                    e
+                                ))
+                            })?;
                         tx.execute(
                             r#"
                             INSERT INTO inference_job_assignments (
                                 assignment_id, job_id, network_id, device_id, ring_position, status,
                                 assigned_at, shard_column_start, shard_column_end,
-                                assigned_capacity_units, execution_provider, active_segment_id
-                            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                                assigned_capacity_units, execution_provider, backend_contract_json,
+                                backend_contract_hash, active_segment_id
+                            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
                             "#,
                             params![
                                 Uuid::new_v4().to_string(),
@@ -5000,7 +5074,9 @@ fn report_assignment_progress(
                                 i64::from(group_member.shard.column_start),
                                 i64::from(group_member.shard.column_end),
                                 i64::from(group_member.assigned_capacity_units),
-                                &group_member.execution_provider,
+                                group_member.backend_contract.provider.as_str(),
+                                backend_contract_json,
+                                &group_member.backend_contract.contract_hash,
                                 &next_segment_id
                             ],
                         )
@@ -5155,7 +5231,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
             r#"
             SELECT device_id, ring_position, status, failure_reason,
                    shard_column_start, shard_column_end, assigned_capacity_units,
-                   execution_provider, execution_time_ms
+                   execution_provider, backend_contract_json, execution_time_ms
             FROM inference_job_assignments
             WHERE job_id = ?
             ORDER BY ring_position ASC
@@ -5165,6 +5241,19 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
 
     let assignments = stmt
         .query_map(params![job_id], |row| {
+            let provider_label = row.get::<_, Option<String>>(7)?;
+            let backend_contract_json = row.get::<_, Option<String>>(8)?;
+            let backend_contract = parse_backend_contract_payload(
+                backend_contract_json.as_deref(),
+                provider_label.as_deref(),
+            )
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(e.to_string())),
+                )
+            })?;
             Ok(InferenceJobAssignmentStatus {
                 device_id: row.get(0)?,
                 ring_position: row.get::<_, i64>(1)? as u32,
@@ -5173,8 +5262,8 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                 shard_column_start: row.get::<_, i64>(4)? as u32,
                 shard_column_end: row.get::<_, i64>(5)? as u32,
                 assigned_capacity_units: row.get::<_, i64>(6)? as u32,
-                execution_provider: row.get(7)?,
-                execution_time_ms: row.get::<_, i64>(8)? as u64,
+                backend_contract: Some(backend_contract),
+                execution_time_ms: row.get::<_, i64>(9)? as u64,
             })
         })
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
@@ -5664,6 +5753,7 @@ fn load_completed_assignment_credit_inputs(
             SELECT
                 a.device_id,
                 a.execution_provider,
+                a.backend_contract_json,
                 a.execution_time_ms,
                 a.reported_completion_tokens,
                 a.assigned_capacity_units,
@@ -5684,34 +5774,39 @@ fn load_completed_assignment_credit_inputs(
 
     let rows = stmt
         .query_map(params![job_id], |row| {
-            let capabilities_json: String = row.get(7)?;
+            let capabilities_json: String = row.get(8)?;
             let capabilities: DeviceCapabilities = serde_json::from_str(&capabilities_json)
                 .map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        7,
+                        8,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
                 })?;
             let contributed_memory =
-                row.get::<_, Option<i64>>(8)?.unwrap_or_default().max(0) as u64;
-            let available_memory_bytes = if contributed_memory > 0 {
-                contributed_memory.max(1)
-            } else {
-                ((capabilities.ram_mb + capabilities.gpu_vram_mb.unwrap_or_default()) as u64
-                    * 1024
-                    * 1024)
-                    .max(1)
-            };
+                row.get::<_, Option<i64>>(9)?.unwrap_or_default().max(0) as u64;
+            let available_memory_bytes =
+                effective_available_memory_bytes(&capabilities, contributed_memory);
+            let backend_contract = parse_backend_contract_payload(
+                row.get::<_, Option<String>>(2)?.as_deref(),
+                row.get::<_, Option<String>>(1)?.as_deref(),
+            )
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(error.to_string())),
+                )
+            })?;
 
             Ok(PersistedCompletedAssignmentCreditInput {
                 device_id: row.get(0)?,
-                execution_provider: row.get(1)?,
-                execution_time_ms: row.get::<_, i64>(2)? as u64,
-                reported_completion_tokens: row.get::<_, i64>(3)? as u32,
-                assigned_capacity_units: row.get::<_, i64>(4)? as u32,
-                shard_column_start: row.get::<_, i64>(5)? as u32,
-                shard_column_end: row.get::<_, i64>(6)? as u32,
+                backend_contract,
+                execution_time_ms: row.get::<_, i64>(3)? as u64,
+                reported_completion_tokens: row.get::<_, i64>(4)? as u32,
+                assigned_capacity_units: row.get::<_, i64>(5)? as u32,
+                shard_column_start: row.get::<_, i64>(6)? as u32,
+                shard_column_end: row.get::<_, i64>(7)? as u32,
                 available_memory_bytes,
             })
         })
@@ -5893,7 +5988,8 @@ fn realtime_earned_credit_metadata(
     serde_json::json!({
         "credit_model": "realtime_contribution",
         "model_id": job_context.model_id,
-        "execution_provider": assignment_input.execution_provider,
+        "backend_contract_hash": assignment_input.backend_contract.contract_hash,
+        "execution_provider": assignment_input.backend_contract.provider.as_str(),
         "execution_time_ms": assignment_input.execution_time_ms,
         "reported_completion_tokens": assignment_input.reported_completion_tokens,
         "assigned_capacity_units": assignment_input.assigned_capacity_units,
@@ -6020,7 +6116,7 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
-    use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
+    use crate::provider::{BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel};
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::device_service;
     use std::collections::HashMap;
@@ -6052,19 +6148,32 @@ mod tests {
                     kind: ExecutionProviderKind::Cpu,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Metal,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Cuda,
                     available: false,
                     reason: Some("cuda provider is only available on Linux builds".into()),
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
                 },
             ],
             default_execution_provider: ExecutionProviderKind::Metal,
+            provider_contracts: vec![
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
+            ],
+            default_provider_contract_hash: BackendContractDescriptor::for_provider(
+                ExecutionProviderKind::Metal,
+            )
+            .contract_hash,
+            memory_model: MemoryModel::UnifiedMemory,
         }
     }
 
@@ -9795,7 +9904,7 @@ mod tests {
         assert!(status
             .assignments
             .iter()
-            .all(|assignment| assignment.execution_provider.is_some()));
+            .all(|assignment| assignment.backend_contract.is_some()));
         assert!(status
             .assignments
             .iter()

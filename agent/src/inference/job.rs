@@ -84,6 +84,10 @@ pub struct InferenceRequest {
     #[serde(default)]
     pub runtime_mode: InferenceRuntimeMode,
 
+    /// Whether the control plane allows provider-specialized fast paths.
+    #[serde(default = "default_fast_path_permitted")]
+    pub fast_path_permitted: bool,
+
     /// Executor ID (for credit tracking)
     pub executor_id: String,
 
@@ -109,6 +113,7 @@ impl InferenceRequest {
             phase: ExecutionPhase::Prefill,
             decode_batch_targets: DecodeBatchTargets::default(),
             runtime_mode: InferenceRuntimeMode::default(),
+            fast_path_permitted: default_fast_path_permitted(),
             executor_id,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -122,6 +127,10 @@ impl InferenceRequest {
         self.config = config;
         self
     }
+}
+
+fn default_fast_path_permitted() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

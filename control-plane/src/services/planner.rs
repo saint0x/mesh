@@ -2,16 +2,19 @@ use uuid::Uuid;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment, InferenceExecutionPlan,
-    InferenceRuntimeMode, KvTransferPolicy, PunchPathReason, PunchPathStrategy, ShardInfo,
-    SubmitInferenceRequest, TransportCapabilityTier,
+    ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment,
+    InferenceExecutionPlan, InferenceRuntimeMode, KvTransferPolicy, PunchPathReason,
+    PunchPathStrategy, RingProtocolClass, ShardInfo, SubmitInferenceRequest,
+    TransportCapabilityTier,
 };
 use crate::connectivity::{ConnectivityPath, DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::{DeviceCapabilities, Tier};
 use crate::model_assets::{
     self, ModelManifest, ResolvedServingLayout, ServingLayoutKind, ServingLayoutRule,
 };
-use crate::provider::ExecutionProviderKind;
+use crate::provider::{
+    BackendContractDescriptor, ExecutionProviderKind, ProviderCompatibilityClass,
+};
 use crate::services::ring_manager::{RingTopology, WorkerTopologyInfo};
 
 const MIN_RUNTIME_CAPACITY_MULTIPLIER: f64 = 0.5;
@@ -23,12 +26,22 @@ const SMALL_MODEL_EXPANSION_SCORE_MARGIN: i64 = 320;
 #[derive(Debug, Clone)]
 pub struct PlannerDeviceMetadata {
     pub assigned_capacity_units: u32,
-    pub execution_provider: String,
+    pub backend_contract: BackendContractDescriptor,
     pub throughput_multiplier: f64,
     pub observed_tokens_per_second: Option<f64>,
     pub observed_deferred_ratio: Option<f64>,
     pub observed_fill_ratio: Option<f64>,
     pub instability_score: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionIsland {
+    island_id: String,
+    compatibility_class: ProviderCompatibilityClass,
+    backend_contract_hash: Option<String>,
+    fast_path_eligible: bool,
+    protocol_class: RingProtocolClass,
+    members: Vec<ExecutionGroupMember>,
 }
 
 pub struct ExecutionPlanner;
@@ -88,6 +101,8 @@ impl ExecutionPlanner {
         let decode_group_id = format!("group-{}-decode", plan_id);
         let prefill_segment_id = format!("segment-{}-prefill", session_id);
         let decode_segment_id = format!("segment-{}-decode", session_id);
+        let prefill_island = classify_execution_island(&req.model_id, ExecutionPhase::Prefill, &prefill_members);
+        let decode_island = classify_execution_island(&req.model_id, ExecutionPhase::Decode, &decode_members);
         let peer_punch_plans = topology
             .peer_punch_plans
             .iter()
@@ -95,8 +110,13 @@ impl ExecutionPlanner {
             .collect::<Vec<_>>();
         let prefill_group = ExecutionGroup {
             group_id: prefill_group_id.clone(),
+            execution_island_id: prefill_island.island_id.clone(),
             model_id: req.model_id.clone(),
             phase: ExecutionPhase::Prefill,
+            compatibility_class: prefill_island.compatibility_class,
+            backend_contract_hash: prefill_island.backend_contract_hash.clone(),
+            fast_path_eligible: prefill_island.fast_path_eligible,
+            protocol_class: prefill_island.protocol_class,
             transport_tier,
             kv_transfer_policy: KvTransferPolicy::CoLocated,
             total_capacity_units,
@@ -105,8 +125,13 @@ impl ExecutionPlanner {
         };
         let decode_group = ExecutionGroup {
             group_id: decode_group_id.clone(),
+            execution_island_id: decode_island.island_id.clone(),
             model_id: req.model_id.clone(),
             phase: ExecutionPhase::Decode,
+            compatibility_class: decode_island.compatibility_class,
+            backend_contract_hash: decode_island.backend_contract_hash.clone(),
+            fast_path_eligible: decode_island.fast_path_eligible,
+            protocol_class: decode_island.protocol_class,
             transport_tier: decode_transport_tier,
             kv_transfer_policy: if same_participants(&prefill_members, &decode_members) {
                 KvTransferPolicy::CoLocated
@@ -126,6 +151,7 @@ impl ExecutionPlanner {
             segment_id: prefill_segment_id.clone(),
             session_id: session_id.clone(),
             execution_group_id: prefill_group_id,
+            execution_island_id: prefill_island.island_id,
             phase: ExecutionPhase::Prefill,
             prompt_tokens: prompt_tokens.to_vec(),
             max_tokens: req.max_tokens,
@@ -139,6 +165,7 @@ impl ExecutionPlanner {
             segment_id: decode_segment_id,
             session_id,
             execution_group_id: decode_group_id,
+            execution_island_id: decode_island.island_id,
             phase: ExecutionPhase::Decode,
             prompt_tokens: Vec::new(),
             max_tokens: req.max_tokens,
@@ -249,6 +276,7 @@ impl ExecutionPlanner {
             .iter()
             .map(|member| member.device_id.clone())
             .collect::<Vec<_>>();
+        let decode_island = classify_execution_island(&model_id, ExecutionPhase::Decode, &decode_members);
 
         let mut refreshed = plan.clone();
         refreshed.runtime_mode = runtime_mode;
@@ -264,6 +292,11 @@ impl ExecutionPlanner {
                 ))
             })?;
         let existing_punch_plans = decode_group.peer_punch_plans.clone();
+        decode_group.execution_island_id = decode_island.island_id.clone();
+        decode_group.compatibility_class = decode_island.compatibility_class;
+        decode_group.backend_contract_hash = decode_island.backend_contract_hash.clone();
+        decode_group.fast_path_eligible = decode_island.fast_path_eligible;
+        decode_group.protocol_class = decode_island.protocol_class;
         decode_group.transport_tier = decode_transport_tier;
         decode_group.kv_transfer_policy = if same_participants(&prefill_members, &decode_members) {
             KvTransferPolicy::CoLocated
@@ -300,6 +333,7 @@ impl ExecutionPlanner {
                 ))
             })?;
         decode_segment.kv_owner_device_id = decode_kv_owner_device_id;
+        decode_segment.execution_island_id = decode_island.island_id;
         decode_segment.shard_owner_device_ids = decode_participant_device_ids.clone();
         decode_segment.participant_device_ids = decode_participant_device_ids;
 
@@ -339,7 +373,7 @@ fn build_member(
         listen_addrs: worker.listen_addrs.clone(),
         direct_candidates: worker.direct_candidates.clone(),
         assigned_capacity_units: metadata.assigned_capacity_units,
-        execution_provider: metadata.execution_provider.clone(),
+        backend_contract: metadata.backend_contract.clone(),
         throughput_multiplier: Some(metadata.throughput_multiplier),
         observed_tokens_per_second: metadata.observed_tokens_per_second,
         observed_deferred_ratio: metadata.observed_deferred_ratio,
@@ -457,9 +491,11 @@ fn candidate_groups(
     runtime_mode: InferenceRuntimeMode,
 ) -> Vec<Vec<ExecutionGroupMember>> {
     let mut candidates = Vec::new();
-    for rule in manifest.layout_rules_for_phase(phase) {
-        for candidate in candidates_for_rule(manifest, members, runtime_mode, &rule) {
-            push_unique_candidate(&mut candidates, candidate);
+    for island in build_execution_islands(&manifest.model_id, phase, members) {
+        for rule in manifest.layout_rules_for_phase(phase) {
+            for candidate in candidates_for_rule(manifest, &island.members, runtime_mode, &rule) {
+                push_unique_candidate(&mut candidates, candidate);
+            }
         }
     }
 
@@ -473,6 +509,128 @@ fn candidate_groups(
     }
 
     candidates
+}
+
+fn build_execution_islands(
+    model_id: &str,
+    phase: ExecutionPhase,
+    members: &[ExecutionGroupMember],
+) -> Vec<ExecutionIsland> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+
+    let mut islands = Vec::new();
+    let mut grouped: std::collections::BTreeMap<(ProviderCompatibilityClass, String), Vec<ExecutionGroupMember>> =
+        std::collections::BTreeMap::new();
+    for member in members {
+        if member.backend_contract.fast_path_eligible {
+            grouped
+                .entry((
+                    member.backend_contract.compatibility_class,
+                    member.backend_contract.contract_hash.clone(),
+                ))
+                .or_default()
+                .push(member.clone());
+        }
+    }
+
+    for ((compatibility_class, contract_hash), grouped_members) in grouped {
+        islands.push(ExecutionIsland {
+            island_id: execution_island_id(
+                model_id,
+                phase,
+                compatibility_class,
+                Some(contract_hash.as_str()),
+            ),
+            compatibility_class,
+            backend_contract_hash: Some(contract_hash),
+            fast_path_eligible: true,
+            protocol_class: RingProtocolClass::ProviderHomogeneousFastRing,
+            members: grouped_members,
+        });
+    }
+
+    islands.push(ExecutionIsland {
+        island_id: execution_island_id(
+            model_id,
+            phase,
+            ProviderCompatibilityClass::HeterogeneousPortable,
+            None,
+        ),
+        compatibility_class: ProviderCompatibilityClass::HeterogeneousPortable,
+        backend_contract_hash: None,
+        fast_path_eligible: false,
+        protocol_class: RingProtocolClass::ProviderHeterogeneousPortableRing,
+        members: members.to_vec(),
+    });
+
+    islands
+}
+
+fn execution_island_id(
+    model_id: &str,
+    phase: ExecutionPhase,
+    compatibility_class: ProviderCompatibilityClass,
+    contract_hash: Option<&str>,
+) -> String {
+    let phase = match phase {
+        ExecutionPhase::Prefill => "prefill",
+        ExecutionPhase::Decode => "decode",
+    };
+    match contract_hash {
+        Some(contract_hash) => format!(
+            "island:{}:{}:{:?}:{}",
+            model_id, phase, compatibility_class, contract_hash
+        )
+        .to_ascii_lowercase(),
+        None => format!("island:{}:{}:heterogeneous_portable", model_id, phase),
+    }
+}
+
+fn classify_execution_island(
+    model_id: &str,
+    phase: ExecutionPhase,
+    members: &[ExecutionGroupMember],
+) -> ExecutionIsland {
+    let unique_hashes = members
+        .iter()
+        .map(|member| member.backend_contract.contract_hash.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_hashes.len() == 1
+        && members
+            .iter()
+            .all(|member| member.backend_contract.fast_path_eligible)
+    {
+        let first = &members[0].backend_contract;
+        return ExecutionIsland {
+            island_id: execution_island_id(
+                model_id,
+                phase,
+                first.compatibility_class,
+                Some(first.contract_hash.as_str()),
+            ),
+            compatibility_class: first.compatibility_class,
+            backend_contract_hash: Some(first.contract_hash.clone()),
+            fast_path_eligible: true,
+            protocol_class: RingProtocolClass::ProviderHomogeneousFastRing,
+            members: members.to_vec(),
+        };
+    }
+
+    ExecutionIsland {
+        island_id: execution_island_id(
+            model_id,
+            phase,
+            ProviderCompatibilityClass::HeterogeneousPortable,
+            None,
+        ),
+        compatibility_class: ProviderCompatibilityClass::HeterogeneousPortable,
+        backend_contract_hash: None,
+        fast_path_eligible: false,
+        protocol_class: RingProtocolClass::ProviderHeterogeneousPortableRing,
+        members: members.to_vec(),
+    }
 }
 
 fn candidates_for_rule(
@@ -1058,7 +1216,7 @@ fn collective_scale_risk_score(
         .count() as u32;
     let mut providers = members
         .iter()
-        .map(|member| member.execution_provider.as_str())
+        .map(|member| member.backend_contract.contract_hash.as_str())
         .collect::<Vec<_>>();
     providers.sort_unstable();
     providers.dedup();
@@ -1149,7 +1307,9 @@ fn is_homogeneous_provider_group(members: &[ExecutionGroupMember]) -> bool {
         .map(|first| {
             members
                 .iter()
-                .all(|member| member.execution_provider == first.execution_provider)
+                .all(|member| {
+                    member.backend_contract.contract_hash == first.backend_contract.contract_hash
+                })
         })
         .unwrap_or(true)
 }
@@ -1198,11 +1358,7 @@ pub fn capacity_units_for_tier(policy: &InferenceSchedulingPolicy, tier: Tier) -
 }
 
 pub fn execution_provider_label(provider: ExecutionProviderKind) -> &'static str {
-    match provider {
-        ExecutionProviderKind::Cpu => "cpu",
-        ExecutionProviderKind::Metal => "metal",
-        ExecutionProviderKind::Cuda => "cuda",
-    }
+    provider.as_str()
 }
 
 pub fn device_metadata_from_capabilities(
@@ -1211,8 +1367,7 @@ pub fn device_metadata_from_capabilities(
 ) -> PlannerDeviceMetadata {
     PlannerDeviceMetadata {
         assigned_capacity_units: capacity_units_for_tier(policy, capabilities.tier),
-        execution_provider: execution_provider_label(capabilities.default_execution_provider)
-            .to_string(),
+        backend_contract: capabilities.default_backend_contract(),
         throughput_multiplier: 1.0,
         observed_tokens_per_second: None,
         observed_deferred_ratio: None,
@@ -1275,9 +1430,15 @@ mod tests {
     }
 
     fn planner_metadata(units: u32, provider: &str) -> PlannerDeviceMetadata {
+        let provider = match provider {
+            "cpu" => ExecutionProviderKind::Cpu,
+            "metal" => ExecutionProviderKind::Metal,
+            "cuda" => ExecutionProviderKind::Cuda,
+            other => panic!("unknown provider {other}"),
+        };
         PlannerDeviceMetadata {
             assigned_capacity_units: units,
-            execution_provider: provider.to_string(),
+            backend_contract: BackendContractDescriptor::for_provider(provider),
             throughput_multiplier: 1.0,
             observed_tokens_per_second: None,
             observed_deferred_ratio: None,
@@ -1379,21 +1540,29 @@ mod tests {
             .iter()
             .find(|group| matches!(group.phase, ExecutionPhase::Prefill))
             .expect("expected prefill group");
-        assert_eq!(prefill_group.members.len(), 2);
+        assert_eq!(prefill_group.members.len(), 1);
         assert_eq!(
             prefill_group
                 .members
                 .iter()
                 .map(|member| member.device_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["a", "b"]
+            vec!["c"]
         );
         assert_eq!(decode_group.members.len(), 1);
         assert_eq!(decode_group.members[0].device_id, "c");
         assert!(matches!(
             decode_group.kv_transfer_policy,
-            KvTransferPolicy::ExportOnHandoff
+            KvTransferPolicy::CoLocated
         ));
+        assert_eq!(
+            decode_group.backend_contract_hash,
+            prefill_group.backend_contract_hash
+        );
+        assert_eq!(
+            decode_group.compatibility_class,
+            prefill_group.compatibility_class
+        );
 
         let decode_segment = plan
             .segments

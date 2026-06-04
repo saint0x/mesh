@@ -735,6 +735,43 @@ fn active_group<'a>(
         .context("Active execution group missing from execution lease")
 }
 
+fn validate_execution_group_contract(
+    config: &DeviceConfig,
+    lease: &InferenceExecutionLease,
+    device_id: &Uuid,
+) -> Result<()> {
+    let member = assigned_member(lease, device_id)?;
+    let group = active_group(lease)?;
+    let selected_provider = config.resolve_execution_provider()?;
+    let local_contract =
+        agent::provider::BackendContractDescriptor::for_provider(selected_provider);
+
+    if member.backend_contract.contract_hash != local_contract.contract_hash {
+        anyhow::bail!(
+            "lease contract {} does not match local contract {}",
+            member.backend_contract.contract_hash,
+            local_contract.contract_hash
+        );
+    }
+
+    if group.fast_path_eligible {
+        let required_hash = group
+            .backend_contract_hash
+            .as_deref()
+            .context("fast-path execution group missing backend contract hash")?;
+        if required_hash != local_contract.contract_hash {
+            anyhow::bail!(
+                "fast-path group {} requires contract {}, local contract is {}",
+                group.execution_island_id,
+                required_hash,
+                local_contract.contract_hash
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn topology_from_execution_lease(lease: &InferenceExecutionLease) -> RingTopologyResponse {
     let group = active_group(lease).expect("active execution group should exist");
     RingTopologyResponse {
@@ -1951,6 +1988,34 @@ async fn cmd_runtime() -> Result<()> {
                 continue;
             }
 
+            if let Err(e) = validate_execution_group_contract(&config, &assignment, &device_id) {
+                error!(job_id = %job_id, error = %e, "Rejected assignment with incompatible backend contract");
+                release_decode_lease_if_needed(
+                    &registration_client,
+                    &assignment,
+                    "incompatible_backend_contract",
+                    Some(e.to_string()),
+                )
+                .await;
+                let _ = registration_client
+                    .report_inference_result(
+                        job_id,
+                        agent::api::types::ReportInferenceAssignmentRequest {
+                            device_id: device_id.to_string(),
+                            segment_id: assignment.active_segment.segment_id.clone(),
+                            success: false,
+                            completion: None,
+                            completion_tokens: None,
+                            execution_time_ms: 0,
+                            time_to_first_token_ms: None,
+                            kv_cache_seq_len: None,
+                            error: Some(e.to_string()),
+                        },
+                    )
+                    .await;
+                continue;
+            }
+
             if let Err(e) = registration_client
                 .acknowledge_inference_assignment(job_id, device_id)
                 .await
@@ -2009,6 +2074,9 @@ async fn cmd_runtime() -> Result<()> {
                         agent::inference::InferenceRuntimeMode::ResilientEdge
                     }
                 },
+                fast_path_permitted: active_group(&assignment)
+                    .map(|group| group.fast_path_eligible)
+                    .unwrap_or(false),
                 executor_id: device_id.to_string(),
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3359,13 +3427,14 @@ fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
     println!("\n{}", "Assignments:".bold());
     for assignment in &status.assignments {
         println!(
-            "  pos={} device={} status={} provider={} shard={}..{} capacity={} time={}ms",
+            "  pos={} device={} status={} contract={} shard={}..{} capacity={} time={}ms",
             assignment.ring_position,
             assignment.device_id,
             assignment.status,
             assignment
-                .execution_provider
-                .as_deref()
+                .backend_contract
+                .as_ref()
+                .map(|contract| contract.contract_hash.as_str())
                 .unwrap_or("unknown"),
             assignment.shard_column_start,
             assignment.shard_column_end,

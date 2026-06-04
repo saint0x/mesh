@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
 use crate::provider::{
-    default_execution_provider, detect_execution_providers, ExecutionProviderInfo,
-    ExecutionProviderKind,
+    default_execution_contract, default_execution_provider, detect_execution_providers,
+    BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
 };
 
 /// Device tier classification based on hardware specs.
@@ -76,6 +76,16 @@ pub struct DeviceCapabilities {
 
     /// Default execution provider for this node.
     pub default_execution_provider: ExecutionProviderKind,
+
+    /// Provider contracts detected on this node.
+    #[serde(default)]
+    pub provider_contracts: Vec<BackendContractDescriptor>,
+
+    /// Contract hash for the default execution provider.
+    pub default_provider_contract_hash: String,
+
+    /// Dominant memory model for the default execution provider.
+    pub memory_model: MemoryModel,
 }
 
 impl DeviceCapabilities {
@@ -111,6 +121,11 @@ impl DeviceCapabilities {
         let arch = Self::detect_arch();
         let execution_providers = detect_execution_providers();
         let default_execution_provider = default_execution_provider(&execution_providers);
+        let default_contract = default_execution_contract(&execution_providers);
+        let provider_contracts = execution_providers
+            .iter()
+            .map(|provider| provider.contract.clone())
+            .collect::<Vec<_>>();
 
         Self {
             tier,
@@ -122,7 +137,18 @@ impl DeviceCapabilities {
             arch,
             execution_providers,
             default_execution_provider,
+            provider_contracts,
+            default_provider_contract_hash: default_contract.contract_hash.clone(),
+            memory_model: default_contract.memory_model,
         }
+    }
+
+    pub fn default_backend_contract(&self) -> BackendContractDescriptor {
+        self.provider_contracts
+            .iter()
+            .find(|contract| contract.contract_hash == self.default_provider_contract_hash)
+            .cloned()
+            .unwrap_or_else(|| BackendContractDescriptor::for_provider(self.default_execution_provider))
     }
 
     /// Detect if GPU is present (basic detection).
@@ -226,8 +252,17 @@ mod tests {
                 kind: ExecutionProviderKind::Cpu,
                 available: true,
                 reason: None,
+                contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
             }],
             default_execution_provider: ExecutionProviderKind::Cpu,
+            provider_contracts: vec![BackendContractDescriptor::for_provider(
+                ExecutionProviderKind::Cpu,
+            )],
+            default_provider_contract_hash: BackendContractDescriptor::for_provider(
+                ExecutionProviderKind::Cpu,
+            )
+            .contract_hash,
+            memory_model: MemoryModel::SystemRam,
         };
 
         let json = serde_json::to_string(&caps).unwrap();

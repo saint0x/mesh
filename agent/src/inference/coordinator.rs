@@ -840,7 +840,7 @@ impl InferenceCoordinator {
                         session.backend.optimization_profile(),
                         session.backend.executor_contract().clone(),
                     ));
-                    if session.backend.is_fast_path_backend() {
+                    if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
                         primary_decode_token_ceiling =
                             FastPathPlanner::decode_token_ceiling_for_context(
                                 &session.backend.fast_path_context(),
@@ -917,7 +917,7 @@ impl InferenceCoordinator {
                     session.backend.optimization_profile(),
                     session.backend.executor_contract().clone(),
                 ));
-                if session.backend.is_fast_path_backend() {
+                if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
                     primary_decode_token_ceiling =
                         FastPathPlanner::decode_token_ceiling_for_context(
                             &session.backend.fast_path_context(),
@@ -1012,7 +1012,9 @@ impl InferenceCoordinator {
                 .iter()
                 .filter_map(|slot| self.sessions.get(&slot.session_id))
                 .collect::<Vec<_>>();
-            if sessions
+            if sessions.iter().any(|session| !session.job.request.fast_path_permitted) {
+                None
+            } else if sessions
                 .iter()
                 .any(|session| !session.backend.is_fast_path_backend())
             {
@@ -1623,7 +1625,7 @@ impl InferenceCoordinator {
                     session.backend.provider_kind(),
                 )
                 .await?;
-            if session.backend.is_fast_path_backend() {
+            if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
                 let prefill_plan = FastPathPlanner::plan_prefill(
                     &session.backend.fast_path_context(),
                     request.prompt_tokens.len(),

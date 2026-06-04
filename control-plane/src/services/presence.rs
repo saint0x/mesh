@@ -169,7 +169,7 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
-    use crate::provider::{ExecutionProviderInfo, ExecutionProviderKind};
+    use crate::provider::{BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel};
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::{device_service::register_device, network_service};
 
@@ -187,19 +187,32 @@ mod tests {
                     kind: ExecutionProviderKind::Cpu,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Metal,
                     available: false,
                     reason: Some("metal provider is only available on macOS".into()),
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Cuda,
                     available: true,
                     reason: None,
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
                 },
             ],
             default_execution_provider: ExecutionProviderKind::Cuda,
+            provider_contracts: vec![
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
+            ],
+            default_provider_contract_hash: BackendContractDescriptor::for_provider(
+                ExecutionProviderKind::Cuda,
+            )
+            .contract_hash,
+            memory_model: MemoryModel::DiscreteVram,
         }
     }
 
