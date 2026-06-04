@@ -4,8 +4,8 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
     ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment,
     InferenceExecutionPlan, InferenceRuntimeMode, KvTransferPolicy, PunchPathReason,
-    PunchPathStrategy, RingProtocolClass, ShardInfo, SubmitInferenceRequest,
-    TransportCapabilityTier,
+    PunchPathStrategy, RingProtocolClass, ShardInfo, SubmitInferenceRequest, SupportGroup,
+    SupportGroupRole, TransportCapabilityTier,
 };
 use crate::connectivity::{ConnectivityPath, DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::{DeviceCapabilities, Tier};
@@ -135,10 +135,8 @@ impl ExecutionPlanner {
             transport_tier: decode_transport_tier,
             kv_transfer_policy: if same_participants(&prefill_members, &decode_members) {
                 KvTransferPolicy::CoLocated
-            } else if matches!(runtime_mode, InferenceRuntimeMode::ResilientEdge) {
-                KvTransferPolicy::RemoteAccess
             } else {
-                KvTransferPolicy::ExportOnHandoff
+                KvTransferPolicy::CheckpointHandoff
             },
             total_capacity_units: decode_members
                 .iter()
@@ -147,6 +145,14 @@ impl ExecutionPlanner {
             members: decode_members.clone(),
             peer_punch_plans,
         };
+        let support_groups = build_support_groups(
+            &plan_id,
+            &req.model_id,
+            &available_members,
+            &prefill_members,
+            &decode_members,
+            &topology.peer_punch_plans,
+        );
         let prefill_segment = ExecutionSegment {
             segment_id: prefill_segment_id.clone(),
             session_id: session_id.clone(),
@@ -180,6 +186,7 @@ impl ExecutionPlanner {
             plan_id,
             runtime_mode,
             execution_groups: vec![prefill_group, decode_group],
+            support_groups,
             segments: vec![prefill_segment, decode_segment],
             initial_segment_id: prefill_segment_id,
         })
@@ -300,10 +307,8 @@ impl ExecutionPlanner {
         decode_group.transport_tier = decode_transport_tier;
         decode_group.kv_transfer_policy = if same_participants(&prefill_members, &decode_members) {
             KvTransferPolicy::CoLocated
-        } else if matches!(runtime_mode, InferenceRuntimeMode::ResilientEdge) {
-            KvTransferPolicy::RemoteAccess
         } else {
-            KvTransferPolicy::ExportOnHandoff
+            KvTransferPolicy::CheckpointHandoff
         };
         decode_group.total_capacity_units = decode_members
             .iter()
@@ -336,8 +341,177 @@ impl ExecutionPlanner {
         decode_segment.execution_island_id = decode_island.island_id;
         decode_segment.shard_owner_device_ids = decode_participant_device_ids.clone();
         decode_segment.participant_device_ids = decode_participant_device_ids;
+        refreshed.support_groups = build_support_groups(
+            &refreshed.plan_id,
+            &model_id,
+            &available_members,
+            &prefill_members,
+            &decode_members,
+            &topology.peer_punch_plans,
+        );
 
         Ok(refreshed)
+    }
+}
+
+fn build_support_groups(
+    plan_id: &str,
+    model_id: &str,
+    all_members: &[ExecutionGroupMember],
+    prefill_members: &[ExecutionGroupMember],
+    decode_members: &[ExecutionGroupMember],
+    peer_punch_plans: &[crate::services::ring_manager::PeerPunchPlan],
+) -> Vec<SupportGroup> {
+    let mut support_groups = Vec::new();
+    let decode_ids = decode_members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let prefill_ids = prefill_members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let non_decode_members = all_members
+        .iter()
+        .filter(|member| !decode_ids.contains(member.device_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let kv_members = select_support_members(all_members, &non_decode_members, 2);
+    support_groups.push(build_support_group(
+        plan_id,
+        model_id,
+        SupportGroupRole::Kv,
+        &kv_members,
+        peer_punch_plans,
+    ));
+
+    let checkpoint_seed = union_members(&kv_members, &non_decode_members);
+    support_groups.push(build_support_group(
+        plan_id,
+        model_id,
+        SupportGroupRole::Checkpoint,
+        &checkpoint_seed,
+        peer_punch_plans,
+    ));
+
+    let recovery_seed = union_members(&kv_members, decode_members);
+    support_groups.push(build_support_group(
+        plan_id,
+        model_id,
+        SupportGroupRole::Recovery,
+        &recovery_seed,
+        peer_punch_plans,
+    ));
+
+    let overflow_seed = all_members
+        .iter()
+        .filter(|member| {
+            !decode_ids.contains(member.device_id.as_str())
+                || !prefill_ids.contains(member.device_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    support_groups.push(build_support_group(
+        plan_id,
+        model_id,
+        SupportGroupRole::Overflow,
+        if overflow_seed.is_empty() {
+            &non_decode_members
+        } else {
+            &overflow_seed
+        },
+        peer_punch_plans,
+    ));
+
+    support_groups
+        .into_iter()
+        .filter(|group| !group.members.is_empty())
+        .collect()
+}
+
+fn select_support_members(
+    all_members: &[ExecutionGroupMember],
+    preferred_members: &[ExecutionGroupMember],
+    max_members: usize,
+) -> Vec<ExecutionGroupMember> {
+    let mut ranked = if preferred_members.is_empty() {
+        all_members.to_vec()
+    } else {
+        preferred_members.to_vec()
+    };
+    ranked.sort_by(|left, right| {
+        right
+            .contributed_memory
+            .cmp(&left.contributed_memory)
+            .then_with(|| right.assigned_capacity_units.cmp(&left.assigned_capacity_units))
+            .then_with(|| left.ring_position.cmp(&right.ring_position))
+    });
+    ranked.truncate(max_members.max(1).min(ranked.len()));
+    ranked
+}
+
+fn union_members(
+    left: &[ExecutionGroupMember],
+    right: &[ExecutionGroupMember],
+) -> Vec<ExecutionGroupMember> {
+    let mut combined = Vec::new();
+    for member in left.iter().chain(right.iter()) {
+        if combined
+            .iter()
+            .all(|existing: &ExecutionGroupMember| existing.device_id != member.device_id)
+        {
+            combined.push(member.clone());
+        }
+    }
+    combined
+}
+
+fn build_support_group(
+    plan_id: &str,
+    model_id: &str,
+    role: SupportGroupRole,
+    members: &[ExecutionGroupMember],
+    peer_punch_plans: &[crate::services::ring_manager::PeerPunchPlan],
+) -> SupportGroup {
+    let group_id = format!(
+        "support:{}:{}",
+        match role {
+            SupportGroupRole::Kv => "kv",
+            SupportGroupRole::Checkpoint => "checkpoint",
+            SupportGroupRole::Recovery => "recovery",
+            SupportGroupRole::Overflow => "overflow",
+        },
+        plan_id
+    );
+    let island = classify_execution_island(model_id, ExecutionPhase::Decode, members);
+    let member_ids = members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    SupportGroup {
+        group_id,
+        role,
+        execution_island_id: island.island_id,
+        model_id: model_id.to_string(),
+        compatibility_class: island.compatibility_class,
+        backend_contract_hash: island.backend_contract_hash,
+        fast_path_eligible: island.fast_path_eligible,
+        protocol_class: island.protocol_class,
+        transport_tier: classify_transport_tier(members),
+        total_capacity_units: members
+            .iter()
+            .map(|member| member.assigned_capacity_units)
+            .sum(),
+        members: members.to_vec(),
+        peer_punch_plans: peer_punch_plans
+            .iter()
+            .filter(|plan| {
+                member_ids.contains(plan.source_device_id.as_str())
+                    && member_ids.contains(plan.target_device_id.as_str())
+            })
+            .map(map_peer_punch_plan)
+            .collect(),
     }
 }
 

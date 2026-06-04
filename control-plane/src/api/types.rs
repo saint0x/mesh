@@ -399,8 +399,16 @@ impl Default for WorkClaimMode {
 #[serde(rename_all = "snake_case")]
 pub enum KvTransferPolicy {
     CoLocated,
-    ExportOnHandoff,
-    RemoteAccess,
+    CheckpointHandoff,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportGroupRole {
+    Kv,
+    Checkpoint,
+    Recovery,
+    Overflow,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -471,6 +479,24 @@ pub struct ExecutionGroup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupportGroup {
+    pub group_id: String,
+    pub role: SupportGroupRole,
+    pub execution_island_id: String,
+    pub model_id: String,
+    pub compatibility_class: ProviderCompatibilityClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_contract_hash: Option<String>,
+    pub fast_path_eligible: bool,
+    pub protocol_class: RingProtocolClass,
+    pub transport_tier: TransportCapabilityTier,
+    pub total_capacity_units: u32,
+    pub members: Vec<ExecutionGroupMember>,
+    #[serde(default)]
+    pub peer_punch_plans: Vec<PeerPunchPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSegment {
     pub segment_id: String,
     pub session_id: String,
@@ -492,6 +518,8 @@ pub struct InferenceExecutionPlan {
     #[serde(default)]
     pub runtime_mode: InferenceRuntimeMode,
     pub execution_groups: Vec<ExecutionGroup>,
+    #[serde(default)]
+    pub support_groups: Vec<SupportGroup>,
     pub segments: Vec<ExecutionSegment>,
     pub initial_segment_id: String,
 }
@@ -756,6 +784,8 @@ pub struct ServingSessionMetadata {
     pub replicas: Vec<InferenceSessionReplicaStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_lease: Option<DecodeLeaseStatus>,
+    #[serde(default)]
+    pub transfers: Vec<KvTransferStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -971,6 +1001,89 @@ pub struct UploadInferenceSessionCheckpointRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportInferenceSessionKvTransferRequest {
+    pub device_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_access_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportInferenceSessionKvTransferResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservePendingKvTransfersResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub transfers: Vec<PendingKvTransferStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingKvTransferStatus {
+    pub transfer_id: String,
+    pub session_id: String,
+    pub job_id: String,
+    pub network_id: String,
+    pub model_id: String,
+    pub segment_id: String,
+    pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_group_key: Option<String>,
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub transfer_kind: String,
+    pub status: String,
+    pub payload_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_access_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadInferenceSessionKvTransferPayloadRequest {
+    pub device_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    pub transfer_id: String,
+    pub payload_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadInferenceSessionKvTransferPayloadResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<PendingKvTransferStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadInferenceSessionCheckpointResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1114,7 +1227,10 @@ pub struct ServingGroupStatus {
     pub job_id: String,
     pub network_id: String,
     pub model_id: String,
-    pub phase: ExecutionPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ExecutionPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_role: Option<SupportGroupRole>,
     pub execution_island_id: String,
     pub compatibility_class: ProviderCompatibilityClass,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1138,7 +1254,10 @@ pub struct RegroupEventStatus {
     pub job_id: String,
     pub network_id: String,
     pub model_id: String,
-    pub phase: ExecutionPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ExecutionPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_role: Option<SupportGroupRole>,
     pub group_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
@@ -1171,6 +1290,7 @@ pub struct KvReplicaResidencyStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KvResidencyKind {
+    LiveResident,
     CheckpointStore,
     TransferBundle,
     RemoteReference,

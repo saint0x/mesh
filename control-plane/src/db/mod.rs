@@ -16,7 +16,7 @@ use crate::api::types::{
     RegroupEventStatus, RingProtocolClass, SchedulerBatchMetrics, SchedulerEventStatus,
     SchedulerJobSummary, SchedulerReadinessStatus, SchedulerReadinessThresholds,
     ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
-    ServingGroupWorkloadStatus,
+    ServingGroupWorkloadStatus, SupportGroupRole,
 };
 use crate::provider::{
     BackendContractDescriptor, ExecutionProviderKind, ProviderCompatibilityClass,
@@ -376,6 +376,9 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         "033_create_inference_session_kv_transfers.sql" => {
             table_exists(conn, "inference_session_kv_transfers")?
         }
+        "041_create_inference_session_kv_transfer_payloads.sql" => {
+            table_exists(conn, "inference_session_kv_transfer_payloads")?
+        }
         "034_create_inference_prompt_cache_entries.sql" => {
             table_exists(conn, "inference_prompt_cache_entries")?
         }
@@ -402,6 +405,12 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
                 && column_exists(conn, "inference_serving_groups", "fast_path_eligible")?
                 && column_exists(conn, "inference_serving_groups", "protocol_class")?
                 && column_exists(conn, "inference_serving_groups", "backend_contract_json")?
+        }
+        "039_add_support_group_roles.sql" => {
+            column_exists(conn, "inference_serving_groups", "support_role")?
+        }
+        "040_add_support_group_regroup_events.sql" => {
+            column_exists(conn, "inference_regroup_events", "support_role")?
         }
         _ => false,
     })
@@ -473,7 +482,8 @@ struct ServingGroupRow {
     job_id: String,
     network_id: String,
     model_id: String,
-    phase: ExecutionPhase,
+    phase: Option<ExecutionPhase>,
+    support_role: Option<SupportGroupRole>,
     execution_island_id: String,
     compatibility_class: ProviderCompatibilityClass,
     backend_contract_hash: Option<String>,
@@ -700,6 +710,23 @@ fn reconcile_kv_tracking_state(conn: &rusqlite::Connection) -> Result<()> {
             updated_at = CURRENT_TIMESTAMP
         WHERE status IN ('queued', 'in_progress')
           AND datetime(updated_at) < datetime('now', '-10 minutes')
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        DELETE FROM inference_session_kv_transfer_payloads
+        WHERE transfer_id IN (
+            SELECT transfer_id
+            FROM inference_session_kv_transfers
+            WHERE status IN ('completed', 'stale', 'failed')
+        )
+           OR job_id IN (
+            SELECT job_id
+            FROM inference_jobs
+            WHERE status IN ('completed', 'failed', 'cancelled')
+              AND datetime(updated_at) < datetime('now', '-30 minutes')
+        )
         "#,
         [],
     )?;
@@ -939,12 +966,12 @@ fn load_serving_group_snapshots(
         let mut stmt = conn.prepare(
             r#"
             SELECT sg.group_id, sg.session_id, sg.job_id, sg.network_id, sg.model_id, sg.phase,
-                   sg.execution_island_id, sg.compatibility_class, sg.backend_contract_hash,
-                   sg.fast_path_eligible, sg.protocol_class, sg.lease_owner_device_id,
-                   sg.lease_expires_at, sg.device_id, sg.ring_position, sg.shard_column_start,
-                   sg.shard_column_end, sg.assigned_capacity_units, sg.execution_provider,
-                   sg.backend_contract_json, sg.status, a.status, a.lease_expires_at,
-                   a.active_segment_id, sg.last_error
+                   sg.support_role, sg.execution_island_id, sg.compatibility_class,
+                   sg.backend_contract_hash, sg.fast_path_eligible, sg.protocol_class,
+                   sg.lease_owner_device_id, sg.lease_expires_at, sg.device_id,
+                   sg.ring_position, sg.shard_column_start, sg.shard_column_end,
+                   sg.assigned_capacity_units, sg.execution_provider, sg.backend_contract_json,
+                   sg.status, a.status, a.lease_expires_at, a.active_segment_id, sg.last_error
             FROM inference_serving_groups sg
             LEFT JOIN inference_job_assignments a
               ON a.job_id = sg.job_id
@@ -954,43 +981,58 @@ fn load_serving_group_snapshots(
             "#,
         )?;
         let rows = stmt.query_map([network_id, job_id], |row| {
-            let provider_label = row.get::<_, Option<String>>(18)?;
-            let backend_contract_json = row.get::<_, Option<String>>(19)?;
+            let provider_label = row.get::<_, Option<String>>(19)?;
+            let backend_contract_json = row.get::<_, Option<String>>(20)?;
+            let backend_contract =
+                parse_backend_contract(backend_contract_json.as_deref(), provider_label.as_deref())
+                    .map_err(to_sql_err)?;
+            let compatibility_class = row
+                .get::<_, Option<String>>(8)?
+                .map(|value| parse_provider_compatibility_class(value.as_str()))
+                .transpose()
+                .map_err(to_sql_err)?
+                .unwrap_or(backend_contract.compatibility_class);
+            let fast_path_eligible = row
+                .get::<_, Option<i64>>(10)?
+                .map(|value| value != 0)
+                .unwrap_or(backend_contract.fast_path_eligible);
+            let protocol_class = row
+                .get::<_, Option<String>>(11)?
+                .map(|value| parse_ring_protocol_class(value.as_str()))
+                .transpose()
+                .map_err(to_sql_err)?
+                .unwrap_or_else(|| default_protocol_class(compatibility_class));
             Ok(ServingGroupRow {
                 group_id: row.get(0)?,
                 session_id: row.get(1)?,
                 job_id: row.get(2)?,
                 network_id: row.get(3)?,
                 model_id: row.get(4)?,
-                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                phase: parse_optional_execution_phase(row.get::<_, Option<String>>(5)?)
                     .map_err(to_sql_err)?,
-                execution_island_id: row.get(6)?,
-                compatibility_class: parse_provider_compatibility_class(
-                    row.get::<_, String>(7)?.as_str(),
-                )
-                .map_err(to_sql_err)?,
-                backend_contract_hash: row.get(8)?,
-                fast_path_eligible: row.get::<_, i64>(9)? != 0,
-                protocol_class: parse_ring_protocol_class(row.get::<_, String>(10)?.as_str())
+                support_role: parse_optional_support_role(row.get::<_, Option<String>>(6)?)
                     .map_err(to_sql_err)?,
-                lease_owner_device_id: row.get(11)?,
-                lease_expires_at: row.get(12)?,
+                execution_island_id: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| row.get::<_, String>(0).unwrap_or_default()),
+                compatibility_class,
+                backend_contract_hash: row.get(9)?,
+                fast_path_eligible,
+                protocol_class,
+                lease_owner_device_id: row.get(12)?,
+                lease_expires_at: row.get(13)?,
                 member: ServingGroupMemberStatus {
-                    device_id: row.get(13)?,
-                    ring_position: row.get::<_, i64>(14)? as u32,
-                    shard_column_start: row.get::<_, i64>(15)? as u32,
-                    shard_column_end: row.get::<_, i64>(16)? as u32,
-                    assigned_capacity_units: row.get::<_, i64>(17)? as u32,
-                    backend_contract: parse_backend_contract(
-                        backend_contract_json.as_deref(),
-                        provider_label.as_deref(),
-                    )
-                    .map_err(to_sql_err)?,
-                    status: row.get(20)?,
-                    assignment_status: row.get(21)?,
-                    assignment_lease_expires_at: row.get(22)?,
-                    active_segment_id: row.get(23)?,
-                    last_error: row.get(24)?,
+                    device_id: row.get(14)?,
+                    ring_position: row.get::<_, i64>(15)? as u32,
+                    shard_column_start: row.get::<_, i64>(16)? as u32,
+                    shard_column_end: row.get::<_, i64>(17)? as u32,
+                    assigned_capacity_units: row.get::<_, i64>(18)? as u32,
+                    backend_contract,
+                    status: row.get(21)?,
+                    assignment_status: row.get(22)?,
+                    assignment_lease_expires_at: row.get(23)?,
+                    active_segment_id: row.get(24)?,
+                    last_error: row.get(25)?,
                 },
             })
         })?;
@@ -999,12 +1041,12 @@ fn load_serving_group_snapshots(
         let mut stmt = conn.prepare(
             r#"
             SELECT sg.group_id, sg.session_id, sg.job_id, sg.network_id, sg.model_id, sg.phase,
-                   sg.execution_island_id, sg.compatibility_class, sg.backend_contract_hash,
-                   sg.fast_path_eligible, sg.protocol_class, sg.lease_owner_device_id,
-                   sg.lease_expires_at, sg.device_id, sg.ring_position, sg.shard_column_start,
-                   sg.shard_column_end, sg.assigned_capacity_units, sg.execution_provider,
-                   sg.backend_contract_json, sg.status, a.status, a.lease_expires_at,
-                   a.active_segment_id, sg.last_error
+                   sg.support_role, sg.execution_island_id, sg.compatibility_class,
+                   sg.backend_contract_hash, sg.fast_path_eligible, sg.protocol_class,
+                   sg.lease_owner_device_id, sg.lease_expires_at, sg.device_id,
+                   sg.ring_position, sg.shard_column_start, sg.shard_column_end,
+                   sg.assigned_capacity_units, sg.execution_provider, sg.backend_contract_json,
+                   sg.status, a.status, a.lease_expires_at, a.active_segment_id, sg.last_error
             FROM inference_serving_groups sg
             LEFT JOIN inference_job_assignments a
               ON a.job_id = sg.job_id
@@ -1014,43 +1056,58 @@ fn load_serving_group_snapshots(
             "#,
         )?;
         let rows = stmt.query_map([network_id], |row| {
-            let provider_label = row.get::<_, Option<String>>(18)?;
-            let backend_contract_json = row.get::<_, Option<String>>(19)?;
+            let provider_label = row.get::<_, Option<String>>(19)?;
+            let backend_contract_json = row.get::<_, Option<String>>(20)?;
+            let backend_contract =
+                parse_backend_contract(backend_contract_json.as_deref(), provider_label.as_deref())
+                    .map_err(to_sql_err)?;
+            let compatibility_class = row
+                .get::<_, Option<String>>(8)?
+                .map(|value| parse_provider_compatibility_class(value.as_str()))
+                .transpose()
+                .map_err(to_sql_err)?
+                .unwrap_or(backend_contract.compatibility_class);
+            let fast_path_eligible = row
+                .get::<_, Option<i64>>(10)?
+                .map(|value| value != 0)
+                .unwrap_or(backend_contract.fast_path_eligible);
+            let protocol_class = row
+                .get::<_, Option<String>>(11)?
+                .map(|value| parse_ring_protocol_class(value.as_str()))
+                .transpose()
+                .map_err(to_sql_err)?
+                .unwrap_or_else(|| default_protocol_class(compatibility_class));
             Ok(ServingGroupRow {
                 group_id: row.get(0)?,
                 session_id: row.get(1)?,
                 job_id: row.get(2)?,
                 network_id: row.get(3)?,
                 model_id: row.get(4)?,
-                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                phase: parse_optional_execution_phase(row.get::<_, Option<String>>(5)?)
                     .map_err(to_sql_err)?,
-                execution_island_id: row.get(6)?,
-                compatibility_class: parse_provider_compatibility_class(
-                    row.get::<_, String>(7)?.as_str(),
-                )
-                .map_err(to_sql_err)?,
-                backend_contract_hash: row.get(8)?,
-                fast_path_eligible: row.get::<_, i64>(9)? != 0,
-                protocol_class: parse_ring_protocol_class(row.get::<_, String>(10)?.as_str())
+                support_role: parse_optional_support_role(row.get::<_, Option<String>>(6)?)
                     .map_err(to_sql_err)?,
-                lease_owner_device_id: row.get(11)?,
-                lease_expires_at: row.get(12)?,
+                execution_island_id: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| row.get::<_, String>(0).unwrap_or_default()),
+                compatibility_class,
+                backend_contract_hash: row.get(9)?,
+                fast_path_eligible,
+                protocol_class,
+                lease_owner_device_id: row.get(12)?,
+                lease_expires_at: row.get(13)?,
                 member: ServingGroupMemberStatus {
-                    device_id: row.get(13)?,
-                    ring_position: row.get::<_, i64>(14)? as u32,
-                    shard_column_start: row.get::<_, i64>(15)? as u32,
-                    shard_column_end: row.get::<_, i64>(16)? as u32,
-                    assigned_capacity_units: row.get::<_, i64>(17)? as u32,
-                    backend_contract: parse_backend_contract(
-                        backend_contract_json.as_deref(),
-                        provider_label.as_deref(),
-                    )
-                    .map_err(to_sql_err)?,
-                    status: row.get(20)?,
-                    assignment_status: row.get(21)?,
-                    assignment_lease_expires_at: row.get(22)?,
-                    active_segment_id: row.get(23)?,
-                    last_error: row.get(24)?,
+                    device_id: row.get(14)?,
+                    ring_position: row.get::<_, i64>(15)? as u32,
+                    shard_column_start: row.get::<_, i64>(16)? as u32,
+                    shard_column_end: row.get::<_, i64>(17)? as u32,
+                    assigned_capacity_units: row.get::<_, i64>(18)? as u32,
+                    backend_contract,
+                    status: row.get(21)?,
+                    assignment_status: row.get(22)?,
+                    assignment_lease_expires_at: row.get(23)?,
+                    active_segment_id: row.get(24)?,
+                    last_error: row.get(25)?,
                 },
             })
         })?;
@@ -1066,6 +1123,7 @@ fn load_serving_group_snapshots(
             network_id: row.network_id.clone(),
             model_id: row.model_id.clone(),
             phase: row.phase,
+            support_role: row.support_role,
             execution_island_id: row.execution_island_id.clone(),
             compatibility_class: row.compatibility_class,
             backend_contract_hash: row.backend_contract_hash.clone(),
@@ -1077,7 +1135,7 @@ fn load_serving_group_snapshots(
                 .as_ref()
                 .or(row.lease_expires_at.as_ref())
                 .map(|_| ServingGroupLeaseStatus {
-                    lease_kind: if matches!(row.phase, ExecutionPhase::Decode) {
+                    lease_kind: if matches!(row.phase, Some(ExecutionPhase::Decode)) {
                         "decode_queue".to_string()
                     } else {
                         "group".to_string()
@@ -1100,7 +1158,7 @@ fn load_serving_group_snapshots(
                 .as_ref()
                 .or(row.lease_expires_at.as_ref())
                 .map(|_| ServingGroupLeaseStatus {
-                    lease_kind: if matches!(row.phase, ExecutionPhase::Decode) {
+                    lease_kind: if matches!(row.phase, Some(ExecutionPhase::Decode)) {
                         "decode_queue".to_string()
                     } else {
                         "group".to_string()
@@ -2166,7 +2224,9 @@ fn compute_near_kv_hint(
                 preferred_device_ids.push(slice.replica_device_id.clone());
             }
             match slice.residency_kind {
-                KvResidencyKind::CheckpointStore | KvResidencyKind::TransferBundle => {
+                KvResidencyKind::LiveResident
+                | KvResidencyKind::CheckpointStore
+                | KvResidencyKind::TransferBundle => {
                     ready_local_replicas += 1;
                 }
                 KvResidencyKind::RemoteReference => {
@@ -2228,8 +2288,9 @@ fn load_regroup_events(
     let rows = if let Some(job_id) = job_id {
         let mut stmt = conn.prepare(
             r#"
-            SELECT event_id, session_id, job_id, network_id, model_id, phase, group_id, device_id,
-                   event_kind, reason, previous_status, new_status, segment_id, observed_at
+            SELECT event_id, session_id, job_id, network_id, model_id, phase, support_role,
+                   group_id, device_id, event_kind, reason, previous_status, new_status,
+                   segment_id, observed_at
             FROM inference_regroup_events
             WHERE network_id = ?1 AND job_id = ?2
             ORDER BY observed_at DESC, event_id DESC
@@ -2243,24 +2304,27 @@ fn load_regroup_events(
                 job_id: row.get(2)?,
                 network_id: row.get(3)?,
                 model_id: row.get(4)?,
-                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                phase: parse_optional_execution_phase(row.get::<_, Option<String>>(5)?)
                     .map_err(to_sql_err)?,
-                group_id: row.get(6)?,
-                device_id: row.get(7)?,
-                event_kind: row.get(8)?,
-                reason: row.get(9)?,
-                previous_status: row.get(10)?,
-                new_status: row.get(11)?,
-                segment_id: row.get(12)?,
-                observed_at: row.get(13)?,
+                support_role: parse_optional_support_role(row.get::<_, Option<String>>(6)?)
+                    .map_err(to_sql_err)?,
+                group_id: row.get(7)?,
+                device_id: row.get(8)?,
+                event_kind: row.get(9)?,
+                reason: row.get(10)?,
+                previous_status: row.get(11)?,
+                new_status: row.get(12)?,
+                segment_id: row.get(13)?,
+                observed_at: row.get(14)?,
             })
         })?;
         collect_rows(rows)
     } else {
         let mut stmt = conn.prepare(
             r#"
-            SELECT event_id, session_id, job_id, network_id, model_id, phase, group_id, device_id,
-                   event_kind, reason, previous_status, new_status, segment_id, observed_at
+            SELECT event_id, session_id, job_id, network_id, model_id, phase, support_role,
+                   group_id, device_id, event_kind, reason, previous_status, new_status,
+                   segment_id, observed_at
             FROM inference_regroup_events
             WHERE network_id = ?1
             ORDER BY observed_at DESC, event_id DESC
@@ -2274,16 +2338,18 @@ fn load_regroup_events(
                 job_id: row.get(2)?,
                 network_id: row.get(3)?,
                 model_id: row.get(4)?,
-                phase: parse_execution_phase(row.get::<_, String>(5)?.as_str())
+                phase: parse_optional_execution_phase(row.get::<_, Option<String>>(5)?)
                     .map_err(to_sql_err)?,
-                group_id: row.get(6)?,
-                device_id: row.get(7)?,
-                event_kind: row.get(8)?,
-                reason: row.get(9)?,
-                previous_status: row.get(10)?,
-                new_status: row.get(11)?,
-                segment_id: row.get(12)?,
-                observed_at: row.get(13)?,
+                support_role: parse_optional_support_role(row.get::<_, Option<String>>(6)?)
+                    .map_err(to_sql_err)?,
+                group_id: row.get(7)?,
+                device_id: row.get(8)?,
+                event_kind: row.get(9)?,
+                reason: row.get(10)?,
+                previous_status: row.get(11)?,
+                new_status: row.get(12)?,
+                segment_id: row.get(13)?,
+                observed_at: row.get(14)?,
             })
         })?;
         collect_rows(rows)
@@ -2307,6 +2373,28 @@ fn parse_execution_phase(value: &str) -> Result<ExecutionPhase> {
             other
         ))),
     }
+}
+
+fn parse_optional_execution_phase(value: Option<String>) -> Result<Option<ExecutionPhase>> {
+    value.map(|value| parse_execution_phase(value.as_str())).transpose()
+}
+
+fn parse_support_role(value: &str) -> Result<SupportGroupRole> {
+    let normalized = if value.starts_with('"') {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value)
+    };
+    serde_json::from_str(&normalized).map_err(|e| {
+        DbError::Data(format!(
+            "Invalid support group role in persisted state ({}): {}",
+            value, e
+        ))
+    })
+}
+
+fn parse_optional_support_role(value: Option<String>) -> Result<Option<SupportGroupRole>> {
+    value.map(|value| parse_support_role(value.as_str())).transpose()
 }
 
 fn parse_kv_transfer_policy(value: &str) -> Result<KvTransferPolicy> {
@@ -2363,6 +2451,20 @@ fn parse_ring_protocol_class(value: &str) -> Result<RingProtocolClass> {
             value, e
         ))
     })
+}
+
+fn default_protocol_class(
+    compatibility_class: ProviderCompatibilityClass,
+) -> RingProtocolClass {
+    match compatibility_class {
+        ProviderCompatibilityClass::HeterogeneousPortable => {
+            RingProtocolClass::ProviderHeterogeneousPortableRing
+        }
+        ProviderCompatibilityClass::CpuPortable => RingProtocolClass::UniformModelRing,
+        ProviderCompatibilityClass::MetalFastPath | ProviderCompatibilityClass::CudaFastPath => {
+            RingProtocolClass::ProviderHomogeneousFastRing
+        }
+    }
 }
 
 fn parse_backend_contract(
@@ -2468,7 +2570,7 @@ mod tests {
                 latest_deferred_decode_sessions, updated_at
             ) VALUES (
                 'session-1', 'job-1', 'net-1', 'model-1', 'decode_pending_transfer',
-                'segment-decode', 'worker-a', 'export_on_handoff', 3,
+                'segment-decode', 'worker-a', 'checkpoint_handoff', 3,
                 2, 3, 11, 1, '2026-04-25T12:00:06Z'
             )
             "#,
@@ -2948,7 +3050,7 @@ mod tests {
                 latest_deferred_decode_sessions
             ) VALUES (
                 'session-1', 'job-1', 'net-1', 'model-1', 'decode_ready', 'segment-1',
-                'worker-a', 'export_on_handoff', 3, 'worker-a', '2026-04-25T12:00:05Z',
+                'worker-a', 'checkpoint_handoff', 3, 'worker-a', '2026-04-25T12:00:05Z',
                 '2026-04-25T12:00:06Z', 2, 3, 11, 1
             );
             INSERT INTO inference_session_replicas (
@@ -2999,6 +3101,8 @@ mod tests {
             "036_add_explicit_shard_identity.sql",
             "037_add_device_memory_telemetry.sql",
             "038_add_backend_contract_metadata.sql",
+            "039_add_support_group_roles.sql",
+            "040_add_support_group_regroup_events.sql",
         ];
         for migration in prior_migrations {
             conn.execute(
@@ -3349,6 +3453,22 @@ mod tests {
         .expect("Failed to age KV transfer");
         conn.execute(
             r#"
+            INSERT INTO inference_session_kv_transfer_payloads (
+                transfer_id, session_id, job_id, source_device_id, target_device_id,
+                kv_sequence_position, payload_size_bytes, payload_sha256, payload_bytes,
+                created_at, updated_at
+            ) VALUES (
+                'transfer-1', 'session-1', 'job-1', 'worker-a', 'worker-b',
+                3, 3, 'deadbeef', X'ABCD', '2026-04-25 11:00:00', '2026-04-25 11:00:00'
+            )
+            ON CONFLICT(transfer_id) DO UPDATE SET
+                updated_at = excluded.updated_at
+            "#,
+            [],
+        )
+        .expect("Failed to seed KV transfer payload");
+        conn.execute(
+            r#"
             UPDATE inference_prompt_cache_entries
             SET status = 'planned',
                 updated_at = '2026-04-25 11:00:00'
@@ -3374,5 +3494,14 @@ mod tests {
             .prompt_cache_entries
             .iter()
             .all(|entry| entry.status == "stale"));
+        let conn = db.get_conn().expect("Failed to get connection");
+        let payload_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM inference_session_kv_transfer_payloads",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to count transfer payloads");
+        assert_eq!(payload_count, 0);
     }
 }

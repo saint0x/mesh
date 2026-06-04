@@ -613,6 +613,35 @@ impl ServingSessionTransport {
         .await
     }
 
+    pub async fn send_checkpoint_bytes(
+        &self,
+        collective_id: Uuid,
+        layer_idx: u32,
+        step: u32,
+        slot: u32,
+        stream_id: u32,
+        sender_position: u32,
+        payload_bytes: &[u8],
+    ) -> Result<()> {
+        let payload_bytes = wire_bytes_for_raw_payload(payload_bytes);
+        send_serving_frame_bytes_on_bound_lane(
+            &self.state,
+            &self.checkpoint_lane,
+            ServingFrameHeader::new(
+                collective_id,
+                sender_position,
+                layer_idx,
+                step,
+                slot,
+                stream_id,
+                CollectiveLane::Checkpoint,
+                (payload_bytes.len() / std::mem::size_of::<f32>()) as u32,
+            ),
+            &payload_bytes,
+        )
+        .await
+    }
+
     pub fn spawn_bulk_transfer(
         &self,
         collective_id: Uuid,
@@ -1247,6 +1276,18 @@ impl TensorPlane {
             bulk_transfer_lane: bind_serving_lane(&self.state, right_peer, bulk_transfer_plan)
                 .await?,
             checkpoint_lane: bind_serving_lane(&self.state, right_peer, checkpoint_plan).await?,
+        })
+    }
+
+    pub async fn recv_frame_bytes(&self, spec: ServingReceiveSpec) -> Result<ServingFrameBytes> {
+        recv_slot(&self.state, &self.inbound, spec).await
+    }
+
+    pub async fn recv_frame(&self, spec: ServingReceiveSpec) -> Result<ServingFrame> {
+        let frame = self.recv_frame_bytes(spec).await?;
+        Ok(ServingFrame {
+            header: frame.header(),
+            chunk_data: frame.decode_payload_vec(),
         })
     }
 
@@ -2050,6 +2091,18 @@ fn wire_bytes_for_f32_slice(chunk_data: &[f32]) -> Cow<'_, [u8]> {
         }
         Cow::Owned(payload)
     }
+}
+
+fn wire_bytes_for_raw_payload(payload_bytes: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(4 + payload_bytes.len() + 3);
+    framed.extend_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
+    framed.extend_from_slice(payload_bytes);
+    let padding = (std::mem::size_of::<f32>() - (framed.len() % std::mem::size_of::<f32>()))
+        % std::mem::size_of::<f32>();
+    if padding > 0 {
+        framed.resize(framed.len() + padding, 0);
+    }
+    framed
 }
 
 fn decode_f32_slice_wire(buf: &[u8]) -> Vec<f32> {

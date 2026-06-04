@@ -42,9 +42,10 @@ use agent::{
     api::types::{
         ClaimInferenceAssignmentRequest, DecodeLeaseStatus, ExecutionGroupMember,
         ExecutionPhase as ApiExecutionPhase, InferenceExecutionLease, InferenceJobStatusResponse,
-        InferenceSchedulerQueueState, PeerPunchPlan, ProgressEventKind, ReleaseDecodeLeaseRequest,
-        RenewDecodeLeaseRequest, ReportInferenceAssignmentProgressRequest, RingTopologyResponse,
-        ServingSessionMetadata, WorkClaimMode, WorkerInfo,
+        InferenceSchedulerQueueState, PeerPunchPlan, PendingKvTransferStatus,
+        ProgressEventKind, ReleaseDecodeLeaseRequest, RenewDecodeLeaseRequest,
+        ReportInferenceAssignmentProgressRequest, RingTopologyResponse, ServingSessionMetadata,
+        UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode, WorkerInfo,
     },
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
@@ -58,9 +59,10 @@ use agent::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -72,6 +74,26 @@ const CLAIM_POLL_INTERVAL_SECS: u64 = 1;
 const IDLE_QUEUE_OBSERVATION_POLL_INTERVAL: u32 = 5;
 const DECODE_PROGRESS_FLUSH_INTERVAL_MS: u64 = 1500;
 const DECODE_PROGRESS_EAGER_TOKEN_DELTA: u32 = 16;
+const LIVE_KV_REQUEST_POLL_TIMEOUT_MS: u64 = 5;
+const LIVE_KV_RESPONSE_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveKvTransferPlaneRequest {
+    transfer_id: String,
+    job_id: String,
+    session_id: String,
+    segment_id: String,
+    target_remote_access_uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveKvTransferPlaneResponse {
+    transfer_id: String,
+    session_id: String,
+    kv_sequence_position: Option<u32>,
+    bytes_total: u64,
+    payload: Vec<u8>,
+}
 
 /// Mesh AI Agent - Distributed compute sharing network
 #[derive(Parser, Debug)]
@@ -610,6 +632,36 @@ fn extract_tensor_addr(addrs: &[String]) -> Option<SocketAddr> {
         .find_map(|addr| parse_data_plane_endpoint(addr))
 }
 
+fn local_dataplane_uri() -> Option<String> {
+    load_local_listen_addrs()
+        .into_iter()
+        .find(|addr| addr.starts_with("dataplane://"))
+}
+
+fn live_kv_collective_id(transfer_id: &str) -> Result<Uuid> {
+    Uuid::parse_str(transfer_id).with_context(|| format!("invalid transfer id {}", transfer_id))
+}
+
+fn encode_plane_message<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(message).context("failed to serialize live KV plane message")
+}
+
+fn decode_plane_message<T: DeserializeOwned>(payload_bytes: &[u8]) -> Result<T> {
+    if payload_bytes.len() < 4 {
+        anyhow::bail!("live KV plane payload is truncated");
+    }
+    let length = u32::from_le_bytes(payload_bytes[0..4].try_into().unwrap()) as usize;
+    if 4 + length > payload_bytes.len() {
+        anyhow::bail!(
+            "live KV plane payload length {} exceeds frame size {}",
+            length,
+            payload_bytes.len()
+        );
+    }
+    serde_json::from_slice(&payload_bytes[4..4 + length])
+        .context("failed to decode live KV plane message")
+}
+
 fn load_local_listen_addrs() -> Vec<String> {
     let Some(path) = listen_addrs_path().ok() else {
         return Vec::new();
@@ -882,6 +934,370 @@ async fn release_decode_lease_if_needed(
             error = %release_error,
             "Failed to release decode lease"
         );
+    }
+}
+
+async fn publish_pending_kv_transfer_payload(
+    registration_client: &RegistrationClient,
+    coordinator: &mut agent::inference::InferenceCoordinator,
+    transfer: &PendingKvTransferStatus,
+    local_device_id: Uuid,
+) -> Result<()> {
+    let session_id = Uuid::parse_str(&transfer.session_id)
+        .with_context(|| format!("invalid session id {}", transfer.session_id))?;
+    let job_id = Uuid::parse_str(&transfer.job_id)
+        .with_context(|| format!("invalid job id {}", transfer.job_id))?;
+    let payload_bytes = if coordinator.has_session(session_id) {
+        coordinator.export_session_checkpoint_bytes(session_id).await?
+    } else {
+        let manager = coordinator
+            .checkpoint_manager()
+            .context("checkpoint manager missing for KV transfer export")?;
+        manager
+            .export_latest_checkpoint_bytes(job_id)
+            .await?
+            .context("no local transfer payload available for queued KV transfer")?
+    };
+
+    registration_client
+        .upload_inference_session_kv_transfer_payload(
+            job_id,
+            UploadInferenceSessionKvTransferPayloadRequest {
+                device_id: local_device_id.to_string(),
+                session_id: transfer.session_id.clone(),
+                segment_id: transfer.segment_id.clone(),
+                transfer_id: transfer.transfer_id.clone(),
+                payload_hex: hex::encode(&payload_bytes),
+                kv_sequence_position: transfer.kv_sequence_position,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn consume_pending_kv_transfer_payload(
+    registration_client: &RegistrationClient,
+    coordinator: &mut agent::inference::InferenceCoordinator,
+    transfer: &PendingKvTransferStatus,
+    local_device_id: Uuid,
+) -> Result<()> {
+    let job_id = Uuid::parse_str(&transfer.job_id)
+        .with_context(|| format!("invalid job id {}", transfer.job_id))?;
+    let Some((payload_transfer, payload_bytes)) = registration_client
+        .download_inference_session_kv_transfer_payload(
+            job_id,
+            &transfer.transfer_id,
+            local_device_id,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let imported_sequence_position = match payload_transfer.transfer_kind.as_str() {
+        "live_kv_handoff" => {
+            coordinator
+                .hydrate_session_from_transfer_bundle(
+                    &payload_bytes,
+                    local_device_id.to_string(),
+                )
+                .await?;
+            transfer
+                .kv_sequence_position
+                .or(payload_transfer.kv_sequence_position)
+        }
+        _ => {
+            let manager = coordinator
+                .checkpoint_manager()
+                .context("checkpoint manager missing for KV transfer import")?;
+            let metadata = manager.import_checkpoint_bytes(&payload_bytes).await?;
+            transfer
+                .kv_sequence_position
+                .or(payload_transfer.kv_sequence_position)
+                .or(Some(metadata.token_index))
+        }
+    };
+    registration_client
+        .report_inference_session_kv_transfer(
+            job_id,
+            agent::api::types::ReportInferenceSessionKvTransferRequest {
+                device_id: local_device_id.to_string(),
+                session_id: payload_transfer.session_id.clone(),
+                segment_id: payload_transfer.segment_id.clone(),
+                status: "completed".to_string(),
+                kv_sequence_position: imported_sequence_position,
+                bytes_total: Some(payload_bytes.len() as u64),
+                bytes_transferred: Some(payload_bytes.len() as u64),
+                remote_access_uri: None,
+                error: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn maybe_serve_live_kv_transfer_request(
+    coordinator: &mut agent::inference::InferenceCoordinator,
+    transfer: &PendingKvTransferStatus,
+) -> Result<()> {
+    let collective_id = live_kv_collective_id(&transfer.transfer_id)?;
+    let request_frame = match tokio::time::timeout(
+        Duration::from_millis(LIVE_KV_REQUEST_POLL_TIMEOUT_MS),
+        coordinator
+            .tensor_plane_mut()
+            .recv_frame_bytes(agent::ServingReceiveSpec {
+                collective_id,
+                expected_sender_position: 1,
+                lane: agent::CollectiveLane::Checkpoint,
+                layer_idx: 0,
+                step: 0,
+                slot: 0,
+                stream_id: 0,
+            }),
+    )
+    .await
+    {
+        Ok(frame) => frame?,
+        Err(_) => return Ok(()),
+    };
+    let request: LiveKvTransferPlaneRequest = decode_plane_message(request_frame.payload_bytes())?;
+    let target_addr = parse_data_plane_endpoint(&request.target_remote_access_uri)
+        .with_context(|| format!("invalid target dataplane URI {}", request.target_remote_access_uri))?;
+    let session_id = Uuid::parse_str(&transfer.session_id)
+        .with_context(|| format!("invalid session id {}", transfer.session_id))?;
+    let payload = coordinator
+        .export_session_live_transfer_bytes(session_id)
+        .await?;
+    let response = LiveKvTransferPlaneResponse {
+        transfer_id: transfer.transfer_id.clone(),
+        session_id: transfer.session_id.clone(),
+        kv_sequence_position: transfer.kv_sequence_position,
+        bytes_total: payload.len() as u64,
+        payload,
+    };
+    let response_bytes = encode_plane_message(&response)?;
+    let transport = coordinator
+        .tensor_plane_mut()
+        .serving_transport_for_neighbors(
+            target_addr,
+            target_addr,
+            agent::inference::InferenceRuntimeMode::ResilientEdge,
+            agent::ExecutionProviderKind::Cpu,
+        )
+        .await?;
+    transport
+        .send_checkpoint_bytes(collective_id, 0, 1, 0, 0, 0, &response_bytes)
+        .await?;
+    Ok(())
+}
+
+async fn consume_live_kv_transfer_from_source(
+    registration_client: &RegistrationClient,
+    coordinator: &mut agent::inference::InferenceCoordinator,
+    transfer: &PendingKvTransferStatus,
+    local_device_id: Uuid,
+) -> Result<()> {
+    let source_remote_access_uri = transfer
+        .remote_access_uri
+        .clone()
+        .context("live KV handoff is missing source dataplane endpoint")?;
+    let source_addr = parse_data_plane_endpoint(&source_remote_access_uri)
+        .with_context(|| format!("invalid source dataplane URI {}", source_remote_access_uri))?;
+    let target_remote_access_uri =
+        local_dataplane_uri().context("local worker has no advertised dataplane endpoint")?;
+    let collective_id = live_kv_collective_id(&transfer.transfer_id)?;
+    let request = LiveKvTransferPlaneRequest {
+        transfer_id: transfer.transfer_id.clone(),
+        job_id: transfer.job_id.clone(),
+        session_id: transfer.session_id.clone(),
+        segment_id: transfer.segment_id.clone(),
+        target_remote_access_uri,
+    };
+    let request_bytes = encode_plane_message(&request)?;
+    let transport = coordinator
+        .tensor_plane_mut()
+        .serving_transport_for_neighbors(
+            source_addr,
+            source_addr,
+            agent::inference::InferenceRuntimeMode::ResilientEdge,
+            agent::ExecutionProviderKind::Cpu,
+        )
+        .await?;
+    transport
+        .send_checkpoint_bytes(collective_id, 0, 0, 0, 0, 1, &request_bytes)
+        .await?;
+    let response_frame = tokio::time::timeout(
+        Duration::from_secs(LIVE_KV_RESPONSE_TIMEOUT_SECS),
+        coordinator
+            .tensor_plane_mut()
+            .recv_frame_bytes(agent::ServingReceiveSpec {
+                collective_id,
+                expected_sender_position: 0,
+                lane: agent::CollectiveLane::Checkpoint,
+                layer_idx: 0,
+                step: 1,
+                slot: 0,
+                stream_id: 0,
+            }),
+    )
+    .await
+    .context("timed out waiting for remote live KV response")??;
+    let response: LiveKvTransferPlaneResponse = decode_plane_message(response_frame.payload_bytes())?;
+    coordinator
+        .hydrate_session_from_transfer_bundle(&response.payload, local_device_id.to_string())
+        .await?;
+    let job_id = Uuid::parse_str(&transfer.job_id)
+        .with_context(|| format!("invalid job id {}", transfer.job_id))?;
+    registration_client
+        .report_inference_session_kv_transfer(
+            job_id,
+            agent::api::types::ReportInferenceSessionKvTransferRequest {
+                device_id: local_device_id.to_string(),
+                session_id: transfer.session_id.clone(),
+                segment_id: transfer.segment_id.clone(),
+                status: "completed".to_string(),
+                kv_sequence_position: response.kv_sequence_position.or(transfer.kv_sequence_position),
+                bytes_total: Some(response.bytes_total),
+                bytes_transferred: Some(response.bytes_total),
+                remote_access_uri: Some(source_remote_access_uri),
+                error: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn drain_pending_kv_transfers(
+    registration_client: &RegistrationClient,
+    coordinator: &mut agent::inference::InferenceCoordinator,
+    local_device_id: Uuid,
+    network_id: &str,
+) {
+    let observed = match registration_client
+        .observe_pending_kv_transfers(local_device_id, network_id)
+        .await
+    {
+        Ok(Some(response)) => response,
+        Ok(None) => return,
+        Err(error) => {
+            debug!(error = %error, "Pending KV transfer observation failed");
+            return;
+        }
+    };
+
+    for transfer in observed.transfers {
+        if matches!(transfer.status.as_str(), "completed" | "failed" | "stale") {
+            continue;
+        }
+
+        if transfer.source_device_id == local_device_id.to_string()
+            && transfer.transfer_kind == "live_kv_handoff"
+        {
+            if let Err(error) =
+                maybe_serve_live_kv_transfer_request(coordinator, &transfer).await
+            {
+                warn!(
+                    transfer_id = %transfer.transfer_id,
+                    session_id = %transfer.session_id,
+                    error = %error,
+                    "Failed to serve live KV transfer request"
+                );
+            }
+            continue;
+        }
+
+        if transfer.source_device_id == local_device_id.to_string() && !transfer.payload_available {
+            if let Err(error) = publish_pending_kv_transfer_payload(
+                registration_client,
+                coordinator,
+                &transfer,
+                local_device_id,
+            )
+            .await
+            {
+                warn!(
+                    transfer_id = %transfer.transfer_id,
+                    session_id = %transfer.session_id,
+                    error = %error,
+                    "Failed to publish pending KV transfer payload"
+                );
+            }
+            continue;
+        }
+
+        if transfer.target_device_id == local_device_id.to_string()
+            && transfer.transfer_kind == "live_kv_handoff"
+        {
+            if let Err(error) = consume_live_kv_transfer_from_source(
+                registration_client,
+                coordinator,
+                &transfer,
+                local_device_id,
+            )
+            .await
+            {
+                warn!(
+                    transfer_id = %transfer.transfer_id,
+                    session_id = %transfer.session_id,
+                    error = %error,
+                    "Failed to consume live KV transfer from source"
+                );
+                if let Ok(job_id) = Uuid::parse_str(&transfer.job_id) {
+                    let _ = registration_client
+                        .report_inference_session_kv_transfer(
+                            job_id,
+                            agent::api::types::ReportInferenceSessionKvTransferRequest {
+                                device_id: local_device_id.to_string(),
+                                session_id: transfer.session_id.clone(),
+                                segment_id: transfer.segment_id.clone(),
+                                status: "failed".to_string(),
+                                kv_sequence_position: transfer.kv_sequence_position,
+                                bytes_total: transfer.bytes_total,
+                                bytes_transferred: transfer.bytes_transferred,
+                                remote_access_uri: transfer.remote_access_uri.clone(),
+                                error: Some(error.to_string()),
+                            },
+                        )
+                        .await;
+                }
+            }
+            continue;
+        }
+
+        if transfer.target_device_id == local_device_id.to_string() && transfer.payload_available {
+            if let Err(error) = consume_pending_kv_transfer_payload(
+                registration_client,
+                coordinator,
+                &transfer,
+                local_device_id,
+            )
+            .await
+            {
+                warn!(
+                    transfer_id = %transfer.transfer_id,
+                    session_id = %transfer.session_id,
+                    error = %error,
+                    "Failed to consume pending KV transfer payload"
+                );
+                if let Ok(job_id) = Uuid::parse_str(&transfer.job_id) {
+                    let _ = registration_client
+                        .report_inference_session_kv_transfer(
+                            job_id,
+                            agent::api::types::ReportInferenceSessionKvTransferRequest {
+                                device_id: local_device_id.to_string(),
+                                session_id: transfer.session_id.clone(),
+                                segment_id: transfer.segment_id.clone(),
+                                status: "failed".to_string(),
+                                kv_sequence_position: transfer.kv_sequence_position,
+                                bytes_total: transfer.bytes_total,
+                                bytes_transferred: transfer.bytes_transferred,
+                                remote_access_uri: transfer.remote_access_uri.clone(),
+                                error: Some(error.to_string()),
+                            },
+                        )
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -1781,6 +2197,13 @@ async fn cmd_runtime() -> Result<()> {
         let mut idle_claim_polls = 0u32;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)).await;
+            drain_pending_kv_transfers(
+                &registration_client,
+                &mut coordinator,
+                device_id,
+                &network_id,
+            )
+            .await;
             let mut claim_response = None;
             let include_idle_queue_observation =
                 idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;

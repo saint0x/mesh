@@ -99,6 +99,22 @@ pub fn create_router(state: AppState) -> Router {
             post(inference::upload_inference_session_checkpoint),
         )
         .route(
+            "/api/inference/jobs/:job_id/session-kv-transfers",
+            post(inference::report_inference_session_kv_transfer),
+        )
+        .route(
+            "/api/inference/session-kv-transfers/pending",
+            get(inference::observe_pending_kv_transfers),
+        )
+        .route(
+            "/api/inference/jobs/:job_id/session-kv-transfers/payloads",
+            post(inference::upload_inference_session_kv_transfer_payload),
+        )
+        .route(
+            "/api/inference/jobs/:job_id/session-kv-transfers/:transfer_id/payload",
+            get(inference::download_inference_session_kv_transfer_payload),
+        )
+        .route(
             "/api/inference/jobs/:job_id/session-checkpoints/:session_id",
             get(inference::download_inference_session_checkpoint),
         )

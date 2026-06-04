@@ -13,10 +13,12 @@ use crate::api::types::PeerPunchPlan;
 use crate::checkpoint::CheckpointRecoveryPoint;
 use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::WorkerRing;
+use crate::inference::kv_cache::KVCacheSnapshot;
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
 use crate::network::{MeshSwarm, ServingSessionTransport, TensorPlane};
 use libp2p::PeerId;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -43,6 +45,17 @@ use super::job::{
     SegmentExecutionResult,
 };
 use super::stats::InferenceStats;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveKvTransferEnvelope {
+    request: InferenceRequest,
+    current_token_idx: u32,
+    generated_tokens: Vec<u32>,
+    last_checkpoint_idx: u32,
+    current_layer: u32,
+    total_layers: u32,
+    kv_snapshot: Option<KVCacheSnapshot>,
+}
 
 /// Configuration for the inference coordinator
 #[derive(Debug, Clone)]
@@ -1151,6 +1164,32 @@ impl InferenceCoordinator {
             })
     }
 
+    pub async fn export_session_live_transfer_bytes(&mut self, session_id: Uuid) -> Result<Vec<u8>> {
+        let session = self.sessions.get(&session_id).ok_or_else(|| {
+            AgentError::Execution(format!(
+                "Session {} is not active for live KV transfer export",
+                session_id
+            ))
+        })?;
+        let envelope = LiveKvTransferEnvelope {
+            request: session.job.request.clone(),
+            current_token_idx: session.job.current_token_idx,
+            generated_tokens: session.job.generated_tokens.clone(),
+            last_checkpoint_idx: session.job.last_checkpoint_idx,
+            current_layer: session.job.current_layer,
+            total_layers: session.job.total_layers,
+            kv_snapshot: session.backend.export_kv_cache(None)?,
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&envelope, &mut bytes).map_err(|e| {
+            AgentError::Execution(format!(
+                "Failed to serialize live KV transfer envelope for session {}: {}",
+                session_id, e
+            ))
+        })?;
+        Ok(bytes)
+    }
+
     pub fn checkpoint_manager(&self) -> Option<Arc<crate::checkpoint::CheckpointManager>> {
         self.checkpoint_manager.clone()
     }
@@ -1462,6 +1501,49 @@ impl InferenceCoordinator {
         self.restore_session_from_recovery_point(request, &position, recovery_point)
             .await?;
         Ok(())
+    }
+
+    pub async fn hydrate_session_from_transfer_bundle(
+        &mut self,
+        transfer_bundle: &[u8],
+        _owner_worker_id: String,
+    ) -> Result<Uuid> {
+        let envelope: LiveKvTransferEnvelope =
+            ciborium::de::from_reader(transfer_bundle).map_err(|e| {
+                AgentError::Execution(format!(
+                    "Failed to deserialize live KV transfer envelope: {}",
+                    e
+                ))
+            })?;
+        let request = envelope.request.clone();
+        let session_id = request.session_id;
+        let position = self.position.clone().ok_or_else(|| {
+            AgentError::Execution("Worker is not part of a ring topology".to_string())
+        })?;
+        let session = self.ensure_session_backend(&request, &position).await?;
+        session.job = InferenceJob {
+            request: envelope.request,
+            current_token_idx: envelope.current_token_idx,
+            generated_tokens: envelope.generated_tokens,
+            start_time: Instant::now(),
+            first_token_time: None,
+            last_checkpoint_idx: envelope.last_checkpoint_idx,
+            current_layer: envelope.current_layer,
+            total_layers: envelope.total_layers,
+        };
+        if let Some(snapshot) = envelope.kv_snapshot {
+            session.backend.import_kv_cache(&snapshot)?;
+        } else {
+            Self::ensure_checkpoint_resume_safe(&session.job, false)?;
+            session.backend.clear();
+        }
+        if let Some(session) = self.sessions.get_mut(&request.session_id) {
+            session.job.request.executor_id = request.executor_id.clone();
+            session.job.request.created_at = request.created_at;
+            session.job.request.decode_batch_targets = request.decode_batch_targets;
+            session.job.request.runtime_mode = request.runtime_mode;
+        }
+        Ok(session_id)
     }
 
     /// Create a checkpoint of the current inference state
@@ -2053,6 +2135,9 @@ impl InferenceCoordinator {
                     "Recovered decode segment session state from checkpoint"
                 );
             }
+        }
+        if let Some(session) = self.sessions.get_mut(&request.session_id) {
+            session.job.request = request.clone();
         }
 
         let job_snapshot = {

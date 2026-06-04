@@ -2,10 +2,12 @@ use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DownloadInferenceSessionCheckpointResponse, HeartbeatRequest,
     HeartbeatResponse, InferenceExecutionLease, InferenceSessionCheckpointPayload,
-    ObserveDecodeQueueStateResponse, RegisterDeviceRequest, RegisterDeviceResponse,
-    ReleaseDecodeLeaseRequest, ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest,
-    RenewDecodeLeaseResponse, ReportInferenceAssignmentProgressRequest,
-    ReportInferenceAssignmentRequest, UploadInferenceSessionCheckpointRequest, WorkClaimMode,
+    ObserveDecodeQueueStateResponse, ObservePendingKvTransfersResponse, PendingKvTransferStatus,
+    RegisterDeviceRequest, RegisterDeviceResponse, ReleaseDecodeLeaseRequest,
+    ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest, RenewDecodeLeaseResponse,
+    ReportInferenceAssignmentProgressRequest, ReportInferenceAssignmentRequest,
+    ReportInferenceSessionKvTransferRequest, UploadInferenceSessionCheckpointRequest,
+    UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode,
 };
 use crate::connectivity::{
     build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
@@ -513,6 +515,90 @@ impl RegistrationClient {
         Ok(())
     }
 
+    pub async fn report_inference_session_kv_transfer(
+        &self,
+        job_id: Uuid,
+        request: ReportInferenceSessionKvTransferRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-kv-transfers",
+            self.control_plane_url, job_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("KV transfer report failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "KV transfer report failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn observe_pending_kv_transfers(
+        &self,
+        device_id: Uuid,
+        network_id: &str,
+    ) -> Result<Option<ObservePendingKvTransfersResponse>> {
+        let url = format!(
+            "{}/api/inference/session-kv-transfers/pending",
+            self.control_plane_url
+        );
+        self.get_optional_json(
+            &url,
+            &[
+                ("device_id", device_id.to_string()),
+                ("network_id", network_id.to_string()),
+            ],
+            "Pending KV transfer observation failed",
+        )
+        .await
+    }
+
+    pub async fn upload_inference_session_kv_transfer_payload(
+        &self,
+        job_id: Uuid,
+        request: UploadInferenceSessionKvTransferPayloadRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-kv-transfers/payloads",
+            self.control_plane_url, job_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("KV transfer payload upload failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "KV transfer payload upload failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
     pub async fn download_inference_session_checkpoint(
         &self,
         job_id: Uuid,
@@ -558,6 +644,62 @@ impl RegistrationClient {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn download_inference_session_kv_transfer_payload(
+        &self,
+        job_id: Uuid,
+        transfer_id: &str,
+        device_id: Uuid,
+    ) -> Result<Option<(PendingKvTransferStatus, Vec<u8>)>> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-kv-transfers/{}/payload",
+            self.control_plane_url, job_id, transfer_id
+        );
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("device_id", device_id.to_string())])
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("KV transfer payload download failed: {}", e)))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "KV transfer payload download failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        let body: crate::api::types::DownloadInferenceSessionKvTransferPayloadResponse =
+            response.json().await.map_err(|e| {
+                AgentError::Serialization(format!(
+                    "Failed to parse KV transfer payload download: {}",
+                    e
+                ))
+            })?;
+        let Some(transfer) = body.transfer else {
+            return Ok(None);
+        };
+        let Some(payload_hex) = body.payload_hex else {
+            return Ok(None);
+        };
+        let payload = hex::decode(&payload_hex).map_err(|e| {
+            AgentError::Serialization(format!(
+                "Downloaded KV transfer payload had invalid hex: {}",
+                e
+            ))
+        })?;
+        Ok(Some((transfer, payload)))
     }
 }
 

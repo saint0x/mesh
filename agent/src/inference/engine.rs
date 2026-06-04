@@ -31,8 +31,7 @@ pub enum ExecutionPhase {
 #[serde(rename_all = "snake_case")]
 pub enum KvTransferPolicy {
     CoLocated,
-    ExportOnHandoff,
-    RemoteAccess,
+    CheckpointHandoff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

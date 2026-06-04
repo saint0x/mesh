@@ -72,6 +72,17 @@ pub struct DecodeQueueRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvTransferRecord {
+    pub session_id: String,
+    pub segment_id: String,
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub transfer_kind: String,
+    pub status: String,
+    pub kv_sequence_position: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailoverConfig {
     pub prefer_replacement: bool,
 }
@@ -96,6 +107,7 @@ pub enum RecoveryState {
 pub enum ResumeMode {
     None,
     Immediate,
+    RequiresLiveKvTransfer,
     RequiresCheckpointTransfer,
     ManualIntervention,
 }
@@ -165,6 +177,7 @@ impl FailoverEngine {
         session: &InferenceSessionRecord,
         replicas: &[SessionReplicaRecord],
         serving_groups: &[ServingGroupRecord],
+        kv_transfers: &[KvTransferRecord],
         decode_queue: Option<&DecodeQueueRecord>,
         lost_device_ids: &[String],
         config: &FailoverConfig,
@@ -244,12 +257,14 @@ impl FailoverEngine {
                 &lost_active,
             )),
             ExecutionPhase::Decode => Self::decode_failover(
+                plan,
                 active_group,
                 active_segment,
                 refreshed_plan,
                 session,
                 replicas,
                 serving_groups,
+                kv_transfers,
                 decode_queue,
                 &lost_active,
                 &lost_set,
@@ -324,12 +339,14 @@ impl FailoverEngine {
 
     #[allow(clippy::too_many_arguments)]
     fn decode_failover(
+        plan: &InferenceExecutionPlan,
         active_group: &ExecutionGroup,
         active_segment: &crate::api::types::ExecutionSegment,
         refreshed_plan: Option<&InferenceExecutionPlan>,
         session: &InferenceSessionRecord,
         replicas: &[SessionReplicaRecord],
         serving_groups: &[ServingGroupRecord],
+        kv_transfers: &[KvTransferRecord],
         decode_queue: Option<&DecodeQueueRecord>,
         lost_active: &[String],
         lost_set: &HashSet<String>,
@@ -458,19 +475,35 @@ impl FailoverEngine {
             .collect::<Vec<_>>();
         let transfer_source_device_id =
             select_transfer_source_device_id(session, lost_set, &target_participants);
-
-        let requires_transfer = if introduced.is_empty() {
-            false
-        } else if session.kv_transfer_policy == "remote_access"
-            && active_participants.contains(&session.kv_owner_device_id)
-            && !lost_set.contains(&session.kv_owner_device_id)
-        {
-            false
+        let active_participant_set = active_participants.iter().cloned().collect::<BTreeSet<_>>();
+        let live_kv_resume_ready = live_kv_resume_ready(
+            session,
+            active_segment.segment_id.as_str(),
+            &active_participant_set,
+            &target_participants,
+            &introduced,
+            lost_set,
+            kv_transfers,
+        );
+        let transfer_mode = if introduced.is_empty() || live_kv_resume_ready {
+            ResumeMode::Immediate
+        } else if live_kv_transfer_possible(
+            refreshed_plan.unwrap_or(plan),
+            &active_participant_set,
+            &target_participants,
+            session,
+            lost_set,
+        ) {
+            ResumeMode::RequiresLiveKvTransfer
         } else {
-            true
+            ResumeMode::RequiresCheckpointTransfer
         };
+        let requires_transfer = matches!(
+            transfer_mode,
+            ResumeMode::RequiresLiveKvTransfer | ResumeMode::RequiresCheckpointTransfer
+        );
 
-        if requires_transfer
+        if matches!(transfer_mode, ResumeMode::RequiresCheckpointTransfer)
             && (transfer_source_device_id.is_none()
                 || !checkpoint_available(session, replicas, &target_participants))
         {
@@ -512,20 +545,39 @@ impl FailoverEngine {
             requires_transfer,
         );
         let pause_reason = if requires_transfer {
-            Some("Pause decode and wait for checkpoint transfer to regroup members".to_string())
+            Some(
+                if matches!(transfer_mode, ResumeMode::RequiresLiveKvTransfer) {
+                    "Pause decode and wait for live KV handoff to regroup members"
+                } else {
+                    "Pause decode and wait for checkpoint transfer to regroup members"
+                }
+                .to_string(),
+            )
         } else if pause_required {
             Some("Pause decode, regroup survivors, and resume immediately".to_string())
         } else {
             None
         };
         let reason = if requires_transfer {
-            format!(
-                "Decode regroup replaces lost participants ({}) and pauses until checkpoint transfer completes",
-                lost_active.join(", ")
-            )
+            if matches!(transfer_mode, ResumeMode::RequiresLiveKvTransfer) {
+                format!(
+                    "Decode regroup replaces lost participants ({}) and pauses until live KV handoff completes",
+                    lost_active.join(", ")
+                )
+            } else {
+                format!(
+                    "Decode regroup replaces lost participants ({}) and pauses until checkpoint transfer completes",
+                    lost_active.join(", ")
+                )
+            }
         } else if introduced.is_empty() {
             format!(
                 "Decode can shrink to surviving participants after losing {}",
+                lost_active.join(", ")
+            )
+        } else if live_kv_resume_ready {
+            format!(
+                "Decode can replace lost participants ({}) using a completed live KV handoff contract",
                 lost_active.join(", ")
             )
         } else {
@@ -554,11 +606,7 @@ impl FailoverEngine {
                 reason: pause_reason,
             },
             resume: ResumePlan {
-                mode: if requires_transfer {
-                    ResumeMode::RequiresCheckpointTransfer
-                } else {
-                    ResumeMode::Immediate
-                },
+                mode: transfer_mode,
                 session_status: Some("decode_ready".to_string()),
                 decode_queue_status: Some("ready".to_string()),
                 next_kv_owner_device_id: Some(next_kv_owner_device_id),
@@ -642,6 +690,7 @@ struct FailoverSessionContext {
     session: InferenceSessionRecord,
     replicas: Vec<SessionReplicaRecord>,
     serving_groups: Vec<ServingGroupRecord>,
+    kv_transfers: Vec<KvTransferRecord>,
     decode_queue: Option<DecodeQueueRecord>,
 }
 
@@ -668,6 +717,7 @@ pub fn reconcile_failover_state(db: &Database, lost_device_ids: &[String]) -> Ap
             &context.session,
             &context.replicas,
             &context.serving_groups,
+            &context.kv_transfers,
             context.decode_queue.as_ref(),
             lost_device_ids,
             &config,
@@ -873,6 +923,7 @@ fn load_session_context(
                        assigned_capacity_units, execution_provider, status, last_error
                 FROM inference_serving_groups
                 WHERE session_id = ?
+                  AND phase IS NOT NULL
                 "#,
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -930,11 +981,41 @@ fn load_session_context(
         .optional()
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
+    let kv_transfers = {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT session_id, segment_id, source_device_id, target_device_id,
+                       transfer_kind, status, kv_sequence_position
+                FROM inference_session_kv_transfers
+                WHERE session_id = ?
+                "#,
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(KvTransferRecord {
+                session_id: row.get(0)?,
+                segment_id: row.get(1)?,
+                source_device_id: row.get(2)?,
+                target_device_id: row.get(3)?,
+                transfer_kind: row.get(4)?,
+                status: row.get(5)?,
+                kv_sequence_position: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
+            })
+        });
+        let collected = rows
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        collected
+    };
+
     Ok(FailoverSessionContext {
         plan,
         session,
         replicas,
         serving_groups,
+        kv_transfers,
         decode_queue,
     })
 }
@@ -1060,7 +1141,16 @@ fn apply_failover_decision(
         &batch_group_key_for_devices(&decision.target_participant_device_ids),
         target_group_id,
     )?;
-    if matches!(decision.resume.mode, ResumeMode::RequiresCheckpointTransfer) {
+    if matches!(decision.resume.mode, ResumeMode::RequiresLiveKvTransfer) {
+        plan_live_kv_transfer_records(
+            tx,
+            context,
+            decision,
+            target_segment_id,
+            target_group_id,
+            now,
+        )?;
+    } else if matches!(decision.resume.mode, ResumeMode::RequiresCheckpointTransfer) {
         plan_checkpoint_transfer_records(
             tx,
             context,
@@ -1234,6 +1324,21 @@ fn classify_regroup_transport_tier(
     } else {
         crate::api::types::TransportCapabilityTier::RelayFallback
     }
+}
+
+fn dataplane_uri_for_member(plan: &InferenceExecutionPlan, device_id: &str) -> Option<String> {
+    plan.execution_groups
+        .iter()
+        .flat_map(|group| group.members.iter())
+        .chain(plan.support_groups.iter().flat_map(|group| group.members.iter()))
+        .find(|member| member.device_id == device_id)
+        .and_then(|member| {
+            member
+                .listen_addrs
+                .iter()
+                .find(|addr| addr.starts_with("dataplane://"))
+                .cloned()
+        })
 }
 
 fn fail_session_job(
@@ -1434,6 +1539,16 @@ fn insert_failover_ledger_event(
             metadata.to_string(),
             now,
         ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    tx.execute(
+        r#"
+        DELETE FROM inference_session_kv_transfer_payloads
+        WHERE job_id IN (
+            SELECT job_id FROM inference_jobs WHERE status IN ('completed', 'failed', 'cancelled')
+        )
+        "#,
+        [],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(())
@@ -1834,6 +1949,81 @@ fn plan_checkpoint_transfer_records(
     Ok(())
 }
 
+fn plan_live_kv_transfer_records(
+    tx: &Transaction<'_>,
+    context: &FailoverSessionContext,
+    decision: &FailoverDecision,
+    target_segment_id: &str,
+    target_group_id: &str,
+    now: &str,
+) -> ApiResult<()> {
+    let Some(source_device_id) = decision.transfer_source_device_id.as_deref() else {
+        return Err(ApiError::Conflict(
+            "Missing live KV transfer source for regroup".to_string(),
+        ));
+    };
+    let source_remote_access_uri = dataplane_uri_for_member(&context.plan, source_device_id)
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "Live KV handoff source {} has no dataplane endpoint",
+                source_device_id
+            ))
+        })?;
+    let batch_group_key = batch_group_key_for_devices(&decision.target_participant_device_ids);
+
+    for target_device_id in &decision.target_participant_device_ids {
+        if target_device_id == source_device_id {
+            continue;
+        }
+
+        tx.execute(
+            r#"
+            INSERT INTO inference_session_kv_transfers (
+                transfer_id, session_id, job_id, network_id, model_id, segment_id, group_id,
+                batch_group_key, source_device_id, target_device_id, transfer_kind, status,
+                checkpoint_id, remote_access_uri, kv_sequence_position, bytes_total, bytes_transferred,
+                started_at, completed_at, updated_at, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live_kv_handoff', 'queued',
+                      NULL, ?, ?, NULL, NULL, ?, NULL, ?, NULL)
+            ON CONFLICT(session_id, segment_id, target_device_id) DO UPDATE SET
+                group_id = excluded.group_id,
+                batch_group_key = excluded.batch_group_key,
+                source_device_id = excluded.source_device_id,
+                transfer_kind = excluded.transfer_kind,
+                status = 'queued',
+                checkpoint_id = NULL,
+                remote_access_uri = excluded.remote_access_uri,
+                kv_sequence_position = excluded.kv_sequence_position,
+                bytes_total = NULL,
+                bytes_transferred = NULL,
+                started_at = excluded.started_at,
+                completed_at = NULL,
+                updated_at = excluded.updated_at,
+                last_error = NULL
+            "#,
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                &context.session.session_id,
+                &context.session.job_id,
+                &context.session.network_id,
+                &context.session.model_id,
+                target_segment_id,
+                target_group_id,
+                &batch_group_key,
+                source_device_id,
+                target_device_id,
+                &source_remote_access_uri,
+                context.session.kv_sequence_position.map(i64::from),
+                now,
+                now
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    }
+
+    Ok(())
+}
+
 fn batch_group_key_for_devices(device_ids: &[String]) -> String {
     let mut sorted = device_ids.to_vec();
     sorted.sort();
@@ -1848,6 +2038,9 @@ fn record_regroup_scheduler_events(
 ) -> ApiResult<()> {
     let batch_group_key = batch_group_key_for_devices(&decision.target_participant_device_ids);
     let event_kind = match (&decision.strategy, &decision.resume.mode) {
+        (RegroupStrategy::Replace { .. }, ResumeMode::RequiresLiveKvTransfer) => {
+            "decode_regroup_live_kv"
+        }
         (RegroupStrategy::Replace { .. }, ResumeMode::RequiresCheckpointTransfer) => {
             "decode_regroup_transfer"
         }
@@ -2204,6 +2397,87 @@ fn checkpoint_available(
     session.latest_checkpoint_device_id.is_some() && session.latest_checkpoint_created_at.is_some()
 }
 
+fn live_kv_resume_ready(
+    session: &InferenceSessionRecord,
+    active_segment_id: &str,
+    active_participants: &BTreeSet<String>,
+    target_participants: &[String],
+    introduced: &[String],
+    lost_set: &HashSet<String>,
+    kv_transfers: &[KvTransferRecord],
+) -> bool {
+    if introduced.is_empty() {
+        return false;
+    }
+    if !active_participants.contains(&session.kv_owner_device_id)
+        || !target_participants.contains(&session.kv_owner_device_id)
+        || lost_set.contains(&session.kv_owner_device_id)
+    {
+        return false;
+    }
+
+    let minimum_sequence = session.kv_sequence_position.unwrap_or(0);
+    introduced.iter().all(|device_id| {
+        kv_transfers.iter().any(|transfer| {
+            transfer.segment_id == active_segment_id
+                && transfer.source_device_id == session.kv_owner_device_id
+                && transfer.target_device_id == *device_id
+                && transfer.transfer_kind == "live_kv_handoff"
+                && transfer.status == "completed"
+                && transfer.kv_sequence_position.unwrap_or(0) >= minimum_sequence
+        })
+    })
+}
+
+fn live_kv_transfer_possible(
+    plan: &InferenceExecutionPlan,
+    active_participants: &BTreeSet<String>,
+    target_participants: &[String],
+    session: &InferenceSessionRecord,
+    lost_set: &HashSet<String>,
+) -> bool {
+    if !active_participants.contains(&session.kv_owner_device_id)
+        || !target_participants.contains(&session.kv_owner_device_id)
+        || lost_set.contains(&session.kv_owner_device_id)
+    {
+        return false;
+    }
+
+    let kv_group = plan
+        .support_groups
+        .iter()
+        .find(|group| matches!(group.role, crate::api::types::SupportGroupRole::Kv));
+    let recovery_group = plan
+        .support_groups
+        .iter()
+        .find(|group| matches!(group.role, crate::api::types::SupportGroupRole::Recovery));
+    let Some(kv_group) = kv_group else {
+        return false;
+    };
+    let Some(recovery_group) = recovery_group else {
+        return false;
+    };
+    let kv_members = kv_group
+        .members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .collect::<HashSet<_>>();
+    let recovery_members = recovery_group
+        .members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .collect::<HashSet<_>>();
+
+    kv_members.contains(session.kv_owner_device_id.as_str())
+        && dataplane_uri_for_member(plan, session.kv_owner_device_id.as_str()).is_some()
+        && target_participants
+            .iter()
+            .all(|device_id| {
+                recovery_members.contains(device_id.as_str())
+                    && dataplane_uri_for_member(plan, device_id.as_str()).is_some()
+            })
+}
+
 fn select_transfer_source_device_id(
     session: &InferenceSessionRecord,
     lost_set: &HashSet<String>,
@@ -2490,7 +2764,7 @@ mod tests {
     use crate::api::types::{
         ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment,
         InferenceExecutionPlan, InferenceRuntimeMode, KvTransferPolicy, PeerPunchPlan, ShardInfo,
-        TransportCapabilityTier,
+        SupportGroup, SupportGroupRole, TransportCapabilityTier,
     };
     use crate::connectivity::{
         ConnectivityAttachment, ConnectivityAttachmentKind, ConnectivityPath,
@@ -2509,7 +2783,7 @@ mod tests {
     #[test]
     fn leaves_session_healthy_when_losses_do_not_hit_active_participants() {
         let (plan, session, replicas, groups, queue) = decode_fixture(
-            KvTransferPolicy::ExportOnHandoff,
+            KvTransferPolicy::CheckpointHandoff,
             vec![
                 member("worker-1", 0, 49),
                 member("worker-2", 50, 99),
@@ -2526,6 +2800,7 @@ mod tests {
             &session,
             &replicas,
             &groups,
+            &[],
             Some(&queue),
             &["worker-3".to_string()],
             &FailoverConfig::default(),
@@ -2546,6 +2821,7 @@ mod tests {
             &session,
             &replicas,
             &groups,
+            &[],
             None,
             &["worker-2".to_string()],
             &FailoverConfig::default(),
@@ -2560,7 +2836,7 @@ mod tests {
     #[test]
     fn pauses_decode_and_requests_checkpoint_transfer_when_replacement_is_needed() {
         let (plan, session, replicas, groups, queue) = decode_fixture(
-            KvTransferPolicy::ExportOnHandoff,
+            KvTransferPolicy::CheckpointHandoff,
             vec![
                 member("worker-1", 0, 49),
                 member("worker-2", 50, 99),
@@ -2577,6 +2853,7 @@ mod tests {
             &session,
             &replicas,
             &groups,
+            &[],
             Some(&queue),
             &["worker-2".to_string()],
             &FailoverConfig::default(),
@@ -2607,6 +2884,98 @@ mod tests {
     }
 
     #[test]
+    fn pauses_decode_and_requests_live_kv_handoff_when_recovery_contract_exists() {
+        let (mut plan, session, replicas, groups, queue) = decode_fixture(
+            KvTransferPolicy::CheckpointHandoff,
+            vec![
+                member("worker-1", 0, 49),
+                member("worker-2", 50, 99),
+                member("worker-3", 50, 99),
+            ],
+            vec!["worker-1".into(), "worker-2".into()],
+            "worker-1",
+            None,
+        );
+        plan.support_groups = vec![
+            support_group(SupportGroupRole::Kv, vec![member("worker-1", 0, 49)]),
+            support_group(
+                SupportGroupRole::Recovery,
+                vec![member("worker-1", 0, 49), member("worker-3", 50, 99)],
+            ),
+        ];
+
+        let decision = FailoverEngine::evaluate(
+            &plan,
+            None,
+            &session,
+            &replicas,
+            &groups,
+            &[],
+            Some(&queue),
+            &["worker-2".to_string()],
+            &FailoverConfig::default(),
+        )
+        .expect("decode live kv replacement decision");
+
+        assert_eq!(decision.recovery_state, RecoveryState::Paused);
+        assert_eq!(decision.resume.mode, ResumeMode::RequiresLiveKvTransfer);
+        assert!(decision.reason.contains("live KV handoff"));
+        assert!(decision
+            .replica_updates
+            .iter()
+            .any(|update| update.device_id == "worker-3"
+                && update.status == "decode_pending_transfer"));
+    }
+
+    #[test]
+    fn replaces_decode_without_checkpoint_pause_when_completed_live_kv_handoff_exists() {
+        let (mut plan, session, replicas, groups, queue) = decode_fixture(
+            KvTransferPolicy::CheckpointHandoff,
+            vec![
+                member("worker-1", 0, 49),
+                member("worker-2", 50, 99),
+                member("worker-3", 50, 99),
+            ],
+            vec!["worker-1".into(), "worker-2".into()],
+            "worker-1",
+            None,
+        );
+        plan.support_groups = vec![
+            support_group(SupportGroupRole::Kv, vec![member("worker-1", 0, 49)]),
+            support_group(
+                SupportGroupRole::Recovery,
+                vec![member("worker-1", 0, 49), member("worker-3", 50, 99)],
+            ),
+        ];
+        let kv_transfers = vec![KvTransferRecord {
+            session_id: "session-a".into(),
+            segment_id: "segment-decode".into(),
+            source_device_id: "worker-1".into(),
+            target_device_id: "worker-3".into(),
+            transfer_kind: "live_kv_handoff".into(),
+            status: "completed".into(),
+            kv_sequence_position: Some(32),
+        }];
+
+        let decision = FailoverEngine::evaluate(
+            &plan,
+            None,
+            &session,
+            &replicas,
+            &groups,
+            &kv_transfers,
+            Some(&queue),
+            &["worker-2".to_string()],
+            &FailoverConfig::default(),
+        )
+        .expect("decode live kv ready decision");
+
+        assert_eq!(decision.recovery_state, RecoveryState::ResumeReady);
+        assert_eq!(decision.resume.mode, ResumeMode::Immediate);
+        assert!(decision.reason.contains("completed live KV handoff"));
+    }
+
+    #[test]
     fn shrinks_decode_when_survivors_still_cover_the_span() {
         let (plan, session, replicas, groups, queue) = decode_fixture(
             KvTransferPolicy::CoLocated,
@@ -2626,6 +2995,7 @@ mod tests {
             &session,
             &replicas,
             &groups,
+            &[],
             Some(&queue),
             &["worker-2".to_string()],
             &FailoverConfig::default(),
@@ -2650,7 +3020,7 @@ mod tests {
     #[test]
     fn fails_decode_when_replacement_needs_a_checkpoint_but_none_exists() {
         let (plan, session, replicas, groups, queue) = decode_fixture(
-            KvTransferPolicy::ExportOnHandoff,
+            KvTransferPolicy::CheckpointHandoff,
             vec![
                 member("worker-1", 0, 49),
                 member("worker-2", 50, 99),
@@ -2667,6 +3037,7 @@ mod tests {
             &session,
             &replicas,
             &groups,
+            &[],
             Some(&queue),
             &["worker-2".to_string()],
             &FailoverConfig::default(),
@@ -2873,7 +3244,7 @@ mod tests {
         let db = create_test_db();
         register_fixture_devices(&db, &["worker-1", "worker-2", "worker-3"]);
         let (plan, session, replicas, groups, queue) = decode_fixture(
-            KvTransferPolicy::ExportOnHandoff,
+            KvTransferPolicy::CheckpointHandoff,
             vec![
                 member("worker-1", 0, 49),
                 member("worker-2", 50, 99),
@@ -2926,11 +3297,71 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_failover_state_queues_live_kv_handoff_when_support_groups_cover_recovery() {
+        let db = create_test_db();
+        register_fixture_devices(&db, &["worker-1", "worker-2", "worker-3"]);
+        let (mut plan, session, replicas, groups, queue) = decode_fixture(
+            KvTransferPolicy::CheckpointHandoff,
+            vec![
+                member("worker-1", 0, 49),
+                member("worker-2", 50, 99),
+                member("worker-3", 50, 99),
+            ],
+            vec!["worker-1".into(), "worker-2".into()],
+            "worker-1",
+            None,
+        );
+        plan.support_groups = vec![
+            support_group(SupportGroupRole::Kv, vec![member("worker-1", 0, 49)]),
+            support_group(
+                SupportGroupRole::Recovery,
+                vec![member("worker-1", 0, 49), member("worker-3", 50, 99)],
+            ),
+        ];
+        persist_session_fixture(
+            &db,
+            &plan,
+            &session,
+            &replicas,
+            &groups,
+            Some(&queue),
+            "running",
+        );
+        mark_device_status(&db, "worker-2", "offline");
+
+        let reconciled = reconcile_failover_state(&db, &["worker-2".to_string()]).unwrap();
+        assert_eq!(reconciled, 1);
+
+        let conn = db.get_conn().unwrap();
+        let transfer_rows = conn
+            .prepare(
+                "SELECT transfer_kind, status, source_device_id, target_device_id FROM inference_session_kv_transfers WHERE session_id = 'session-a'",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(transfer_rows.len(), 1);
+        assert_eq!(transfer_rows[0].0, "live_kv_handoff");
+        assert_eq!(transfer_rows[0].1, "queued");
+        assert_eq!(transfer_rows[0].2, "worker-1");
+        assert_eq!(transfer_rows[0].3, "worker-3");
+    }
+
+    #[test]
     fn reconcile_failover_state_fails_when_latest_checkpoint_source_is_offline() {
         let db = create_test_db();
         register_fixture_devices(&db, &["worker-1", "worker-2", "worker-3"]);
         let (plan, session, replicas, groups, queue) = decode_fixture(
-            KvTransferPolicy::ExportOnHandoff,
+            KvTransferPolicy::CheckpointHandoff,
             vec![
                 member("worker-1", 0, 49),
                 member("worker-2", 50, 99),
@@ -3167,6 +3598,7 @@ mod tests {
             plan_id: "plan-a".into(),
             runtime_mode: InferenceRuntimeMode::ThroughputFirst,
             execution_groups: vec![prefill_group],
+            support_groups: Vec::new(),
             segments: vec![prefill_segment.clone()],
             initial_segment_id: prefill_segment.segment_id.clone(),
         };
@@ -3275,6 +3707,7 @@ mod tests {
             plan_id: "plan-a".into(),
             runtime_mode: InferenceRuntimeMode::ResilientEdge,
             execution_groups: vec![decode_group],
+            support_groups: Vec::new(),
             segments: vec![decode_segment.clone()],
             initial_segment_id: decode_segment.segment_id.clone(),
         };
@@ -3289,8 +3722,7 @@ mod tests {
             kv_owner_device_id: kv_owner_device_id.into(),
             kv_transfer_policy: match kv_transfer_policy {
                 KvTransferPolicy::CoLocated => "co_located",
-                KvTransferPolicy::ExportOnHandoff => "export_on_handoff",
-                KvTransferPolicy::RemoteAccess => "remote_access",
+                KvTransferPolicy::CheckpointHandoff => "checkpoint_handoff",
             }
             .into(),
             kv_sequence_position: Some(32),
@@ -3370,7 +3802,7 @@ mod tests {
             left_neighbor: String::new(),
             right_neighbor: String::new(),
             connectivity_state: None,
-            listen_addrs: Vec::new(),
+            listen_addrs: vec![format!("dataplane://127.0.0.1:{}", 9000 + start)],
             direct_candidates: Vec::new(),
             assigned_capacity_units: 1,
             backend_contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
@@ -3379,6 +3811,28 @@ mod tests {
             observed_deferred_ratio: None,
             observed_fill_ratio: None,
             instability_score: None,
+        }
+    }
+
+    fn support_group(role: SupportGroupRole, members: Vec<ExecutionGroupMember>) -> SupportGroup {
+        SupportGroup {
+            group_id: format!("support-{:?}", role).to_lowercase(),
+            role,
+            execution_island_id: "support-island".into(),
+            model_id: "model-a".into(),
+            compatibility_class: ProviderCompatibilityClass::CpuPortable,
+            backend_contract_hash: Some(
+                BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu).contract_hash,
+            ),
+            fast_path_eligible: false,
+            protocol_class: crate::api::types::RingProtocolClass::UniformModelRing,
+            transport_tier: TransportCapabilityTier::DirectPreferred,
+            total_capacity_units: members
+                .iter()
+                .map(|member| member.assigned_capacity_units)
+                .sum(),
+            members,
+            peer_punch_plans: Vec::new(),
         }
     }
 
