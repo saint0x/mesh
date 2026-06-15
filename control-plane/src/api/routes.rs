@@ -6,7 +6,7 @@ use axum::{
 };
 use tracing::instrument;
 
-use crate::api::error::{execute_with_db_lock_retry, ApiError, ApiResult};
+use crate::api::error::{execute_with_db_lock_retry, log_locked_route_error, ApiError, ApiResult};
 use crate::api::types::{
     CreateNetworkRequest, CreateNetworkResponse, HeartbeatRequest, HeartbeatResponse,
     ListNetworksResponse, RegisterDeviceRequest, RegisterDeviceResponse,
@@ -45,7 +45,11 @@ pub async fn register_device(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &result {
+        log_locked_route_error("register_device", err);
+    }
+    let result = result?;
 
     Ok(Json(RegisterDeviceResponse {
         success: true,
@@ -62,7 +66,7 @@ pub async fn create_network(
     Json(req): Json<CreateNetworkRequest>,
 ) -> ApiResult<Json<CreateNetworkResponse>> {
     let db = state.db.clone();
-    let network = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         execute_with_db_lock_retry(|| {
             network_service::create_network(
                 &db,
@@ -75,7 +79,11 @@ pub async fn create_network(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &result {
+        log_locked_route_error("create_network", err);
+    }
+    let network = result?;
 
     Ok(Json(CreateNetworkResponse {
         success: true,
@@ -86,11 +94,19 @@ pub async fn create_network(
 #[instrument(skip(state))]
 pub async fn list_networks(State(state): State<AppState>) -> ApiResult<Json<ListNetworksResponse>> {
     let db = state.db.clone();
-    let networks = tokio::task::spawn_blocking(move || {
+    let db_gate = state.inference_write_gate.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _db_guard = db_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| network_service::list_networks(&db))
     })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &result {
+        log_locked_route_error("list_networks", err);
+    }
+    let networks = result?;
 
     Ok(Json(ListNetworksResponse {
         success: true,
@@ -107,8 +123,7 @@ pub async fn heartbeat(
 ) -> ApiResult<Json<HeartbeatResponse>> {
     // Execute blocking database operation in thread pool
     let db = state.db.clone();
-
-    let last_seen = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         execute_with_db_lock_retry(|| {
             device_service::update_heartbeat(
                 &db,
@@ -120,7 +135,12 @@ pub async fn heartbeat(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+
+    if let Err(err) = &result {
+        log_locked_route_error("heartbeat", err);
+    }
+    let last_seen = result?;
 
     Ok(Json(HeartbeatResponse {
         success: true,

@@ -6,7 +6,9 @@ use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use tracing::instrument;
 
-use crate::api::error::{execute_with_db_lock_retry, ApiError, ApiResult};
+use crate::api::error::{
+    execute_with_db_lock_retry, log_locked_route_error, ApiError, ApiResult,
+};
 use crate::api::types::{
     CreateHandoffRequest, CreateHandoffResponse, HandoffInfo, ListHandoffsResponse, PeerPunchPlan,
     PunchPathReason, PunchPathStrategy, RegisterCallbackRequest, RegisterCallbackResponse,
@@ -50,9 +52,13 @@ pub async fn join_ring(
         return Err(ApiError::BadRequest("model_id cannot be empty".to_string()));
     }
 
-    execute_with_db_lock_retry(|| {
+    let route_result = execute_with_db_lock_retry(|| {
         network_service::require_network_exists(&state.db, &req.network_id)
-    })?;
+    });
+    if let Err(err) = &route_result {
+        log_locked_route_error("join_ring", err);
+    }
+    route_result?;
 
     // Get or create ring manager for this network
     let ring_manager = state.get_ring_manager(&req.network_id)?;
@@ -68,11 +74,15 @@ pub async fn join_ring(
     };
 
     // Execute blocking database operation in thread pool
-    let position = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         execute_with_db_lock_retry(|| ring_manager.add_worker(worker.clone()))
     })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &result {
+        log_locked_route_error("join_ring", err);
+    }
+    let position = result?;
 
     // Send topology notification for worker join
     let notifier = state.topology_notifier.clone();
@@ -124,8 +134,12 @@ pub async fn get_topology(
     // Check if network exists
     let db = state.db.clone();
     let network_id = query.network_id.clone();
+    let db_gate = state.inference_write_gate.clone();
 
-    let network_exists = tokio::task::spawn_blocking(move || {
+    let network_exists_result = tokio::task::spawn_blocking(move || {
+        let _db_guard = db_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| {
             let conn = db.get_conn()?;
             let exists: Option<String> = conn
@@ -140,7 +154,11 @@ pub async fn get_topology(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &network_exists_result {
+        log_locked_route_error("get_topology", err);
+    }
+    let network_exists = network_exists_result?;
 
     if !network_exists {
         return Err(ApiError::NotFound(format!(
@@ -152,13 +170,21 @@ pub async fn get_topology(
     // Get ring manager for this network
     let ring_manager = state.get_ring_manager(&query.network_id)?;
     let network_id = query.network_id.clone();
+    let db_gate = state.inference_write_gate.clone();
 
     // Execute blocking database operation in thread pool
-    let topology = tokio::task::spawn_blocking(move || {
+    let topology_result = tokio::task::spawn_blocking(move || {
+        let _db_guard = db_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| ring_manager.get_topology(&network_id))
     })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &topology_result {
+        log_locked_route_error("get_topology", err);
+    }
+    let topology = topology_result?;
 
     // Convert to API response types
     let workers: Vec<WorkerInfo> = topology
@@ -241,7 +267,7 @@ pub async fn leave_ring(
     let db = state.db.clone();
     let device_id_clone = device_id.clone();
 
-    let network_id: Option<String> = tokio::task::spawn_blocking(move || {
+    let network_id_result = tokio::task::spawn_blocking(move || {
         execute_with_db_lock_retry(|| {
             let conn = db.get_conn()?;
             let network: Option<String> = conn
@@ -256,7 +282,11 @@ pub async fn leave_ring(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &network_id_result {
+        log_locked_route_error("leave_ring", err);
+    }
+    let network_id: Option<String> = network_id_result?;
 
     let network_id =
         network_id.ok_or_else(|| ApiError::NotFound(format!("Device {} not found", device_id)))?;
@@ -266,11 +296,15 @@ pub async fn leave_ring(
 
     // Execute blocking database operation in thread pool
     let device_id_clone = device_id.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         execute_with_db_lock_retry(|| ring_manager.handle_worker_failure(device_id_clone.clone()))
     })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    if let Err(err) = &result {
+        log_locked_route_error("leave_ring", err);
+    }
+    result?;
 
     // Send topology notification for worker leave
     let notifier = state.topology_notifier.clone();

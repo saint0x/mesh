@@ -7,6 +7,7 @@ use serde_json::json;
 use thiserror::Error;
 use std::thread;
 use std::time::Duration;
+use tracing::Span;
 
 pub(crate) const DB_LOCKED_HEADER: HeaderName = HeaderName::from_static("x-meshnet-db-locked");
 const DB_LOCK_RETRY_MAX_WAIT_MS: u64 = 10_000;
@@ -111,6 +112,12 @@ pub(crate) fn execute_with_db_lock_retry<T>(
     }
 }
 
+pub(crate) fn log_locked_route_error(route: &'static str, error: &ApiError) {
+    if is_locked_api_error(error) {
+        tracing::error!(route, "SQLite lock surfaced through API route");
+    }
+}
+
 /// Convert ApiError into HTTP response
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -119,6 +126,11 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg, false),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg, false),
             ApiError::Database(e) => {
+                let handler = Span::current()
+                    .metadata()
+                    .map(|metadata| metadata.name())
+                    .unwrap_or("unknown");
+                tracing::error!("Database error handler={}", handler);
                 tracing::error!(error = %e, "Database error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
