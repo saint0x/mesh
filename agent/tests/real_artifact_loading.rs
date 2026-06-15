@@ -6,6 +6,8 @@ use agent::model_assets::{load_model_manifest, model_store_dir};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_MODEL_ID: &str = "smollm2-135m-instruct";
+
 fn enabled() -> bool {
     std::env::var("MESHNET_ENABLE_REAL_ARTIFACT_TEST")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -18,6 +20,11 @@ fn discover_model_dir(root: &Path) -> Option<PathBuf> {
         if candidate.is_dir() {
             return Some(candidate);
         }
+    }
+
+    let preferred = root.join(DEFAULT_MODEL_ID);
+    if preferred.is_dir() {
+        return Some(preferred);
     }
 
     let entries = fs::read_dir(root).ok()?;

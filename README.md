@@ -216,6 +216,7 @@ MESHNET_REAL_ARTIFACT_MODEL_ID=smollm2-135m-instruct bash scripts/test_real_arti
 ```
 
 The default fetch target is `HuggingFaceTB/SmolLM2-135M-Instruct`, which converts into two Mesh shards of roughly 419 MB each on this machine.
+The default `bash scripts/test_real_artifact_loading.sh` smoke path also prefers `smollm2-135m-instruct` when it is installed, and only falls back to generic artifact discovery if that lower-memory model is absent.
 
 ## Core Components
 
