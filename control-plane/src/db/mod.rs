@@ -95,15 +95,16 @@ impl Database {
             Ok(())
         });
 
-        // SQLite still has a single-writer model, but the control plane issues
-        // nested service calls that legitimately need more than one pooled
-        // connection. Keep a moderate default and allow explicit overrides for
-        // bring-up, benchmarking, or tighter serialization experiments.
+        // Production correctness wins here: SQLite still has a single-writer
+        // model, and the control plane's inference lifecycle issues tightly
+        // coupled read/write bursts against the same tables. Default to a
+        // single shared connection to eliminate inter-connection lock races,
+        // while still allowing explicit overrides for controlled experiments.
         let max_pool_size = std::env::var("MESHNET_SQLITE_POOL_MAX_SIZE")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(10);
+            .unwrap_or(if is_memory { 10 } else { 1 });
         let pool = Pool::builder().max_size(max_pool_size).build(manager)?;
 
         tracing::info!("Database connected successfully");

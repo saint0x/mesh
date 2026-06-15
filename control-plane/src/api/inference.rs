@@ -6,7 +6,7 @@ use rusqlite::{params, ErrorCode, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::thread;
 use time::{Duration, OffsetDateTime};
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 use uuid::Uuid;
 
 use crate::api::error::{ApiError, ApiResult};
@@ -3306,11 +3306,25 @@ pub async fn report_inference_progress(
     let app_state = state.clone();
     let inference_write_gate = state.inference_write_gate.clone();
     let request = req.clone();
+    let job_id_for_log = job_id.clone();
     tokio::task::spawn_blocking(move || {
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| report_assignment_progress(&app_state, &job_id, &request))
+        let result = execute_with_db_lock_retry(|| {
+            report_assignment_progress(&app_state, &job_id, &request)
+        });
+        if let Err(err) = &result {
+            if is_locked_api_error(err) {
+                error!(
+                    job_id = %job_id_for_log,
+                    device_id = %request.device_id,
+                    segment_id = %request.segment_id,
+                    "SQLite lock surfaced through report_inference_progress route"
+                );
+            }
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3612,9 +3626,8 @@ fn validate_submit_request(req: &SubmitInferenceRequest) -> ApiResult<()> {
 
 fn cancel_job(db: &crate::db::Database, job_id: &str) -> ApiResult<CancelledJobResult> {
     let mut conn = db.get_conn()?;
+    let job_context = load_job_context(&conn, job_id)?;
     let tx = begin_immediate_transaction(&mut conn)?;
-
-    let job_context = load_job_context(&tx, job_id)?;
     let current_state = load_job_settlement_state(&tx, job_id)?;
     let current_status: String = tx
         .query_row(
@@ -4086,20 +4099,25 @@ fn claim_assignment(
     db: &crate::db::Database,
     req: &ClaimInferenceAssignmentRequest,
 ) -> ApiResult<Option<PersistedAssignment>> {
-    let scheduling_policy =
-        network_service::load_network_settings(db, &req.network_id)?.scheduling_policy;
-    let mut conn = db.get_conn()?;
-    let tx = begin_immediate_transaction(&mut conn)?;
+    let mut step = "load_scheduling_policy";
+    let result = (|| -> ApiResult<Option<PersistedAssignment>> {
+        let scheduling_policy =
+            network_service::load_network_settings(db, &req.network_id)?.scheduling_policy;
+        step = "open_transaction";
+        let mut conn = db.get_conn()?;
+        let tx = begin_immediate_transaction(&mut conn)?;
 
-    let now = OffsetDateTime::now_utc();
-    let now_str = format_time(now)?;
-    let lease_expires = format_time(now + Duration::seconds(ASSIGNMENT_LEASE_SECS))?;
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_time(now)?;
+        let lease_expires = format_time(now + Duration::seconds(ASSIGNMENT_LEASE_SECS))?;
 
-    let selected_assignment_id = select_claim_assignment_id(&tx, req, &scheduling_policy)?;
+        step = "select_assignment";
+        let selected_assignment_id = select_claim_assignment_id(&tx, req, &scheduling_policy)?;
 
-    let mut row = if let Some(selected_assignment_id) = selected_assignment_id {
-        tx.query_row(
-            r#"
+        step = "load_assignment_row";
+        let mut row = if let Some(selected_assignment_id) = selected_assignment_id {
+            tx.query_row(
+                r#"
             SELECT
                 a.assignment_id, a.job_id, a.network_id, a.device_id, a.ring_position,
                 j.model_id, j.prompt_tokens, j.max_tokens, j.temperature, j.top_p,
@@ -4120,84 +4138,93 @@ fn claim_assignment(
                 ON r.session_id = s.session_id AND r.device_id = a.device_id
             WHERE a.assignment_id = ?
             "#,
-            params![selected_assignment_id],
-            |row| {
-                Ok(PersistedLeaseRecord {
-                    lease_id: row.get(0)?,
-                    job_id: row.get(1)?,
-                    network_id: row.get(2)?,
-                    device_id: row.get(3)?,
-                    model_id: row.get(5)?,
-                    reserved_credits: row.get(10)?,
-                    available_completion_tokens: row.get::<_, i64>(11)? as u32,
-                    model_size_factor: row.get(12)?,
-                    lease_expires_at: lease_expires.clone(),
-                    execution_plan_json: row.get(13)?,
-                    active_segment_id: row.get(14)?,
-                    session_id: row.get(15)?,
-                    session_status: row.get(16)?,
-                    session_active_segment_id: row.get(17)?,
-                    kv_owner_device_id: row.get(18)?,
-                    kv_transfer_policy: row.get(19)?,
-                    kv_sequence_position: row.get::<_, Option<i64>>(20)?.map(|v| v as u32),
-                    latest_batch_size: row.get::<_, Option<i64>>(21)?.map(|v| v as u32),
-                    latest_active_decode_sessions: row.get::<_, Option<i64>>(22)?.map(|v| v as u32),
-                    latest_batch_kv_tokens: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
-                    latest_deferred_decode_sessions: row
-                        .get::<_, Option<i64>>(24)?
-                        .map(|v| v as u32),
-                    lease_target_session_count: row.get::<_, Option<i64>>(25)?.map(|v| v as u32),
-                    lease_target_batch_size: row.get::<_, Option<i64>>(26)?.map(|v| v as u32),
-                    pooled_batch_group_key: None,
-                    pooled_total_sessions: None,
-                    pooled_ready_sessions: None,
-                    pooled_blocked_sessions: None,
-                    pooled_leased_sessions: None,
-                    pooled_active_sessions: None,
-                    kv_checkpoint_device_id: None,
-                    kv_checkpoint_created_at: None,
-                    session_updated_at: row.get(27)?,
-                    replica_status: row.get(28)?,
-                    replica_active_segment_id: row.get(29)?,
-                    replica_kv_sequence_position: row.get::<_, Option<i64>>(30)?.map(|v| v as u32),
-                    replica_checkpoint_created_at: None,
-                    replica_updated_at: row.get(31)?,
-                    replica_last_error: row.get(32)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
-    } else {
-        None
-    };
+                params![selected_assignment_id],
+                |row| {
+                    Ok(PersistedLeaseRecord {
+                        lease_id: row.get(0)?,
+                        job_id: row.get(1)?,
+                        network_id: row.get(2)?,
+                        device_id: row.get(3)?,
+                        model_id: row.get(5)?,
+                        reserved_credits: row.get(10)?,
+                        available_completion_tokens: row.get::<_, i64>(11)? as u32,
+                        model_size_factor: row.get(12)?,
+                        lease_expires_at: lease_expires.clone(),
+                        execution_plan_json: row.get(13)?,
+                        active_segment_id: row.get(14)?,
+                        session_id: row.get(15)?,
+                        session_status: row.get(16)?,
+                        session_active_segment_id: row.get(17)?,
+                        kv_owner_device_id: row.get(18)?,
+                        kv_transfer_policy: row.get(19)?,
+                        kv_sequence_position: row.get::<_, Option<i64>>(20)?.map(|v| v as u32),
+                        latest_batch_size: row.get::<_, Option<i64>>(21)?.map(|v| v as u32),
+                        latest_active_decode_sessions: row
+                            .get::<_, Option<i64>>(22)?
+                            .map(|v| v as u32),
+                        latest_batch_kv_tokens: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
+                        latest_deferred_decode_sessions: row
+                            .get::<_, Option<i64>>(24)?
+                            .map(|v| v as u32),
+                        lease_target_session_count: row
+                            .get::<_, Option<i64>>(25)?
+                            .map(|v| v as u32),
+                        lease_target_batch_size: row.get::<_, Option<i64>>(26)?.map(|v| v as u32),
+                        pooled_batch_group_key: None,
+                        pooled_total_sessions: None,
+                        pooled_ready_sessions: None,
+                        pooled_blocked_sessions: None,
+                        pooled_leased_sessions: None,
+                        pooled_active_sessions: None,
+                        kv_checkpoint_device_id: None,
+                        kv_checkpoint_created_at: None,
+                        session_updated_at: row.get(27)?,
+                        replica_status: row.get(28)?,
+                        replica_active_segment_id: row.get(29)?,
+                        replica_kv_sequence_position: row
+                            .get::<_, Option<i64>>(30)?
+                            .map(|v| v as u32),
+                        replica_checkpoint_created_at: None,
+                        replica_updated_at: row.get(31)?,
+                        replica_last_error: row.get(32)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
+        } else {
+            None
+        };
 
-    if let Some(assignment) = row.as_mut() {
-        let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
-        assignment.kv_checkpoint_device_id = checkpoint
-            .as_ref()
-            .map(|item| item.source_device_id.clone());
-        assignment.kv_checkpoint_created_at =
-            checkpoint.as_ref().map(|item| item.created_at.clone());
-        assignment.replica_checkpoint_created_at =
-            if assignment.replica_kv_sequence_position.is_some() {
-                checkpoint.as_ref().map(|item| item.created_at.clone())
-            } else {
-                None
-            };
-        tx.execute(
-            r#"
+        if let Some(assignment) = row.as_mut() {
+            step = "load_checkpoint";
+            let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
+            assignment.kv_checkpoint_device_id = checkpoint
+                .as_ref()
+                .map(|item| item.source_device_id.clone());
+            assignment.kv_checkpoint_created_at =
+                checkpoint.as_ref().map(|item| item.created_at.clone());
+            assignment.replica_checkpoint_created_at =
+                if assignment.replica_kv_sequence_position.is_some() {
+                    checkpoint.as_ref().map(|item| item.created_at.clone())
+                } else {
+                    None
+                };
+            step = "mark_assignment_leased";
+            tx.execute(
+                r#"
             UPDATE inference_job_assignments
             SET status = 'leased', lease_expires_at = ?
             WHERE assignment_id = ?
             "#,
-            params![&lease_expires, &assignment.lease_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        let execution_plan = load_execution_plan_json(&assignment.execution_plan_json)?;
-        let active = active_segment(&execution_plan, &assignment.active_segment_id)?;
-        tx.execute(
-            r#"
+                params![&lease_expires, &assignment.lease_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let execution_plan = load_execution_plan_json(&assignment.execution_plan_json)?;
+            let active = active_segment(&execution_plan, &assignment.active_segment_id)?;
+            step = "update_serving_group";
+            tx.execute(
+                r#"
             UPDATE inference_serving_groups
             SET status = CASE
                     WHEN device_id = ? THEN ?
@@ -4209,115 +4236,147 @@ fn claim_assignment(
                 last_error = NULL
             WHERE job_id = ? AND group_id = ? AND phase = ?
             "#,
-            params![
-                &assignment.device_id,
-                match active.phase {
-                    crate::api::types::ExecutionPhase::Prefill => "prefill_leased",
-                    crate::api::types::ExecutionPhase::Decode => "decode_leased",
-                },
-                &assignment.device_id,
-                &lease_expires,
-                &now_str,
-                &assignment.job_id,
-                &active.execution_group_id,
-                match active.phase {
-                    crate::api::types::ExecutionPhase::Prefill => "prefill",
-                    crate::api::types::ExecutionPhase::Decode => "decode",
-                }
-            ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        if matches!(active.phase, crate::api::types::ExecutionPhase::Decode) {
-            let batch_group_key = decode_batch_group_key(&execution_plan, &active.segment_id)?;
-            let (lease_target_session_count, lease_target_batch_size) =
-                compute_decode_lease_targets(
+                params![
+                    &assignment.device_id,
+                    match active.phase {
+                        crate::api::types::ExecutionPhase::Prefill => "prefill_leased",
+                        crate::api::types::ExecutionPhase::Decode => "decode_leased",
+                    },
+                    &assignment.device_id,
+                    &lease_expires,
+                    &now_str,
+                    &assignment.job_id,
+                    &active.execution_group_id,
+                    match active.phase {
+                        crate::api::types::ExecutionPhase::Prefill => "prefill",
+                        crate::api::types::ExecutionPhase::Decode => "decode",
+                    }
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            if matches!(active.phase, crate::api::types::ExecutionPhase::Decode) {
+                step = "decode_queue_prepare";
+                let batch_group_key = decode_batch_group_key(&execution_plan, &active.segment_id)?;
+                let (lease_target_session_count, lease_target_batch_size) =
+                    compute_decode_lease_targets(
+                        &tx,
+                        &assignment.network_id,
+                        &batch_group_key,
+                        &active.execution_group_id,
+                    )?;
+                assignment.lease_target_session_count = Some(lease_target_session_count);
+                assignment.lease_target_batch_size = Some(lease_target_batch_size);
+                step = "upsert_decode_queue";
+                upsert_decode_queue(
+                    &tx,
+                    &assignment.session_id,
+                    &assignment.job_id,
+                    &assignment.network_id,
+                    &active.segment_id,
+                    &active.execution_group_id,
+                    &batch_group_key,
+                    "leased",
+                    Some(&now_str),
+                    Some(&assignment.device_id),
+                    Some(&lease_expires),
+                    Some(lease_target_session_count),
+                    Some(lease_target_batch_size),
+                    None,
+                    &now_str,
+                )?;
+                step = "refresh_decode_targets";
+                refresh_decode_batch_targets(
                     &tx,
                     &assignment.network_id,
                     &batch_group_key,
                     &active.execution_group_id,
                 )?;
-            assignment.lease_target_session_count = Some(lease_target_session_count);
-            assignment.lease_target_batch_size = Some(lease_target_batch_size);
-            upsert_decode_queue(
-                &tx,
-                &assignment.session_id,
-                &assignment.job_id,
-                &assignment.network_id,
-                &active.segment_id,
-                &active.execution_group_id,
-                &batch_group_key,
-                "leased",
-                Some(&now_str),
-                Some(&assignment.device_id),
-                Some(&lease_expires),
-                Some(lease_target_session_count),
-                Some(lease_target_batch_size),
-                None,
-                &now_str,
-            )?;
-            refresh_decode_batch_targets(
-                &tx,
-                &assignment.network_id,
-                &batch_group_key,
-                &active.execution_group_id,
-            )?;
-            let cohort_leased = lease_decode_cohort_ready_sessions(
-                &tx,
-                &assignment.network_id,
-                &batch_group_key,
-                &active.execution_group_id,
-                &assignment.device_id,
-                &lease_expires,
-                lease_target_session_count,
-                lease_target_batch_size,
-                &now_str,
-            )?;
-            let cohort = load_decode_lease_cohort_status(&tx, &assignment.session_id)?;
-            assignment.pooled_batch_group_key = cohort.pooled_batch_group_key;
-            assignment.pooled_total_sessions = cohort.pooled_total_sessions;
-            assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
-            assignment.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
-            assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
-            assignment.pooled_active_sessions = cohort.pooled_active_sessions;
-            record_scheduler_event(
-                &tx,
-                SchedulerEventRecord {
-                    network_id: &assignment.network_id,
-                    job_id: Some(&assignment.job_id),
-                    session_id: Some(&assignment.session_id),
-                    device_id: Some(&assignment.device_id),
-                    segment_id: Some(&active.segment_id),
-                    group_id: Some(&active.execution_group_id),
-                    batch_group_key: Some(&batch_group_key),
-                    event_kind: "decode_claimed",
-                    queue_status: Some("leased"),
-                    detail: Some(if cohort_leased.is_empty() {
-                        "decode assignment claimed"
-                    } else {
-                        "decode assignment claimed and pooled cohort leased"
-                    }),
-                    lease_target_session_count: Some(lease_target_session_count),
-                    lease_target_batch_size: Some(lease_target_batch_size),
-                    created_at: &now_str,
-                },
-            )?;
+                step = "lease_decode_cohort";
+                let cohort_leased = lease_decode_cohort_ready_sessions(
+                    &tx,
+                    &assignment.network_id,
+                    &batch_group_key,
+                    &active.execution_group_id,
+                    &assignment.device_id,
+                    &lease_expires,
+                    lease_target_session_count,
+                    lease_target_batch_size,
+                    &now_str,
+                )?;
+                step = "load_decode_cohort_status";
+                let cohort = load_decode_lease_cohort_status(&tx, &assignment.session_id)?;
+                assignment.pooled_batch_group_key = cohort.pooled_batch_group_key;
+                assignment.pooled_total_sessions = cohort.pooled_total_sessions;
+                assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
+                assignment.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
+                assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
+                assignment.pooled_active_sessions = cohort.pooled_active_sessions;
+                step = "record_scheduler_event";
+                record_scheduler_event(
+                    &tx,
+                    SchedulerEventRecord {
+                        network_id: &assignment.network_id,
+                        job_id: Some(&assignment.job_id),
+                        session_id: Some(&assignment.session_id),
+                        device_id: Some(&assignment.device_id),
+                        segment_id: Some(&active.segment_id),
+                        group_id: Some(&active.execution_group_id),
+                        batch_group_key: Some(&batch_group_key),
+                        event_kind: "decode_claimed",
+                        queue_status: Some("leased"),
+                        detail: Some(if cohort_leased.is_empty() {
+                            "decode assignment claimed"
+                        } else {
+                            "decode assignment claimed and pooled cohort leased"
+                        }),
+                        lease_target_session_count: Some(lease_target_session_count),
+                        lease_target_batch_size: Some(lease_target_batch_size),
+                        created_at: &now_str,
+                    },
+                )?;
+            }
+        }
+
+        let row = if let Some(assignment) = row {
+            step = "load_final_checkpoint";
+            let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
+            Some(PersistedAssignment {
+                assignment,
+                checkpoint,
+            })
+        } else {
+            None
+        };
+
+        step = "commit";
+        if let Err(e) = tx.commit() {
+            let error = ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e)));
+            if is_locked_api_error(&error) {
+                error!(
+                    network_id = %req.network_id,
+                    device_id = %req.device_id,
+                    step,
+                    "SQLite lock while claiming inference assignment"
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(row)
+    })();
+
+    if let Err(err) = &result {
+        if is_locked_api_error(err) {
+            error!(
+                network_id = %req.network_id,
+                device_id = %req.device_id,
+                step,
+                "SQLite lock while claiming inference assignment"
+            );
         }
     }
 
-    let row = if let Some(assignment) = row {
-        let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
-        Some(PersistedAssignment {
-            assignment,
-            checkpoint,
-        })
-    } else {
-        None
-    };
-
-    tx.commit()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-    Ok(row)
+    result
 }
 
 fn acknowledge_assignment(
@@ -4325,79 +4384,87 @@ fn acknowledge_assignment(
     job_id: &str,
     device_id: &str,
 ) -> ApiResult<()> {
-    let mut conn = db.get_conn()?;
-    let tx = begin_immediate_transaction(&mut conn)?;
-    let now = now_rfc3339()?;
+    let mut step = "open_transaction";
+    let result = (|| -> ApiResult<()> {
+        let mut conn = db.get_conn()?;
+        let tx = begin_immediate_transaction(&mut conn)?;
+        let now = now_rfc3339()?;
 
-    let updated = tx
-        .execute(
-            r#"
+        step = "mark_assignment_acknowledged";
+        let updated = tx
+            .execute(
+                r#"
             UPDATE inference_job_assignments
             SET status = 'acknowledged', acknowledged_at = ?, lease_expires_at = NULL
             WHERE job_id = ? AND device_id = ? AND status = 'leased'
             "#,
-            params![&now, job_id, device_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                params![&now, job_id, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    if updated == 0 {
-        return Err(ApiError::Conflict(format!(
-            "No leased assignment found for job {} and device {}",
-            job_id, device_id
-        )));
-    }
+        if updated == 0 {
+            return Err(ApiError::Conflict(format!(
+                "No leased assignment found for job {} and device {}",
+                job_id, device_id
+            )));
+        }
 
-    tx.execute(
-        r#"
+        step = "mark_job_running";
+        tx.execute(
+            r#"
         UPDATE inference_jobs
         SET status = CASE WHEN status = 'dispatched' THEN 'running' ELSE status END,
             started_at = COALESCE(started_at, ?),
             updated_at = ?
         WHERE job_id = ?
         "#,
-        params![&now, &now, job_id],
-    )
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            params![&now, &now, job_id],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    let (execution_plan_json, active_segment_id): (Option<String>, Option<String>) = tx
+        step = "load_active_segment";
+        let (execution_plan_json, active_segment_id): (Option<String>, Option<String>) = tx
         .query_row(
             "SELECT execution_plan_json, active_segment_id FROM inference_jobs WHERE job_id = ?",
             params![job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    if let (Some(execution_plan_json), Some(active_segment_id)) =
-        (execution_plan_json, active_segment_id)
-    {
-        let execution_plan = load_execution_plan_json(&execution_plan_json)?;
-        let phase = active_segment(&execution_plan, &active_segment_id)?.phase;
-        let session_status = match phase {
-            crate::api::types::ExecutionPhase::Prefill => "prefill_active",
-            crate::api::types::ExecutionPhase::Decode => "decode_active",
-        };
-        tx.execute(
-            r#"
+        if let (Some(execution_plan_json), Some(active_segment_id)) =
+            (execution_plan_json, active_segment_id)
+        {
+            let execution_plan = load_execution_plan_json(&execution_plan_json)?;
+            let phase = active_segment(&execution_plan, &active_segment_id)?.phase;
+            let session_status = match phase {
+                crate::api::types::ExecutionPhase::Prefill => "prefill_active",
+                crate::api::types::ExecutionPhase::Decode => "decode_active",
+            };
+            step = "update_session_status";
+            tx.execute(
+                r#"
             UPDATE inference_sessions
             SET status = ?, active_segment_id = ?, updated_at = ?
             WHERE job_id = ?
             "#,
-            params![session_status, &active_segment_id, &now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
+                params![session_status, &active_segment_id, &now, job_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "update_replica_status";
+            tx.execute(
+                r#"
             UPDATE inference_session_replicas
             SET status = ?, active_segment_id = ?, updated_at = ?, last_error = NULL
             WHERE job_id = ? AND device_id = ?
             "#,
-            params![session_status, &active_segment_id, &now, job_id, device_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        let group_id = active_segment(&execution_plan, &active_segment_id)?
-            .execution_group_id
-            .clone();
-        tx.execute(
-            r#"
+                params![session_status, &active_segment_id, &now, job_id, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            let group_id = active_segment(&execution_plan, &active_segment_id)?
+                .execution_group_id
+                .clone();
+            step = "update_serving_groups";
+            tx.execute(
+                r#"
             UPDATE inference_serving_groups
             SET status = CASE
                     WHEN device_id = ? THEN ?
@@ -4412,37 +4479,39 @@ fn acknowledge_assignment(
                 last_error = NULL
             WHERE job_id = ? AND group_id = ? AND phase = ?
             "#,
-            params![
-                device_id,
-                match phase {
-                    crate::api::types::ExecutionPhase::Prefill => "prefill_active",
-                    crate::api::types::ExecutionPhase::Decode => "decode_active",
-                },
-                match phase {
-                    crate::api::types::ExecutionPhase::Prefill => "prefill",
-                    crate::api::types::ExecutionPhase::Decode => "decode",
-                },
-                device_id,
-                &now,
-                job_id,
-                &group_id,
-                match phase {
-                    crate::api::types::ExecutionPhase::Prefill => "prefill",
-                    crate::api::types::ExecutionPhase::Decode => "decode",
-                }
-            ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        if matches!(phase, crate::api::types::ExecutionPhase::Decode) {
-            let network_id: String = tx
-                .query_row(
-                    "SELECT network_id FROM inference_jobs WHERE job_id = ?",
-                    params![job_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            tx.execute(
-                r#"
+                params![
+                    device_id,
+                    match phase {
+                        crate::api::types::ExecutionPhase::Prefill => "prefill_active",
+                        crate::api::types::ExecutionPhase::Decode => "decode_active",
+                    },
+                    match phase {
+                        crate::api::types::ExecutionPhase::Prefill => "prefill",
+                        crate::api::types::ExecutionPhase::Decode => "decode",
+                    },
+                    device_id,
+                    &now,
+                    job_id,
+                    &group_id,
+                    match phase {
+                        crate::api::types::ExecutionPhase::Prefill => "prefill",
+                        crate::api::types::ExecutionPhase::Decode => "decode",
+                    }
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            if matches!(phase, crate::api::types::ExecutionPhase::Decode) {
+                step = "load_network_id";
+                let network_id: String = tx
+                    .query_row(
+                        "SELECT network_id FROM inference_jobs WHERE job_id = ?",
+                        params![job_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "update_decode_queue_active";
+                tx.execute(
+                    r#"
                 UPDATE inference_decode_queue
                 SET status = 'active',
                     lease_owner_device_id = ?,
@@ -4454,18 +4523,19 @@ fn acknowledge_assignment(
                   AND lease_owner_device_id = ?
                   AND status IN ('leased', 'active')
                 "#,
-                params![
-                    device_id,
-                    &now,
-                    &network_id,
-                    &decode_batch_group_key(&execution_plan, &active_segment_id)?,
-                    device_id
-                ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            let batch_group_key = decode_batch_group_key(&execution_plan, &active_segment_id)?;
-            tx.execute(
-                r#"
+                    params![
+                        device_id,
+                        &now,
+                        &network_id,
+                        &decode_batch_group_key(&execution_plan, &active_segment_id)?,
+                        device_id
+                    ],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                let batch_group_key = decode_batch_group_key(&execution_plan, &active_segment_id)?;
+                step = "fanout_decode_sessions";
+                tx.execute(
+                    r#"
                 UPDATE inference_sessions
                 SET status = 'decode_active',
                     active_segment_id = ?,
@@ -4479,17 +4549,18 @@ fn acknowledge_assignment(
                       AND status = 'active'
                 )
                 "#,
-                params![
-                    &active_segment_id,
-                    &now,
-                    &network_id,
-                    &batch_group_key,
-                    device_id
-                ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            tx.execute(
-                r#"
+                    params![
+                        &active_segment_id,
+                        &now,
+                        &network_id,
+                        &batch_group_key,
+                        device_id
+                    ],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "fanout_decode_replicas";
+                tx.execute(
+                    r#"
                 UPDATE inference_session_replicas
                 SET status = 'decode_active',
                     active_segment_id = ?,
@@ -4505,18 +4576,19 @@ fn acknowledge_assignment(
                 )
                   AND device_id = ?
                 "#,
-                params![
-                    &active_segment_id,
-                    &now,
-                    &network_id,
-                    &batch_group_key,
-                    device_id,
-                    device_id
-                ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            tx.execute(
-                r#"
+                    params![
+                        &active_segment_id,
+                        &now,
+                        &network_id,
+                        &batch_group_key,
+                        device_id,
+                        device_id
+                    ],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "fanout_decode_serving_groups";
+                tx.execute(
+                    r#"
                 UPDATE inference_serving_groups
                 SET status = 'decode_active',
                     lease_owner_device_id = ?,
@@ -4528,17 +4600,39 @@ fn acknowledge_assignment(
                   AND phase = 'decode'
                   AND lease_owner_device_id = ?
                 "#,
-                params![device_id, &now, &network_id, &group_id, device_id],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            refresh_decode_batch_targets(&tx, &network_id, &batch_group_key, &group_id)?;
+                    params![device_id, &now, &network_id, &group_id, device_id],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "refresh_decode_targets";
+                refresh_decode_batch_targets(&tx, &network_id, &batch_group_key, &group_id)?;
+            }
+        }
+
+        step = "commit";
+        if let Err(e) = tx.commit() {
+            let error = ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e)));
+            if is_locked_api_error(&error) {
+                error!(
+                    job_id,
+                    device_id, step, "SQLite lock while acknowledging assignment"
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = &result {
+        if is_locked_api_error(err) {
+            error!(
+                job_id,
+                device_id, step, "SQLite lock while acknowledging assignment"
+            );
         }
     }
 
-    tx.commit()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-    Ok(())
+    result
 }
 
 fn report_assignment_result(
@@ -4546,32 +4640,38 @@ fn report_assignment_result(
     job_id: &str,
     req: &ReportInferenceAssignmentRequest,
 ) -> ApiResult<()> {
-    let mut conn = db.get_conn()?;
-    let tx = begin_immediate_transaction(&mut conn)?;
+    let mut step = "load_job_context";
+    let result = (|| -> ApiResult<()> {
+        let mut conn = db.get_conn()?;
+        let job_context = load_job_context(&conn, job_id)?;
+        step = "open_transaction";
+        let tx = begin_immediate_transaction(&mut conn)?;
 
-    let now = now_rfc3339()?;
-    let decode_group_refs = tx
-        .query_row(
-            r#"
+        let now = now_rfc3339()?;
+        step = "load_decode_group_refs";
+        let decode_group_refs = tx
+            .query_row(
+                r#"
             SELECT network_id, group_id, batch_group_key
             FROM inference_decode_queue
             WHERE job_id = ?
               AND segment_id = ?
             "#,
-            params![job_id, &req.segment_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    let assignment_status = if req.success { "completed" } else { "failed" };
-    let prefill_completed_at = req.time_to_first_token_ms.map(|_| now.clone());
-    let rows = tx
+                params![job_id, &req.segment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        let assignment_status = if req.success { "completed" } else { "failed" };
+        let prefill_completed_at = req.time_to_first_token_ms.map(|_| now.clone());
+        step = "mark_assignment_result";
+        let rows = tx
         .execute(
             r#"
             UPDATE inference_job_assignments
@@ -4595,151 +4695,160 @@ fn report_assignment_result(
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-    if rows == 0 {
-        return Err(ApiError::NotFound(format!(
-            "Assignment not found for job {} and device {}",
-            job_id, req.device_id
-        )));
-    }
+        if rows == 0 {
+            return Err(ApiError::NotFound(format!(
+                "Assignment not found for job {} and device {}",
+                job_id, req.device_id
+            )));
+        }
 
-    let assignment_states = load_assignment_states(&tx, job_id)?;
-    let job_context = load_job_context(&tx, job_id)?;
-    let settlement_state = load_job_settlement_state(&tx, job_id)?;
-    let relevant_participants = job_context
-        .execution_plan
-        .as_ref()
-        .map(|plan| participants_for_segment(plan, &req.segment_id))
-        .transpose()?
-        .unwrap_or_else(|| {
-            assignment_states
-                .iter()
-                .map(|(device_id, _, _)| device_id.clone())
-                .collect()
+        step = "load_assignment_states";
+        let assignment_states = load_assignment_states(&tx, job_id)?;
+        step = "load_settlement_state";
+        let settlement_state = load_job_settlement_state(&tx, job_id)?;
+        let relevant_participants = job_context
+            .execution_plan
+            .as_ref()
+            .map(|plan| participants_for_segment(plan, &req.segment_id))
+            .transpose()?
+            .unwrap_or_else(|| {
+                assignment_states
+                    .iter()
+                    .map(|(device_id, _, _)| device_id.clone())
+                    .collect()
+            });
+        let assignment_state_map = assignment_states
+            .iter()
+            .map(|(device_id, status, failure_reason)| {
+                (
+                    device_id.clone(),
+                    (status.as_str(), failure_reason.as_ref().map(String::as_str)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let failed = relevant_participants.iter().find_map(|device_id| {
+            assignment_state_map
+                .get(device_id)
+                .filter(|(status, _)| *status == "failed")
+                .map(|(_, failure_reason)| {
+                    ((*device_id).clone(), failure_reason.map(str::to_string))
+                })
         });
-    let assignment_state_map = assignment_states
-        .iter()
-        .map(|(device_id, status, failure_reason)| {
+        let all_completed = relevant_participants.iter().all(|device_id| {
+            assignment_state_map
+                .get(device_id)
+                .map(|(status, _)| *status == "completed")
+                .unwrap_or(false)
+        });
+
+        let authoritative_execution_time_ms =
+            compute_job_execution_time_ms(&tx, job_id, &now).unwrap_or(req.execution_time_ms);
+
+        let (
+            job_status,
+            completion,
+            completion_tokens,
+            execution_time_ms,
+            settled_credits,
+            released_credits,
+            error,
+            completed_at,
+        ) = if let Some((_, failure_reason)) = failed {
+            if settlement_state.released_credits <= f64::EPSILON {
+                step = "insert_failure_credit_release";
+                insert_ledger_event(
+                    &tx,
+                    &job_context.network_id,
+                    "credits_released",
+                    Some(job_id),
+                    Some(&job_context.submitted_by_device_id),
+                    None,
+                    serde_json::json!({
+                        "credit_model": "consumption_v1",
+                        "model_id": job_context.model_id,
+                        "reserved_credits": job_context.reserved_credits,
+                        "release_reason": "job_failed",
+                    }),
+                )?;
+            }
             (
-                device_id.clone(),
-                (status.as_str(), failure_reason.as_ref().map(String::as_str)),
+                "failed",
+                None,
+                0_i64,
+                authoritative_execution_time_ms as i64,
+                settlement_state.settled_credits,
+                if settlement_state.released_credits > f64::EPSILON {
+                    settlement_state.released_credits
+                } else {
+                    job_context.reserved_credits
+                },
+                failure_reason.clone().or_else(|| req.error.clone()),
+                Some(now.clone()),
             )
-        })
-        .collect::<HashMap<_, _>>();
+        } else if all_completed {
+            step = "reconcile_realtime_accounting";
+            reconcile_realtime_job_accounting(
+                &tx,
+                job_id,
+                &job_context,
+                &settlement_state,
+                &relevant_participants,
+            )?;
 
-    let failed = relevant_participants.iter().find_map(|device_id| {
-        assignment_state_map
-            .get(device_id)
-            .filter(|(status, _)| *status == "failed")
-            .map(|(_, failure_reason)| ((*device_id).clone(), failure_reason.map(str::to_string)))
-    });
-    let all_completed = relevant_participants.iter().all(|device_id| {
-        assignment_state_map
-            .get(device_id)
-            .map(|(status, _)| *status == "completed")
-            .unwrap_or(false)
-    });
-
-    let authoritative_execution_time_ms =
-        compute_job_execution_time_ms(&tx, job_id, &now).unwrap_or(req.execution_time_ms);
-
-    let (
-        job_status,
-        completion,
-        completion_tokens,
-        execution_time_ms,
-        settled_credits,
-        released_credits,
-        error,
-        completed_at,
-    ) = if let Some((_, failure_reason)) = failed {
-        if settlement_state.released_credits <= f64::EPSILON {
+            step = "reload_settlement_state";
+            let refreshed_settlement_state = load_job_settlement_state(&tx, job_id)?;
+            if refreshed_settlement_state.released_credits <= f64::EPSILON {
+                step = "insert_success_credit_release";
+                insert_ledger_event(
+                    &tx,
+                    &job_context.network_id,
+                    "credits_released",
+                    Some(job_id),
+                    Some(&job_context.submitted_by_device_id),
+                    None,
+                    serde_json::json!({
+                        "credit_model": "consumption_v1",
+                        "model_id": job_context.model_id,
+                        "reserved_credits": job_context.reserved_credits,
+                        "release_reason": "job_settlement",
+                    }),
+                )?;
+            }
+            step = "insert_job_completed_event";
             insert_ledger_event(
                 &tx,
                 &job_context.network_id,
-                "credits_released",
+                "job_completed",
                 Some(job_id),
                 Some(&job_context.submitted_by_device_id),
                 None,
                 serde_json::json!({
-                    "credit_model": "consumption_v1",
+                    "credit_model": "realtime_pipeline",
                     "model_id": job_context.model_id,
+                    "ring_worker_count": job_context.ring_worker_count,
+                    "execution_time_ms": authoritative_execution_time_ms,
                     "reserved_credits": job_context.reserved_credits,
-                    "release_reason": "job_failed",
+                    "settled_credits": refreshed_settlement_state.settled_credits,
+                    "accounted_completion_tokens": refreshed_settlement_state.accounted_completion_tokens,
                 }),
             )?;
-        }
-        (
-            "failed",
-            None,
-            0_i64,
-            authoritative_execution_time_ms as i64,
-            settlement_state.settled_credits,
-            if settlement_state.released_credits > f64::EPSILON {
-                settlement_state.released_credits
-            } else {
-                job_context.reserved_credits
-            },
-            failure_reason.clone().or_else(|| req.error.clone()),
-            Some(now.clone()),
-        )
-    } else if all_completed {
-        reconcile_realtime_job_accounting(
-            &tx,
-            job_id,
-            &job_context,
-            &settlement_state,
-            &relevant_participants,
-        )?;
-
-        let refreshed_settlement_state = load_job_settlement_state(&tx, job_id)?;
-        if refreshed_settlement_state.released_credits <= f64::EPSILON {
-            insert_ledger_event(
-                &tx,
-                &job_context.network_id,
-                "credits_released",
-                Some(job_id),
-                Some(&job_context.submitted_by_device_id),
+            (
+                "completed",
+                req.completion.clone(),
+                req.completion_tokens.unwrap_or(0) as i64,
+                authoritative_execution_time_ms as i64,
+                refreshed_settlement_state.settled_credits,
+                job_context.reserved_credits,
                 None,
-                serde_json::json!({
-                    "credit_model": "consumption_v1",
-                    "model_id": job_context.model_id,
-                    "reserved_credits": job_context.reserved_credits,
-                    "release_reason": "job_settlement",
-                }),
-            )?;
-        }
-        insert_ledger_event(
-            &tx,
-            &job_context.network_id,
-            "job_completed",
-            Some(job_id),
-            Some(&job_context.submitted_by_device_id),
-            None,
-            serde_json::json!({
-                "credit_model": "realtime_pipeline",
-                "model_id": job_context.model_id,
-                "ring_worker_count": job_context.ring_worker_count,
-                "execution_time_ms": authoritative_execution_time_ms,
-                "reserved_credits": job_context.reserved_credits,
-                "settled_credits": refreshed_settlement_state.settled_credits,
-                "accounted_completion_tokens": refreshed_settlement_state.accounted_completion_tokens,
-            }),
-        )?;
-        (
-            "completed",
-            req.completion.clone(),
-            req.completion_tokens.unwrap_or(0) as i64,
-            authoritative_execution_time_ms as i64,
-            refreshed_settlement_state.settled_credits,
-            job_context.reserved_credits,
-            None,
-            Some(now.clone()),
-        )
-    } else {
-        ("running", None, 0_i64, 0_i64, 0.0_f64, 0.0_f64, None, None)
-    };
+                Some(now.clone()),
+            )
+        } else {
+            ("running", None, 0_i64, 0_i64, 0.0_f64, 0.0_f64, None, None)
+        };
 
-    tx.execute(
+        step = "update_inference_job";
+        tx.execute(
         r#"
         UPDATE inference_jobs
         SET status = ?, completion = COALESCE(?, completion), completion_tokens = CASE WHEN ? > 0 THEN ? ELSE completion_tokens END,
@@ -4776,8 +4885,9 @@ fn report_assignment_result(
         ],
     )
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    tx.execute(
-        r#"
+        step = "update_inference_sessions";
+        tx.execute(
+            r#"
         UPDATE inference_sessions
         SET status = ?,
             active_segment_id = CASE
@@ -4789,24 +4899,25 @@ fn report_assignment_result(
             last_error = ?
         WHERE job_id = ?
         "#,
-        params![
-            if req.success && all_completed {
-                "completed"
-            } else if !req.success {
-                "failed"
-            } else {
-                "decode_active"
-            },
-            job_status,
-            req.kv_cache_seq_len.map(i64::from),
-            &now,
-            error.as_deref().or(req.error.as_deref()),
-            job_id
-        ],
-    )
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    tx.execute(
-        r#"
+            params![
+                if req.success && all_completed {
+                    "completed"
+                } else if !req.success {
+                    "failed"
+                } else {
+                    "decode_active"
+                },
+                job_status,
+                req.kv_cache_seq_len.map(i64::from),
+                &now,
+                error.as_deref().or(req.error.as_deref()),
+                job_id
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        step = "update_session_replicas";
+        tx.execute(
+            r#"
         UPDATE inference_session_replicas
         SET status = ?,
             active_segment_id = NULL,
@@ -4815,20 +4926,21 @@ fn report_assignment_result(
             last_error = ?
         WHERE job_id = ? AND device_id = ?
         "#,
-        params![
-            if req.success { "completed" } else { "failed" },
-            req.kv_cache_seq_len.map(i64::from),
-            &now,
-            error.as_deref().or(req.error.as_deref()),
-            job_id,
-            &req.device_id
-        ],
-    )
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    if let Some(plan) = &job_context.execution_plan {
-        if let Ok(segment) = active_segment(plan, &req.segment_id) {
-            tx.execute(
-                r#"
+            params![
+                if req.success { "completed" } else { "failed" },
+                req.kv_cache_seq_len.map(i64::from),
+                &now,
+                error.as_deref().or(req.error.as_deref()),
+                job_id,
+                &req.device_id
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        if let Some(plan) = &job_context.execution_plan {
+            if let Ok(segment) = active_segment(plan, &req.segment_id) {
+                step = "update_serving_groups";
+                tx.execute(
+                    r#"
                 UPDATE inference_serving_groups
                 SET status = ?,
                     lease_owner_device_id = NULL,
@@ -4837,22 +4949,23 @@ fn report_assignment_result(
                     last_error = ?
                 WHERE job_id = ? AND group_id = ? AND device_id = ?
                 "#,
-                params![
-                    if req.success { "completed" } else { "failed" },
-                    &now,
-                    error.as_deref().or(req.error.as_deref()),
-                    job_id,
-                    &segment.execution_group_id,
-                    &req.device_id
-                ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                    params![
+                        if req.success { "completed" } else { "failed" },
+                        &now,
+                        error.as_deref().or(req.error.as_deref()),
+                        job_id,
+                        &segment.execution_group_id,
+                        &req.device_id
+                    ],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            }
         }
-    }
 
-    if job_status == "completed" {
-        tx.execute(
-            r#"
+        if job_status == "completed" {
+            step = "complete_assignments";
+            tx.execute(
+                r#"
             UPDATE inference_job_assignments
             SET status = 'completed',
                 completed_at = COALESCE(completed_at, ?),
@@ -4862,11 +4975,12 @@ fn report_assignment_result(
             WHERE job_id = ?
               AND status NOT IN ('completed', 'failed', 'cancelled')
             "#,
-            params![&now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
+                params![&now, job_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "complete_replicas";
+            tx.execute(
+                r#"
             UPDATE inference_session_replicas
             SET status = 'completed',
                 active_segment_id = NULL,
@@ -4875,11 +4989,12 @@ fn report_assignment_result(
             WHERE job_id = ?
               AND status != 'failed'
             "#,
-            params![&now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
+                params![&now, job_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "complete_serving_groups";
+            tx.execute(
+                r#"
             UPDATE inference_serving_groups
             SET status = 'completed',
                 lease_owner_device_id = NULL,
@@ -4888,11 +5003,12 @@ fn report_assignment_result(
                 last_error = NULL
             WHERE job_id = ?
             "#,
-            params![&now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        tx.execute(
-            r#"
+                params![&now, job_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "complete_decode_queue";
+            tx.execute(
+                r#"
             UPDATE inference_decode_queue
             SET status = 'completed',
                 lease_owner_device_id = NULL,
@@ -4901,13 +5017,15 @@ fn report_assignment_result(
                 updated_at = ?
             WHERE job_id = ?
             "#,
-            params![&now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        mark_session_kv_tracking_terminal(&tx, job_id, job_status, None, &now)?;
-    } else if job_status == "failed" {
-        tx.execute(
-            r#"
+                params![&now, job_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "finalize_kv_tracking_completed";
+            mark_session_kv_tracking_terminal(&tx, job_id, job_status, None, &now)?;
+        } else if job_status == "failed" {
+            step = "fail_decode_queue";
+            tx.execute(
+                r#"
             UPDATE inference_decode_queue
             SET status = 'failed',
                 lease_owner_device_id = NULL,
@@ -4916,38 +5034,67 @@ fn report_assignment_result(
                 updated_at = ?
             WHERE job_id = ?
             "#,
-            params![error.as_deref().or(req.error.as_deref()), &now, job_id],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        mark_session_kv_tracking_terminal(
-            &tx,
-            job_id,
-            job_status,
-            error.as_deref().or(req.error.as_deref()),
-            &now,
-        )?;
-    }
+                params![error.as_deref().or(req.error.as_deref()), &now, job_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "finalize_kv_tracking_failed";
+            mark_session_kv_tracking_terminal(
+                &tx,
+                job_id,
+                job_status,
+                error.as_deref().or(req.error.as_deref()),
+                &now,
+            )?;
+        }
 
-    if let Some((network_id, group_id, batch_group_key)) = decode_group_refs {
-        if let Some(plan) = &job_context.execution_plan {
-            if matches!(
-                active_segment(plan, &req.segment_id).map(|segment| &segment.phase),
-                Ok(crate::api::types::ExecutionPhase::Decode)
-            ) {
-                refresh_decode_batch_targets(
-                    &tx,
-                    &network_id,
-                    batch_group_key.as_deref().unwrap_or(""),
-                    &group_id,
-                )?;
+        if let Some((network_id, group_id, batch_group_key)) = decode_group_refs {
+            if let Some(plan) = &job_context.execution_plan {
+                if matches!(
+                    active_segment(plan, &req.segment_id).map(|segment| &segment.phase),
+                    Ok(crate::api::types::ExecutionPhase::Decode)
+                ) {
+                    step = "refresh_decode_targets";
+                    refresh_decode_batch_targets(
+                        &tx,
+                        &network_id,
+                        batch_group_key.as_deref().unwrap_or(""),
+                        &group_id,
+                    )?;
+                }
             }
+        }
+
+        step = "commit";
+        if let Err(e) = tx.commit() {
+            let error = ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e)));
+            if is_locked_api_error(&error) {
+                error!(
+                    job_id,
+                    device_id = %req.device_id,
+                    segment_id = %req.segment_id,
+                    step,
+                    "SQLite lock while reporting assignment result"
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = &result {
+        if is_locked_api_error(err) {
+            error!(
+                job_id,
+                device_id = %req.device_id,
+                segment_id = %req.segment_id,
+                step,
+                "SQLite lock while reporting assignment result"
+            );
         }
     }
 
-    tx.commit()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-    Ok(())
+    result
 }
 
 fn report_assignment_progress(
@@ -4975,6 +5122,7 @@ fn report_assignment_progress(
     };
 
     let mut conn = state.db.get_conn()?;
+    let job_context = load_job_context(&conn, job_id)?;
     let tx = begin_immediate_transaction(&mut conn)?;
     let segment_completed_at = if prefill_complete {
         Some(now_rfc3339()?)
@@ -5096,7 +5244,6 @@ fn report_assignment_progress(
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-        let job_context = load_job_context(&tx, job_id)?;
         if req.batch_size.is_some()
             || req.active_decode_sessions.is_some()
             || req.batch_kv_tokens.is_some()
@@ -5191,7 +5338,6 @@ fn report_assignment_progress(
 
     if prefill_complete {
         let now = now_rfc3339()?;
-        let job_context = load_job_context(&tx, job_id)?;
         let mut execution_plan = job_context.execution_plan.clone().ok_or_else(|| {
             ApiError::Internal(format!("Job {} is missing an execution plan", job_id))
         })?;
@@ -5858,9 +6004,7 @@ fn store_session_checkpoint(
     req: &UploadInferenceSessionCheckpointRequest,
 ) -> ApiResult<()> {
     let mut conn = db.get_conn()?;
-    let tx = conn
-        .transaction()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let tx = begin_immediate_transaction(&mut conn)?;
     let now = now_rfc3339()?;
 
     let phase = serialize_execution_phase(req.phase);
@@ -6096,9 +6240,7 @@ fn store_session_kv_transfer_report(
     req: &ReportInferenceSessionKvTransferRequest,
 ) -> ApiResult<()> {
     let mut conn = db.get_conn()?;
-    let tx = conn
-        .transaction()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let tx = begin_immediate_transaction(&mut conn)?;
     let now = now_rfc3339()?;
 
     if !matches!(
@@ -6351,9 +6493,7 @@ fn store_session_kv_transfer_payload(
     }
 
     let mut conn = db.get_conn()?;
-    let tx = conn
-        .transaction()
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let tx = begin_immediate_transaction(&mut conn)?;
     let now = now_rfc3339()?;
 
     let (session_id, segment_id, source_device_id, target_device_id, status): (
@@ -6560,62 +6700,47 @@ fn load_execution_plan_json(json: &str) -> ApiResult<InferenceExecutionPlan> {
         .map_err(|e| ApiError::Internal(format!("Failed to parse execution plan: {}", e)))
 }
 
-fn load_job_context(
-    conn: &rusqlite::Transaction<'_>,
-    job_id: &str,
-) -> ApiResult<PersistedJobContext> {
-    conn.query_row(
-        r#"
+fn load_job_context(conn: &rusqlite::Connection, job_id: &str) -> ApiResult<PersistedJobContext> {
+    let row = conn
+        .query_row(
+            r#"
         SELECT network_id, model_id, submitted_by_device_id, ring_worker_count, prompt_tokens,
                reserved_credits, execution_plan_json
         FROM inference_jobs
         WHERE job_id = ?
         "#,
-        params![job_id],
-        |row| {
-            let prompt_tokens_json: String = row.get(4)?;
-            let prompt_tokens =
-                serde_json::from_str::<Vec<u32>>(&prompt_tokens_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-            let manifest =
-                model_assets::load_model_manifest(&row.get::<_, String>(1)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::other(e.to_string())),
-                    )
-                })?;
-            let execution_plan = row
-                .get::<_, Option<String>>(6)?
-                .as_deref()
-                .map(load_execution_plan_json)
-                .transpose()
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::other(e.to_string())),
-                    )
-                })?;
-            Ok(PersistedJobContext {
-                network_id: row.get(0)?,
-                model_id: row.get(1)?,
-                submitted_by_device_id: row.get(2)?,
-                ring_worker_count: row.get::<_, i64>(3)? as u32,
-                prompt_tokens: prompt_tokens.len() as u32,
-                reserved_credits: row.get(5)?,
-                total_model_bytes: manifest.total_model_bytes,
-                total_columns: manifest.tensor_parallelism_dim,
-                execution_plan,
-            })
-        },
-    )
-    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+            params![job_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u32,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let prompt_tokens = serde_json::from_str::<Vec<u32>>(&row.4)
+        .map_err(|e| ApiError::Internal(format!("Failed to parse prompt tokens: {}", e)))?;
+    let manifest = model_assets::load_model_manifest(&row.1)
+        .map_err(|e| ApiError::Internal(format!("Failed to load model manifest: {}", e)))?;
+    let execution_plan = row.6.as_deref().map(load_execution_plan_json).transpose()?;
+
+    Ok(PersistedJobContext {
+        network_id: row.0,
+        model_id: row.1,
+        submitted_by_device_id: row.2,
+        ring_worker_count: row.3,
+        prompt_tokens: prompt_tokens.len() as u32,
+        reserved_credits: row.5,
+        total_model_bytes: manifest.total_model_bytes,
+        total_columns: manifest.tensor_parallelism_dim,
+        execution_plan,
+    })
 }
 
 fn load_completed_assignment_credit_inputs(
