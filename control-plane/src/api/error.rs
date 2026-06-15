@@ -4,9 +4,9 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use thiserror::Error;
 use std::thread;
 use std::time::Duration;
+use thiserror::Error;
 use tracing::Span;
 
 pub(crate) const DB_LOCKED_HEADER: HeaderName = HeaderName::from_static("x-meshnet-db-locked");
@@ -39,8 +39,9 @@ impl From<crate::db::DbError> for ApiError {
 }
 
 fn is_locked_sqlite_error(error: &(dyn std::error::Error + 'static)) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("database is locked") || message.contains("database is busy") {
+    if message_indicates_locked(&error.to_string())
+        || message_indicates_locked(&format!("{error:?}"))
+    {
         return true;
     }
 
@@ -67,6 +68,15 @@ fn is_locked_sqlite_error(error: &(dyn std::error::Error + 'static)) -> bool {
     }
 
     false
+}
+
+fn message_indicates_locked(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("database is locked")
+        || lowered.contains("database is busy")
+        || lowered.contains("database table is locked")
+        || lowered.contains("database schema is locked")
+        || (lowered.contains("database") && lowered.contains("locked"))
 }
 
 fn is_locked_database_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {

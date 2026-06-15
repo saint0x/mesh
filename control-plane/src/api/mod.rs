@@ -165,15 +165,17 @@ pub fn create_router(state: AppState) -> Router {
                         path = %request.uri().path()
                     )
                 })
-                .on_response(|response: &Response, latency: std::time::Duration, span: &Span| {
-                    if response.status().is_server_error() {
-                        tracing::error!(
-                            parent: span,
-                            status = %response.status(),
-                            latency_ms = latency.as_millis(),
-                            "HTTP request completed with server error"
-                        );
-                    }
-                }),
+                .on_response(
+                    |response: &Response, latency: std::time::Duration, span: &Span| {
+                        if response.status().is_server_error() {
+                            tracing::error!(
+                                parent: span,
+                                status = %response.status(),
+                                latency_ms = latency.as_millis(),
+                                "HTTP request completed with server error"
+                            );
+                        }
+                    },
+                ),
         )
 }

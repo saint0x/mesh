@@ -8,9 +8,7 @@ use time::{Duration, OffsetDateTime};
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
-use crate::api::error::{
-    execute_with_db_lock_retry, is_locked_api_error, ApiError, ApiResult,
-};
+use crate::api::error::{execute_with_db_lock_retry, is_locked_api_error, ApiError, ApiResult};
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DecodeLeaseStatus,
@@ -69,6 +67,13 @@ pub(crate) fn log_locked_route_error(
         device_id = device_id.unwrap_or("-"),
         segment_id = segment_id.unwrap_or("-"),
         "SQLite lock surfaced through inference route"
+    );
+    error!(
+        "SQLite lock route={} job_id={} device_id={} segment_id={}",
+        route,
+        job_id.unwrap_or("-"),
+        device_id.unwrap_or("-"),
+        segment_id.unwrap_or("-")
     );
 }
 
@@ -768,8 +773,8 @@ fn prepare_inference_submission(
                 &request.network_id,
                 &worker.device_id,
                 &request.model_id,
-            scheduling_policy,
-        )
+                scheduling_policy,
+            )
         })
         .collect::<ApiResult<Vec<_>>>()?;
     let execution_plan = ExecutionPlanner::plan(
@@ -829,9 +834,8 @@ pub async fn claim_inference_assignment(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        let result = execute_with_db_lock_retry(|| {
-            claim_assignment(&db, &req_clone, &scheduling_policy)
-        });
+        let result =
+            execute_with_db_lock_retry(|| claim_assignment(&db, &req_clone, &scheduling_policy));
         if let Err(err) = &result {
             log_locked_route_error(
                 "claim_inference_assignment",
@@ -856,15 +860,16 @@ pub async fn claim_inference_assignment(
         let device_id = req.device_id.clone();
         let inference_write_gate = state.inference_write_gate.clone();
         match tokio::task::spawn_blocking(move || {
-            let _write_guard = inference_write_gate
-                .lock()
-                .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
+            let _write_guard = inference_write_gate.lock().map_err(|_| {
+                ApiError::Internal("Inference write gate lock poisoned".to_string())
+            })?;
             execute_with_db_lock_retry(|| {
                 load_queue_observation(&db, &network_id, &device_id, active_session_id.clone())
             })
         })
         .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))? {
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?
+        {
             Ok(observation) => Some(observation),
             Err(err) if is_locked_api_error(&err) => {
                 error!(
@@ -4750,10 +4755,7 @@ fn acknowledge_assignment(
                 ))
             })?;
             let network_id = network_id.ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "Decode network id missing for job {}",
-                    job_id
-                ))
+                ApiError::Internal(format!("Decode network id missing for job {}", job_id))
             })?;
             step = "update_decode_queue_active";
             tx.execute(
@@ -4788,7 +4790,13 @@ fn acknowledge_assignment(
                   AND status = 'active'
             )
             "#,
-                params![&active_segment_id, &now, &network_id, &batch_group_key, device_id],
+                params![
+                    &active_segment_id,
+                    &now,
+                    &network_id,
+                    &batch_group_key,
+                    device_id
+                ],
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             step = "fanout_decode_replicas";
@@ -4884,9 +4892,13 @@ fn load_acknowledge_context(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-    let (execution_plan_json, active_segment_id) = execution_plan_json
-        .zip(active_segment_id)
-        .ok_or_else(|| ApiError::Conflict(format!("Job {} has no active segment to acknowledge", job_id)))?;
+    let (execution_plan_json, active_segment_id) =
+        execution_plan_json.zip(active_segment_id).ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "Job {} has no active segment to acknowledge",
+                job_id
+            ))
+        })?;
     let execution_plan = load_execution_plan_json(&execution_plan_json)?;
     let segment = active_segment(&execution_plan, &active_segment_id)?;
     let batch_group_key = if matches!(segment.phase, crate::api::types::ExecutionPhase::Decode) {

@@ -6,9 +6,7 @@ use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use tracing::instrument;
 
-use crate::api::error::{
-    execute_with_db_lock_retry, log_locked_route_error, ApiError, ApiResult,
-};
+use crate::api::error::{execute_with_db_lock_retry, log_locked_route_error, ApiError, ApiResult};
 use crate::api::types::{
     CreateHandoffRequest, CreateHandoffResponse, HandoffInfo, ListHandoffsResponse, PeerPunchPlan,
     PunchPathReason, PunchPathStrategy, RegisterCallbackRequest, RegisterCallbackResponse,
@@ -300,7 +298,7 @@ pub async fn leave_ring(
         execute_with_db_lock_retry(|| ring_manager.handle_worker_failure(device_id_clone.clone()))
     })
     .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?;
     if let Err(err) = &result {
         log_locked_route_error("leave_ring", err);
     }

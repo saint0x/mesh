@@ -4,9 +4,7 @@ use axum::{
 };
 use tracing::instrument;
 
-use crate::api::error::{
-    execute_with_db_lock_retry, log_locked_route_error, ApiError, ApiResult,
-};
+use crate::api::error::{execute_with_db_lock_retry, log_locked_route_error, ApiError, ApiResult};
 use crate::api::types::{JobSchedulerStatusResponse, NetworkSchedulerStatusResponse};
 use crate::state::AppState;
 

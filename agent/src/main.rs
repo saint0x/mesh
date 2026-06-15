@@ -2426,8 +2426,7 @@ async fn cmd_runtime() -> Result<()> {
                 &network_id,
             )
             .await;
-            let observe_idle_queue =
-                idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
+            let observe_idle_queue = idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
             let claim_response = match registration_client
                 .claim_inference_work(ClaimInferenceAssignmentRequest {
                     device_id: device_id.to_string(),
@@ -4055,14 +4054,40 @@ async fn fetch_job_status(
     job_id: &str,
 ) -> Result<InferenceJobStatusResponse> {
     let url = control_plane_url(config, &format!("/api/inference/jobs/{}", job_id));
-    control_plane_client()
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<InferenceJobStatusResponse>()
-        .await
-        .map_err(Into::into)
+    let started_at = std::time::Instant::now();
+    let mut attempt = 0u32;
+
+    loop {
+        let response = control_plane_client().get(url.clone()).send().await?;
+        if response.status().is_success() {
+            return response
+                .json::<InferenceJobStatusResponse>()
+                .await
+                .map_err(Into::into);
+        }
+
+        let is_locked = response.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            && response.headers().contains_key("x-meshnet-db-locked");
+        if !is_locked {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Control-plane job status request failed: {} {}",
+                status,
+                body
+            );
+        }
+
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        if elapsed_ms >= 10_000 {
+            anyhow::bail!("Timed out waiting for locked control-plane status read to clear");
+        }
+
+        attempt = attempt.saturating_add(1);
+        let remaining_ms = 10_000u64.saturating_sub(elapsed_ms);
+        let backoff_ms = (100u64 * attempt as u64).min(1_000).min(remaining_ms);
+        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+    }
 }
 
 fn print_job_status_snapshot(status: &InferenceJobStatusResponse) {
