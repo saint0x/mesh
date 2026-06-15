@@ -76,6 +76,8 @@ const DECODE_PROGRESS_FLUSH_INTERVAL_MS: u64 = 1500;
 const DECODE_PROGRESS_EAGER_TOKEN_DELTA: u32 = 16;
 const LIVE_KV_REQUEST_POLL_TIMEOUT_MS: u64 = 5;
 const LIVE_KV_RESPONSE_TIMEOUT_SECS: u64 = 5;
+const CONTROL_PLANE_WRITE_RETRY_MAX_WAIT_SECS: u64 = 30;
+const CONTROL_PLANE_WRITE_RETRY_STEP_MS: u64 = 250;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LiveKvTransferPlaneRequest {
@@ -1046,6 +1048,59 @@ async fn release_decode_lease_if_needed(
             error = %release_error,
             "Failed to release decode lease"
         );
+    }
+}
+
+async fn retry_control_plane_write(
+    operation: &str,
+    job_id: Uuid,
+    segment_id: Option<&str>,
+    mut op: impl FnMut() -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>,
+    >,
+) -> Result<()> {
+    let started_at = std::time::Instant::now();
+    let mut attempt = 0u64;
+    loop {
+        match op().await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!(
+                        job_id = %job_id,
+                        segment_id = segment_id,
+                        operation,
+                        attempts = attempt + 1,
+                        "Control-plane lifecycle write succeeded after retry"
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let elapsed = started_at.elapsed();
+                if elapsed >= Duration::from_secs(CONTROL_PLANE_WRITE_RETRY_MAX_WAIT_SECS) {
+                    return Err(anyhow::anyhow!(
+                        "{} failed after {} attempts over {:?}: {}",
+                        operation,
+                        attempt + 1,
+                        elapsed,
+                        error
+                    ));
+                }
+                let backoff_ms = (CONTROL_PLANE_WRITE_RETRY_STEP_MS * (attempt + 1))
+                    .min(CONTROL_PLANE_WRITE_RETRY_STEP_MS * 8);
+                warn!(
+                    job_id = %job_id,
+                    segment_id = segment_id,
+                    operation,
+                    attempt = attempt + 1,
+                    error,
+                    retry_in_ms = backoff_ms,
+                    "Control-plane lifecycle write failed; retrying"
+                );
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
     }
 }
 
@@ -2371,32 +2426,19 @@ async fn cmd_runtime() -> Result<()> {
                 &network_id,
             )
             .await;
-            let include_idle_queue_observation =
+            let observe_idle_queue =
                 idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
             let claim_response = match registration_client
                 .claim_inference_work(ClaimInferenceAssignmentRequest {
                     device_id: device_id.to_string(),
                     network_id: network_id.clone(),
                     claim_mode: WorkClaimMode::Any,
-                    include_queue_state: include_idle_queue_observation,
+                    include_queue_state: false,
                     include_serving_session: false,
                 })
                 .await
             {
-                Ok(response) => {
-                    if response.assignment.is_none() && include_idle_queue_observation {
-                        if let Some(queue_state) = response.queue_state.as_ref() {
-                            debug!(
-                                queue_status = queue_state.status.as_deref(),
-                                ready_sessions = queue_state.ready_sessions,
-                                blocked_sessions = queue_state.blocked_sessions,
-                                local_ready_sessions = queue_state.local_ready_sessions,
-                                "No inference work claimed; scheduler queue state observed"
-                            );
-                        }
-                    }
-                    response
-                }
+                Ok(response) => response,
                 Err(e) => {
                     debug!(error = %e, "Inference assignment claim failed");
                     continue;
@@ -2419,6 +2461,33 @@ async fn cmd_runtime() -> Result<()> {
                     assignment
                 }
                 None => {
+                    if observe_idle_queue {
+                        match registration_client
+                            .observe_decode_queue_state(device_id, &network_id)
+                            .await
+                        {
+                            Ok(Some(observation)) => {
+                                if let Some(queue_state) = observation.queue_state.as_ref() {
+                                    debug!(
+                                        queue_status = queue_state.status.as_deref(),
+                                        ready_sessions = queue_state.ready_sessions,
+                                        blocked_sessions = queue_state.blocked_sessions,
+                                        local_ready_sessions = queue_state.local_ready_sessions,
+                                        "No inference work claimed; scheduler queue state observed"
+                                    );
+                                    log_scheduler_queue_state(
+                                        observation.queue_state.as_ref(),
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug!(error = %e, "Decode queue observation failed");
+                            }
+                        }
+                    }
                     idle_claim_polls = idle_claim_polls.saturating_add(1);
                     continue;
                 }
@@ -2577,9 +2646,21 @@ async fn cmd_runtime() -> Result<()> {
                 continue;
             }
 
-            if let Err(e) = registration_client
-                .acknowledge_inference_assignment(job_id, device_id)
-                .await
+            if let Err(e) = retry_control_plane_write(
+                "acknowledge_inference_assignment",
+                job_id,
+                Some(&assignment.active_segment.segment_id),
+                || {
+                    let registration_client = registration_client.clone();
+                    Box::pin(async move {
+                        registration_client
+                            .acknowledge_inference_assignment(job_id, device_id)
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                },
+            )
+            .await
             {
                 error!(job_id = %job_id, error = %e, "Failed to acknowledge assignment");
                 release_decode_lease_if_needed(
@@ -3093,22 +3174,33 @@ async fn cmd_runtime() -> Result<()> {
                         }
                     });
 
-                    if let Err(e) = registration_client
-                        .report_inference_result(
-                            job_id,
-                            agent::api::types::ReportInferenceAssignmentRequest {
-                                device_id: device_id.to_string(),
-                                segment_id: active_segment_id.clone(),
-                                success: result.success,
-                                completion,
-                                completion_tokens: Some(result.completion_tokens),
-                                execution_time_ms: result.execution_time_ms,
-                                time_to_first_token_ms: result.time_to_first_token_ms,
-                                kv_cache_seq_len: None,
-                                error: result.error.clone(),
-                            },
-                        )
-                        .await
+                    let result_request = agent::api::types::ReportInferenceAssignmentRequest {
+                        device_id: device_id.to_string(),
+                        segment_id: active_segment_id.clone(),
+                        success: result.success,
+                        completion,
+                        completion_tokens: Some(result.completion_tokens),
+                        execution_time_ms: result.execution_time_ms,
+                        time_to_first_token_ms: result.time_to_first_token_ms,
+                        kv_cache_seq_len: None,
+                        error: result.error.clone(),
+                    };
+                    if let Err(e) = retry_control_plane_write(
+                        "report_inference_result",
+                        job_id,
+                        Some(&active_segment_id),
+                        || {
+                            let registration_client = registration_client.clone();
+                            let request = result_request.clone();
+                            Box::pin(async move {
+                                registration_client
+                                    .report_inference_result(job_id, request)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            })
+                        },
+                    )
+                    .await
                     {
                         error!(job_id = %job_id, error = %e, "Failed to report inference result");
                     }
@@ -3122,22 +3214,33 @@ async fn cmd_runtime() -> Result<()> {
                         Some(e.to_string()),
                     )
                     .await;
-                    let _ = registration_client
-                        .report_inference_result(
-                            job_id,
-                            agent::api::types::ReportInferenceAssignmentRequest {
-                                device_id: device_id.to_string(),
-                                segment_id: active_segment_id.clone(),
-                                success: false,
-                                completion: None,
-                                completion_tokens: None,
-                                execution_time_ms: 0,
-                                time_to_first_token_ms: None,
-                                kv_cache_seq_len: None,
-                                error: Some(e.to_string()),
-                            },
-                        )
-                        .await;
+                    let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
+                        device_id: device_id.to_string(),
+                        segment_id: active_segment_id.clone(),
+                        success: false,
+                        completion: None,
+                        completion_tokens: None,
+                        execution_time_ms: 0,
+                        time_to_first_token_ms: None,
+                        kv_cache_seq_len: None,
+                        error: Some(e.to_string()),
+                    };
+                    let _ = retry_control_plane_write(
+                        "report_inference_result",
+                        job_id,
+                        Some(&active_segment_id),
+                        || {
+                            let registration_client = registration_client.clone();
+                            let request = failure_request.clone();
+                            Box::pin(async move {
+                                registration_client
+                                    .report_inference_result(job_id, request)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            })
+                        },
+                    )
+                    .await;
                 }
             }
         }

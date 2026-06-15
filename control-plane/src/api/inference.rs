@@ -827,6 +827,17 @@ pub async fn claim_inference_assignment(
         ));
     }
 
+    let scheduling_policy = {
+        let db = state.db.clone();
+        let network_id = req.network_id.clone();
+        tokio::task::spawn_blocking(move || {
+            network_service::load_network_settings(&db, &network_id)
+                .map(|settings| settings.scheduling_policy)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??
+    };
+
     let db = state.db.clone();
     let inference_write_gate = state.inference_write_gate.clone();
     let req_clone = req.clone();
@@ -834,7 +845,9 @@ pub async fn claim_inference_assignment(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        let result = execute_with_db_lock_retry(|| claim_assignment(&db, &req_clone));
+        let result = execute_with_db_lock_retry(|| {
+            claim_assignment(&db, &req_clone, &scheduling_policy)
+        });
         if let Err(err) = &result {
             log_locked_route_error(
                 "claim_inference_assignment",
@@ -4331,12 +4344,10 @@ fn throughput_multiplier_for_device_rows(rows: &[(String, f64)], device_id: &str
 fn claim_assignment(
     db: &crate::db::Database,
     req: &ClaimInferenceAssignmentRequest,
+    scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<Option<PersistedAssignment>> {
-    let mut step = "load_scheduling_policy";
+    let mut step = "open_transaction";
     let result = (|| -> ApiResult<Option<PersistedAssignment>> {
-        let scheduling_policy =
-            network_service::load_network_settings(db, &req.network_id)?.scheduling_policy;
-        step = "open_transaction";
         let mut conn = db.get_conn()?;
         let tx = begin_immediate_transaction(&mut conn)?;
 
@@ -4430,19 +4441,6 @@ fn claim_assignment(
         };
 
         if let Some(assignment) = row.as_mut() {
-            step = "load_checkpoint";
-            let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
-            assignment.kv_checkpoint_device_id = checkpoint
-                .as_ref()
-                .map(|item| item.source_device_id.clone());
-            assignment.kv_checkpoint_created_at =
-                checkpoint.as_ref().map(|item| item.created_at.clone());
-            assignment.replica_checkpoint_created_at =
-                if assignment.replica_kv_sequence_position.is_some() {
-                    checkpoint.as_ref().map(|item| item.created_at.clone())
-                } else {
-                    None
-                };
             step = "mark_assignment_leased";
             tx.execute(
                 r#"
@@ -4536,14 +4534,6 @@ fn claim_assignment(
                     lease_target_batch_size,
                     &now_str,
                 )?;
-                step = "load_decode_cohort_status";
-                let cohort = load_decode_lease_cohort_status(&tx, &assignment.session_id)?;
-                assignment.pooled_batch_group_key = cohort.pooled_batch_group_key;
-                assignment.pooled_total_sessions = cohort.pooled_total_sessions;
-                assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
-                assignment.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
-                assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
-                assignment.pooled_active_sessions = cohort.pooled_active_sessions;
                 step = "record_scheduler_event";
                 record_scheduler_event(
                     &tx,
@@ -4570,17 +4560,6 @@ fn claim_assignment(
             }
         }
 
-        let row = if let Some(assignment) = row {
-            step = "load_final_checkpoint";
-            let checkpoint = load_latest_session_checkpoint_status(&tx, &assignment.session_id)?;
-            Some(PersistedAssignment {
-                assignment,
-                checkpoint,
-            })
-        } else {
-            None
-        };
-
         step = "commit";
         if let Err(e) = tx.commit() {
             let error = ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e)));
@@ -4595,7 +4574,8 @@ fn claim_assignment(
             return Err(error);
         }
 
-        Ok(row)
+        row.map(|assignment| enrich_claimed_assignment(db, assignment))
+            .transpose()
     })();
 
     if let Err(err) = &result {
@@ -4610,6 +4590,46 @@ fn claim_assignment(
     }
 
     result
+}
+
+fn enrich_claimed_assignment(
+    db: &crate::db::Database,
+    mut assignment: PersistedLeaseRecord,
+) -> ApiResult<PersistedAssignment> {
+    let conn = db.get_conn()?;
+    let checkpoint = load_latest_session_checkpoint_status(&conn, &assignment.session_id)?;
+    assignment.kv_checkpoint_device_id = checkpoint
+        .as_ref()
+        .map(|item| item.source_device_id.clone());
+    assignment.kv_checkpoint_created_at = checkpoint.as_ref().map(|item| item.created_at.clone());
+    assignment.replica_checkpoint_created_at = if assignment.replica_kv_sequence_position.is_some()
+    {
+        checkpoint.as_ref().map(|item| item.created_at.clone())
+    } else {
+        None
+    };
+
+    if matches!(
+        active_segment(
+            &load_execution_plan_json(&assignment.execution_plan_json)?,
+            &assignment.active_segment_id,
+        )?
+        .phase,
+        crate::api::types::ExecutionPhase::Decode
+    ) {
+        let cohort = load_decode_lease_cohort_status(&conn, &assignment.session_id)?;
+        assignment.pooled_batch_group_key = cohort.pooled_batch_group_key;
+        assignment.pooled_total_sessions = cohort.pooled_total_sessions;
+        assignment.pooled_ready_sessions = cohort.pooled_ready_sessions;
+        assignment.pooled_blocked_sessions = cohort.pooled_blocked_sessions;
+        assignment.pooled_leased_sessions = cohort.pooled_leased_sessions;
+        assignment.pooled_active_sessions = cohort.pooled_active_sessions;
+    }
+
+    Ok(PersistedAssignment {
+        assignment,
+        checkpoint,
+    })
 }
 
 fn acknowledge_assignment(

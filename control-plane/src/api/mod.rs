@@ -100,10 +100,6 @@ pub fn create_router(state: AppState) -> Router {
             post(inference::claim_inference_assignment),
         )
         .route(
-            "/api/inference/decode/claim",
-            post(inference::claim_inference_assignment),
-        )
-        .route(
             "/api/inference/decode/queue",
             get(inference::observe_decode_queue_state),
         )
