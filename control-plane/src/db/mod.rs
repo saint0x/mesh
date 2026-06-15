@@ -93,14 +93,14 @@ impl Database {
             Ok(())
         });
 
-        // Create connection pool. SQLite still has a single-writer model, so
-        // allowing this to be tuned is useful for live bring-up and benchmarks
-        // where serialized access can be more stable than maximizing concurrency.
+        // SQLite has a single-writer model; defaulting to a single pooled
+        // connection avoids self-inflicted lock contention during multi-device
+        // inference bring-up while still allowing explicit overrides.
         let max_pool_size = std::env::var("MESHNET_SQLITE_POOL_MAX_SIZE")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(10);
+            .unwrap_or(1);
         let pool = Pool::builder().max_size(max_pool_size).build(manager)?;
 
         tracing::info!("Database connected successfully");

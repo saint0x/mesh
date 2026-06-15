@@ -2993,13 +2993,18 @@ fn describe_decode_topology_change(
         .find(|group| matches!(group.phase, crate::api::types::ExecutionPhase::Decode))?;
     let previous_members = sorted_member_ids(&previous_decode.members);
     let refreshed_members = sorted_member_ids(&refreshed_decode.members);
+    let layout_changed = member_layout_signature(&previous_decode.members)
+        != member_layout_signature(&refreshed_decode.members);
     if previous_members == refreshed_members
         && previous_decode.transport_tier == refreshed_decode.transport_tier
+        && !layout_changed
     {
         return None;
     }
 
-    let change_kind = if refreshed_members.len() < previous_members.len() {
+    let change_kind = if previous_members == refreshed_members {
+        "reshape"
+    } else if refreshed_members.len() < previous_members.len() {
         "downshift"
     } else if refreshed_members.len() > previous_members.len() {
         "expansion"
@@ -3007,12 +3012,14 @@ fn describe_decode_topology_change(
         "rebuild"
     };
     Some(format!(
-        "decode topology {} from [{}] to [{}] (transport {:?} -> {:?})",
+        "decode topology {} from [{}] to [{}] (transport {:?} -> {:?}, layout {} -> {})",
         change_kind,
         previous_members.join(","),
         refreshed_members.join(","),
         previous_decode.transport_tier,
         refreshed_decode.transport_tier,
+        member_layout_signature(&previous_decode.members),
+        member_layout_signature(&refreshed_decode.members),
     ))
 }
 
@@ -3023,6 +3030,26 @@ fn sorted_member_ids(members: &[crate::api::types::ExecutionGroupMember]) -> Vec
         .collect::<Vec<_>>();
     ids.sort();
     ids
+}
+
+fn member_layout_signature(members: &[crate::api::types::ExecutionGroupMember]) -> String {
+    let mut layout = members
+        .iter()
+        .map(|member| {
+            format!(
+                "{}:{}:{}-{}:{}:{}:{}",
+                member.device_id,
+                member.ring_position,
+                member.shard.column_start,
+                member.shard.column_end,
+                member.shard_worker_position,
+                member.shard_total_workers,
+                member.assigned_capacity_units
+            )
+        })
+        .collect::<Vec<_>>();
+    layout.sort();
+    layout.join("|")
 }
 
 fn load_latest_session_checkpoint_status(

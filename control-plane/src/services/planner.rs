@@ -264,7 +264,9 @@ impl ExecutionPlanner {
                     };
                 let materially_better =
                     selected_score >= current_score.saturating_add(required_margin);
-                if (selected_is_expansion
+                if same_participants(&decode_members, &current_decode_members) {
+                    decode_members = current_decode_members;
+                } else if (selected_is_expansion
                     || !same_participants(&decode_members, &current_decode_members))
                     && !materially_better
                 {
@@ -1095,6 +1097,47 @@ fn same_participants(left: &[ExecutionGroupMember], right: &[ExecutionGroupMembe
     left_ids == right_ids
 }
 
+#[cfg(test)]
+fn same_member_layout(left: &[ExecutionGroupMember], right: &[ExecutionGroupMember]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut left_layout = left
+        .iter()
+        .map(|member| {
+            (
+                member.device_id.as_str(),
+                member.ring_position,
+                member.shard.column_start,
+                member.shard.column_end,
+                member.shard_worker_position,
+                member.shard_total_workers,
+                member.assigned_capacity_units,
+                member.backend_contract.contract_hash.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut right_layout = right
+        .iter()
+        .map(|member| {
+            (
+                member.device_id.as_str(),
+                member.ring_position,
+                member.shard.column_start,
+                member.shard.column_end,
+                member.shard_worker_position,
+                member.shard_total_workers,
+                member.assigned_capacity_units,
+                member.backend_contract.contract_hash.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    left_layout.sort_unstable();
+    right_layout.sort_unstable();
+    left_layout == right_layout
+}
+
 fn is_full_replica_group(members: &[ExecutionGroupMember]) -> bool {
     let Some(max_column_end) = members.iter().map(|member| member.shard.column_end).max() else {
         return false;
@@ -1116,19 +1159,15 @@ fn current_valid_decode_members(
     else {
         return Ok(None);
     };
-    let current_members = existing_decode_group
-        .members
-        .iter()
-        .map(|member| {
-            available_members
-                .iter()
-                .find(|candidate| candidate.device_id == member.device_id)
-                .cloned()
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(current_members) = current_members else {
+    let current_members = existing_decode_group.members.clone();
+    let all_present = current_members.iter().all(|member| {
+        available_members
+            .iter()
+            .any(|candidate| candidate.device_id == member.device_id)
+    });
+    if !all_present {
         return Ok(None);
-    };
+    }
     if validate_serving_group_legality(model_id, ExecutionPhase::Decode, &current_members).is_err()
     {
         return Ok(None);
@@ -2127,6 +2166,71 @@ mod tests {
             }
             other => panic!("expected conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refresh_decode_plan_preserves_existing_layout_for_unchanged_decode_participants() {
+        model_assets::testsupport::ensure_test_model("planner-refresh-stable-layout", 20);
+        model_assets::clear_model_asset_cache();
+
+        let original = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-refresh-stable-layout".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-refresh-stable-layout", "a", 0, 0, 10),
+                    worker_with_model_range("planner-refresh-stable-layout", "b", 1, 10, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[planner_metadata(4, "metal"), planner_metadata(4, "metal")],
+        )
+        .unwrap();
+
+        let refreshed = ExecutionPlanner::refresh_decode_plan(
+            &original,
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-refresh-stable-layout", "a", 0, 0, 8),
+                    worker_with_model_range("planner-refresh-stable-layout", "b", 1, 8, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[planner_metadata(4, "metal"), planner_metadata(4, "metal")],
+        )
+        .unwrap();
+
+        let original_decode = original
+            .execution_groups
+            .iter()
+            .find(|group| matches!(group.phase, ExecutionPhase::Decode))
+            .unwrap();
+        let refreshed_decode = refreshed
+            .execution_groups
+            .iter()
+            .find(|group| matches!(group.phase, ExecutionPhase::Decode))
+            .unwrap();
+
+        assert!(same_member_layout(
+            &original_decode.members,
+            &refreshed_decode.members
+        ));
+        assert_eq!(
+            refreshed_decode.kv_transfer_policy,
+            KvTransferPolicy::CoLocated
+        );
     }
 
     #[test]
