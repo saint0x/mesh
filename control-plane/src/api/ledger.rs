@@ -87,10 +87,15 @@ pub async fn create_ledger_event(
     // Insert ledger event into database
     let event_id = Uuid::new_v4().to_string();
     let persisted_event_id = event_id.clone();
+    let write_gate = state.inference_write_gate.clone();
     tokio::task::spawn_blocking({
         let db = state.db.clone();
         let event = event.clone();
+        let write_gate = write_gate.clone();
         move || -> Result<(), ApiError> {
+            let _write_guard = write_gate
+                .lock()
+                .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
             let conn = db
                 .get_conn()
                 .map_err(|e| ApiError::Internal(format!("Failed to get connection: {}", e)))?;

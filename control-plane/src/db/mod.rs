@@ -3,6 +3,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -46,6 +47,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 #[derive(Clone)]
 pub struct Database {
     pool: Pool<SqliteConnectionManager>,
+    write_gate: Arc<Mutex<()>>,
 }
 
 impl Database {
@@ -93,19 +95,23 @@ impl Database {
             Ok(())
         });
 
-        // SQLite has a single-writer model; defaulting to a single pooled
-        // connection avoids self-inflicted lock contention during multi-device
-        // inference bring-up while still allowing explicit overrides.
+        // SQLite still has a single-writer model, but the control plane issues
+        // nested service calls that legitimately need more than one pooled
+        // connection. Keep a moderate default and allow explicit overrides for
+        // bring-up, benchmarking, or tighter serialization experiments.
         let max_pool_size = std::env::var("MESHNET_SQLITE_POOL_MAX_SIZE")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(1);
+            .unwrap_or(10);
         let pool = Pool::builder().max_size(max_pool_size).build(manager)?;
 
         tracing::info!("Database connected successfully");
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            write_gate: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Run database migrations
@@ -194,6 +200,10 @@ impl Database {
     /// Get a connection from the pool
     pub fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         Ok(self.pool.get()?)
+    }
+
+    pub fn write_gate(&self) -> Arc<Mutex<()>> {
+        self.write_gate.clone()
     }
 
     /// Get default database path: `~/.meshnet/control-plane.db`

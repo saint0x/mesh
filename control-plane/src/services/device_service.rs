@@ -39,6 +39,10 @@ pub fn register_device(
     let connectivity = network_service::load_network_connectivity(db, &network_id)?;
     let initial_connectivity_state = DeviceConnectivityState::unknown(&connectivity);
 
+    let write_gate = db.write_gate();
+    let _write_guard = write_gate
+        .lock()
+        .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
     let conn = db.get_conn()?;
 
     // Check if device already registered
@@ -149,6 +153,10 @@ pub fn update_heartbeat(
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| ApiError::Internal(format!("Failed to format timestamp: {}", e)))?;
 
+    let write_gate = db.write_gate();
+    let _write_guard = write_gate
+        .lock()
+        .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
     let conn = db.get_conn()?;
 
     // Update last_seen and set status to online

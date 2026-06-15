@@ -4,7 +4,7 @@ use crate::services::certificate::ControlPlaneKeypair;
 use crate::services::ring_manager::RingTopologyManager;
 use crate::services::topology_notifier::TopologyNotifier;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Axum application state shared across all request handlers
 #[derive(Clone)]
@@ -17,17 +17,21 @@ pub struct AppState {
     ring_managers: Arc<RwLock<HashMap<String, Arc<RingTopologyManager>>>>,
     /// Topology notifier for worker notifications
     pub topology_notifier: Arc<TopologyNotifier>,
+    /// SQLite is a single-writer database; serialize inference mutations explicitly.
+    pub inference_write_gate: Arc<Mutex<()>>,
 }
 
 impl AppState {
     /// Create new application state
     pub fn new(db: Database, keypair: Arc<ControlPlaneKeypair>) -> Self {
         let topology_notifier = Arc::new(TopologyNotifier::new(Arc::new(db.clone())));
+        let inference_write_gate = db.write_gate();
         Self {
             db,
             keypair,
             ring_managers: Arc::new(RwLock::new(HashMap::new())),
             topology_notifier,
+            inference_write_gate,
         }
     }
 

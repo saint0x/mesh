@@ -16,7 +16,7 @@ use crate::executor::ring_allreduce::WorkerRing;
 use crate::inference::kv_cache::KVCacheSnapshot;
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
-use crate::network::{MeshSwarm, ServingSessionTransport, TensorPlane};
+use crate::network::{MeshSwarm, TensorPlane};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -275,9 +275,6 @@ pub struct InferenceCoordinator {
     /// Governs checkpoint recovery cadence and node-level recovery load.
     #[allow(dead_code)]
     recovery_governor: RecoveryGovernor,
-
-    /// Reused serving-session transport for the current ring topology and backend class.
-    serving_transport_cache: Option<ServingTransportCacheEntry>,
 }
 
 struct ActiveSession {
@@ -287,22 +284,6 @@ struct ActiveSession {
     queued_for_decode: bool,
     decode_steps_served: u64,
     last_active_at: Instant,
-}
-
-#[derive(Clone)]
-struct ServingTransportCacheEntry {
-    key: ServingTransportCacheKey,
-    transport: ServingSessionTransport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ServingTransportCacheKey {
-    my_position: u32,
-    total_workers: u32,
-    left_peer: SocketAddr,
-    right_peer: SocketAddr,
-    runtime_mode: InferenceRuntimeMode,
-    provider: crate::provider::ExecutionProviderKind,
 }
 
 struct DecodeStepOutcome {
@@ -376,45 +357,7 @@ impl InferenceCoordinator {
             decode_queue_index: HashMap::new(),
             next_decode_fairness_epoch: 0,
             recovery_governor: RecoveryGovernor::default(),
-            serving_transport_cache: None,
         }
-    }
-
-    async fn prepared_serving_transport(
-        &mut self,
-        position: &WorkerPosition,
-        runtime_mode: InferenceRuntimeMode,
-        provider: crate::provider::ExecutionProviderKind,
-    ) -> Result<ServingSessionTransport> {
-        let key = ServingTransportCacheKey {
-            my_position: position.position,
-            total_workers: position.total_workers,
-            left_peer: position.left_neighbor_tensor_addr,
-            right_peer: position.right_neighbor_tensor_addr,
-            runtime_mode,
-            provider,
-        };
-
-        if let Some(cache) = self.serving_transport_cache.as_ref() {
-            if cache.key == key {
-                return Ok(cache.transport.clone());
-            }
-        }
-
-        let transport = self
-            .tensor_plane
-            .serving_transport_for_neighbors(
-                position.left_neighbor_tensor_addr,
-                position.right_neighbor_tensor_addr,
-                runtime_mode,
-                provider,
-            )
-            .await?;
-        self.serving_transport_cache = Some(ServingTransportCacheEntry {
-            key,
-            transport: transport.clone(),
-        });
-        Ok(transport)
     }
 
     fn build_session_state(
@@ -1709,13 +1652,6 @@ impl InferenceCoordinator {
                     "session backend missing at prefill execution time".to_string(),
                 )
             })?;
-            let serving_transport = self
-                .prepared_serving_transport(
-                    position,
-                    session.job.request.runtime_mode,
-                    session.backend.provider_kind(),
-                )
-                .await?;
             if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
                 let prefill_plan = FastPathPlanner::plan_prefill(
                     &session.backend.fast_path_context(),
@@ -1737,7 +1673,7 @@ impl InferenceCoordinator {
                 session.job.request.runtime_mode,
                 session.backend.provider_kind(),
                 session.backend.executor_contract().clone(),
-                Some(serving_transport),
+                None,
                 self.tensor_plane_mut(),
             );
             worker_ring.prepare_serving_group_channels().await?;
@@ -1857,9 +1793,6 @@ impl InferenceCoordinator {
             .first()
             .map(|(_, session, _)| session.backend.provider_kind())
             .unwrap_or(crate::provider::ExecutionProviderKind::Cpu);
-        let serving_transport = self
-            .prepared_serving_transport(position, runtime_mode, provider)
-            .await?;
         let mut worker_ring = WorkerRing::new(
             position.position,
             position.total_workers,
@@ -1877,7 +1810,7 @@ impl InferenceCoordinator {
                         crate::provider::ExecutionProviderKind::Cpu,
                     )
                 }),
-            Some(serving_transport),
+            None,
             self.tensor_plane_mut(),
         );
         worker_ring.prepare_serving_group_channels().await?;
@@ -2573,108 +2506,6 @@ mod tests {
         assert_eq!(position.total_workers, 10);
         assert_eq!(position.shard_worker_position, 3);
         assert_eq!(position.shard_total_workers, 10);
-    }
-
-    #[tokio::test]
-    async fn test_prepared_serving_transport_cache_tracks_ring_topology_and_backend_class() {
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
-        let swarm = MeshSwarm::builder(keypair).build().expect("test swarm");
-        let tensor_plane = TensorPlane::bind(TensorPlaneConfig::default())
-            .await
-            .expect("tensor plane");
-        let left_plane_a = TensorPlane::bind(TensorPlaneConfig::default())
-            .await
-            .expect("left plane a");
-        let right_plane_a = TensorPlane::bind(TensorPlaneConfig::default())
-            .await
-            .expect("right plane a");
-        let left_plane_b = TensorPlane::bind(TensorPlaneConfig::default())
-            .await
-            .expect("left plane b");
-        let right_plane_b = TensorPlane::bind(TensorPlaneConfig::default())
-            .await
-            .expect("right plane b");
-        let mut coordinator =
-            InferenceCoordinator::new(swarm, tensor_plane, InferenceConfig::default());
-        let position_a = WorkerPosition {
-            position: 0,
-            total_workers: 2,
-            left_neighbor: PeerId::random(),
-            left_neighbor_addrs: vec![],
-            left_neighbor_punch_plan: None,
-            left_neighbor_tensor_addr: left_plane_a.local_addr(),
-            right_neighbor: PeerId::random(),
-            right_neighbor_addrs: vec![],
-            right_neighbor_punch_plan: None,
-            right_neighbor_tensor_addr: right_plane_a.local_addr(),
-            shard_column_range: (0, 1024),
-            shard_worker_position: 0,
-            shard_total_workers: 2,
-            shard_memory_bytes: 1024,
-        };
-        let position_b = WorkerPosition {
-            left_neighbor_tensor_addr: left_plane_b.local_addr(),
-            right_neighbor_tensor_addr: right_plane_b.local_addr(),
-            ..position_a.clone()
-        };
-
-        let first = coordinator
-            .prepared_serving_transport(
-                &position_a,
-                InferenceRuntimeMode::ThroughputFirst,
-                ExecutionProviderKind::Cuda,
-            )
-            .await
-            .unwrap();
-        let first_cached = coordinator
-            .serving_transport_cache
-            .as_ref()
-            .expect("transport cache after first prepare");
-        assert_eq!(
-            first_cached.key.left_peer,
-            position_a.left_neighbor_tensor_addr
-        );
-        assert_eq!(
-            first_cached.key.right_peer,
-            position_a.right_neighbor_tensor_addr
-        );
-        assert_eq!(
-            first_cached.key.runtime_mode,
-            InferenceRuntimeMode::ThroughputFirst
-        );
-        assert_eq!(first_cached.key.provider, ExecutionProviderKind::Cuda);
-
-        let second = coordinator
-            .prepared_serving_transport(
-                &position_a,
-                InferenceRuntimeMode::ThroughputFirst,
-                ExecutionProviderKind::Cuda,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            second.stream_id_for(crate::network::CollectiveLane::ReduceScatter, 3, 2),
-            first.stream_id_for(crate::network::CollectiveLane::ReduceScatter, 3, 2),
-            "identical ring topology should reuse the same serving lane plan"
-        );
-
-        coordinator
-            .prepared_serving_transport(
-                &position_b,
-                InferenceRuntimeMode::ThroughputFirst,
-                ExecutionProviderKind::Cuda,
-            )
-            .await
-            .unwrap();
-        let updated = coordinator
-            .serving_transport_cache
-            .as_ref()
-            .expect("transport cache after topology change");
-        assert_eq!(updated.key.left_peer, position_b.left_neighbor_tensor_addr);
-        assert_eq!(
-            updated.key.right_peer,
-            position_b.right_neighbor_tensor_addr
-        );
     }
 
     #[test]

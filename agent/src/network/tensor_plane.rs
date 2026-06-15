@@ -922,7 +922,8 @@ impl TensorPlane {
                                         let header = frame.header;
                                         let queue_len = {
                                             let mut slots = inbound.slots.lock().await;
-                                            let queue = slots.entry(slot).or_insert_with(VecDeque::new);
+                                            let queue =
+                                                slots.entry(slot).or_insert_with(VecDeque::new);
                                             queue.push_back(InboundServingFrame {
                                                 frame,
                                                 queued_at: Instant::now(),
@@ -930,7 +931,8 @@ impl TensorPlane {
                                             });
                                             queue.len()
                                         };
-                                        tracing::info!(
+                                        debug!(
+                                            inbound_id = format_args!("{:p}", Arc::as_ptr(&inbound)),
                                             remote_addr = %remote_addr,
                                             collective_id = %header.collective_id,
                                             collective_seq = header.collective_seq,
@@ -1224,7 +1226,14 @@ impl TensorPlane {
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
+        let mut unique_peers = Vec::with_capacity(peers.len());
         for &peer in peers {
+            if unique_peers.contains(&peer) {
+                continue;
+            }
+            unique_peers.push(peer);
+        }
+        for peer in unique_peers {
             for plan in hot_lane_plans {
                 for stream_id in 0..plan.desired_stream_count as u32 {
                     self.ensure_connection_pool(
@@ -1248,8 +1257,6 @@ impl TensorPlane {
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
     ) -> Result<ServingSessionTransport> {
-        self.prepare_serving_peer_channels(&[left_peer, right_peer], runtime_mode, provider)
-            .await?;
         let reduce_scatter_plan = lane_plan(
             CollectiveLane::ReduceScatter,
             self.state.profile,
@@ -1581,7 +1588,10 @@ async fn recv_slot(
     };
 
     loop {
-        let delivered = {
+        let notified = inbound.notify.notified();
+        tokio::pin!(notified);
+        let inbound_id = format!("{:p}", Arc::as_ptr(inbound));
+        let (delivered, queued_slot_keys) = {
             let mut slots = inbound.slots.lock().await;
             let mut should_remove = false;
             let delivered = slots.get_mut(&slot_key).and_then(|queue| {
@@ -1592,10 +1602,34 @@ async fn recv_slot(
             if should_remove {
                 slots.remove(&slot_key);
             }
-            delivered
+            let queued_slot_keys = if delivered.is_some() {
+                None
+            } else {
+                Some(
+                    slots
+                        .iter()
+                        .map(|(key, queue)| {
+                            format!(
+                                "{}:{}:{}:{:?}:{}:{}:{}:{}(len={})",
+                                key.collective_id,
+                                key.collective_seq,
+                                key.sender_position,
+                                key.lane,
+                                key.layer_idx,
+                                key.step,
+                                key.slot,
+                                key.stream_id,
+                                queue.len()
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            (delivered, queued_slot_keys)
         };
         if let Some(message) = delivered {
-            tracing::info!(
+            debug!(
+                inbound_id = %inbound_id,
                 collective_id = %slot_key.collective_id,
                 collective_seq = slot_key.collective_seq,
                 sender_position = slot_key.sender_position,
@@ -1620,7 +1654,8 @@ async fn recv_slot(
                 .fetch_add(wait_ms, Ordering::Relaxed);
             return Ok(message.frame);
         }
-        tracing::info!(
+        debug!(
+            inbound_id = %inbound_id,
             collective_id = %slot_key.collective_id,
             collective_seq = slot_key.collective_seq,
             sender_position = slot_key.sender_position,
@@ -1629,9 +1664,10 @@ async fn recv_slot(
             step = slot_key.step,
             slot = slot_key.slot,
             stream_id = slot_key.stream_id,
-                "Waiting for serving dataplane frame"
+            queued_slot_keys = ?queued_slot_keys,
+            "Waiting for serving dataplane frame"
         );
-        inbound.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -2459,6 +2495,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_serving_transport_deduplicates_same_neighbor_endpoint() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let target = plane.local_addr();
+
+        plane
+            .serving_transport_for_neighbors(
+                target,
+                target,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+
+        wait_for_metric(&plane, |snapshot| {
+            snapshot.current_outbound_connections >= 5
+        })
+        .await;
+        let snapshot = plane.metrics_snapshot();
+        assert_eq!(snapshot.current_outbound_connections, 5);
+    }
+
+    #[tokio::test]
     async fn test_logical_serving_stream_ids_bind_to_stable_underlying_channels() {
         let plane = TensorPlane::bind(TensorPlaneConfig {
             max_concurrent_outbound_streams_per_peer: 3,
@@ -2568,8 +2629,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_serving_frame_write_read_roundtrip_preserves_payload_and_shape() {
-        let header =
-            ServingFrameHeader::new(Uuid::new_v4(), 4, 3, 7, 2, 1, 0, CollectiveLane::AllGather, 3);
+        let header = ServingFrameHeader::new(
+            Uuid::new_v4(),
+            4,
+            3,
+            7,
+            2,
+            1,
+            0,
+            CollectiveLane::AllGather,
+            3,
+        );
         let chunk_data = [1.5_f32, -2.25, 8.0];
         let (mut writer, mut reader) = tokio::io::duplex(1024);
 

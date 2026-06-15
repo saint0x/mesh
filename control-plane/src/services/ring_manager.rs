@@ -355,6 +355,10 @@ impl RingTopologyManager {
             .mutation_lock
             .lock()
             .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
+        let write_gate = self.db.write_gate();
+        let _write_guard = write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".to_string()))?;
 
         if worker.device_id.is_empty() {
             return Err(ApiError::BadRequest(
@@ -659,6 +663,10 @@ impl RingTopologyManager {
             .mutation_lock
             .lock()
             .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
+        let write_gate = self.db.write_gate();
+        let _write_guard = write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".to_string()))?;
 
         let conn = self.db.get_conn()?;
 
@@ -769,6 +777,10 @@ impl RingTopologyManager {
             .mutation_lock
             .lock()
             .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
+        let write_gate = self.db.write_gate();
+        let _write_guard = write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".to_string()))?;
 
         if failed_worker_id.is_empty() {
             return Err(ApiError::BadRequest(

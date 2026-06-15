@@ -137,6 +137,10 @@ fn mark_device_offline(
     db: &Database,
     device: &StaleDeviceRecord,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let write_gate = db.write_gate();
+    let _write_guard = write_gate
+        .lock()
+        .map_err(|_| std::io::Error::other("Database write gate lock poisoned"))?;
     let conn = db.get_conn()?;
     let connectivity_state = device
         .connectivity_state_json

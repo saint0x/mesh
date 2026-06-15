@@ -1728,6 +1728,31 @@ fn control_plane_url(config: &DeviceConfig, path: &str) -> String {
     format!("{}{}", config.control_plane_url.trim_end_matches('/'), path)
 }
 
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).context("Failed to listen for SIGTERM")?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("Failed to listen for ctrl-c")?;
+                Ok("SIGINT")
+            }
+            _ = terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to listen for ctrl-c")?;
+        Ok("SIGINT")
+    }
+}
+
 /// Run agent daemon
 pub(crate) async fn cmd_start(log_level: String) -> Result<()> {
     println!("🛡️  Starting Mesh inference supervisor...\n");
@@ -1783,9 +1808,9 @@ pub(crate) async fn cmd_start(log_level: String) -> Result<()> {
                 );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("Failed to listen for ctrl-c")?;
-                info!("Supervisor received shutdown signal");
+            signal = wait_for_shutdown_signal() => {
+                let signal = signal?;
+                info!(signal, "Supervisor received shutdown signal");
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 return Ok(());
@@ -3178,8 +3203,9 @@ async fn cmd_runtime() -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown signal received");
+            signal = wait_for_shutdown_signal() => {
+                let signal = signal?;
+                info!(signal, "Shutdown signal received");
                 break;
             }
             event = swarm.next_event() => {
