@@ -22,6 +22,17 @@ async fn log_locked_db_route(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let response = next.run(req).await;
+    if response.status().is_server_error() {
+        tracing::error!(
+            %method,
+            %path,
+            status = %response.status(),
+            db_locked = response
+                .headers()
+                .contains_key(&crate::api::error::DB_LOCKED_HEADER),
+            "HTTP route returned server error"
+        );
+    }
     if response
         .headers()
         .contains_key(&crate::api::error::DB_LOCKED_HEADER)

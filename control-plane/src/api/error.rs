@@ -33,16 +33,46 @@ impl From<crate::db::DbError> for ApiError {
     }
 }
 
+fn is_locked_sqlite_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("database is locked") || message.contains("database is busy") {
+        return true;
+    }
+
+    if let Some(db_error) = error.downcast_ref::<crate::db::DbError>() {
+        if matches!(
+            db_error,
+            crate::db::DbError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+                    || code.code == rusqlite::ErrorCode::DatabaseLocked
+        ) {
+            return true;
+        }
+    }
+
+    if let Some(sqlite_error) = error.downcast_ref::<rusqlite::Error>() {
+        if matches!(
+            sqlite_error,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+                    || code.code == rusqlite::ErrorCode::DatabaseLocked
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn is_locked_database_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    let Some(db_error) = error.downcast_ref::<crate::db::DbError>() else {
-        return false;
-    };
-    matches!(
-        db_error,
-        crate::db::DbError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-            if code.code == rusqlite::ErrorCode::DatabaseBusy
-                || code.code == rusqlite::ErrorCode::DatabaseLocked
-    )
+    let mut current = Some(error as &(dyn std::error::Error + 'static));
+    while let Some(err) = current {
+        if is_locked_sqlite_error(err) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// Convert ApiError into HTTP response
