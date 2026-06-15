@@ -4511,51 +4511,95 @@ fn claim_assignment(
         };
 
         if let Some(assignment) = row.as_mut() {
-            step = "mark_assignment_leased";
-            tx.execute(
-                r#"
-            UPDATE inference_job_assignments
-            SET status = 'leased', lease_expires_at = ?
-            WHERE assignment_id = ?
-            "#,
-                params![&lease_expires, &assignment.lease_id],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             let execution_plan = load_execution_plan_json(&assignment.execution_plan_json)?;
             let active = active_segment(&execution_plan, &assignment.active_segment_id)?;
-            step = "update_serving_group";
-            tx.execute(
-                r#"
-            UPDATE inference_serving_groups
-            SET status = CASE
-                    WHEN device_id = ? THEN ?
-                    ELSE status
-                END,
-                lease_owner_device_id = ?,
-                lease_expires_at = ?,
-                updated_at = ?,
-                last_error = NULL
-            WHERE job_id = ? AND group_id = ? AND phase = ?
-            "#,
-                params![
-                    &assignment.device_id,
-                    match active.phase {
-                        crate::api::types::ExecutionPhase::Prefill => "prefill_leased",
-                        crate::api::types::ExecutionPhase::Decode => "decode_leased",
-                    },
-                    &assignment.device_id,
-                    &lease_expires,
-                    &now_str,
+            if matches!(active.phase, crate::api::types::ExecutionPhase::Prefill) {
+                step = "lease_prefill_group_assignments";
+                lease_prefill_group_assignments(
+                    &tx,
                     &assignment.job_id,
+                    &active.segment_id,
                     &active.execution_group_id,
-                    match active.phase {
-                        crate::api::types::ExecutionPhase::Prefill => "prefill",
-                        crate::api::types::ExecutionPhase::Decode => "decode",
-                    }
-                ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            if matches!(active.phase, crate::api::types::ExecutionPhase::Decode) {
+                    &lease_expires,
+                )?;
+                step = "update_prefill_serving_group";
+                tx.execute(
+                    r#"
+                UPDATE inference_serving_groups
+                SET status = CASE
+                        WHEN status = 'prefill_active' THEN status
+                        ELSE 'prefill_leased'
+                    END,
+                    lease_owner_device_id = NULL,
+                    lease_expires_at = ?,
+                    updated_at = ?,
+                    last_error = NULL
+                WHERE job_id = ? AND group_id = ? AND phase = 'prefill'
+                "#,
+                    params![
+                        &lease_expires,
+                        &now_str,
+                        &assignment.job_id,
+                        &active.execution_group_id
+                    ],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "record_prefill_claim";
+                record_scheduler_event(
+                    &tx,
+                    SchedulerEventRecord {
+                        network_id: &assignment.network_id,
+                        job_id: Some(&assignment.job_id),
+                        session_id: Some(&assignment.session_id),
+                        device_id: Some(&assignment.device_id),
+                        segment_id: Some(&active.segment_id),
+                        group_id: Some(&active.execution_group_id),
+                        batch_group_key: None,
+                        event_kind: "prefill_claimed",
+                        queue_status: Some("leased"),
+                        detail: Some("prefill execution group leased atomically"),
+                        lease_target_session_count: None,
+                        lease_target_batch_size: None,
+                        created_at: &now_str,
+                    },
+                )?;
+            } else {
+                step = "mark_assignment_leased";
+                tx.execute(
+                    r#"
+                UPDATE inference_job_assignments
+                SET status = 'leased', lease_expires_at = ?
+                WHERE assignment_id = ?
+                "#,
+                    params![&lease_expires, &assignment.lease_id],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "update_serving_group";
+                tx.execute(
+                    r#"
+                UPDATE inference_serving_groups
+                SET status = CASE
+                        WHEN device_id = ? THEN ?
+                        ELSE status
+                    END,
+                    lease_owner_device_id = ?,
+                    lease_expires_at = ?,
+                    updated_at = ?,
+                    last_error = NULL
+                WHERE job_id = ? AND group_id = ? AND phase = ?
+                "#,
+                    params![
+                        &assignment.device_id,
+                        "decode_leased",
+                        &assignment.device_id,
+                        &lease_expires,
+                        &now_str,
+                        &assignment.job_id,
+                        &active.execution_group_id,
+                        "decode",
+                    ],
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
                 step = "decode_queue_prepare";
                 let batch_group_key = decode_batch_group_key(&execution_plan, &active.segment_id)?;
                 let (lease_target_session_count, lease_target_batch_size) =
@@ -4660,6 +4704,41 @@ fn claim_assignment(
     }
 
     result
+}
+
+fn lease_prefill_group_assignments(
+    conn: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    active_segment_id: &str,
+    group_id: &str,
+    lease_expires_at: &str,
+) -> ApiResult<()> {
+    conn.execute(
+        r#"
+        UPDATE inference_job_assignments
+        SET status = 'leased',
+            lease_expires_at = ?
+        WHERE job_id = ?
+          AND active_segment_id = ?
+          AND status IN ('pending', 'leased')
+          AND device_id IN (
+                SELECT sg.device_id
+                FROM inference_serving_groups sg
+                WHERE sg.job_id = ?
+                  AND sg.group_id = ?
+                  AND sg.phase = 'prefill'
+          )
+        "#,
+        params![
+            lease_expires_at,
+            job_id,
+            active_segment_id,
+            job_id,
+            group_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
 }
 
 fn enrich_claimed_assignment(
@@ -7903,6 +7982,171 @@ mod tests {
 
         assert_eq!(status.status, "running");
         assert_eq!(status.assignments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_prefill_claim_leases_entire_execution_group_atomically() {
+        let network_id = "test-network-prefill-atomic-lease";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "atomic prefill".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected first assignment");
+        assert_eq!(first_claim.job_id, submit.job_id);
+
+        let conn = state.db.get_conn().unwrap();
+        let leased_assignments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM inference_job_assignments WHERE job_id = ? AND status = 'leased'",
+                params![&submit.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let leased_prefill_members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM inference_serving_groups WHERE job_id = ? AND phase = 'prefill' AND status = 'prefill_leased'",
+                params![&submit.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(leased_assignments, 2);
+        assert_eq!(leased_prefill_members, 2);
+
+        let second_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected peer assignment");
+
+        assert_eq!(second_claim.job_id, submit.job_id);
+        assert_ne!(second_claim.device_id, first_claim.device_id);
+    }
+
+    #[tokio::test]
+    async fn test_prefill_claim_joins_existing_inflight_group_before_fresh_job() {
+        let network_id = "test-network-prefill-inflight-join";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit_a = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "first job".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected first assignment");
+        assert_eq!(first_claim.job_id, submit_a.job_id);
+
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(submit_a.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let submit_b = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "second job".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let second_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected peer assignment");
+
+        assert_eq!(second_claim.job_id, submit_a.job_id);
+        assert_ne!(second_claim.job_id, submit_b.job_id);
     }
 
     #[tokio::test]
@@ -11846,7 +12090,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let submit_b1 = submit_inference(
+        let _submit_b1 = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -11954,7 +12198,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let model_y = submit_inference(
+        let _model_y = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),

@@ -116,6 +116,11 @@ pub fn select_claim_assignment_id(
     req: &ClaimInferenceAssignmentRequest,
     scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<Option<String>> {
+    if matches!(req.claim_mode, WorkClaimMode::Any | WorkClaimMode::Prefill) {
+        if let Some(assignment_id) = select_inflight_prefill_assignment_id(conn, req)? {
+            return Ok(Some(assignment_id));
+        }
+    }
     Ok(
         schedule_claim_decision(conn, req, scheduling_policy, SchedulerPolicyMode::FitFirst)?
             .selected_assignment_id,
@@ -263,6 +268,42 @@ fn load_scheduler_snapshot(
             scheduling_policy,
         )?,
     })
+}
+
+fn select_inflight_prefill_assignment_id(
+    conn: &Transaction<'_>,
+    req: &ClaimInferenceAssignmentRequest,
+) -> ApiResult<Option<String>> {
+    conn.query_row(
+        r#"
+        SELECT a.assignment_id
+        FROM inference_job_assignments a
+        INNER JOIN inference_jobs j ON j.job_id = a.job_id
+        INNER JOIN inference_serving_groups sg
+            ON sg.job_id = a.job_id AND sg.device_id = a.device_id
+        WHERE a.network_id = ?
+          AND a.device_id = ?
+          AND a.active_segment_id = j.active_segment_id
+          AND a.status IN ('pending', 'leased')
+          AND sg.phase = 'prefill'
+          AND sg.status IN ('prefill_member', 'prefill_leased')
+          AND EXISTS (
+                SELECT 1
+                FROM inference_serving_groups sg_peer
+                WHERE sg_peer.job_id = a.job_id
+                  AND sg_peer.group_id = sg.group_id
+                  AND sg_peer.phase = 'prefill'
+                  AND sg_peer.device_id <> a.device_id
+                  AND sg_peer.status IN ('prefill_leased', 'prefill_active')
+          )
+        ORDER BY j.created_at ASC, a.assignment_id ASC
+        LIMIT 1
+        "#,
+        params![&req.network_id, &req.device_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
 fn classify_candidate(
