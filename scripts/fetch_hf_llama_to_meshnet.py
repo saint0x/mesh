@@ -9,8 +9,14 @@ from pathlib import Path
 import numpy as np
 from huggingface_hub import hf_hub_download
 from safetensors.numpy import save_file
-from safetensors.torch import load_file
-import torch
+from safetensors import safe_open
+
+try:
+    import torch
+    from safetensors.torch import load_file as load_torch_file
+except ImportError:  # pragma: no cover - optional dependency for bf16 source weights
+    torch = None
+    load_torch_file = None
 
 
 def partition_start(total_columns: int, worker_position: int, total_workers: int) -> int:
@@ -65,14 +71,57 @@ def tensor_name_map(layer_idx: int) -> dict[str, str]:
     }
 
 
-def tensor_to_f32_numpy(tensor: torch.Tensor) -> np.ndarray:
+def tensor_to_f32_numpy(array: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(np.asarray(array, dtype=np.float32))
+
+
+def tensor_from_file(source, name: str) -> np.ndarray:
+    return tensor_to_f32_numpy(source.get_tensor(name))
+
+
+def transpose_rows_slice(source, name: str, start: int, length: int) -> np.ndarray:
+    tensor = source.get_tensor(name)
+    return np.ascontiguousarray(np.asarray(tensor[start : start + length, :], dtype=np.float32).T)
+
+
+def transpose_cols_slice(source, name: str, start: int, length: int) -> np.ndarray:
+    tensor = source.get_tensor(name)
+    return np.ascontiguousarray(np.asarray(tensor[:, start : start + length], dtype=np.float32).T)
+
+
+def tensor_from_torch(source, name: str) -> np.ndarray:
+    tensor = source[name]
     return tensor.detach().to(dtype=torch.float32, device="cpu").contiguous().numpy()
 
 
+def transpose_rows_slice_torch(source, name: str, start: int, length: int) -> np.ndarray:
+    tensor = source[name]
+    return (
+        tensor[start : start + length, :]
+        .transpose(0, 1)
+        .detach()
+        .to(dtype=torch.float32, device="cpu")
+        .contiguous()
+        .numpy()
+    )
+
+
+def transpose_cols_slice_torch(source, name: str, start: int, length: int) -> np.ndarray:
+    tensor = source[name]
+    return (
+        tensor[:, start : start + length]
+        .transpose(0, 1)
+        .detach()
+        .to(dtype=torch.float32, device="cpu")
+        .contiguous()
+        .numpy()
+    )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch a real HF Llama-family model and convert it to MeshNet shards.")
-    parser.add_argument("--repo-id", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    parser.add_argument("--model-id", default="tinyllama-1.1b-chat-v1.0")
+    parser = argparse.ArgumentParser(description="Fetch a real HF causal LM model and convert it to MeshNet shards.")
+    parser.add_argument("--repo-id", default="HuggingFaceTB/SmolLM2-135M-Instruct")
+    parser.add_argument("--model-id", default="smollm2-135m-instruct")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args()
@@ -107,12 +156,6 @@ def main() -> None:
         },
     )
 
-    source = load_file(model_path, device="cpu")
-    embedding = tensor_to_f32_numpy(source["model.embed_tokens.weight"])
-    final_norm = tensor_to_f32_numpy(source["model.norm.weight"])
-    lm_head_name = "lm_head.weight" if "lm_head.weight" in source else "model.embed_tokens.weight"
-    lm_head = tensor_to_f32_numpy(source[lm_head_name].transpose(0, 1).contiguous())
-
     metadata = {
         "mesh.model_id": args.model_id,
         "mesh.hidden_dim": str(hidden_dim),
@@ -125,74 +168,151 @@ def main() -> None:
         "mesh.rope_base": str(rope_base),
     }
 
-    for worker_position in range(args.workers):
-        q_start = partition_start(hidden_dim, worker_position, args.workers)
-        q_cols = partition_columns(hidden_dim, worker_position, args.workers)
-        kv_start = partition_start(kv_hidden_dim, worker_position, args.workers)
-        kv_cols = partition_columns(kv_hidden_dim, worker_position, args.workers)
-        mlp_start = partition_start(intermediate_size, worker_position, args.workers)
-        mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
+    try:
+        with safe_open(model_path, framework="np") as source:
+            keys = set(source.keys())
+            embedding = tensor_from_file(source, "model.embed_tokens.weight")
+            final_norm = tensor_from_file(source, "model.norm.weight")
+            lm_head_name = "lm_head.weight" if "lm_head.weight" in keys else "model.embed_tokens.weight"
+            lm_head = np.ascontiguousarray(np.asarray(source.get_tensor(lm_head_name), dtype=np.float32).T)
 
-        tensors: dict[str, np.ndarray] = {
-            "embedding": embedding,
-            "final_norm": final_norm,
-            "lm_head": lm_head,
-        }
+            for worker_position in range(args.workers):
+                q_start = partition_start(hidden_dim, worker_position, args.workers)
+                q_cols = partition_columns(hidden_dim, worker_position, args.workers)
+                kv_start = partition_start(kv_hidden_dim, worker_position, args.workers)
+                kv_cols = partition_columns(kv_hidden_dim, worker_position, args.workers)
+                mlp_start = partition_start(intermediate_size, worker_position, args.workers)
+                mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
 
-        for layer_idx in range(num_layers):
-            names = tensor_name_map(layer_idx)
-            q_proj = source[names["w_q"]]
-            k_proj = source[names["w_k"]]
-            v_proj = source[names["w_v"]]
-            o_proj = source[names["w_o"]]
-            up_proj = source[names["w_up"]]
-            gate_proj = source[names["w_gate"]]
-            down_proj = source[names["w_down"]]
+                tensors: dict[str, np.ndarray] = {
+                    "embedding": embedding,
+                    "final_norm": final_norm,
+                    "lm_head": lm_head,
+                }
 
-            tensors[f"layers.{layer_idx}.w_q"] = tensor_to_f32_numpy(
-                q_proj[q_start : q_start + q_cols, :].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.w_k"] = tensor_to_f32_numpy(
-                k_proj[kv_start : kv_start + kv_cols, :].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.w_v"] = tensor_to_f32_numpy(
-                v_proj[kv_start : kv_start + kv_cols, :].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.w_o"] = tensor_to_f32_numpy(
-                o_proj[:, q_start : q_start + q_cols].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.w_up"] = tensor_to_f32_numpy(
-                up_proj[mlp_start : mlp_start + mlp_cols, :].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.w_gate"] = tensor_to_f32_numpy(
-                gate_proj[mlp_start : mlp_start + mlp_cols, :].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.w_down"] = tensor_to_f32_numpy(
-                down_proj[:, mlp_start : mlp_start + mlp_cols].transpose(0, 1).contiguous()
-            )
-            tensors[f"layers.{layer_idx}.attn_norm"] = tensor_to_f32_numpy(source[names["attn_norm"]])
-            tensors[f"layers.{layer_idx}.mlp_norm"] = tensor_to_f32_numpy(source[names["mlp_norm"]])
+                for layer_idx in range(num_layers):
+                    names = tensor_name_map(layer_idx)
+                    tensors[f"layers.{layer_idx}.w_q"] = transpose_rows_slice(
+                        source, names["w_q"], q_start, q_cols
+                    )
+                    tensors[f"layers.{layer_idx}.w_k"] = transpose_rows_slice(
+                        source, names["w_k"], kv_start, kv_cols
+                    )
+                    tensors[f"layers.{layer_idx}.w_v"] = transpose_rows_slice(
+                        source, names["w_v"], kv_start, kv_cols
+                    )
+                    tensors[f"layers.{layer_idx}.w_o"] = transpose_cols_slice(
+                        source, names["w_o"], q_start, q_cols
+                    )
+                    tensors[f"layers.{layer_idx}.w_up"] = transpose_rows_slice(
+                        source, names["w_up"], mlp_start, mlp_cols
+                    )
+                    tensors[f"layers.{layer_idx}.w_gate"] = transpose_rows_slice(
+                        source, names["w_gate"], mlp_start, mlp_cols
+                    )
+                    tensors[f"layers.{layer_idx}.w_down"] = transpose_cols_slice(
+                        source, names["w_down"], mlp_start, mlp_cols
+                    )
+                    tensors[f"layers.{layer_idx}.attn_norm"] = tensor_from_file(source, names["attn_norm"])
+                    tensors[f"layers.{layer_idx}.mlp_norm"] = tensor_from_file(source, names["mlp_norm"])
 
-        shard_path = out_dir / f"shard-{worker_position}-of-{args.workers}.safetensors"
-        shard_metadata = {
-            **metadata,
-            "mesh.worker_position": str(worker_position),
-            "mesh.total_workers": str(args.workers),
-        }
-        save_file(tensors, str(shard_path), metadata=shard_metadata)
+                shard_path = out_dir / f"shard-{worker_position}-of-{args.workers}.safetensors"
+                shard_metadata = {
+                    **metadata,
+                    "mesh.worker_position": str(worker_position),
+                    "mesh.total_workers": str(args.workers),
+                }
+                save_file(tensors, str(shard_path), metadata=shard_metadata)
 
-        digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
-        save_json(
-            out_dir / f"shard-{worker_position}-of-{args.workers}.manifest.json",
-            {
-                "model_id": args.model_id,
-                "worker_position": worker_position,
-                "total_workers": args.workers,
-                "expected_sha256": digest,
-            },
+                digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+                save_json(
+                    out_dir / f"shard-{worker_position}-of-{args.workers}.manifest.json",
+                    {
+                        "model_id": args.model_id,
+                        "worker_position": worker_position,
+                        "total_workers": args.workers,
+                        "expected_sha256": digest,
+                    },
+                )
+
+                print(f"wrote {shard_path}")
+    except TypeError as exc:
+        if "bfloat16" not in str(exc) or load_torch_file is None or torch is None:
+            raise
+
+        source = load_torch_file(model_path, device="cpu")
+        embedding = tensor_from_torch(source, "model.embed_tokens.weight")
+        final_norm = tensor_from_torch(source, "model.norm.weight")
+        lm_head_name = "lm_head.weight" if "lm_head.weight" in source else "model.embed_tokens.weight"
+        lm_head = (
+            source[lm_head_name]
+            .transpose(0, 1)
+            .detach()
+            .to(dtype=torch.float32, device="cpu")
+            .contiguous()
+            .numpy()
         )
 
-        print(f"wrote {shard_path}")
+        for worker_position in range(args.workers):
+            q_start = partition_start(hidden_dim, worker_position, args.workers)
+            q_cols = partition_columns(hidden_dim, worker_position, args.workers)
+            kv_start = partition_start(kv_hidden_dim, worker_position, args.workers)
+            kv_cols = partition_columns(kv_hidden_dim, worker_position, args.workers)
+            mlp_start = partition_start(intermediate_size, worker_position, args.workers)
+            mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
+
+            tensors: dict[str, np.ndarray] = {
+                "embedding": embedding,
+                "final_norm": final_norm,
+                "lm_head": lm_head,
+            }
+
+            for layer_idx in range(num_layers):
+                names = tensor_name_map(layer_idx)
+                tensors[f"layers.{layer_idx}.w_q"] = transpose_rows_slice_torch(
+                    source, names["w_q"], q_start, q_cols
+                )
+                tensors[f"layers.{layer_idx}.w_k"] = transpose_rows_slice_torch(
+                    source, names["w_k"], kv_start, kv_cols
+                )
+                tensors[f"layers.{layer_idx}.w_v"] = transpose_rows_slice_torch(
+                    source, names["w_v"], kv_start, kv_cols
+                )
+                tensors[f"layers.{layer_idx}.w_o"] = transpose_cols_slice_torch(
+                    source, names["w_o"], q_start, q_cols
+                )
+                tensors[f"layers.{layer_idx}.w_up"] = transpose_rows_slice_torch(
+                    source, names["w_up"], mlp_start, mlp_cols
+                )
+                tensors[f"layers.{layer_idx}.w_gate"] = transpose_rows_slice_torch(
+                    source, names["w_gate"], mlp_start, mlp_cols
+                )
+                tensors[f"layers.{layer_idx}.w_down"] = transpose_cols_slice_torch(
+                    source, names["w_down"], mlp_start, mlp_cols
+                )
+                tensors[f"layers.{layer_idx}.attn_norm"] = tensor_from_torch(source, names["attn_norm"])
+                tensors[f"layers.{layer_idx}.mlp_norm"] = tensor_from_torch(source, names["mlp_norm"])
+
+            shard_path = out_dir / f"shard-{worker_position}-of-{args.workers}.safetensors"
+            shard_metadata = {
+                **metadata,
+                "mesh.worker_position": str(worker_position),
+                "mesh.total_workers": str(args.workers),
+            }
+            save_file(tensors, str(shard_path), metadata=shard_metadata)
+
+            digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+            save_json(
+                out_dir / f"shard-{worker_position}-of-{args.workers}.manifest.json",
+                {
+                    "model_id": args.model_id,
+                    "worker_position": worker_position,
+                    "total_workers": args.workers,
+                    "expected_sha256": digest,
+                },
+            )
+
+            print(f"wrote {shard_path}")
 
 
 if __name__ == "__main__":

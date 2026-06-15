@@ -205,6 +205,18 @@ Every worker needs real model assets under `~/.meshnet/models/<model_id>/`:
 
 The same canonical artifacts are used across providers. Provider choice changes execution, not model semantics.
 
+For lower-memory bring-up on laptops or CPU-only machines, start with a smaller real model:
+
+```bash
+uv venv -p 3.12 /tmp/mesh-model-py312
+source /tmp/mesh-model-py312/bin/activate
+uv pip install numpy safetensors huggingface_hub torch
+python scripts/fetch_hf_llama_to_meshnet.py --out-dir ~/.meshnet/models --workers 2
+MESHNET_REAL_ARTIFACT_MODEL_ID=smollm2-135m-instruct bash scripts/test_real_artifact_loading.sh
+```
+
+The default fetch target is `HuggingFaceTB/SmolLM2-135M-Instruct`, which converts into two Mesh shards of roughly 419 MB each on this machine.
+
 ## Core Components
 
 - `agent`: worker runtime and CLI for device bring-up, pool participation, ring membership, shard loading, inference execution, and dataplane transport. It embeds `zip` inside the larger worker process. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
