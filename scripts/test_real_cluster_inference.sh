@@ -161,7 +161,7 @@ fi
 mkdir -p "$CONTROL_HOME" "$WORKER1_HOME" "$WORKER2_HOME"
 
 cd "$ROOT_DIR"
-cargo build -p agent --bin agent -p control-plane >/dev/null
+cargo build -p agent --bin agent -p control-plane --bin control-plane >/dev/null
 
 AGENT_BIN="$(find "$ROOT_DIR/target" -type f \( -path '*/debug/agent' -o -path '*/debug/agent.exe' \) | head -n 1)"
 CONTROL_BIN="$(find "$ROOT_DIR/target" -type f \( -path '*/debug/control-plane' -o -path '*/debug/control-plane.exe' \) | head -n 1)"

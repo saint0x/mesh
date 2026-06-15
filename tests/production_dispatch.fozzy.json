@@ -5,33 +5,25 @@
     {
       "name": "scripted control-plane dispatch contract",
       "type": "proc_when",
-      "cmd": "cargo",
+      "cmd": "python3",
       "args": [
-        "test",
-        "-p",
-        "control-plane",
-        "api::inference",
-        "--",
-        "--nocapture"
+        "-c",
+        "import re, subprocess, sys; p = subprocess.run(['cargo', 'test', '-q', '-p', 'control-plane', 'api::inference', '--', '--format', 'terse'], capture_output=True, text=True); sys.stdout.write(re.sub(r'finished in [0-9.]+s', 'finished in <time>', p.stdout)); sys.stderr.write(p.stderr); raise SystemExit(p.returncode)"
       ],
       "exit_code": 0,
-      "stdout": "test result: ok.\n",
+      "stdout": "\nrunning 31 tests\n...............................\ntest result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 149 filtered out; finished in <time>\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <time>\n\n",
       "times": 1
     },
     {
       "name": "control-plane inference dispatch tests",
       "type": "proc_spawn",
-      "cmd": "cargo",
+      "cmd": "python3",
       "args": [
-        "test",
-        "-p",
-        "control-plane",
-        "api::inference",
-        "--",
-        "--nocapture"
+        "-c",
+        "import re, subprocess, sys; p = subprocess.run(['cargo', 'test', '-q', '-p', 'control-plane', 'api::inference', '--', '--format', 'terse'], capture_output=True, text=True); sys.stdout.write(re.sub(r'finished in [0-9.]+s', 'finished in <time>', p.stdout)); sys.stderr.write(p.stderr); raise SystemExit(p.returncode)"
       ],
       "expect_exit": 0,
-      "expect_stdout": "test result: ok.\n"
+      "expect_stdout": "\nrunning 31 tests\n...............................\ntest result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 149 filtered out; finished in <time>\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <time>\n\n"
     }
   ]
 }

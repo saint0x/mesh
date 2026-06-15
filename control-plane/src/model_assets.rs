@@ -902,9 +902,21 @@ pub mod testsupport {
     static TEST_MODEL_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
     fn atomic_write(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
         let temp_path = path.with_extension("tmp");
         fs::write(&temp_path, bytes).unwrap();
-        fs::rename(&temp_path, path).unwrap();
+        if let Err(error) = fs::rename(&temp_path, path) {
+            // Some CI/macOS temp directory states can report NotFound during the
+            // final rename even though the write itself succeeded. Fall back to a
+            // direct destination write so test model setup stays deterministic.
+            if error.kind() != std::io::ErrorKind::NotFound {
+                panic!("failed to atomically write {}: {}", path.display(), error);
+            }
+            fs::write(path, bytes).unwrap();
+            let _ = fs::remove_file(&temp_path);
+        }
     }
 
     pub fn ensure_test_model(model_id: &str, tensor_parallelism_dim: u32) -> PathBuf {
@@ -959,7 +971,17 @@ pub mod testsupport {
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer_tmp_path = tokenizer_path.with_extension("tmp");
         tokenizer.save(&tokenizer_tmp_path, false).unwrap();
-        fs::rename(tokenizer_tmp_path, tokenizer_path).unwrap();
+        if let Err(error) = fs::rename(&tokenizer_tmp_path, &tokenizer_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                panic!(
+                    "failed to atomically write {}: {}",
+                    tokenizer_path.display(),
+                    error
+                );
+            }
+            tokenizer.save(&tokenizer_path, false).unwrap();
+            let _ = fs::remove_file(&tokenizer_tmp_path);
+        }
 
         atomic_write(
             &model_dir.join("tokenizer_config.json"),

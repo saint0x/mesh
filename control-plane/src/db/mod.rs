@@ -95,16 +95,16 @@ impl Database {
             Ok(())
         });
 
-        // Production correctness wins here: SQLite still has a single-writer
-        // model, and the control plane's inference lifecycle issues tightly
-        // coupled read/write bursts against the same tables. Default to a
-        // single shared connection to eliminate inter-connection lock races,
-        // while still allowing explicit overrides for controlled experiments.
+        // SQLite still has a single-writer model, but the control plane now
+        // serializes write-side mutations explicitly with a write gate. Keep a
+        // multi-connection pool so background reads, health/status routes, and
+        // ring lifecycle requests do not starve behind a single checked-out
+        // handle while preserving single-writer behavior at the mutation layer.
         let max_pool_size = std::env::var("MESHNET_SQLITE_POOL_MAX_SIZE")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(if is_memory { 10 } else { 1 });
+            .unwrap_or(if is_memory { 10 } else { 8 });
         let pool = Pool::builder().max_size(max_pool_size).build(manager)?;
 
         tracing::info!("Database connected successfully");
