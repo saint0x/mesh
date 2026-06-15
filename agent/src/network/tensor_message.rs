@@ -59,6 +59,7 @@ impl CollectiveLane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServingSlotKey {
     pub collective_id: Uuid,
+    pub collective_seq: u32,
     pub sender_position: u32,
     pub lane: CollectiveLane,
     pub layer_idx: u32,
@@ -71,6 +72,7 @@ pub struct ServingSlotKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServingFrameHeader {
     pub collective_id: Uuid,
+    pub collective_seq: u32,
     pub sender_position: u32,
     pub layer_idx: u32,
     pub step: u32,
@@ -83,6 +85,7 @@ pub struct ServingFrameHeader {
 impl ServingFrameHeader {
     pub fn new(
         collective_id: Uuid,
+        collective_seq: u32,
         sender_position: u32,
         layer_idx: u32,
         step: u32,
@@ -93,6 +96,7 @@ impl ServingFrameHeader {
     ) -> Self {
         Self {
             collective_id,
+            collective_seq,
             sender_position,
             layer_idx,
             step,
@@ -104,12 +108,13 @@ impl ServingFrameHeader {
     }
 
     pub const fn fixed_size() -> usize {
-        45
+        49
     }
 
     pub fn slot_key(&self) -> ServingSlotKey {
         ServingSlotKey {
             collective_id: self.collective_id,
+            collective_seq: self.collective_seq,
             sender_position: self.sender_position,
             lane: self.lane,
             layer_idx: self.layer_idx,
@@ -133,6 +138,7 @@ impl ServingFrameHeader {
         }
 
         put(&mut bytes, &mut offset, self.collective_id.as_bytes());
+        put(&mut bytes, &mut offset, &self.collective_seq.to_be_bytes());
         put(&mut bytes, &mut offset, &self.sender_position.to_be_bytes());
         put(&mut bytes, &mut offset, &self.layer_idx.to_be_bytes());
         put(&mut bytes, &mut offset, &self.step.to_be_bytes());
@@ -176,6 +182,7 @@ impl ServingFrameHeader {
 
         let mut offset = 0usize;
         let collective_id = Uuid::from_bytes(take::<16>(bytes, &mut offset)?);
+        let collective_seq = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
         let sender_position = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
         let layer_idx = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
         let step = u32::from_be_bytes(take::<4>(bytes, &mut offset)?);
@@ -198,6 +205,7 @@ impl ServingFrameHeader {
 
         Ok(Self {
             collective_id,
+            collective_seq,
             sender_position,
             layer_idx,
             step,

@@ -628,6 +628,7 @@ impl<'a> WorkerRing<'a> {
         partial_result: Tensor,
         job_id: Uuid,
         layer_idx: u32,
+        collective_seq: u32,
     ) -> Result<Tensor> {
         self.reap_completed_background_transfers().await?;
         if self.total_workers <= 1 {
@@ -646,6 +647,7 @@ impl<'a> WorkerRing<'a> {
                 .send_chunk_to_right_recv_from_left(
                     CollectiveLane::ReduceScatter,
                     job_id,
+                    collective_seq,
                     layer_idx,
                     0,
                     0,
@@ -698,6 +700,7 @@ impl<'a> WorkerRing<'a> {
                 .send_chunk_to_right_recv_from_left(
                     CollectiveLane::ReduceScatter,
                     job_id,
+                    collective_seq,
                     layer_idx,
                     step as u32,
                     step_plan.send_slot,
@@ -740,6 +743,7 @@ impl<'a> WorkerRing<'a> {
                 .send_chunk_to_right_recv_from_left(
                     CollectiveLane::AllGather,
                     job_id,
+                    collective_seq,
                     layer_idx,
                     step as u32,
                     step_plan.send_slot,
@@ -781,11 +785,12 @@ impl<'a> WorkerRing<'a> {
         partial_result: Tensor,
         job_id: Uuid,
         layer_idx: u32,
+        collective_seq: u32,
         timeout: Duration,
     ) -> Result<Tensor> {
         tokio::time::timeout(
             timeout,
-            self.ring_all_reduce(partial_result, job_id, layer_idx),
+            self.ring_all_reduce(partial_result, job_id, layer_idx, collective_seq),
         )
         .await
         .map_err(|_| {
@@ -798,6 +803,7 @@ impl<'a> WorkerRing<'a> {
         mut partial_result: CollectiveMatrix,
         job_id: Uuid,
         layer_idx: u32,
+        collective_seq: u32,
     ) -> Result<CollectiveMatrix> {
         self.reap_completed_background_transfers().await?;
         if self.total_workers <= 1 {
@@ -814,6 +820,7 @@ impl<'a> WorkerRing<'a> {
                 .send_chunk_to_right_recv_from_left(
                     CollectiveLane::ReduceScatter,
                     job_id,
+                    collective_seq,
                     layer_idx,
                     0,
                     0,
@@ -855,6 +862,7 @@ impl<'a> WorkerRing<'a> {
                 .send_chunk_to_right_recv_from_left(
                     CollectiveLane::ReduceScatter,
                     job_id,
+                    collective_seq,
                     layer_idx,
                     step as u32,
                     step_plan.send_slot,
@@ -890,6 +898,7 @@ impl<'a> WorkerRing<'a> {
                 .send_chunk_to_right_recv_from_left(
                     CollectiveLane::AllGather,
                     job_id,
+                    collective_seq,
                     layer_idx,
                     step as u32,
                     step_plan.send_slot,
@@ -924,11 +933,12 @@ impl<'a> WorkerRing<'a> {
         partial_result: CollectiveMatrix,
         job_id: Uuid,
         layer_idx: u32,
+        collective_seq: u32,
         timeout: Duration,
     ) -> Result<CollectiveMatrix> {
         tokio::time::timeout(
             timeout,
-            self.ring_all_reduce_matrix(partial_result, job_id, layer_idx),
+            self.ring_all_reduce_matrix(partial_result, job_id, layer_idx, collective_seq),
         )
         .await
         .map_err(|_| {
@@ -953,6 +963,7 @@ impl<'a> WorkerRing<'a> {
             .send_chunk_to_right_recv_from_left(
                 CollectiveLane::Control,
                 job_id,
+                0,
                 layer_idx,
                 0,
                 0,
@@ -1106,6 +1117,7 @@ impl<'a> WorkerRing<'a> {
         &mut self,
         lane: CollectiveLane,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         send_slot: u32,
@@ -1117,6 +1129,24 @@ impl<'a> WorkerRing<'a> {
         let transport = self.serving_transport()?.clone();
         let send_stream_id = transport.stream_id_for(lane, step, send_slot);
         let recv_stream_id = transport.stream_id_for(lane, step, recv_slot);
+        tracing::info!(
+            worker_position = self.my_position,
+            total_workers = self.total_workers,
+            lane = ?lane,
+            collective_id = %collective_id,
+            collective_seq,
+            layer_idx,
+            step,
+            send_slot,
+            recv_slot,
+            send_stream_id,
+            recv_stream_id,
+            chunk_len = chunk_data.len(),
+            left_tensor_addr = %self.left_tensor_addr,
+            right_tensor_addr = %self.right_tensor_addr,
+            expected_sender_position,
+            "Starting ring collective exchange"
+        );
         let io_started = std::time::Instant::now();
         let ((send_result, send_wait_ms), (inbound, receive_wait_ms)) = tokio::join!(
             async {
@@ -1125,6 +1155,7 @@ impl<'a> WorkerRing<'a> {
                         transport
                             .send_reduce_scatter_chunk(
                                 collective_id,
+                                collective_seq,
                                 layer_idx,
                                 step,
                                 send_slot,
@@ -1138,6 +1169,7 @@ impl<'a> WorkerRing<'a> {
                         transport
                             .send_all_gather_chunk(
                                 collective_id,
+                                collective_seq,
                                 layer_idx,
                                 step,
                                 send_slot,
@@ -1151,6 +1183,7 @@ impl<'a> WorkerRing<'a> {
                         transport
                             .send_control(
                                 collective_id,
+                                collective_seq,
                                 layer_idx,
                                 step,
                                 send_slot,
@@ -1171,6 +1204,7 @@ impl<'a> WorkerRing<'a> {
                 let result = transport
                     .recv_frame_bytes(ServingReceiveSpec {
                         collective_id,
+                        collective_seq,
                         lane,
                         layer_idx,
                         step,
@@ -1184,6 +1218,27 @@ impl<'a> WorkerRing<'a> {
         );
         send_result?;
         let inbound = inbound?;
+        tracing::info!(
+            worker_position = self.my_position,
+            total_workers = self.total_workers,
+            lane = ?lane,
+            collective_id = %collective_id,
+            collective_seq,
+            layer_idx,
+            step,
+            send_slot,
+            recv_slot,
+            send_stream_id,
+            recv_stream_id,
+            received_sender_position = inbound.header().sender_position,
+            received_stream_id = inbound.header().stream_id,
+            received_slot = inbound.header().slot,
+            received_elements = inbound.element_count(),
+            send_wait_ms,
+            receive_wait_ms,
+            elapsed_ms = io_started.elapsed().as_millis() as u64,
+            "Completed ring collective exchange"
+        );
 
         Ok((inbound, send_wait_ms, receive_wait_ms))
     }
@@ -1268,6 +1323,7 @@ impl<'a> WorkerRing<'a> {
                 self.background_transfers
                     .push(transport.spawn_bulk_transfer(
                         collective_id,
+                        0,
                         layer_idx,
                         step,
                         slot,
@@ -1288,6 +1344,7 @@ impl<'a> WorkerRing<'a> {
                 );
                 self.background_transfers.push(transport.spawn_checkpoint(
                     collective_id,
+                    0,
                     layer_idx,
                     step,
                     slot,
@@ -1301,6 +1358,7 @@ impl<'a> WorkerRing<'a> {
                 transport
                     .send_bulk_transfer(
                         collective_id,
+                        0,
                         layer_idx,
                         step,
                         slot,
@@ -1314,6 +1372,7 @@ impl<'a> WorkerRing<'a> {
                 transport
                     .send_checkpoint(
                         collective_id,
+                        0,
                         layer_idx,
                         step,
                         slot,
@@ -1650,11 +1709,13 @@ mod tests {
                 Tensor::new(vec![1.0, 2.0], vec![2]),
                 collective_id,
                 0,
+                0,
                 Duration::from_secs(5),
             ),
             ring_b.ring_all_reduce_with_timeout(
                 Tensor::new(vec![10.0, 20.0], vec![2]),
                 collective_id,
+                0,
                 0,
                 Duration::from_secs(5),
             )
@@ -1724,11 +1785,13 @@ mod tests {
                 CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2),
                 collective_id,
                 0,
+                0,
                 Duration::from_secs(5),
             ),
             ring_b.ring_all_reduce_matrix_with_timeout(
                 CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0], 2, 2),
                 collective_id,
+                0,
                 0,
                 Duration::from_secs(5),
             )
@@ -1740,6 +1803,94 @@ mod tests {
         assert_eq!(result_b.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
         assert_eq!(ring_a.last_run_metrics().all_gather_step_time_ms, 0);
         assert_eq!(ring_b.last_run_metrics().all_gather_step_time_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn test_two_worker_matrix_allreduce_with_independent_neighbor_transports() {
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        let session_a = plane_a
+            .serving_transport_for_neighbors(
+                addr_b,
+                addr_b,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let session_b = plane_b
+            .serving_transport_for_neighbors(
+                addr_a,
+                addr_a,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+
+        let mut ring_a = WorkerRing::new(
+            0,
+            2,
+            peer_b,
+            peer_b,
+            addr_b,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
+            Some(session_a),
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            2,
+            peer_a,
+            peer_a,
+            addr_a,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cpu,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
+            Some(session_b),
+            &mut plane_b,
+        );
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b) = tokio::join!(
+            ring_a.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2),
+                collective_id,
+                0,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0], 2, 2),
+                collective_id,
+                0,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+
+        assert_eq!(
+            result_a.unwrap().to_host_vec(),
+            vec![11.0, 22.0, 33.0, 44.0]
+        );
+        assert_eq!(
+            result_b.unwrap().to_host_vec(),
+            vec![11.0, 22.0, 33.0, 44.0]
+        );
     }
 
     #[test]
@@ -1870,17 +2021,20 @@ mod tests {
                 CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3),
                 collective_id,
                 0,
+                0,
                 Duration::from_secs(5),
             ),
             ring_b.ring_all_reduce_matrix_with_timeout(
                 CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], 2, 3),
                 collective_id,
                 0,
+                0,
                 Duration::from_secs(5),
             ),
             ring_c.ring_all_reduce_matrix_with_timeout(
                 CollectiveMatrix::new(vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0], 2, 3),
                 collective_id,
+                0,
                 0,
                 Duration::from_secs(5),
             )
@@ -1964,17 +2118,20 @@ mod tests {
                 Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6]),
                 collective_id,
                 0,
+                0,
                 Duration::from_secs(5),
             ),
             ring_b.ring_all_reduce_with_timeout(
                 Tensor::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], vec![6]),
                 collective_id,
                 0,
+                0,
                 Duration::from_secs(5),
             ),
             ring_c.ring_all_reduce_with_timeout(
                 Tensor::new(vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0], vec![6]),
                 collective_id,
+                0,
                 0,
                 Duration::from_secs(5),
             )

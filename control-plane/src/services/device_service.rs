@@ -4,7 +4,7 @@ use crate::db::Database;
 use crate::device::DeviceCapabilities;
 use crate::services::certificate::ControlPlaneKeypair;
 use crate::services::network_service;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, ErrorCode, OptionalExtension};
 use time::OffsetDateTime;
 use tracing::{debug, info};
 
@@ -152,8 +152,8 @@ pub fn update_heartbeat(
     let conn = db.get_conn()?;
 
     // Update last_seen and set status to online
-    let rows_affected = conn
-        .execute(
+    let rows_affected = execute_with_locked_retry(&conn, |conn| {
+        conn.execute(
             r#"
         UPDATE devices
         SET last_seen = ?, status = 'online', connectivity_state = ?, listen_addrs = ?, direct_candidates = ?
@@ -167,7 +167,8 @@ pub fn update_heartbeat(
                 &device_id
             ],
         )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    })
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
     if rows_affected == 0 {
         return Err(ApiError::NotFound(format!(
@@ -179,6 +180,36 @@ pub fn update_heartbeat(
     debug!(device_id = %device_id, last_seen = %now_str, "Heartbeat updated");
 
     Ok((now_str, connectivity_state, listen_addrs, direct_candidates))
+}
+
+fn execute_with_locked_retry<T>(
+    conn: &rusqlite::Connection,
+    mut op: impl FnMut(&rusqlite::Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    const MAX_ATTEMPTS: usize = 6;
+    const BASE_BACKOFF_MS: u64 = 25;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match op(conn) {
+            Ok(value) => return Ok(value),
+            Err(error) if is_locked_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    BASE_BACKOFF_MS * (attempt as u64 + 1),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("retry loop must return or error")
+}
+
+fn is_locked_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked
+    )
 }
 
 #[cfg(test)]

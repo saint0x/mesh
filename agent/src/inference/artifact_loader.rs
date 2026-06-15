@@ -31,6 +31,8 @@ struct ShardArtifactManifest {
     model_id: String,
     worker_position: u32,
     total_workers: u32,
+    column_start: u32,
+    column_end: u32,
     expected_sha256: String,
 }
 
@@ -97,6 +99,8 @@ impl ArtifactShardLoader {
         if manifest.model_id != model_id
             || manifest.worker_position != assignment.worker_position
             || manifest.total_workers != assignment.total_workers
+            || manifest.column_start != assignment.column_start
+            || manifest.column_end != assignment.column_end
         {
             return Err(AgentError::Config(format!(
                 "Shard manifest does not match requested assignment for model {}",
@@ -312,9 +316,17 @@ fn validate_metadata(
 
     let worker_position = metadata_u32(metadata, "mesh.worker_position")?;
     let total_workers = metadata_u32(metadata, "mesh.total_workers")?;
+    let column_start = metadata_u32(metadata, "mesh.column_start")?;
+    let column_end = metadata_u32(metadata, "mesh.column_end")?;
     if worker_position != assignment.worker_position || total_workers != assignment.total_workers {
         return Err(AgentError::Config(format!(
             "Safetensors metadata shard assignment mismatch for model {}",
+            model_id
+        )));
+    }
+    if column_start != assignment.column_start || column_end != assignment.column_end {
+        return Err(AgentError::Config(format!(
+            "Safetensors metadata shard range mismatch for model {}",
             model_id
         )));
     }
@@ -337,6 +349,48 @@ fn partition_columns(total_columns: usize, worker_position: u32, total_workers: 
     } else {
         columns_per_worker
     }
+}
+
+fn resolve_attention_shard_widths(
+    config: &ModelConfig,
+    assignment: &ShardAssignment,
+) -> Result<(usize, usize)> {
+    if config.hidden_dim % config.num_heads != 0 {
+        return Err(AgentError::Config(format!(
+            "Unsupported attention geometry: hidden_dim {} num_heads {}",
+            config.hidden_dim, config.num_heads
+        )));
+    }
+    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
+        return Err(AgentError::Config(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+
+    let shard_start = assignment.column_start as usize;
+    let shard_end = assignment.column_end as usize;
+    if shard_start >= shard_end || shard_end > config.hidden_dim {
+        return Err(AgentError::Config(format!(
+            "Invalid shard range {}..{} for hidden_dim {}",
+            assignment.column_start, assignment.column_end, config.hidden_dim
+        )));
+    }
+
+    let head_dim = config.hidden_dim / config.num_heads;
+    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
+    let q_group_width = q_heads_per_kv_head * head_dim;
+    if shard_start % q_group_width != 0 || shard_end % q_group_width != 0 {
+        return Err(AgentError::Config(format!(
+            "Shard range {}..{} is not aligned to grouped-query shard width {}",
+            assignment.column_start, assignment.column_end, q_group_width
+        )));
+    }
+
+    let q_cols = shard_end - shard_start;
+    let local_group_count = q_cols / q_group_width;
+    let kv_cols = local_group_count * head_dim;
+    Ok((q_cols, kv_cols))
 }
 
 fn load_tensor_2d(tensors: &SafeTensors<'_>, name: &str) -> Result<Tensor2D> {
@@ -419,14 +473,7 @@ fn validate_weight_shapes(
         )));
     }
 
-    let expected_cols = assignment.num_columns() as usize;
-    let head_dim = config.hidden_dim / config.num_heads;
-    let kv_total_cols = config.num_kv_heads * head_dim;
-    let expected_kv_cols = partition_columns(
-        kv_total_cols,
-        assignment.worker_position,
-        assignment.total_workers,
-    );
+    let (expected_cols, expected_kv_cols) = resolve_attention_shard_widths(config, assignment)?;
     let expected_mlp_cols = partition_columns(
         config.intermediate_size,
         assignment.worker_position,
@@ -597,19 +644,22 @@ mod tests {
 
     fn write_test_shard(root: &Path, assignment: &ShardAssignment) -> Result<()> {
         let hidden_dim = 8usize;
-        let q_shard_cols = assignment.num_columns() as usize;
         let vocab_size = 16usize;
         let intermediate_size = 16usize;
         let num_layers = 2usize;
         let num_heads = 2usize;
         let num_kv_heads = 2usize;
-        let head_dim = hidden_dim / num_heads;
-        let kv_total_cols = num_kv_heads * head_dim;
-        let kv_shard_cols = partition_columns(
-            kv_total_cols,
-            assignment.worker_position,
-            assignment.total_workers,
-        );
+        let config = ModelConfig {
+            hidden_dim,
+            num_heads,
+            num_kv_heads,
+            num_layers,
+            vocab_size,
+            intermediate_size,
+            rms_norm_eps: 1e-5,
+            rope_base: 10000.0,
+        };
+        let (q_shard_cols, kv_shard_cols) = resolve_attention_shard_widths(&config, assignment)?;
         let mlp_shard_cols = partition_columns(
             intermediate_size,
             assignment.worker_position,
@@ -683,6 +733,14 @@ mod tests {
                 "mesh.total_workers".to_string(),
                 assignment.total_workers.to_string(),
             ),
+            (
+                "mesh.column_start".to_string(),
+                assignment.column_start.to_string(),
+            ),
+            (
+                "mesh.column_end".to_string(),
+                assignment.column_end.to_string(),
+            ),
             ("mesh.hidden_dim".to_string(), hidden_dim.to_string()),
             ("mesh.num_heads".to_string(), num_heads.to_string()),
             ("mesh.num_kv_heads".to_string(), num_kv_heads.to_string()),
@@ -707,6 +765,8 @@ mod tests {
             model_id: assignment.model_id.clone(),
             worker_position: assignment.worker_position,
             total_workers: assignment.total_workers,
+            column_start: assignment.column_start,
+            column_end: assignment.column_end,
             expected_sha256: hex::encode(Sha256::digest(&bytes)),
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())?;

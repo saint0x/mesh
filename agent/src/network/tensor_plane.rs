@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::errors::{AgentError, Result};
@@ -382,6 +382,7 @@ struct BoundServingLane {
 #[derive(Debug, Clone, Copy)]
 pub struct ServingReceiveSpec {
     pub collective_id: Uuid,
+    pub collective_seq: u32,
     pub lane: CollectiveLane,
     pub layer_idx: u32,
     pub step: u32,
@@ -481,6 +482,7 @@ impl ServingSessionTransport {
     pub async fn send_reduce_scatter_chunk(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -491,6 +493,7 @@ impl ServingSessionTransport {
         self.send_frame(
             ServingFrameHeader::new(
                 collective_id,
+                collective_seq,
                 sender_position,
                 layer_idx,
                 step,
@@ -508,6 +511,7 @@ impl ServingSessionTransport {
     pub async fn send_all_gather_chunk(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -518,6 +522,7 @@ impl ServingSessionTransport {
         self.send_frame(
             ServingFrameHeader::new(
                 collective_id,
+                collective_seq,
                 sender_position,
                 layer_idx,
                 step,
@@ -535,6 +540,7 @@ impl ServingSessionTransport {
     pub async fn send_control(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -545,6 +551,7 @@ impl ServingSessionTransport {
         self.send_frame(
             ServingFrameHeader::new(
                 collective_id,
+                collective_seq,
                 sender_position,
                 layer_idx,
                 step,
@@ -562,6 +569,7 @@ impl ServingSessionTransport {
     pub async fn send_bulk_transfer(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -572,6 +580,7 @@ impl ServingSessionTransport {
         self.send_frame(
             ServingFrameHeader::new(
                 collective_id,
+                collective_seq,
                 sender_position,
                 layer_idx,
                 step,
@@ -589,6 +598,7 @@ impl ServingSessionTransport {
     pub async fn send_checkpoint(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -599,6 +609,7 @@ impl ServingSessionTransport {
         self.send_frame(
             ServingFrameHeader::new(
                 collective_id,
+                collective_seq,
                 sender_position,
                 layer_idx,
                 step,
@@ -616,6 +627,7 @@ impl ServingSessionTransport {
     pub async fn send_checkpoint_bytes(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -629,6 +641,7 @@ impl ServingSessionTransport {
             &self.checkpoint_lane,
             ServingFrameHeader::new(
                 collective_id,
+                collective_seq,
                 sender_position,
                 layer_idx,
                 step,
@@ -645,6 +658,7 @@ impl ServingSessionTransport {
     pub fn spawn_bulk_transfer(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -654,6 +668,7 @@ impl ServingSessionTransport {
     ) -> ServingBackgroundTransfer {
         self.spawn_background_frame(
             collective_id,
+            collective_seq,
             layer_idx,
             step,
             slot,
@@ -667,6 +682,7 @@ impl ServingSessionTransport {
     pub fn spawn_checkpoint(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -676,6 +692,7 @@ impl ServingSessionTransport {
     ) -> ServingBackgroundTransfer {
         self.spawn_background_frame(
             collective_id,
+            collective_seq,
             layer_idx,
             step,
             slot,
@@ -711,6 +728,7 @@ impl ServingSessionTransport {
     fn spawn_background_frame(
         &self,
         collective_id: Uuid,
+        collective_seq: u32,
         layer_idx: u32,
         step: u32,
         slot: u32,
@@ -729,6 +747,7 @@ impl ServingSessionTransport {
                 &lane_binding,
                 ServingFrameHeader::new(
                     collective_id,
+                    collective_seq,
                     sender_position,
                     layer_idx,
                     step,
@@ -967,11 +986,11 @@ impl TensorPlane {
                                             .metrics
                                             .receive_timeout_count
                                             .fetch_add(1, Ordering::Relaxed);
-                                        warn!(
+                                        debug!(
                                             remote_addr = %remote_addr,
-                                            "serving dataplane receive timed out"
+                                            "serving dataplane connection was idle past the receive timeout; keeping channel open"
                                         );
-                                        return;
+                                        continue;
                                     }
                                 }
                             }
@@ -1550,6 +1569,7 @@ async fn recv_slot(
 ) -> Result<ServingFrameBytes> {
     let slot_key = ServingSlotKey {
         collective_id: spec.collective_id,
+        collective_seq: spec.collective_seq,
         sender_position: spec.expected_sender_position,
         lane: spec.lane,
         layer_idx: spec.layer_idx,
@@ -2177,12 +2197,12 @@ mod tests {
             .unwrap();
 
         session_a
-            .send_reduce_scatter_chunk(Uuid::new_v4(), 1, 0, 0, 0, 9, &[1.0, 2.0])
+            .send_reduce_scatter_chunk(Uuid::new_v4(), 0, 1, 0, 0, 0, 9, &[1.0, 2.0])
             .await
             .unwrap();
         let collective_b = Uuid::new_v4();
         session_b
-            .send_reduce_scatter_chunk(collective_b, 1, 0, 0, 0, 7, &[3.0, 4.0])
+            .send_reduce_scatter_chunk(collective_b, 0, 1, 0, 0, 0, 7, &[3.0, 4.0])
             .await
             .unwrap();
 
@@ -2190,6 +2210,7 @@ mod tests {
             Duration::from_secs(1),
             session_b.recv_frame(ServingReceiveSpec {
                 collective_id: collective_b,
+                collective_seq: 0,
                 lane: CollectiveLane::ReduceScatter,
                 layer_idx: 1,
                 step: 0,
@@ -2229,6 +2250,7 @@ mod tests {
                 session
                     .recv_frame(ServingReceiveSpec {
                         collective_id,
+                        collective_seq: 0,
                         lane: CollectiveLane::ReduceScatter,
                         layer_idx: 3,
                         step: 1,
@@ -2246,6 +2268,7 @@ mod tests {
                 session
                     .recv_frame(ServingReceiveSpec {
                         collective_id,
+                        collective_seq: 0,
                         lane: CollectiveLane::ReduceScatter,
                         layer_idx: 3,
                         step: 1,
@@ -2259,11 +2282,11 @@ mod tests {
         };
 
         session
-            .send_reduce_scatter_chunk(collective_id, 3, 1, 2, 0, 12, &[6.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 3, 1, 2, 0, 12, &[6.0])
             .await
             .unwrap();
         session
-            .send_reduce_scatter_chunk(collective_id, 3, 1, 1, 0, 11, &[5.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 3, 1, 1, 0, 11, &[5.0])
             .await
             .unwrap();
 
@@ -2295,6 +2318,7 @@ mod tests {
                 session
                     .recv_frame(ServingReceiveSpec {
                         collective_id,
+                        collective_seq: 0,
                         lane: CollectiveLane::ReduceScatter,
                         layer_idx: 6,
                         step: 2,
@@ -2312,6 +2336,7 @@ mod tests {
                 session
                     .recv_frame(ServingReceiveSpec {
                         collective_id,
+                        collective_seq: 0,
                         lane: CollectiveLane::ReduceScatter,
                         layer_idx: 6,
                         step: 2,
@@ -2325,11 +2350,11 @@ mod tests {
         };
 
         session
-            .send_reduce_scatter_chunk(collective_id, 6, 2, 0, 0, 11, &[5.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 6, 2, 0, 0, 11, &[5.0])
             .await
             .unwrap();
         session
-            .send_reduce_scatter_chunk(collective_id, 6, 2, 0, 0, 11, &[6.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 6, 2, 0, 0, 11, &[6.0])
             .await
             .unwrap();
 
@@ -2368,6 +2393,7 @@ mod tests {
                 session
                     .recv_frame(ServingReceiveSpec {
                         collective_id,
+                        collective_seq: 0,
                         lane: CollectiveLane::ReduceScatter,
                         layer_idx: 5,
                         step: 2,
@@ -2381,11 +2407,11 @@ mod tests {
         };
 
         session
-            .send_reduce_scatter_chunk(collective_id, 5, 2, 0, 0, 12, &[9.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 5, 2, 0, 0, 12, &[9.0])
             .await
             .unwrap();
         session
-            .send_reduce_scatter_chunk(collective_id, 5, 2, 0, 0, 11, &[7.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 5, 2, 0, 0, 11, &[7.0])
             .await
             .unwrap();
 
@@ -2535,12 +2561,13 @@ mod tests {
         }
 
         session
-            .send_reduce_scatter_chunk(collective_id, 2, 0, 0, 0, 7, &[4.0, 5.0])
+            .send_reduce_scatter_chunk(collective_id, 0, 2, 0, 0, 0, 7, &[4.0, 5.0])
             .await
             .unwrap();
         let frame = session
             .recv_frame(ServingReceiveSpec {
                 collective_id,
+                collective_seq: 0,
                 lane: CollectiveLane::ReduceScatter,
                 layer_idx: 2,
                 step: 0,
@@ -2561,7 +2588,7 @@ mod tests {
     #[tokio::test]
     async fn test_serving_frame_write_read_roundtrip_preserves_payload_and_shape() {
         let header =
-            ServingFrameHeader::new(Uuid::new_v4(), 3, 7, 2, 1, 0, CollectiveLane::AllGather, 3);
+            ServingFrameHeader::new(Uuid::new_v4(), 4, 3, 7, 2, 1, 0, CollectiveLane::AllGather, 3);
         let chunk_data = [1.5_f32, -2.25, 8.0];
         let (mut writer, mut reader) = tokio::io::duplex(1024);
 
@@ -2594,17 +2621,18 @@ mod tests {
         let bulk_collective = Uuid::new_v4();
 
         session
-            .send_bulk_transfer(bulk_collective, 4, 0, 0, 0, 2, &[1.0, 2.0, 3.0])
+            .send_bulk_transfer(bulk_collective, 0, 4, 0, 0, 0, 2, &[1.0, 2.0, 3.0])
             .await
             .unwrap();
         session
-            .send_checkpoint(checkpoint_collective, 4, 1, 0, 0, 2, &[9.0])
+            .send_checkpoint(checkpoint_collective, 0, 4, 1, 0, 0, 2, &[9.0])
             .await
             .unwrap();
 
         let bulk = session
             .recv_frame(ServingReceiveSpec {
                 collective_id: bulk_collective,
+                collective_seq: 0,
                 lane: CollectiveLane::BulkTransfer,
                 layer_idx: 4,
                 step: 0,
@@ -2617,6 +2645,7 @@ mod tests {
         let checkpoint = session
             .recv_frame(ServingReceiveSpec {
                 collective_id: checkpoint_collective,
+                collective_seq: 0,
                 lane: CollectiveLane::Checkpoint,
                 layer_idx: 4,
                 step: 1,
@@ -2653,12 +2682,13 @@ mod tests {
         let collective_id = Uuid::new_v4();
 
         session
-            .send_control(collective_id, 7, 0, 0, 0, 3, &[3.0])
+            .send_control(collective_id, 0, 7, 0, 0, 0, 3, &[3.0])
             .await
             .unwrap();
         let _ = session
             .recv_frame(ServingReceiveSpec {
                 collective_id,
+                collective_seq: 0,
                 lane: CollectiveLane::Control,
                 layer_idx: 7,
                 step: 0,
@@ -2673,5 +2703,89 @@ mod tests {
         assert_eq!(snapshot.latency_critical_send_count, 1);
         assert_eq!(snapshot.barrier_bytes_sent > 0, true);
         assert_eq!(snapshot.barrier_bytes_received > 0, true);
+    }
+
+    #[tokio::test]
+    async fn test_serving_session_discriminates_same_layer_collectives_by_sequence() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let collective_id = Uuid::new_v4();
+
+        session
+            .send_reduce_scatter_chunk(collective_id, 1, 4, 0, 0, 0, 11, &[8.0])
+            .await
+            .unwrap();
+        session
+            .send_reduce_scatter_chunk(collective_id, 0, 4, 0, 0, 0, 11, &[5.0])
+            .await
+            .unwrap();
+
+        let frame = session
+            .recv_frame(ServingReceiveSpec {
+                collective_id,
+                collective_seq: 0,
+                lane: CollectiveLane::ReduceScatter,
+                layer_idx: 4,
+                step: 0,
+                slot: 0,
+                stream_id: 0,
+                expected_sender_position: 11,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(frame.chunk_data, vec![5.0]);
+    }
+
+    #[tokio::test]
+    async fn test_serving_transport_survives_idle_gap_before_first_frame() {
+        let plane = TensorPlane::bind(TensorPlaneConfig {
+            io_timeout: Duration::from_millis(50),
+            ..TensorPlaneConfig::default()
+        })
+        .await
+        .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let collective_id = Uuid::new_v4();
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+
+        session
+            .send_reduce_scatter_chunk(collective_id, 0, 9, 0, 0, 0, 7, &[4.0, 5.0])
+            .await
+            .unwrap();
+        let frame = session
+            .recv_frame(ServingReceiveSpec {
+                collective_id,
+                collective_seq: 0,
+                lane: CollectiveLane::ReduceScatter,
+                layer_idx: 9,
+                step: 0,
+                slot: 0,
+                stream_id: 0,
+                expected_sender_position: 7,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(frame.chunk_data, vec![4.0, 5.0]);
     }
 }

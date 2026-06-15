@@ -647,38 +647,76 @@ impl DeviceKVCache {
     }
 }
 
-fn partition_start(total_columns: usize, worker_position: u32, total_workers: u32) -> usize {
-    if total_workers == 0 {
-        return 0;
-    }
-
-    let total_workers = total_workers as usize;
-    let worker_position = worker_position as usize;
-    let columns_per_worker = total_columns / total_workers;
-    let remainder = total_columns % total_workers;
-
-    if worker_position < remainder {
-        worker_position * (columns_per_worker + 1)
-    } else {
-        remainder * (columns_per_worker + 1) + (worker_position - remainder) * columns_per_worker
-    }
+#[derive(Debug, Clone, Copy)]
+struct AttentionShardLayout {
+    head_dim: usize,
+    q_heads_per_kv_head: usize,
+    q_cols: usize,
+    q_head_start: usize,
+    local_q_heads: usize,
+    kv_cols: usize,
+    kv_head_start: usize,
+    local_kv_heads: usize,
 }
 
-fn partition_columns(total_columns: usize, worker_position: u32, total_workers: u32) -> usize {
-    if total_workers == 0 {
-        return total_columns;
+fn resolve_attention_shard_layout(
+    config: &ModelConfig,
+    shard_start: usize,
+    shard_end: usize,
+) -> Result<AttentionShardLayout> {
+    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
+        return Err(AgentError::Execution(format!(
+            "Unsupported attention geometry: hidden_dim {} num_heads {}",
+            config.hidden_dim, config.num_heads
+        )));
+    }
+    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
+        return Err(AgentError::Execution(format!(
+            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
+            config.num_heads, config.num_kv_heads
+        )));
+    }
+    if shard_start >= shard_end || shard_end > config.hidden_dim {
+        return Err(AgentError::Execution(format!(
+            "Invalid shard range {}..{} for hidden_dim {}",
+            shard_start, shard_end, config.hidden_dim
+        )));
     }
 
-    let total_workers = total_workers as usize;
-    let worker_position = worker_position as usize;
-    let columns_per_worker = total_columns / total_workers;
-    let remainder = total_columns % total_workers;
-
-    if worker_position < remainder {
-        columns_per_worker + 1
-    } else {
-        columns_per_worker
+    let head_dim = config.hidden_dim / config.num_heads;
+    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
+    let q_group_width = q_heads_per_kv_head * head_dim;
+    if config.hidden_dim % q_group_width != 0 {
+        return Err(AgentError::Execution(format!(
+            "Hidden dim {} is not divisible by grouped-query shard width {}",
+            config.hidden_dim, q_group_width
+        )));
     }
+    if shard_start % q_group_width != 0 || shard_end % q_group_width != 0 {
+        return Err(AgentError::Execution(format!(
+            "Shard range {}..{} is not aligned to grouped-query shard width {}",
+            shard_start, shard_end, q_group_width
+        )));
+    }
+
+    let q_cols = shard_end - shard_start;
+    let local_group_count = q_cols / q_group_width;
+    let local_q_heads = local_group_count * q_heads_per_kv_head;
+    let q_head_start = shard_start / head_dim;
+    let kv_head_start = shard_start / q_group_width;
+    let local_kv_heads = local_group_count;
+    let kv_cols = local_kv_heads * head_dim;
+
+    Ok(AttentionShardLayout {
+        head_dim,
+        q_heads_per_kv_head,
+        q_cols,
+        q_head_start,
+        local_q_heads,
+        kv_cols,
+        kv_head_start,
+        local_kv_heads,
+    })
 }
 
 fn causal_attention_with_prefix(
@@ -767,29 +805,16 @@ fn build_positions(start: usize, count: usize) -> Vec<u32> {
 fn attention_output(
     kv_cache: &mut KVCache,
     config: &ModelConfig,
-    worker_position: u32,
-    total_workers: u32,
+    shard_start: usize,
+    shard_end: usize,
     layer_idx: usize,
     absolute_positions: &[u32],
     q_local: Tensor2D,
     k_local: Tensor2D,
     v_local: Tensor2D,
 ) -> Result<Tensor2D> {
-    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Unsupported attention geometry: hidden_dim {} num_heads {}",
-            config.hidden_dim, config.num_heads
-        )));
-    }
-    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
-            config.num_heads, config.num_kv_heads
-        )));
-    }
-
-    let head_dim = config.hidden_dim / config.num_heads;
-    let kv_hidden_dim = config.num_kv_heads * head_dim;
+    let attention_layout = resolve_attention_shard_layout(config, shard_start, shard_end)?;
+    let head_dim = attention_layout.head_dim;
     if q_local.cols % head_dim != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local query projection width {} is not a multiple of head_dim {}",
@@ -802,25 +827,18 @@ fn attention_output(
             head_dim, k_local.cols, v_local.cols
         )));
     }
-    let expected_q_cols = partition_columns(config.hidden_dim, worker_position, total_workers);
-    if q_local.cols != expected_q_cols {
+    if q_local.cols != attention_layout.q_cols {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local query projection width mismatch: expected {}, got {}",
-            expected_q_cols, q_local.cols
+            attention_layout.q_cols, q_local.cols
         )));
     }
-    let expected_kv_cols = partition_columns(kv_hidden_dim, worker_position, total_workers);
-    if k_local.cols != expected_kv_cols || v_local.cols != expected_kv_cols {
+    if k_local.cols != attention_layout.kv_cols || v_local.cols != attention_layout.kv_cols {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local KV projection width mismatch: expected {}, got k={} v={}",
-            expected_kv_cols, k_local.cols, v_local.cols
+            attention_layout.kv_cols, k_local.cols, v_local.cols
         )));
     }
-
-    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
-    let q_head_start =
-        partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
-    let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
 
     let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
     let incoming_rows = absolute_positions.len();
@@ -856,18 +874,20 @@ fn attention_output(
 
     let mut output_heads = Vec::with_capacity(local_q_heads);
     for (local_q_idx, q_head) in q_heads.iter().enumerate() {
-        let global_q_head = q_head_start + local_q_idx;
-        let global_kv_head = global_q_head / q_heads_per_kv_head;
-        if global_kv_head < kv_head_start || global_kv_head >= kv_head_start + local_kv_heads {
+        let global_q_head = attention_layout.q_head_start + local_q_idx;
+        let global_kv_head = global_q_head / attention_layout.q_heads_per_kv_head;
+        if global_kv_head < attention_layout.kv_head_start
+            || global_kv_head >= attention_layout.kv_head_start + local_kv_heads
+        {
             return Err(crate::errors::AgentError::Execution(format!(
                 "Local KV head ownership mismatch: q_head {} maps to kv_head {}, local kv range {}..{}",
                 global_q_head,
                 global_kv_head,
-                kv_head_start,
-                kv_head_start + local_kv_heads
+                attention_layout.kv_head_start,
+                attention_layout.kv_head_start + local_kv_heads
             )));
         }
-        let local_kv_idx = global_kv_head - kv_head_start;
+        let local_kv_idx = global_kv_head - attention_layout.kv_head_start;
         output_heads.push(causal_attention_with_prefix(
             q_head,
             &k_heads[local_kv_idx],
@@ -1102,6 +1122,7 @@ pub struct ForwardPass {
     device_weights: Arc<DeviceModelWeights>,
     config: ModelConfig,
     allreduce_timeout: std::time::Duration,
+    attention_layout: AttentionShardLayout,
     local_kv_head_indices: CandleTensor,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collective_scratch: ReusableMetalCollectiveScratchPool,
@@ -1142,20 +1163,10 @@ impl ForwardPass {
             head_dim: config.hidden_dim / config.num_heads,
             max_seq_len: 4096,
         };
-        let head_dim = config.hidden_dim / config.num_heads;
-        let local_q_heads =
-            partition_columns(config.hidden_dim, worker_position, total_workers) / head_dim;
-        let q_head_start =
-            partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
+        let attention_layout = resolve_attention_shard_layout(&config, shard_start, shard_end)?;
         let local_kv_head_indices = CandleTensor::from_vec(
-            build_local_kv_head_indices(
-                &config,
-                worker_position,
-                total_workers,
-                local_q_heads,
-                q_head_start,
-            )?,
-            local_q_heads,
+            build_local_kv_head_indices(attention_layout)?,
+            attention_layout.local_q_heads,
             residency.device_weights.embedding.device(),
         )
         .map_err(device_error)?;
@@ -1164,6 +1175,7 @@ impl ForwardPass {
             device_weights: Arc::clone(&residency.device_weights),
             config,
             allreduce_timeout,
+            attention_layout,
             local_kv_head_indices,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             collective_scratch: ReusableMetalCollectiveScratchPool::default(),
@@ -1247,8 +1259,7 @@ impl ForwardPass {
         let attn_output = attention_output_device(
             &mut self.device_kv_cache,
             &config,
-            self.worker_position,
-            self.total_workers,
+            self.attention_layout,
             layer_idx,
             absolute_positions,
             &self.local_kv_head_indices,
@@ -1262,7 +1273,7 @@ impl ForwardPass {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
         let o_full = self
-            .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32)
+            .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
             .await?;
 
         // 7. Residual connection
@@ -1288,7 +1299,7 @@ impl ForwardPass {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
         let down_full = self
-            .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32)
+            .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
             .await?;
 
         // 9. Final residual
@@ -1446,21 +1457,12 @@ impl ForwardPass {
             )));
         }
 
-        let (
-            config,
-            device_weights,
-            local_kv_head_indices,
-            worker_position,
-            total_workers,
-            allreduce_timeout,
-        ) = {
+        let (config, device_weights, local_kv_head_indices, allreduce_timeout) = {
             let template = &backends[0].forward_pass;
             (
                 template.config.clone(),
                 template.device_weights.clone(),
                 template.local_kv_head_indices.clone(),
-                template.worker_position,
-                template.total_workers,
                 template.allreduce_timeout,
             )
         };
@@ -1498,6 +1500,14 @@ impl ForwardPass {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
         let mut metrics = RingAllReduceMetrics::default();
+        let attention_layout = backends
+            .first()
+            .map(|backend| backend.forward_pass.attention_layout)
+            .ok_or_else(|| {
+                AgentError::Execution(
+                    "Device batch attention requires at least one backend".to_string(),
+                )
+            })?;
 
         for layer_idx in 0..config.num_layers {
             let layer = &device_weights.layers[layer_idx];
@@ -1507,8 +1517,7 @@ impl ForwardPass {
             let attn_output = attention_output_device_batch_from_backends(
                 backends,
                 &config,
-                worker_position,
-                total_workers,
+                attention_layout,
                 layer_idx,
                 &positions,
                 &local_kv_head_indices,
@@ -1529,6 +1538,7 @@ impl ForwardPass {
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
+                0,
                 allreduce_timeout,
                 &mut metrics,
             )
@@ -1556,6 +1566,7 @@ impl ForwardPass {
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
+                1,
                 allreduce_timeout,
                 &mut metrics,
             )
@@ -1585,6 +1596,7 @@ impl ForwardPass {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
+        collective_seq: u32,
     ) -> Result<CandleTensor> {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
@@ -1597,7 +1609,13 @@ impl ForwardPass {
             None,
         )?;
         let reduced = worker_ring
-            .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
+            .ring_all_reduce_matrix_with_timeout(
+                flat,
+                job_id,
+                layer_idx,
+                collective_seq,
+                self.allreduce_timeout,
+            )
             .await?;
         self.last_allreduce_metrics
             .accumulate(worker_ring.last_run_metrics());
@@ -1613,6 +1631,7 @@ impl ForwardPass {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
+        collective_seq: u32,
         allreduce_timeout: std::time::Duration,
         metrics: &mut RingAllReduceMetrics,
     ) -> Result<CandleTensor> {
@@ -1621,7 +1640,13 @@ impl ForwardPass {
         }
         let flat = collective_buffer_from_candle_2d_with_scratch(tensor, scratch)?;
         let reduced = worker_ring
-            .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, allreduce_timeout)
+            .ring_all_reduce_matrix_with_timeout(
+                flat,
+                job_id,
+                layer_idx,
+                collective_seq,
+                allreduce_timeout,
+            )
             .await?;
         metrics.accumulate(worker_ring.last_run_metrics());
         candle_2d_from_collective_buffer_owned_like(reduced, tensor)
@@ -1719,8 +1744,7 @@ impl ForwardPass {
 fn attention_output_device(
     kv_cache: &mut DeviceKVCache,
     config: &ModelConfig,
-    worker_position: u32,
-    total_workers: u32,
+    attention_layout: AttentionShardLayout,
     layer_idx: usize,
     absolute_positions: &[u32],
     local_kv_head_indices: &CandleTensor,
@@ -1728,21 +1752,7 @@ fn attention_output_device(
     k_local: CandleTensor,
     v_local: CandleTensor,
 ) -> Result<CandleTensor> {
-    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Unsupported attention geometry: hidden_dim {} num_heads {}",
-            config.hidden_dim, config.num_heads
-        )));
-    }
-    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
-            config.num_heads, config.num_kv_heads
-        )));
-    }
-
-    let head_dim = config.hidden_dim / config.num_heads;
-    let kv_hidden_dim = config.num_kv_heads * head_dim;
+    let head_dim = attention_layout.head_dim;
     let q_dims = q_local.dims();
     let k_dims = k_local.dims();
     let v_dims = v_local.dims();
@@ -1763,18 +1773,16 @@ fn attention_output_device(
             head_dim, k_cols, v_cols
         )));
     }
-    let expected_q_cols = partition_columns(config.hidden_dim, worker_position, total_workers);
-    if q_cols != expected_q_cols {
+    if q_cols != attention_layout.q_cols {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local query projection width mismatch: expected {}, got {}",
-            expected_q_cols, q_cols
+            attention_layout.q_cols, q_cols
         )));
     }
-    let expected_kv_cols = partition_columns(kv_hidden_dim, worker_position, total_workers);
-    if k_cols != expected_kv_cols || v_cols != expected_kv_cols {
+    if k_cols != attention_layout.kv_cols || v_cols != attention_layout.kv_cols {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local KV projection width mismatch: expected {}, got k={} v={}",
-            expected_kv_cols, k_cols, v_cols
+            attention_layout.kv_cols, k_cols, v_cols
         )));
     }
 
@@ -1804,8 +1812,7 @@ fn attention_output_device(
     attention_output_device_cached(
         kv_cache,
         config,
-        worker_position,
-        total_workers,
+        attention_layout,
         layer_idx,
         cache_prefix_len,
         local_kv_head_indices,
@@ -1816,8 +1823,7 @@ fn attention_output_device(
 fn attention_output_device_batch_from_backends(
     backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
     config: &ModelConfig,
-    worker_position: u32,
-    total_workers: u32,
+    attention_layout: AttentionShardLayout,
     layer_idx: usize,
     absolute_positions: &[u32],
     local_kv_head_indices: &CandleTensor,
@@ -1838,21 +1844,7 @@ fn attention_output_device_batch_from_backends(
             "Device batch attention requires at least one backend".to_string(),
         ));
     }
-    if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Unsupported attention geometry: hidden_dim {} num_heads {}",
-            config.hidden_dim, config.num_heads
-        )));
-    }
-    if config.num_kv_heads == 0 || config.num_heads % config.num_kv_heads != 0 {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Unsupported grouped-query attention geometry: num_heads {} num_kv_heads {}",
-            config.num_heads, config.num_kv_heads
-        )));
-    }
-
-    let head_dim = config.hidden_dim / config.num_heads;
-    let kv_hidden_dim = config.num_kv_heads * head_dim;
+    let head_dim = attention_layout.head_dim;
     let q_dims = q_local.dims();
     let k_dims = k_local.dims();
     let v_dims = v_local.dims();
@@ -1872,18 +1864,16 @@ fn attention_output_device_batch_from_backends(
             head_dim, k_cols, v_cols
         )));
     }
-    let expected_q_cols = partition_columns(config.hidden_dim, worker_position, total_workers);
-    if q_cols != expected_q_cols {
+    if q_cols != attention_layout.q_cols {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local query projection width mismatch: expected {}, got {}",
-            expected_q_cols, q_cols
+            attention_layout.q_cols, q_cols
         )));
     }
-    let expected_kv_cols = partition_columns(kv_hidden_dim, worker_position, total_workers);
-    if k_cols != expected_kv_cols || v_cols != expected_kv_cols {
+    if k_cols != attention_layout.kv_cols || v_cols != attention_layout.kv_cols {
         return Err(crate::errors::AgentError::Execution(format!(
             "Local KV projection width mismatch: expected {}, got k={} v={}",
-            expected_kv_cols, k_cols, v_cols
+            attention_layout.kv_cols, k_cols, v_cols
         )));
     }
 
@@ -1925,8 +1915,7 @@ fn attention_output_device_batch_from_backends(
         outputs.push(attention_output_device_cached(
             kv_cache,
             config,
-            worker_position,
-            total_workers,
+            attention_layout,
             layer_idx,
             prefix_len,
             local_kv_head_indices,
@@ -1941,8 +1930,7 @@ fn attention_output_device_batch_from_backends(
 fn attention_output_device_cached(
     kv_cache: &DeviceKVCache,
     config: &ModelConfig,
-    _worker_position: u32,
-    _total_workers: u32,
+    _attention_layout: AttentionShardLayout,
     layer_idx: usize,
     cache_prefix_len: usize,
     local_kv_head_indices: &CandleTensor,
@@ -2032,33 +2020,23 @@ fn attention_output_device_cached(
         .map_err(device_error)
 }
 
-fn build_local_kv_head_indices(
-    config: &ModelConfig,
-    worker_position: u32,
-    total_workers: u32,
-    local_q_heads: usize,
-    q_head_start: usize,
-) -> Result<Vec<u32>> {
-    let head_dim = config.hidden_dim / config.num_heads;
-    let kv_hidden_dim = config.num_kv_heads * head_dim;
-    let local_kv_heads =
-        partition_columns(kv_hidden_dim, worker_position, total_workers) / head_dim;
-    let q_heads_per_kv_head = config.num_heads / config.num_kv_heads;
-    let kv_head_start = partition_start(kv_hidden_dim, worker_position, total_workers) / head_dim;
-    let mut indices = Vec::with_capacity(local_q_heads);
-    for local_q_idx in 0..local_q_heads {
-        let global_q_head = q_head_start + local_q_idx;
-        let global_kv_head = global_q_head / q_heads_per_kv_head;
-        if global_kv_head < kv_head_start || global_kv_head >= kv_head_start + local_kv_heads {
+fn build_local_kv_head_indices(attention_layout: AttentionShardLayout) -> Result<Vec<u32>> {
+    let mut indices = Vec::with_capacity(attention_layout.local_q_heads);
+    for local_q_idx in 0..attention_layout.local_q_heads {
+        let global_q_head = attention_layout.q_head_start + local_q_idx;
+        let global_kv_head = global_q_head / attention_layout.q_heads_per_kv_head;
+        if global_kv_head < attention_layout.kv_head_start
+            || global_kv_head >= attention_layout.kv_head_start + attention_layout.local_kv_heads
+        {
             return Err(AgentError::Execution(format!(
                 "Local KV head ownership mismatch: q_head {} maps to kv_head {}, local kv range {}..{}",
                 global_q_head,
                 global_kv_head,
-                kv_head_start,
-                kv_head_start + local_kv_heads
+                attention_layout.kv_head_start,
+                attention_layout.kv_head_start + attention_layout.local_kv_heads
             )));
         }
-        indices.push((global_kv_head - kv_head_start) as u32);
+        indices.push((global_kv_head - attention_layout.kv_head_start) as u32);
     }
     Ok(indices)
 }
@@ -2209,7 +2187,7 @@ impl LocalForwardPass {
                 &mut self.kv_cache,
                 config,
                 0,
-                1,
+                config.hidden_dim,
                 layer_idx,
                 &absolute_positions,
                 q_local,
@@ -2430,6 +2408,37 @@ mod tests {
         assert_eq!(forward.shard_start, 0);
         assert_eq!(forward.shard_end, 16);
         assert_eq!(forward.total_workers, 4);
+    }
+
+    #[test]
+    fn test_attention_shard_layout_supports_gqa_aligned_uneven_shards() {
+        let config = ModelConfig {
+            hidden_dim: 576,
+            num_heads: 9,
+            num_kv_heads: 3,
+            num_layers: 2,
+            vocab_size: 100,
+            intermediate_size: 1536,
+            rms_norm_eps: 1e-5,
+            rope_base: 10000.0,
+        };
+
+        let first = resolve_attention_shard_layout(&config, 0, 384).unwrap();
+        assert_eq!(first.q_cols, 384);
+        assert_eq!(first.local_q_heads, 6);
+        assert_eq!(first.kv_cols, 128);
+        assert_eq!(first.local_kv_heads, 2);
+        assert_eq!(
+            build_local_kv_head_indices(first).unwrap(),
+            vec![0, 0, 0, 1, 1, 1]
+        );
+
+        let second = resolve_attention_shard_layout(&config, 384, 576).unwrap();
+        assert_eq!(second.q_cols, 192);
+        assert_eq!(second.local_q_heads, 3);
+        assert_eq!(second.kv_cols, 64);
+        assert_eq!(second.local_kv_heads, 1);
+        assert_eq!(build_local_kv_head_indices(second).unwrap(), vec![0, 0, 0]);
     }
 
     #[test]

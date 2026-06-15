@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "real-cluster-inference",
+  "steps": [
+    {
+      "name": "host-backed real two-worker inference and serving dynamics",
+      "type": "proc_when",
+      "cmd": "bash",
+      "args": [
+        "scripts/test_real_cluster_inference.sh"
+      ],
+      "exit_code": 0,
+      "stdout": "real cluster inference test passed\n",
+      "times": 1
+    }
+  ]
+}

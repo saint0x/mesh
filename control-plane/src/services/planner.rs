@@ -1758,6 +1758,8 @@ mod tests {
         model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
             model_id: "planner-provider-guard".to_string(),
             tensor_parallelism_dim: 20,
+            attention_head_count: None,
+            kv_head_count: None,
             total_model_bytes: 1024 * 1024,
             transformer_layer_count: None,
             tokenizer_file: "tokenizer.json".to_string(),
@@ -1832,6 +1834,8 @@ mod tests {
         model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
             model_id: "planner-hybrid-supported".to_string(),
             tensor_parallelism_dim: 20,
+            attention_head_count: None,
+            kv_head_count: None,
             total_model_bytes: 1024 * 1024,
             transformer_layer_count: Some(24),
             tokenizer_file: "tokenizer.json".to_string(),
@@ -1936,6 +1940,8 @@ mod tests {
         model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
             model_id: "planner-provider-variant".to_string(),
             tensor_parallelism_dim: 20,
+            attention_head_count: None,
+            kv_head_count: None,
             total_model_bytes: 1024 * 1024,
             transformer_layer_count: None,
             tokenizer_file: "tokenizer.json".to_string(),
@@ -2032,6 +2038,8 @@ mod tests {
         model_assets::testsupport::ensure_test_model_with_manifest(ModelManifest {
             model_id: "planner-invalid-pipeline".to_string(),
             tensor_parallelism_dim: 20,
+            attention_head_count: None,
+            kv_head_count: None,
             total_model_bytes: 1024 * 1024,
             transformer_layer_count: Some(24),
             tokenizer_file: "tokenizer.json".to_string(),

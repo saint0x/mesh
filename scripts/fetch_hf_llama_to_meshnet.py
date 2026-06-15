@@ -39,6 +39,47 @@ def partition_columns(total_columns: int, worker_position: int, total_workers: i
     return columns_per_worker
 
 
+def allocate_weighted_groups(total_groups: int, total_workers: int) -> list[tuple[int, int]]:
+    if total_workers <= 0:
+        return [(0, total_groups)]
+    groups_per_worker = total_groups // total_workers
+    remainder = total_groups % total_workers
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for worker_position in range(total_workers):
+        width = groups_per_worker + (1 if worker_position < remainder else 0)
+        end = start + width
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def attention_shard_geometry(
+    hidden_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+    total_workers: int,
+    worker_position: int,
+) -> tuple[int, int, int, int]:
+    if hidden_dim % num_heads != 0:
+        raise ValueError(f"hidden_dim {hidden_dim} is not divisible by num_heads {num_heads}")
+    if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"unsupported grouped-query attention geometry: num_heads={num_heads} num_kv_heads={num_kv_heads}"
+        )
+    head_dim = hidden_dim // num_heads
+    q_heads_per_kv_head = num_heads // num_kv_heads
+    q_group_width = q_heads_per_kv_head * head_dim
+    group_ranges = allocate_weighted_groups(num_kv_heads, total_workers)
+    group_start, group_end = group_ranges[worker_position]
+    group_count = group_end - group_start
+    q_start = group_start * q_group_width
+    q_cols = group_count * q_group_width
+    kv_start = group_start * head_dim
+    kv_cols = group_count * head_dim
+    return q_start, q_cols, kv_start, kv_cols
+
+
 def copy_tokenizer(repo_id: str, out_dir: Path) -> None:
     tokenizer_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.json")
     shutil.copy2(tokenizer_path, out_dir / "tokenizer.json")
@@ -150,6 +191,8 @@ def main() -> None:
         {
             "model_id": args.model_id,
             "tensor_parallelism_dim": hidden_dim,
+            "attention_head_count": num_heads,
+            "kv_head_count": num_kv_heads,
             "total_model_bytes": model_size_bytes,
             "tokenizer_file": "tokenizer.json",
             "tokenizer_config_file": "tokenizer_config.json",
@@ -177,10 +220,9 @@ def main() -> None:
             lm_head = np.ascontiguousarray(np.asarray(source.get_tensor(lm_head_name), dtype=np.float32).T)
 
             for worker_position in range(args.workers):
-                q_start = partition_start(hidden_dim, worker_position, args.workers)
-                q_cols = partition_columns(hidden_dim, worker_position, args.workers)
-                kv_start = partition_start(kv_hidden_dim, worker_position, args.workers)
-                kv_cols = partition_columns(kv_hidden_dim, worker_position, args.workers)
+                q_start, q_cols, kv_start, kv_cols = attention_shard_geometry(
+                    hidden_dim, num_heads, num_kv_heads, args.workers, worker_position
+                )
                 mlp_start = partition_start(intermediate_size, worker_position, args.workers)
                 mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
 
@@ -221,6 +263,8 @@ def main() -> None:
                     **metadata,
                     "mesh.worker_position": str(worker_position),
                     "mesh.total_workers": str(args.workers),
+                    "mesh.column_start": str(q_start),
+                    "mesh.column_end": str(q_start + q_cols),
                 }
                 save_file(tensors, str(shard_path), metadata=shard_metadata)
 
@@ -231,6 +275,8 @@ def main() -> None:
                         "model_id": args.model_id,
                         "worker_position": worker_position,
                         "total_workers": args.workers,
+                        "column_start": q_start,
+                        "column_end": q_start + q_cols,
                         "expected_sha256": digest,
                     },
                 )
@@ -254,10 +300,9 @@ def main() -> None:
         )
 
         for worker_position in range(args.workers):
-            q_start = partition_start(hidden_dim, worker_position, args.workers)
-            q_cols = partition_columns(hidden_dim, worker_position, args.workers)
-            kv_start = partition_start(kv_hidden_dim, worker_position, args.workers)
-            kv_cols = partition_columns(kv_hidden_dim, worker_position, args.workers)
+            q_start, q_cols, kv_start, kv_cols = attention_shard_geometry(
+                hidden_dim, num_heads, num_kv_heads, args.workers, worker_position
+            )
             mlp_start = partition_start(intermediate_size, worker_position, args.workers)
             mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
 
@@ -298,6 +343,8 @@ def main() -> None:
                 **metadata,
                 "mesh.worker_position": str(worker_position),
                 "mesh.total_workers": str(args.workers),
+                "mesh.column_start": str(q_start),
+                "mesh.column_end": str(q_start + q_cols),
             }
             save_file(tensors, str(shard_path), metadata=shard_metadata)
 
@@ -308,6 +355,8 @@ def main() -> None:
                     "model_id": args.model_id,
                     "worker_position": worker_position,
                     "total_workers": args.workers,
+                    "column_start": q_start,
+                    "column_end": q_start + q_cols,
                     "expected_sha256": digest,
                 },
             )

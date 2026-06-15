@@ -60,7 +60,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
@@ -177,6 +177,10 @@ enum DeviceCommands {
         /// Control plane URL
         #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
         control_plane_url: String,
+
+        /// Preferred execution provider to register and run on (`cpu`, `metal`, `cuda`)
+        #[arg(long)]
+        preferred_provider: Option<String>,
     },
     /// Run the production agent daemon
     Start {
@@ -338,9 +342,10 @@ async fn main() -> Result<()> {
                 network_id,
                 name,
                 control_plane_url,
+                preferred_provider,
             } => {
                 init_simple_logging("warn")?;
-                cmd_init(network_id, name, control_plane_url).await?;
+                cmd_init(network_id, name, control_plane_url, preferred_provider).await?;
             }
             DeviceCommands::Start { log_level } => {
                 init_production_logging(&log_level, None)?;
@@ -463,6 +468,7 @@ pub(crate) async fn cmd_init(
     network_id: String,
     name: String,
     control_plane_url: String,
+    preferred_provider: Option<String>,
 ) -> Result<()> {
     println!("🔧 Initializing Mesh AI agent...\n");
 
@@ -470,6 +476,16 @@ pub(crate) async fn cmd_init(
     println!("📝 Generating device configuration...");
     let mut config =
         DeviceConfig::generate(name.clone(), network_id.clone(), control_plane_url.clone());
+    if let Some(provider) = preferred_provider.as_deref() {
+        let parsed = agent::ExecutionProviderKind::from_str(provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported execution provider '{}'. Expected one of: cpu, metal, cuda",
+                provider
+            )
+        })?;
+        config.execution.preferred_provider = Some(parsed);
+    }
+    let selected_provider = config.resolve_execution_provider()?;
 
     println!("   Device ID: {}", config.device_id);
     println!("   Network ID: {}", network_id);
@@ -496,6 +512,7 @@ pub(crate) async fn cmd_init(
         "   Default Provider: {}",
         config.capabilities.default_execution_provider.as_str()
     );
+    println!("   Selected Provider: {}", selected_provider.as_str());
 
     // Save configuration
     let config_path = DeviceConfig::default_path()?;
@@ -626,16 +643,87 @@ fn persist_advertised_endpoint(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_tensor_addr(addrs: &[String]) -> Option<SocketAddr> {
+fn persist_tensor_plane_endpoints(local_addr: SocketAddr, advertised_endpoint: &str) -> Result<()> {
+    let local_endpoint = format!("dataplane://127.0.0.1:{}", local_addr.port());
+    persist_advertised_endpoint(&local_endpoint)?;
+    let advertised_addr = parse_data_plane_endpoint(advertised_endpoint)
+        .ok_or_else(|| anyhow::anyhow!("invalid advertised tensor-plane endpoint"))?;
+    if advertised_addr.ip().is_loopback() && advertised_addr.port() == local_addr.port() {
+        return Ok(());
+    }
+    persist_advertised_endpoint(advertised_endpoint)
+}
+
+fn extract_tensor_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     addrs
         .iter()
-        .find_map(|addr| parse_data_plane_endpoint(addr))
+        .filter_map(|addr| parse_data_plane_endpoint(addr))
+        .collect()
+}
+
+fn extract_non_loopback_listen_ips(addrs: &[String]) -> std::collections::HashSet<IpAddr> {
+    let mut ips = std::collections::HashSet::new();
+    for addr in addrs
+        .iter()
+        .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+    {
+        for protocol in addr.iter() {
+            let Some(ip) = (match protocol {
+                libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !ip.is_loopback() {
+                ips.insert(ip);
+            }
+        }
+    }
+    ips
+}
+
+fn select_tensor_addr(self_addrs: &[String], target_addrs: &[String]) -> Option<SocketAddr> {
+    let target_tensor_addrs = extract_tensor_addrs(target_addrs);
+    if target_tensor_addrs.is_empty() {
+        return None;
+    }
+
+    let self_ips = extract_non_loopback_listen_ips(self_addrs);
+    let target_ips = extract_non_loopback_listen_ips(target_addrs);
+    let same_host =
+        !self_ips.is_empty() && !target_ips.is_empty() && !self_ips.is_disjoint(&target_ips);
+
+    if same_host {
+        if let Some(loopback) = target_tensor_addrs
+            .iter()
+            .copied()
+            .find(|addr| addr.ip().is_loopback())
+        {
+            return Some(loopback);
+        }
+    }
+
+    target_tensor_addrs
+        .iter()
+        .copied()
+        .find(|addr| !addr.ip().is_loopback())
+        .or_else(|| target_tensor_addrs.first().copied())
 }
 
 fn local_dataplane_uri() -> Option<String> {
     load_local_listen_addrs()
         .into_iter()
         .find(|addr| addr.starts_with("dataplane://"))
+}
+
+fn runtime_heartbeat_interval() -> Duration {
+    std::env::var("MESHNET_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(2))
 }
 
 fn live_kv_collective_id(transfer_id: &str) -> Result<Uuid> {
@@ -740,8 +828,11 @@ fn build_worker_position_from_topology(
             left_peer_id,
         ),
         left_neighbor_punch_plan: left_punch_plan,
-        left_neighbor_tensor_addr: extract_tensor_addr(&left_worker.listen_addrs)
-            .context("Left neighbor has no dedicated tensor data-plane endpoint")?,
+        left_neighbor_tensor_addr: select_tensor_addr(
+            &self_worker.listen_addrs,
+            &left_worker.listen_addrs,
+        )
+        .context("Left neighbor has no dedicated tensor data-plane endpoint")?,
         right_neighbor: right_peer_id,
         right_neighbor_addrs: resolve_target_direct_addrs(
             topology,
@@ -750,13 +841,34 @@ fn build_worker_position_from_topology(
             right_peer_id,
         ),
         right_neighbor_punch_plan: right_punch_plan,
-        right_neighbor_tensor_addr: extract_tensor_addr(&right_worker.listen_addrs)
-            .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
+        right_neighbor_tensor_addr: select_tensor_addr(
+            &self_worker.listen_addrs,
+            &right_worker.listen_addrs,
+        )
+        .context("Right neighbor has no dedicated tensor data-plane endpoint")?,
         shard_column_range: (self_worker.shard.column_start, self_worker.shard.column_end),
         shard_worker_position: self_worker.shard_worker_position,
         shard_total_workers: self_worker.shard_total_workers,
         shard_memory_bytes: self_worker.contributed_memory,
     })
+}
+
+async fn fetch_worker_position_from_control_plane(
+    topology_url: &str,
+    device_id: &Uuid,
+) -> Result<agent::inference::coordinator::WorkerPosition> {
+    let response = reqwest::Client::new()
+        .get(topology_url)
+        .send()
+        .await
+        .context("Failed to request ring topology")?
+        .error_for_status()
+        .context("Ring topology request failed")?;
+    let topology = response
+        .json::<RingTopologyResponse>()
+        .await
+        .context("Failed to parse ring topology")?;
+    build_worker_position_from_topology(&topology, device_id)
 }
 
 fn assigned_member<'a>(
@@ -1045,6 +1157,7 @@ async fn maybe_serve_live_kv_transfer_request(
             .tensor_plane_mut()
             .recv_frame_bytes(agent::ServingReceiveSpec {
                 collective_id,
+                collective_seq: 0,
                 expected_sender_position: 1,
                 lane: agent::CollectiveLane::Checkpoint,
                 layer_idx: 0,
@@ -1089,7 +1202,7 @@ async fn maybe_serve_live_kv_transfer_request(
         )
         .await?;
     transport
-        .send_checkpoint_bytes(collective_id, 0, 1, 0, 0, 0, &response_bytes)
+        .send_checkpoint_bytes(collective_id, 0, 0, 1, 0, 0, 0, &response_bytes)
         .await?;
     Ok(())
 }
@@ -1127,7 +1240,7 @@ async fn consume_live_kv_transfer_from_source(
         )
         .await?;
     transport
-        .send_checkpoint_bytes(collective_id, 0, 0, 0, 0, 1, &request_bytes)
+        .send_checkpoint_bytes(collective_id, 0, 0, 0, 0, 0, 1, &request_bytes)
         .await?;
     let response_frame = tokio::time::timeout(
         Duration::from_secs(LIVE_KV_RESPONSE_TIMEOUT_SECS),
@@ -1135,6 +1248,7 @@ async fn consume_live_kv_transfer_from_source(
             .tensor_plane_mut()
             .recv_frame_bytes(agent::ServingReceiveSpec {
                 collective_id,
+                collective_seq: 0,
                 expected_sender_position: 0,
                 lane: agent::CollectiveLane::Checkpoint,
                 layer_idx: 0,
@@ -1791,7 +1905,7 @@ async fn cmd_runtime() -> Result<()> {
         use agent::pki::PoolConfig;
 
         // Check if pools exist before starting any background services
-        let has_pools = match PoolConfig::list_pools() {
+        let _has_pools = match PoolConfig::list_pools() {
             Ok(pools) => !pools.is_empty(),
             Err(_) => false,
         };
@@ -1980,16 +2094,22 @@ async fn cmd_runtime() -> Result<()> {
                 }
             };
 
-            // Give transport and optional beacon services a moment to publish endpoints
-            // before the first heartbeat snapshot is sent.
-            let initial_delay_secs = if has_pools { 3 } else { 1 };
-            tokio::time::sleep(tokio::time::Duration::from_secs(initial_delay_secs)).await;
+            // Wait briefly for the dedicated tensor plane to publish its endpoint
+            // so the first post-restart heartbeat does not erase neighbor routing
+            // with an empty listen-address set. Fall back to a best-effort heartbeat
+            // if startup is unusually slow so workers still reassert liveness.
+            for _ in 0..40 {
+                if local_dataplane_uri().is_some() {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
 
             loop {
                 if let Err(e) = client.heartbeat(&heartbeat_config).await {
                     tracing::warn!(error = %e, "Heartbeat failed (control plane may be offline)");
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(runtime_heartbeat_interval()).await;
             }
         });
     }
@@ -2098,6 +2218,12 @@ async fn cmd_runtime() -> Result<()> {
             bind_addr: parse_tensor_plane_bind_addr_env()
                 .unwrap_or_else(|| TensorPlaneConfig::default().bind_addr),
             advertised_addr: parse_tensor_plane_advertised_addr_env(),
+            // Keep persistent serving channels alive for the full inference window.
+            // Collective-level timeouts still bound stalled all-reduce operations,
+            // so the transport should not reap healthy-but-idle sockets first.
+            io_timeout: inference_runtime_config.job_timeout.max(
+                inference_runtime_config.allreduce_timeout + std::time::Duration::from_secs(30),
+            ),
             max_message_bytes: inference_config_task
                 .governance
                 .tensor_plane_max_message_bytes,
@@ -2123,7 +2249,10 @@ async fn cmd_runtime() -> Result<()> {
                 return;
             }
         };
-        if let Err(e) = persist_advertised_endpoint(&tensor_plane.advertised_endpoint()) {
+        if let Err(e) = persist_tensor_plane_endpoints(
+            tensor_plane.local_addr(),
+            &tensor_plane.advertised_endpoint(),
+        ) {
             warn!(error = %e, "Failed to persist tensor data-plane endpoint");
         } else {
             info!(
@@ -2162,31 +2291,20 @@ async fn cmd_runtime() -> Result<()> {
         );
 
         let mut ring_position = None;
-        match reqwest::Client::new()
-            .get(&topology_url)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-        {
-            Ok(response) => match response.json::<RingTopologyResponse>().await {
-                Ok(topology) => match build_worker_position_from_topology(&topology, &device_id) {
-                    Ok(position) => {
-                        if let Err(e) = coordinator.join_ring(position.clone()) {
-                            error!(error = %e, "Failed to join ring in coordinator");
-                        } else {
-                            info!(
-                                position = position.position,
-                                total_workers = position.total_workers,
-                                shard_range = ?position.shard_column_range,
-                                "Loaded ring position for inference"
-                            );
-                            ring_position = Some(position);
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "Failed to build worker position from topology"),
-                },
-                Err(e) => warn!(error = %e, "Failed to parse ring topology"),
-            },
+        match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
+            Ok(position) => {
+                if let Err(e) = coordinator.join_ring(position.clone()) {
+                    error!(error = %e, "Failed to join ring in coordinator");
+                } else {
+                    info!(
+                        position = position.position,
+                        total_workers = position.total_workers,
+                        shard_range = ?position.shard_column_range,
+                        "Loaded ring position for inference"
+                    );
+                    ring_position = Some(position);
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "Failed to refresh ring topology before inference startup")
             }
@@ -2202,6 +2320,26 @@ async fn cmd_runtime() -> Result<()> {
         let mut idle_claim_polls = 0u32;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)).await;
+            if ring_position.is_none() {
+                match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
+                    Ok(position) => {
+                        if let Err(e) = coordinator.join_ring(position.clone()) {
+                            error!(error = %e, "Failed to join ring in coordinator");
+                        } else {
+                            info!(
+                                position = position.position,
+                                total_workers = position.total_workers,
+                                shard_range = ?position.shard_column_range,
+                                "Recovered ring position for inference"
+                            );
+                            ring_position = Some(position);
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Ring topology not yet ready for inference startup");
+                    }
+                }
+            }
             drain_pending_kv_transfers(
                 &registration_client,
                 &mut coordinator,
@@ -2384,7 +2522,32 @@ async fn cmd_runtime() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "Failed to build worker position from execution lease")
+                    warn!(error = %e, "Failed to build worker position from execution lease");
+                    match fetch_worker_position_from_control_plane(&topology_url, &device_id).await
+                    {
+                        Ok(position) => {
+                            if let Err(join_error) = coordinator.join_ring(position.clone()) {
+                                error!(
+                                    error = %join_error,
+                                    "Failed to recover ring position from topology refresh"
+                                );
+                            } else {
+                                info!(
+                                    position = position.position,
+                                    total_workers = position.total_workers,
+                                    shard_range = ?position.shard_column_range,
+                                    "Recovered ring position from topology refresh"
+                                );
+                                ring_position = Some(position);
+                            }
+                        }
+                        Err(refresh_error) => {
+                            debug!(
+                                error = %refresh_error,
+                                "Topology refresh after lease processing is still not ready"
+                            );
+                        }
+                    }
                 }
             }
 

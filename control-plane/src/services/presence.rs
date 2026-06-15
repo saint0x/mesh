@@ -24,7 +24,7 @@ fn stale_device_timeout() -> time::Duration {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .map(time::Duration::milliseconds)
-        .unwrap_or_else(|| time::Duration::milliseconds(1500))
+        .unwrap_or_else(|| time::Duration::seconds(5))
 }
 
 #[derive(Debug, Clone)]

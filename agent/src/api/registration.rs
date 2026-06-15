@@ -23,7 +23,7 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-fn heartbeat_interval() -> Duration {
+pub(crate) fn heartbeat_interval() -> Duration {
     std::env::var("MESHNET_HEARTBEAT_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -64,7 +64,7 @@ impl RegistrationClient {
                 .public()
                 .to_peer_id()
                 .to_string(),
-            capabilities: config.capabilities.clone(),
+            capabilities: config.effective_capabilities()?,
         };
 
         info!(

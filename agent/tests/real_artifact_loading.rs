@@ -3,6 +3,7 @@ use agent::inference::{ArtifactShardLoader, ShardLoader};
 use agent::model::ShardAssignment;
 use agent::model::ShardRegistry;
 use agent::model_assets::{load_model_manifest, model_store_dir};
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,28 +53,30 @@ fn discover_model_dir(root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn discover_assignment(
-    model_id: &str,
-    model_dir: &Path,
-    total_columns: u32,
-) -> Option<ShardAssignment> {
+#[derive(Deserialize)]
+struct RealShardArtifactManifest {
+    worker_position: u32,
+    total_workers: u32,
+    column_start: u32,
+    column_end: u32,
+}
+
+fn discover_assignment(model_id: &str, model_dir: &Path) -> Option<ShardAssignment> {
     let entries = fs::read_dir(model_dir).ok()?;
     for entry in entries.flatten() {
-        let filename = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let filename = path.file_name()?.to_string_lossy().to_string();
         if !(filename.starts_with("shard-") && filename.ends_with(".manifest.json")) {
             continue;
         }
-        let core = filename
-            .strip_prefix("shard-")?
-            .strip_suffix(".manifest.json")?;
-        let mut parts = core.split("-of-");
-        let worker_position = parts.next()?.parse::<u32>().ok()?;
-        let total_workers = parts.next()?.parse::<u32>().ok()?;
-        return Some(ShardAssignment::new(
+        let manifest: RealShardArtifactManifest =
+            serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        return Some(ShardAssignment::from_column_range(
             model_id.to_string(),
-            worker_position,
-            total_workers,
-            total_columns,
+            manifest.worker_position,
+            manifest.total_workers,
+            manifest.column_start,
+            manifest.column_end,
         ));
     }
     None
@@ -94,8 +97,8 @@ async fn loads_real_artifact_shard_into_residency() {
         .expect("model dir name")
         .to_string_lossy()
         .to_string();
-    let manifest = load_model_manifest(&model_id).expect("load real model manifest");
-    let assignment = discover_assignment(&model_id, &model_dir, manifest.tensor_parallelism_dim)
+    let _manifest = load_model_manifest(&model_id).expect("load real model manifest");
+    let assignment = discover_assignment(&model_id, &model_dir)
         .expect("discover shard assignment from real artifact manifest");
 
     let registry_root = tempfile::tempdir().expect("registry tempdir");

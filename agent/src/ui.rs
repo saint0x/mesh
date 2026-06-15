@@ -442,6 +442,7 @@ struct DeviceInitRequest {
     network_id: String,
     name: String,
     control_plane_url: String,
+    preferred_provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -704,7 +705,14 @@ async fn init_device(
         );
     }
 
-    match crate::cmd_init(body.network_id, body.name, body.control_plane_url).await {
+    match crate::cmd_init(
+        body.network_id,
+        body.name,
+        body.control_plane_url,
+        body.preferred_provider,
+    )
+    .await
+    {
         Ok(()) => ok_response(serde_json::json!({ "initialized": true })),
         Err(error) => error_response(
             StatusCode::BAD_REQUEST,

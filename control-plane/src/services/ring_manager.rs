@@ -221,6 +221,53 @@ fn allocate_weighted_column_ranges(
         .collect()
 }
 
+fn allocate_weighted_group_ranges(
+    total_columns: u32,
+    group_width: u32,
+    profiles: &[WorkerCapacityProfile],
+    scheduling_policy: &InferenceSchedulingPolicy,
+) -> ApiResult<Vec<(u32, u32)>> {
+    if group_width == 0 {
+        return Err(ApiError::BadRequest(
+            "group_width must be greater than zero".to_string(),
+        ));
+    }
+    if total_columns % group_width != 0 {
+        return Err(ApiError::BadRequest(format!(
+            "tensor parallel dimension {} is not divisible by grouped-query width {}",
+            total_columns, group_width
+        )));
+    }
+
+    let total_groups = total_columns / group_width;
+    let group_ranges = if total_groups as usize >= profiles.len() {
+        let mut reserved = vec![1u32; profiles.len()];
+        let remaining_groups = total_groups.saturating_sub(profiles.len() as u32);
+        let bonus_ranges =
+            allocate_weighted_column_ranges(remaining_groups, profiles, scheduling_policy);
+        for (slot, (start, end)) in reserved.iter_mut().zip(bonus_ranges.into_iter()) {
+            *slot = slot.saturating_add(end.saturating_sub(start));
+        }
+
+        let mut start = 0u32;
+        reserved
+            .into_iter()
+            .map(|width| {
+                let end = start + width;
+                let range = (start, end);
+                start = end;
+                range
+            })
+            .collect::<Vec<_>>()
+    } else {
+        allocate_weighted_column_ranges(total_groups, profiles, scheduling_policy)
+    };
+    Ok(group_ranges
+        .into_iter()
+        .map(|(start, end)| (start * group_width, end * group_width))
+        .collect())
+}
+
 impl RingTopologyManager {
     /// Create a new RingTopologyManager
     pub fn new(db: Arc<Database>) -> Self {
@@ -529,11 +576,20 @@ impl RingTopologyManager {
         let profiles =
             self.load_worker_capacity_profiles(conn, &network_id, &model_id, ring_seq)?;
         let manifest = model_assets::load_model_manifest(&model_id)?;
-        let ranges = allocate_weighted_column_ranges(
-            manifest.tensor_parallelism_dim,
-            &profiles,
-            &scheduling_policy,
-        );
+        let ranges = if let Some(group_width) = model_assets::attention_group_width(&manifest)? {
+            allocate_weighted_group_ranges(
+                manifest.tensor_parallelism_dim,
+                group_width,
+                &profiles,
+                &scheduling_policy,
+            )?
+        } else {
+            allocate_weighted_column_ranges(
+                manifest.tensor_parallelism_dim,
+                &profiles,
+                &scheduling_policy,
+            )
+        };
 
         Ok(profiles
             .into_iter()
@@ -566,11 +622,20 @@ impl RingTopologyManager {
                 stability_multiplier: 1.0,
             })
             .collect::<Vec<_>>();
-        let ranges = allocate_weighted_column_ranges(
-            manifest.tensor_parallelism_dim,
-            &profiles,
-            &InferenceSchedulingPolicy::default(),
-        );
+        let ranges = if let Some(group_width) = model_assets::attention_group_width(&manifest)? {
+            allocate_weighted_group_ranges(
+                manifest.tensor_parallelism_dim,
+                group_width,
+                &profiles,
+                &InferenceSchedulingPolicy::default(),
+            )?
+        } else {
+            allocate_weighted_column_ranges(
+                manifest.tensor_parallelism_dim,
+                &profiles,
+                &InferenceSchedulingPolicy::default(),
+            )
+        };
         let column_range = ranges
             .get(position as usize)
             .copied()
@@ -1371,6 +1436,34 @@ mod tests {
         for window in ranges.windows(2) {
             assert_eq!(window[0].1, window[1].0);
         }
+    }
+
+    #[test]
+    fn test_allocate_weighted_group_ranges_aligns_to_attention_groups() {
+        let ranges = allocate_weighted_group_ranges(
+            576,
+            192,
+            &[
+                WorkerCapacityProfile {
+                    tier: Tier::Tier4,
+                    contributed_memory: 16 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 16384,
+                    throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
+                },
+                WorkerCapacityProfile {
+                    tier: Tier::Tier1,
+                    contributed_memory: 4 * 1024 * 1024 * 1024,
+                    fallback_memory_mb: 4096,
+                    throughput_multiplier: 1.0,
+                    stability_multiplier: 1.0,
+                },
+            ],
+            &InferenceSchedulingPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(ranges, vec![(0, 384), (384, 576)]);
     }
 
     #[test]

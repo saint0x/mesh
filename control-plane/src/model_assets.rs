@@ -72,6 +72,10 @@ pub struct ResolvedServingLayout {
 pub struct ModelManifest {
     pub model_id: String,
     pub tensor_parallelism_dim: u32,
+    #[serde(default)]
+    pub attention_head_count: Option<u32>,
+    #[serde(default)]
+    pub kv_head_count: Option<u32>,
     pub total_model_bytes: u64,
     #[serde(default)]
     pub transformer_layer_count: Option<u32>,
@@ -189,6 +193,26 @@ fn validate_manifest(
             path.display()
         )));
     }
+    if let (Some(num_heads), Some(num_kv_heads)) =
+        (manifest.attention_head_count, manifest.kv_head_count)
+    {
+        if num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(ApiError::BadRequest(format!(
+                "Model manifest {} declares invalid attention geometry num_heads={} num_kv_heads={}",
+                path.display(),
+                num_heads,
+                num_kv_heads
+            )));
+        }
+        if manifest.tensor_parallelism_dim % num_heads != 0 {
+            return Err(ApiError::BadRequest(format!(
+                "Model manifest {} declares tensor_parallelism_dim {} not divisible by attention_head_count {}",
+                path.display(),
+                manifest.tensor_parallelism_dim,
+                num_heads
+            )));
+        }
+    }
     validate_layout_rules(
         path,
         manifest.transformer_layer_count,
@@ -197,6 +221,30 @@ fn validate_manifest(
     )?;
 
     Ok(manifest)
+}
+
+pub fn attention_group_width(manifest: &ModelManifest) -> Result<Option<u32>, ApiError> {
+    let (Some(num_heads), Some(num_kv_heads)) =
+        (manifest.attention_head_count, manifest.kv_head_count)
+    else {
+        return Ok(None);
+    };
+
+    if num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(ApiError::BadRequest(format!(
+            "Model {} declares invalid attention geometry num_heads={} num_kv_heads={}",
+            manifest.model_id, num_heads, num_kv_heads
+        )));
+    }
+    if manifest.tensor_parallelism_dim % num_heads != 0 {
+        return Err(ApiError::BadRequest(format!(
+            "Model {} declares tensor_parallelism_dim {} not divisible by attention_head_count {}",
+            manifest.model_id, manifest.tensor_parallelism_dim, num_heads
+        )));
+    }
+
+    let head_dim = manifest.tensor_parallelism_dim / num_heads;
+    Ok(Some((num_heads / num_kv_heads) * head_dim))
 }
 
 fn validate_layout_rules(
@@ -656,6 +704,7 @@ fn validate_tensor_parallel_layout(
         }
     }
 
+    let alignment = attention_group_width(manifest).map_err(|err| err.to_string())?;
     let mut intervals = members
         .iter()
         .map(|member| {
@@ -670,6 +719,14 @@ fn validate_tensor_parallel_layout(
 
     let mut cursor = 0;
     for (device_id, start, end) in intervals {
+        if let Some(alignment) = alignment {
+            if start % alignment != 0 || end % alignment != 0 {
+                return Err(format!(
+                    "member {} shard span {}..{} is not aligned to grouped-query width {}",
+                    device_id, start, end, alignment
+                ));
+            }
+        }
         if start != cursor {
             if start < cursor {
                 return Err(format!(
@@ -854,6 +911,8 @@ pub mod testsupport {
         ensure_test_model_with_manifest(ModelManifest {
             model_id: model_id.to_string(),
             tensor_parallelism_dim,
+            attention_head_count: None,
+            kv_head_count: None,
             total_model_bytes: 1024 * 1024,
             transformer_layer_count: None,
             tokenizer_file: "tokenizer.json".to_string(),

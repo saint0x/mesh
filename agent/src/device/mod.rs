@@ -181,6 +181,25 @@ impl DeviceConfig {
         )
     }
 
+    pub fn effective_capabilities(&self) -> Result<DeviceCapabilities> {
+        let selected_provider = self.resolve_execution_provider()?;
+        let selected_contract = self
+            .capabilities
+            .execution_providers
+            .iter()
+            .find(|provider| provider.kind == selected_provider)
+            .map(|provider| provider.contract.clone())
+            .unwrap_or_else(|| {
+                crate::provider::BackendContractDescriptor::for_provider(selected_provider)
+            });
+
+        let mut capabilities = self.capabilities.clone();
+        capabilities.default_execution_provider = selected_provider;
+        capabilities.default_provider_contract_hash = selected_contract.contract_hash.clone();
+        capabilities.memory_model = selected_contract.memory_model;
+        Ok(capabilities)
+    }
+
     /// Get default configuration file path: `~/.meshnet/device.toml`
     ///
     /// # Errors
@@ -435,6 +454,30 @@ mod tests {
             config.governance.recovery_max_checkpoint_loads_per_minute,
             8
         );
+    }
+
+    #[test]
+    fn test_effective_capabilities_honor_preferred_provider() {
+        let mut config = DeviceConfig::generate(
+            "test-device".to_string(),
+            "test-network".to_string(),
+            "http://localhost:8080".to_string(),
+        );
+        config.execution.preferred_provider = Some(ExecutionProviderKind::Cpu);
+
+        let capabilities = config.effective_capabilities().unwrap();
+        let cpu_contract =
+            crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu);
+
+        assert_eq!(
+            capabilities.default_execution_provider,
+            ExecutionProviderKind::Cpu
+        );
+        assert_eq!(
+            capabilities.default_provider_contract_hash,
+            cpu_contract.contract_hash
+        );
+        assert_eq!(capabilities.memory_model, cpu_contract.memory_model);
     }
 
     #[test]
