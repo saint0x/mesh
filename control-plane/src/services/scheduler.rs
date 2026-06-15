@@ -59,6 +59,7 @@ struct SchedulerCandidate {
     job_id: String,
     session_id: String,
     model_id: String,
+    ring_position: u32,
     runtime_mode: SchedulerPolicyMode,
     submitted_by_device_id: String,
     created_at: String,
@@ -75,6 +76,7 @@ struct SchedulerCandidate {
     prefill_group_total_members: u32,
     prefill_group_leased_members: u32,
     prefill_group_active_members: u32,
+    model_prefill_inflight_groups: u32,
     decode_lease_target_session_count: Option<u32>,
     decode_cohort_ready_sessions: u32,
     decode_cohort_blocked_sessions: u32,
@@ -313,7 +315,18 @@ fn classify_candidate(
 ) -> Result<String, SchedulerBlockedReason> {
     match candidate.phase {
         SchedulerPhase::Prefill => match candidate.group_status.as_str() {
-            "prefill_member" | "prefill_leased" => Ok(candidate.created_at.clone()),
+            "prefill_member" | "prefill_leased" => {
+                let inflight_members = candidate
+                    .prefill_group_leased_members
+                    .saturating_add(candidate.prefill_group_active_members);
+                if inflight_members == 0 && candidate.model_prefill_inflight_groups > 0 {
+                    Err(SchedulerBlockedReason::LeaseHeldByPeer)
+                } else if inflight_members == 0 && candidate.ring_position != 0 {
+                    Err(SchedulerBlockedReason::LeaseHeldByPeer)
+                } else {
+                    Ok(candidate.created_at.clone())
+                }
+            }
             "prefill_active" => Err(SchedulerBlockedReason::AlreadyRunning),
             _ => Err(SchedulerBlockedReason::NotEligible),
         },
@@ -805,17 +818,27 @@ fn load_scheduler_candidates(
                 FROM inference_serving_groups
                 WHERE phase = 'prefill'
                 GROUP BY network_id, job_id, group_id
+            ),
+            prefill_model_inflight AS (
+                SELECT
+                    network_id,
+                    model_id,
+                    COUNT(DISTINCT group_id) AS inflight_groups
+                FROM inference_serving_groups
+                WHERE phase = 'prefill'
+                  AND status IN ('prefill_leased', 'prefill_active')
+                GROUP BY network_id, model_id
             )
             SELECT
                 a.assignment_id,
                 a.job_id,
                 s.session_id,
                 j.model_id,
+                a.ring_position,
                 j.execution_plan_json,
                 j.submitted_by_device_id,
                 j.created_at,
                 a.assigned_at,
-                sg.group_id,
                 sg.phase,
                 s.status,
                 sg.status,
@@ -829,6 +852,7 @@ fn load_scheduler_candidates(
                 COALESCE(prefill_stats.total_members, 0),
                 COALESCE(prefill_stats.leased_members, 0),
                 COALESCE(prefill_stats.active_members, 0),
+                COALESCE(prefill_model_inflight.inflight_groups, 0),
                 dq.lease_target_session_count,
                 COALESCE(stats.ready_sessions, 0),
                 COALESCE(stats.blocked_sessions, 0),
@@ -849,6 +873,9 @@ fn load_scheduler_candidates(
                 ON prefill_stats.network_id = a.network_id
                AND prefill_stats.job_id = a.job_id
                AND prefill_stats.group_id = sg.group_id
+            LEFT JOIN prefill_model_inflight
+                ON prefill_model_inflight.network_id = a.network_id
+               AND prefill_model_inflight.model_id = j.model_id
             WHERE a.device_id = ?
               AND a.network_id = ?
               AND a.active_segment_id = j.active_segment_id
@@ -874,16 +901,17 @@ fn load_scheduler_candidates(
     let rows = stmt.query_map(params![&req.device_id, &req.network_id], |row| {
         let phase: String = row.get(9)?;
         Ok((
-            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
             SchedulerCandidate {
                 assignment_id: row.get(0)?,
                 job_id: row.get(1)?,
                 session_id: row.get(2)?,
                 model_id: row.get(3)?,
+                ring_position: row.get::<_, i64>(4)? as u32,
                 runtime_mode: SchedulerPolicyMode::FitFirst,
-                submitted_by_device_id: row.get(5)?,
-                created_at: row.get(6)?,
-                assigned_at: row.get(7)?,
+                submitted_by_device_id: row.get(6)?,
+                created_at: row.get(7)?,
+                assigned_at: row.get(8)?,
                 phase: parse_scheduler_phase(&phase).map_err(to_from_sql_error)?,
                 group_status: row.get(11)?,
                 decode_queue_status: row.get(12)?,
@@ -896,12 +924,13 @@ fn load_scheduler_candidates(
                 prefill_group_total_members: row.get::<_, i64>(19)? as u32,
                 prefill_group_leased_members: row.get::<_, i64>(20)? as u32,
                 prefill_group_active_members: row.get::<_, i64>(21)? as u32,
-                decode_lease_target_session_count: row.get::<_, Option<i64>>(22)?.map(|v| v as u32),
-                decode_cohort_ready_sessions: row.get::<_, i64>(23)? as u32,
-                decode_cohort_blocked_sessions: row.get::<_, i64>(24)? as u32,
-                decode_cohort_oldest_ready_at: row.get(25)?,
-                decode_cohort_leased_sessions: row.get::<_, i64>(26)? as u32,
-                decode_cohort_active_sessions: row.get::<_, i64>(27)? as u32,
+                model_prefill_inflight_groups: row.get::<_, i64>(22)? as u32,
+                decode_lease_target_session_count: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
+                decode_cohort_ready_sessions: row.get::<_, i64>(24)? as u32,
+                decode_cohort_blocked_sessions: row.get::<_, i64>(25)? as u32,
+                decode_cohort_oldest_ready_at: row.get(26)?,
+                decode_cohort_leased_sessions: row.get::<_, i64>(27)? as u32,
+                decode_cohort_active_sessions: row.get::<_, i64>(28)? as u32,
                 decode_topology_rank: u32::MAX,
             },
         ))
@@ -1706,6 +1735,7 @@ mod tests {
             job_id: "job-1".into(),
             session_id: "session-1".into(),
             model_id: "model-a".into(),
+            ring_position: 0,
             runtime_mode: SchedulerPolicyMode::FitFirst,
             submitted_by_device_id: "submitter-a".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -1722,6 +1752,7 @@ mod tests {
             prefill_group_total_members: 1,
             prefill_group_leased_members: 0,
             prefill_group_active_members: 0,
+            model_prefill_inflight_groups: 0,
             decode_lease_target_session_count: None,
             decode_cohort_ready_sessions: 0,
             decode_cohort_blocked_sessions: 0,
@@ -1955,6 +1986,34 @@ mod tests {
         );
 
         assert!(inflight_rank < fresh_rank);
+    }
+
+    #[test]
+    fn fresh_prefill_is_blocked_while_same_model_prefill_group_is_inflight() {
+        let mut candidate = base_candidate(SchedulerPhase::Prefill);
+        candidate.model_prefill_inflight_groups = 1;
+        candidate.prefill_group_leased_members = 0;
+        candidate.prefill_group_active_members = 0;
+
+        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+
+        candidate.prefill_group_leased_members = 1;
+        let runnable = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(runnable, Ok("2026-01-01T00:00:00Z".into()));
+    }
+
+    #[test]
+    fn fresh_prefill_requires_group_leader_to_open_new_cohort() {
+        let mut candidate = base_candidate(SchedulerPhase::Prefill);
+        candidate.ring_position = 1;
+
+        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+
+        candidate.ring_position = 0;
+        let runnable = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(runnable, Ok("2026-01-01T00:00:00Z".into()));
     }
 
     #[test]
