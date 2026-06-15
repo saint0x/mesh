@@ -1240,73 +1240,69 @@ impl ForwardPass {
         let hidden_rows = hidden_dims[0];
         let hidden_cols = hidden_dims[1];
 
-        // 1. RMS Norm before attention
-        let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
+        let o_partial = tokio::task::block_in_place(|| -> Result<_> {
+            // These CPU-side tensor ops can run long enough under concurrent inference
+            // to starve async control loops if they stay on Tokio worker threads.
+            let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
 
-        // 2. Compute partial QKV projections (my columns only)
-        let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
+            let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
-        debug!(
-            "Layer {} QKV partial computed: {}x{} -> {}x{}",
-            layer_idx,
-            hidden_rows,
-            hidden_cols,
-            q_partial.dims()[0],
-            q_partial.dims()[1]
-        );
+            debug!(
+                "Layer {} QKV partial computed: {}x{} -> {}x{}",
+                layer_idx,
+                hidden_rows,
+                hidden_cols,
+                q_partial.dims()[0],
+                q_partial.dims()[1]
+            );
 
-        // 3. Compute causal attention on local heads only
-        let attn_output = attention_output_device(
-            &mut self.device_kv_cache,
-            &config,
-            self.attention_layout,
-            layer_idx,
-            absolute_positions,
-            &self.local_kv_head_indices,
-            q_partial,
-            k_partial,
-            v_partial,
-        )?;
+            let attn_output = attention_output_device(
+                &mut self.device_kv_cache,
+                &config,
+                self.attention_layout,
+                layer_idx,
+                absolute_positions,
+                &self.local_kv_head_indices,
+                q_partial,
+                k_partial,
+                v_partial,
+            )?;
 
-        // 6. Output projection (partial)
-        let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+
+            Ok(o_partial)
         })?;
         let o_full = self
             .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
             .await?;
 
-        // 7. Residual connection
-        let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        drop(o_full);
+        let (post_attn, down_partial) = tokio::task::block_in_place(|| -> Result<_> {
+            let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
 
-        // 8. MLP with SwiGLU
-        let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
-
-        // Gate and up projections are column-parallel and stay local
-        let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
-
-        // SwiGLU: silu(gate) * up
-        let gate_activated = silu_candle(&gate_partial)?;
-        let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-
-        // Down projection (partial)
-        let down_partial = mlp_hidden.matmul(&layer.w_down).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
+            let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
+            let gate_activated = silu_candle(&gate_partial)?;
+            let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            let down_partial = mlp_hidden.matmul(&layer.w_down).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })?;
+            Ok((post_attn, down_partial))
         })?;
         let down_full = self
             .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
             .await?;
 
-        // 9. Final residual
-        let output = post_attn.broadcast_add(&down_full).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        let output = tokio::task::block_in_place(|| {
+            post_attn.broadcast_add(&down_full).map_err(|e| {
+                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+            })
         })?;
-        drop(down_full);
 
         debug!(
             "Layer {} forward complete in {:?}",
@@ -1704,7 +1700,7 @@ impl ForwardPass {
         let absolute_positions = build_positions(absolute_position_start, tokens.len());
         self.last_allreduce_metrics = RingAllReduceMetrics::default();
 
-        let mut hidden = self.embed(tokens)?;
+        let mut hidden = tokio::task::block_in_place(|| self.embed(tokens))?;
         let hidden_dims = hidden.dims();
         debug!(
             "Embedded {} tokens -> {:?} at positions {}..{}",
@@ -1720,11 +1716,13 @@ impl ForwardPass {
                 .await?;
         }
 
-        hidden = rms_norm_candle(
-            &hidden,
-            &self.device_weights.final_norm,
-            self.config.rms_norm_eps,
-        )?;
+        hidden = tokio::task::block_in_place(|| {
+            rms_norm_candle(
+                &hidden,
+                &self.device_weights.final_norm,
+                self.config.rms_norm_eps,
+            )
+        })?;
 
         info!(
             positions = format!(

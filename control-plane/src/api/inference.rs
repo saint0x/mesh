@@ -4587,32 +4587,6 @@ fn claim_assignment(
                     &active.execution_group_id,
                     &lease_expires,
                 )?;
-                step = "update_serving_group";
-                tx.execute(
-                    r#"
-                UPDATE inference_serving_groups
-                SET status = CASE
-                        WHEN device_id = ? THEN ?
-                        ELSE status
-                    END,
-                    lease_owner_device_id = ?,
-                    lease_expires_at = ?,
-                    updated_at = ?,
-                    last_error = NULL
-                WHERE job_id = ? AND group_id = ? AND phase = ?
-                "#,
-                    params![
-                        &assignment.device_id,
-                        "decode_leased",
-                        &assignment.device_id,
-                        &lease_expires,
-                        &now_str,
-                        &assignment.job_id,
-                        &active.execution_group_id,
-                        "decode",
-                    ],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
                 step = "decode_queue_prepare";
                 let batch_group_key = decode_batch_group_key(&execution_plan, &active.segment_id)?;
                 let (lease_target_session_count, lease_target_batch_size) =
@@ -4624,43 +4598,126 @@ fn claim_assignment(
                     )?;
                 assignment.lease_target_session_count = Some(lease_target_session_count);
                 assignment.lease_target_batch_size = Some(lease_target_batch_size);
-                step = "upsert_decode_queue";
-                upsert_decode_queue(
-                    &tx,
-                    &assignment.session_id,
-                    &assignment.job_id,
-                    &assignment.network_id,
-                    &active.segment_id,
-                    &active.execution_group_id,
-                    &batch_group_key,
-                    "leased",
-                    Some(&now_str),
-                    Some(&assignment.device_id),
-                    Some(&lease_expires),
-                    Some(lease_target_session_count),
-                    Some(lease_target_batch_size),
-                    None,
-                    &now_str,
-                )?;
-                step = "refresh_decode_targets";
-                refresh_decode_batch_targets(
-                    &tx,
-                    &assignment.network_id,
-                    &batch_group_key,
-                    &active.execution_group_id,
-                )?;
-                step = "lease_decode_cohort";
-                let cohort_leased = lease_decode_cohort_ready_sessions(
-                    &tx,
-                    &assignment.network_id,
-                    &batch_group_key,
-                    &active.execution_group_id,
-                    &assignment.device_id,
-                    &lease_expires,
-                    lease_target_session_count,
-                    lease_target_batch_size,
-                    &now_str,
-                )?;
+                let queue_state = tx
+                    .query_row(
+                        r#"
+                        SELECT status, lease_owner_device_id
+                        FROM inference_decode_queue
+                        WHERE session_id = ?
+                        "#,
+                        params![&assignment.session_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                let attaching_to_active_peer = queue_state
+                    .as_ref()
+                    .map(|(status, owner)| {
+                        status.as_deref() == Some("active")
+                            && owner
+                                .as_deref()
+                                .is_some_and(|owner| owner != assignment.device_id)
+                    })
+                    .unwrap_or(false);
+
+                let cohort_leased = if attaching_to_active_peer {
+                    step = "update_decode_attach_serving_group";
+                    tx.execute(
+                        r#"
+                        UPDATE inference_serving_groups
+                        SET status = CASE
+                                WHEN device_id = ? THEN 'decode_leased'
+                                ELSE status
+                            END,
+                            lease_expires_at = CASE
+                                WHEN device_id = ? THEN ?
+                                ELSE lease_expires_at
+                            END,
+                            updated_at = ?,
+                            last_error = NULL
+                        WHERE job_id = ? AND group_id = ? AND phase = 'decode'
+                        "#,
+                        params![
+                            &assignment.device_id,
+                            &assignment.device_id,
+                            &lease_expires,
+                            &now_str,
+                            &assignment.job_id,
+                            &active.execution_group_id
+                        ],
+                    )
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                    Vec::new()
+                } else {
+                    step = "update_serving_group";
+                    tx.execute(
+                        r#"
+                    UPDATE inference_serving_groups
+                    SET status = CASE
+                            WHEN device_id = ? THEN ?
+                            ELSE status
+                        END,
+                        lease_owner_device_id = ?,
+                        lease_expires_at = ?,
+                        updated_at = ?,
+                        last_error = NULL
+                    WHERE job_id = ? AND group_id = ? AND phase = ?
+                    "#,
+                        params![
+                            &assignment.device_id,
+                            "decode_leased",
+                            &assignment.device_id,
+                            &lease_expires,
+                            &now_str,
+                            &assignment.job_id,
+                            &active.execution_group_id,
+                            "decode",
+                        ],
+                    )
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                    step = "upsert_decode_queue";
+                    upsert_decode_queue(
+                        &tx,
+                        &assignment.session_id,
+                        &assignment.job_id,
+                        &assignment.network_id,
+                        &active.segment_id,
+                        &active.execution_group_id,
+                        &batch_group_key,
+                        "leased",
+                        Some(&now_str),
+                        Some(&assignment.device_id),
+                        Some(&lease_expires),
+                        Some(lease_target_session_count),
+                        Some(lease_target_batch_size),
+                        None,
+                        &now_str,
+                    )?;
+                    step = "refresh_decode_targets";
+                    refresh_decode_batch_targets(
+                        &tx,
+                        &assignment.network_id,
+                        &batch_group_key,
+                        &active.execution_group_id,
+                    )?;
+                    step = "lease_decode_cohort";
+                    lease_decode_cohort_ready_sessions(
+                        &tx,
+                        &assignment.network_id,
+                        &batch_group_key,
+                        &active.execution_group_id,
+                        &assignment.device_id,
+                        &lease_expires,
+                        lease_target_session_count,
+                        lease_target_batch_size,
+                        &now_str,
+                    )?
+                };
                 step = "record_scheduler_event";
                 record_scheduler_event(
                     &tx,
@@ -4673,9 +4730,17 @@ fn claim_assignment(
                         group_id: Some(&active.execution_group_id),
                         batch_group_key: Some(&batch_group_key),
                         event_kind: "decode_claimed",
-                        queue_status: Some("leased"),
+                        queue_status: Some(if attaching_to_active_peer {
+                            "active"
+                        } else {
+                            "leased"
+                        }),
                         detail: Some(if cohort_leased.is_empty() {
-                            "decode assignment claimed"
+                            if attaching_to_active_peer {
+                                "decode assignment attached to active cohort"
+                            } else {
+                                "decode assignment claimed"
+                            }
                         } else {
                             "decode assignment claimed and pooled cohort leased"
                         }),
@@ -5019,7 +5084,11 @@ fn acknowledge_assignment(
             tx.execute(
                 r#"
             UPDATE inference_serving_groups
-            SET status = 'decode_active',
+            SET status = CASE
+                    WHEN device_id = ? THEN 'decode_active'
+                    WHEN status IN ('decode_ready', 'decode_leased') THEN 'decode_member'
+                    ELSE status
+                END,
                 lease_owner_device_id = ?,
                 lease_expires_at = NULL,
                 updated_at = ?,
@@ -5029,7 +5098,14 @@ fn acknowledge_assignment(
               AND phase = 'decode'
               AND lease_owner_device_id = ?
             "#,
-                params![device_id, &now, &network_id, &group_id, device_id],
+                params![
+                    device_id,
+                    device_id,
+                    &now,
+                    &network_id,
+                    &group_id,
+                    device_id
+                ],
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
             step = "refresh_decode_targets";
@@ -9933,6 +10009,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         let _ = report_inference_result(
             State(state.clone()),
             Path(submit.job_id.clone()),
@@ -10221,6 +10298,139 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(event_kinds.contains(&"decode_claimed"));
         assert!(event_kinds.contains(&"decode_lease_released"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_peer_can_attach_after_leader_acknowledges_active_queue() {
+        let network_id = "test-network-decode-active-attach";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "attach".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let plan = submit
+            .execution_plan
+            .clone()
+            .expect("expected execution plan");
+        let decode_segment_id = plan
+            .segments
+            .iter()
+            .find(|segment| matches!(segment.phase, ExecutionPhase::Decode))
+            .map(|segment| segment.segment_id.clone())
+            .expect("expected decode segment id");
+
+        let status = drive_job_to_decode_ready(&state, &submit.job_id, network_id, &plan).await;
+        assert_eq!(status.status, "running");
+        assert_eq!(
+            status
+                .session
+                .as_ref()
+                .map(|session| session.status.as_str()),
+            Some("decode_ready")
+        );
+
+        let leader_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected leader decode claim");
+        assert_eq!(leader_claim.active_segment.segment_id, decode_segment_id);
+
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(submit.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let conn = state.db.get_conn().unwrap();
+        let worker2_assignment_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, active_segment_id
+                FROM inference_job_assignments
+                WHERE job_id = ? AND device_id = 'worker-2'
+                "#,
+                params![submit.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let worker2_group_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, lease_owner_device_id
+                FROM inference_serving_groups
+                WHERE job_id = ? AND device_id = 'worker-2' AND phase = 'decode'
+                "#,
+                params![submit.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let decode_queue_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, lease_owner_device_id
+                FROM inference_decode_queue
+                WHERE job_id = ?
+                "#,
+                params![submit.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(worker2_assignment_state.0, "leased");
+        assert_eq!(
+            worker2_assignment_state.1.as_deref(),
+            Some(decode_segment_id.as_str())
+        );
+        assert_eq!(worker2_group_state.0, "decode_member");
+        assert_eq!(worker2_group_state.1.as_deref(), Some("worker-1"));
+        assert_eq!(decode_queue_state.0, "active");
+        assert_eq!(decode_queue_state.1.as_deref(), Some("worker-1"));
+
+        let follower_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected follower to attach to active decode cohort");
+        assert_eq!(follower_claim.active_segment.segment_id, decode_segment_id);
     }
 
     #[tokio::test]
