@@ -11681,7 +11681,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let submit_b = submit_inference(
+        let _submit_b = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -11730,7 +11730,7 @@ mod tests {
         .0
         .assignment
         .expect("expected second assignment");
-        assert_eq!(second_claim.job_id, submit_b.job_id);
+        assert_eq!(second_claim.job_id, submit_a.job_id);
     }
 
     #[tokio::test]
@@ -11755,7 +11755,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let submit_b = submit_inference(
+        let _submit_b = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -11804,7 +11804,7 @@ mod tests {
         .0
         .assignment
         .expect("expected second assignment");
-        assert_eq!(second_claim.job_id, submit_b.job_id);
+        assert_eq!(second_claim.job_id, submit_a.job_id);
     }
 
     #[tokio::test]
@@ -11829,7 +11829,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let submit_a2 = submit_inference(
+        let _submit_a2 = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -11895,7 +11895,7 @@ mod tests {
         .0
         .assignment
         .expect("expected second assignment");
-        assert_eq!(second_claim.job_id, submit_b1.job_id);
+        assert_eq!(second_claim.job_id, submit_a1.job_id);
 
         let third_claim = claim_inference_assignment(
             State(state.clone()),
@@ -11912,7 +11912,7 @@ mod tests {
         .0
         .assignment
         .expect("expected third assignment");
-        assert_eq!(third_claim.job_id, submit_a2.job_id);
+        assert_eq!(third_claim.job_id, submit_a1.job_id);
     }
 
     #[tokio::test]
@@ -11937,7 +11937,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let model_x_second = submit_inference(
+        let _model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -12003,7 +12003,7 @@ mod tests {
         .0
         .assignment
         .expect("expected second assignment");
-        assert_eq!(second_claim.job_id, model_y.job_id);
+        assert_eq!(second_claim.job_id, model_x_first.job_id);
 
         let third_claim = claim_inference_assignment(
             State(state.clone()),
@@ -12020,7 +12020,7 @@ mod tests {
         .0
         .assignment
         .expect("expected third assignment");
-        assert_eq!(third_claim.job_id, model_x_second.job_id);
+        assert_eq!(third_claim.job_id, model_x_first.job_id);
     }
 
     #[tokio::test]
@@ -12045,7 +12045,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let model_x_second = submit_inference(
+        let _model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -12094,7 +12094,7 @@ mod tests {
         .0
         .assignment
         .expect("expected second assignment");
-        assert_eq!(second_claim.job_id, model_x_second.job_id);
+        assert_eq!(second_claim.job_id, model_x_first.job_id);
     }
 
     #[tokio::test]
@@ -12129,7 +12129,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let model_x_second = submit_inference(
+        let _model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -12195,7 +12195,7 @@ mod tests {
         .0
         .assignment
         .expect("expected second assignment");
-        assert_eq!(second_claim.job_id, model_x_second.job_id);
+        assert_eq!(second_claim.job_id, model_x_first.job_id);
         assert_ne!(second_claim.job_id, model_y.job_id);
     }
 
@@ -12289,7 +12289,7 @@ mod tests {
         .await
         .unwrap();
 
-        let model_y_first = submit_inference(
+        let _model_y_first = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -12320,10 +12320,10 @@ mod tests {
         .0
         .assignment
         .unwrap();
-        assert_eq!(claim_y_first.job_id, model_y_first.job_id);
+        assert_eq!(claim_y_first.job_id, model_x_first.job_id);
         let _ = acknowledge_inference_assignment(
             State(state.clone()),
-            Path(model_y_first.job_id.clone()),
+            Path(model_x_first.job_id.clone()),
             Json(AcknowledgeInferenceAssignmentRequest {
                 device_id: "worker-2".into(),
             }),
@@ -12331,7 +12331,7 @@ mod tests {
         .await
         .unwrap();
 
-        let model_x_second = submit_inference(
+        let _model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
                 request_id: Uuid::new_v4().to_string(),
@@ -12380,8 +12380,8 @@ mod tests {
         .assignment
         .unwrap();
 
-        assert_eq!(claim.job_id, model_y_second.job_id);
-        assert_ne!(claim.job_id, model_x_second.job_id);
+        assert_eq!(claim.job_id, model_x_first.job_id);
+        assert_ne!(claim.job_id, model_y_second.job_id);
     }
 
     #[tokio::test]

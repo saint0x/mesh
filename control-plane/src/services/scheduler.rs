@@ -72,6 +72,9 @@ struct SchedulerCandidate {
     decode_updated_at: Option<String>,
     group_lease_owner_device_id: Option<String>,
     group_lease_expires_at: Option<String>,
+    prefill_group_total_members: u32,
+    prefill_group_leased_members: u32,
+    prefill_group_active_members: u32,
     decode_lease_target_session_count: Option<u32>,
     decode_cohort_ready_sessions: u32,
     decode_cohort_blocked_sessions: u32,
@@ -361,6 +364,9 @@ fn rank_candidate(
     leased_assignments_by_job: &HashMap<String, u32>,
 ) -> (
     u8,
+    u32,
+    u32,
+    u8,
     u8,
     u8,
     u8,
@@ -369,6 +375,7 @@ fn rank_candidate(
     u8,
     (String, u32, u32, String, String, u32),
 ) {
+    let coordination_rank = coordination_rank(candidate);
     let submitter_active_jobs = active_jobs_by_submitter
         .get(&candidate.candidate.submitted_by_device_id)
         .copied()
@@ -410,6 +417,9 @@ fn rank_candidate(
     );
 
     (
+        coordination_rank.0,
+        coordination_rank.1,
+        coordination_rank.2,
         fairness_rank.0,
         fairness_rank.1,
         fairness_rank.2,
@@ -426,6 +436,31 @@ fn rank_candidate(
             topology_rank,
         ),
     )
+}
+
+fn coordination_rank(candidate: &RunnableCandidate) -> (u8, u32, u32) {
+    match candidate.candidate.phase {
+        SchedulerPhase::Prefill => {
+            let in_flight_members = candidate
+                .candidate
+                .prefill_group_leased_members
+                .saturating_add(candidate.candidate.prefill_group_active_members);
+            if in_flight_members == 0 {
+                return (1, 0, 0);
+            }
+
+            let remaining_members = candidate
+                .candidate
+                .prefill_group_total_members
+                .saturating_sub(in_flight_members);
+            (
+                0,
+                remaining_members,
+                u32::MAX.saturating_sub(in_flight_members),
+            )
+        }
+        SchedulerPhase::Decode => (2, 0, 0),
+    }
 }
 
 fn scheduler_topology_rank(mode: SchedulerPolicyMode, candidate: &RunnableCandidate) -> u32 {
@@ -717,6 +752,18 @@ fn load_scheduler_candidates(
                     SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_sessions
                 FROM inference_decode_queue
                 GROUP BY network_id, COALESCE(batch_group_key, group_id)
+            ),
+            prefill_group_stats AS (
+                SELECT
+                    network_id,
+                    job_id,
+                    group_id,
+                    COUNT(*) AS total_members,
+                    SUM(CASE WHEN status = 'prefill_leased' THEN 1 ELSE 0 END) AS leased_members,
+                    SUM(CASE WHEN status = 'prefill_active' THEN 1 ELSE 0 END) AS active_members
+                FROM inference_serving_groups
+                WHERE phase = 'prefill'
+                GROUP BY network_id, job_id, group_id
             )
             SELECT
                 a.assignment_id,
@@ -738,6 +785,9 @@ fn load_scheduler_candidates(
                 dq.updated_at,
                 sg.lease_owner_device_id,
                 sg.lease_expires_at,
+                COALESCE(prefill_stats.total_members, 0),
+                COALESCE(prefill_stats.leased_members, 0),
+                COALESCE(prefill_stats.active_members, 0),
                 dq.lease_target_session_count,
                 COALESCE(stats.ready_sessions, 0),
                 COALESCE(stats.blocked_sessions, 0),
@@ -754,6 +804,10 @@ fn load_scheduler_candidates(
             LEFT JOIN decode_cohort_stats stats
                 ON stats.network_id = a.network_id
                AND stats.cohort_key = COALESCE(dq.batch_group_key, dq.group_id)
+            LEFT JOIN prefill_group_stats prefill_stats
+                ON prefill_stats.network_id = a.network_id
+               AND prefill_stats.job_id = a.job_id
+               AND prefill_stats.group_id = sg.group_id
             WHERE a.device_id = ?
               AND a.network_id = ?
               AND a.active_segment_id = j.active_segment_id
@@ -798,12 +852,15 @@ fn load_scheduler_candidates(
                 decode_updated_at: row.get(16)?,
                 group_lease_owner_device_id: row.get(17)?,
                 group_lease_expires_at: row.get(18)?,
-                decode_lease_target_session_count: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-                decode_cohort_ready_sessions: row.get::<_, i64>(20)? as u32,
-                decode_cohort_blocked_sessions: row.get::<_, i64>(21)? as u32,
-                decode_cohort_oldest_ready_at: row.get(22)?,
-                decode_cohort_leased_sessions: row.get::<_, i64>(23)? as u32,
-                decode_cohort_active_sessions: row.get::<_, i64>(24)? as u32,
+                prefill_group_total_members: row.get::<_, i64>(19)? as u32,
+                prefill_group_leased_members: row.get::<_, i64>(20)? as u32,
+                prefill_group_active_members: row.get::<_, i64>(21)? as u32,
+                decode_lease_target_session_count: row.get::<_, Option<i64>>(22)?.map(|v| v as u32),
+                decode_cohort_ready_sessions: row.get::<_, i64>(23)? as u32,
+                decode_cohort_blocked_sessions: row.get::<_, i64>(24)? as u32,
+                decode_cohort_oldest_ready_at: row.get(25)?,
+                decode_cohort_leased_sessions: row.get::<_, i64>(26)? as u32,
+                decode_cohort_active_sessions: row.get::<_, i64>(27)? as u32,
                 decode_topology_rank: u32::MAX,
             },
         ))
@@ -1621,6 +1678,9 @@ mod tests {
             decode_updated_at: None,
             group_lease_owner_device_id: None,
             group_lease_expires_at: None,
+            prefill_group_total_members: 1,
+            prefill_group_leased_members: 0,
+            prefill_group_active_members: 0,
             decode_lease_target_session_count: None,
             decode_cohort_ready_sessions: 0,
             decode_cohort_blocked_sessions: 0,
@@ -1794,6 +1854,66 @@ mod tests {
             &HashMap::new(),
         );
         assert!(right < left);
+    }
+
+    #[test]
+    fn fit_first_prefers_finishing_inflight_prefill_group_before_fresh_work() {
+        let mut inflight = base_candidate(SchedulerPhase::Prefill);
+        inflight.assignment_id = "inflight".into();
+        inflight.job_id = "job-inflight".into();
+        inflight.group_lease_owner_device_id = Some("worker-peer".into());
+        inflight.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        inflight.prefill_group_total_members = 2;
+        inflight.prefill_group_leased_members = 1;
+
+        let mut fresh = base_candidate(SchedulerPhase::Prefill);
+        fresh.assignment_id = "fresh".into();
+        fresh.job_id = "job-fresh".into();
+        fresh.created_at = "2025-12-31T23:59:00Z".into();
+        fresh.prefill_group_total_members = 2;
+
+        let inflight = RunnableCandidate {
+            ready_at: inflight.created_at.clone(),
+            candidate: inflight,
+        };
+        let fresh = RunnableCandidate {
+            ready_at: fresh.created_at.clone(),
+            candidate: fresh,
+        };
+
+        let policy = InferenceSchedulingPolicy::default();
+        let inflight_rank = rank_candidate(
+            &inflight,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            1,
+            1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([
+                ("job-inflight".into(), 1),
+                ("job-fresh".into(), 0),
+            ]),
+        );
+        let fresh_rank = rank_candidate(
+            &fresh,
+            SchedulerPolicyMode::FitFirst,
+            &policy,
+            1,
+            1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([
+                ("job-inflight".into(), 1),
+                ("job-fresh".into(), 0),
+            ]),
+        );
+
+        assert!(inflight_rank < fresh_rank);
     }
 
     #[test]
