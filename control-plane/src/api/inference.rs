@@ -420,6 +420,15 @@ struct RenewDecodeLeaseSnapshot {
     decode_lease: Option<DecodeLeaseStatus>,
 }
 
+struct PreparedInferenceSubmission {
+    prompt_tokens_json: String,
+    consumption_quote: crate::consumption_policy::ConsumptionPolicyOutput,
+    execution_plan: InferenceExecutionPlan,
+    execution_plan_json: String,
+    initial_participants: HashSet<String>,
+    device_metadata: Vec<PlannerDeviceMetadata>,
+}
+
 #[instrument(skip(state))]
 pub async fn submit_inference(
     State(state): State<AppState>,
@@ -454,11 +463,26 @@ pub async fn submit_inference(
     }
 
     let prompt_tokens = model_assets::tokenize_prompt(&req.model_id, &req.prompt)?;
+    let manifest = model_assets::load_model_manifest(&req.model_id)?;
+    let db = state.db.clone();
+    let request = req.clone();
+    let topology_for_prepare = topology.clone();
+    let prompt_tokens_for_prepare = prompt_tokens.clone();
+    let prepared_submission = tokio::task::spawn_blocking(move || {
+        prepare_inference_submission(
+            &db,
+            &request,
+            &topology_for_prepare,
+            &prompt_tokens_for_prepare,
+            &manifest,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
     let db = state.db.clone();
     let inference_write_gate = state.inference_write_gate.clone();
     let request = req.clone();
-    let topology_for_submit = topology.clone();
     let workers = topology.workers.clone();
     let job_id = Uuid::new_v4().to_string();
 
@@ -470,91 +494,20 @@ pub async fn submit_inference(
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             let mut conn = db.get_conn()?;
+            let now = now_rfc3339()?;
+            let tx = begin_immediate_transaction(&mut conn)?;
 
-            let device_exists: Option<String> = conn
-                .query_row(
-                    "SELECT device_id FROM devices WHERE device_id = ? AND network_id = ?",
-                    params![&request.device_id, &request.network_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-            if device_exists.is_none() {
-                return Err(ApiError::NotFound(format!(
-                    "Device {} not found in network {}",
-                    request.device_id, request.network_id
+            let available_credits =
+                load_device_available_credits(&tx, &request.network_id, &request.device_id)?;
+            if available_credits + f64::EPSILON < prepared_submission.consumption_quote.total_credits {
+                return Err(ApiError::Conflict(format!(
+                    "Device {} has insufficient credits: available {:.3}, required {:.3}",
+                    request.device_id, available_credits, prepared_submission.consumption_quote.total_credits
                 )));
             }
 
-            let now = now_rfc3339()?;
-            let prompt_tokens_json = serde_json::to_string(&prompt_tokens).map_err(|e| {
-                ApiError::Internal(format!("Failed to serialize prompt tokens: {}", e))
-            })?;
-            let manifest = model_assets::load_model_manifest(&request.model_id)?;
-            let consumption_quote = quote_consumption(ConsumptionQuoteInput {
-                prompt_tokens: prompt_tokens.len() as u32,
-                requested_completion_tokens: request.max_tokens,
-                total_model_bytes: manifest.total_model_bytes,
-            });
-
-            let scheduling_policy =
-                network_service::load_network_settings(&db, &request.network_id)?
-                    .scheduling_policy;
-            let device_metadata = topology_for_submit
-                .workers
-                .iter()
-                .map(|worker| {
-                    load_device_assignment_metadata_from_connection(
-                        &conn,
-                        &request.network_id,
-                        &worker.device_id,
-                        &request.model_id,
-                        &scheduling_policy,
-                    )
-                })
-                .collect::<ApiResult<Vec<_>>>()?;
-            let execution_plan = ExecutionPlanner::plan(
-                &request,
-                &prompt_tokens,
-                &topology_for_submit,
-                &scheduling_policy,
-                &device_metadata,
-            )?;
-            let execution_plan_json = serde_json::to_string(&execution_plan).map_err(|e| {
-                ApiError::Internal(format!("Failed to serialize execution plan: {}", e))
-            })?;
-            let initial_participants = execution_plan
-                .segments
-                .iter()
-                .find(|segment| segment.segment_id == execution_plan.initial_segment_id)
-                .map(|segment| {
-                    segment
-                        .participant_device_ids
-                        .iter()
-                        .cloned()
-                        .collect::<HashSet<_>>()
-                })
-                .ok_or_else(|| {
-                    ApiError::Internal(format!(
-                        "Initial segment {} missing from execution plan {}",
-                        execution_plan.initial_segment_id, execution_plan.plan_id
-                    ))
-                })?;
-
-        let tx = begin_immediate_transaction(&mut conn)?;
-
-        let available_credits =
-            load_device_available_credits(&tx, &request.network_id, &request.device_id)?;
-        if available_credits + f64::EPSILON < consumption_quote.total_credits {
-            return Err(ApiError::Conflict(format!(
-                "Device {} has insufficient credits: available {:.3}, required {:.3}",
-                request.device_id, available_credits, consumption_quote.total_credits
-            )));
-        }
-
-        tx.execute(
-            r#"
+            tx.execute(
+                r#"
             INSERT INTO inference_jobs (
                 job_id, network_id, submitted_by_device_id, model_id, prompt, prompt_tokens,
                 max_tokens, temperature, top_p, status, ring_worker_count, created_at, updated_at,
@@ -568,44 +521,44 @@ pub async fn submit_inference(
                 &request.device_id,
                 &request.model_id,
                 &request.prompt,
-                &prompt_tokens_json,
+                &prepared_submission.prompt_tokens_json,
                 request.max_tokens,
                 request.temperature,
                 request.top_p,
                 workers.len() as i64,
                 &now,
                 &now,
-                consumption_quote.total_credits,
+                prepared_submission.consumption_quote.total_credits,
                 request.max_tokens,
-                consumption_quote.model_size_factor,
-                execution_plan_json,
-                execution_plan.initial_segment_id,
+                prepared_submission.consumption_quote.model_size_factor,
+                &prepared_submission.execution_plan_json,
+                &prepared_submission.execution_plan.initial_segment_id,
             ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-        let initial_segment = execution_plan
-            .segments
-            .iter()
-            .find(|segment| segment.segment_id == execution_plan.initial_segment_id)
-            .ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "Initial segment {} missing from execution plan {}",
-                    execution_plan.initial_segment_id, execution_plan.plan_id
-                ))
-            })?;
-        let initial_group = execution_plan
-            .execution_groups
-            .iter()
-            .find(|group| group.group_id == initial_segment.execution_group_id)
-            .ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "Execution group {} missing from execution plan {}",
-                    initial_segment.execution_group_id, execution_plan.plan_id
-                ))
-            })?;
-        tx.execute(
-            r#"
+            let initial_segment = prepared_submission.execution_plan
+                .segments
+                .iter()
+                .find(|segment| segment.segment_id == prepared_submission.execution_plan.initial_segment_id)
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "Initial segment {} missing from execution plan {}",
+                        prepared_submission.execution_plan.initial_segment_id, prepared_submission.execution_plan.plan_id
+                    ))
+                })?;
+            let initial_group = prepared_submission.execution_plan
+                .execution_groups
+                .iter()
+                .find(|group| group.group_id == initial_segment.execution_group_id)
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "Execution group {} missing from execution plan {}",
+                        initial_segment.execution_group_id, prepared_submission.execution_plan.plan_id
+                    ))
+                })?;
+            tx.execute(
+                r#"
             INSERT INTO inference_sessions (
                 session_id, job_id, network_id, model_id, status, active_segment_id,
                 kv_owner_device_id, kv_transfer_policy, kv_sequence_position,
@@ -624,11 +577,11 @@ pub async fn submit_inference(
                 &now,
                 &now,
             ],
-        )
-        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        for worker in &workers {
-            tx.execute(
-                r#"
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            for worker in &workers {
+                tx.execute(
+                    r#"
                 INSERT INTO inference_session_replicas (
                     session_id, device_id, job_id, status, active_segment_id, kv_sequence_position,
                     updated_at, last_error
@@ -638,108 +591,110 @@ pub async fn submit_inference(
                     &initial_segment.session_id,
                     &worker.device_id,
                     &persisted_job_id,
-                    if initial_participants.contains(&worker.device_id) {
+                    if prepared_submission.initial_participants.contains(&worker.device_id) {
                         "prefill_pending"
                     } else {
                         "waiting"
                     },
-                    if initial_participants.contains(&worker.device_id) {
+                    if prepared_submission.initial_participants.contains(&worker.device_id) {
                         Some(initial_segment.segment_id.as_str())
                     } else {
                         None
                     },
                     &now,
                 ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        }
-        sync_serving_groups(
-            &tx,
-            &persisted_job_id,
-            &request.network_id,
-            &request.model_id,
-            &execution_plan,
-            &now,
-        )?;
-        initialize_session_kv_tracking(
-            &tx,
-            &persisted_job_id,
-            &request.network_id,
-            &request.model_id,
-            &execution_plan,
-            &prompt_tokens,
-            &now,
-        )?;
-        if let Some(decode_segment) = execution_plan
-            .segments
-            .iter()
-            .find(|segment| matches!(segment.phase, crate::api::types::ExecutionPhase::Decode))
-        {
-            let decode_batch_group_key =
-                decode_batch_group_key(&execution_plan, &decode_segment.segment_id)?;
-            upsert_decode_queue(
+                )
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            }
+            sync_serving_groups(
                 &tx,
-                &decode_segment.session_id,
                 &persisted_job_id,
                 &request.network_id,
-                &decode_segment.segment_id,
-                &decode_segment.execution_group_id,
-                &decode_batch_group_key,
-                "blocked_on_prefill",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                &request.model_id,
+                &prepared_submission.execution_plan,
                 &now,
             )?;
-        }
+            initialize_session_kv_tracking(
+                &tx,
+                &persisted_job_id,
+                &request.network_id,
+                &request.model_id,
+                &prepared_submission.execution_plan,
+                &prompt_tokens,
+                &now,
+            )?;
+            if let Some(decode_segment) = prepared_submission.execution_plan
+                .segments
+                .iter()
+                .find(|segment| matches!(segment.phase, crate::api::types::ExecutionPhase::Decode))
+            {
+                let decode_batch_group_key =
+                    decode_batch_group_key(&prepared_submission.execution_plan, &decode_segment.segment_id)?;
+                upsert_decode_queue(
+                    &tx,
+                    &decode_segment.session_id,
+                    &persisted_job_id,
+                    &request.network_id,
+                    &decode_segment.segment_id,
+                    &decode_segment.execution_group_id,
+                    &decode_batch_group_key,
+                    "blocked_on_prefill",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &now,
+                )?;
+            }
 
-        insert_ledger_event(
-            &tx,
-            &request.network_id,
-            "credits_reserved",
-            Some(&persisted_job_id),
-            Some(&request.device_id),
-            None,
-            serde_json::json!({
-                "credit_model": "consumption_v1",
-                "model_id": request.model_id,
-                "prompt_tokens": prompt_tokens.len(),
-                "requested_completion_tokens": request.max_tokens,
-                "reserved_credits": consumption_quote.total_credits,
-                "model_size_factor": consumption_quote.model_size_factor,
-            }),
-        )?;
+            insert_ledger_event(
+                &tx,
+                &request.network_id,
+                "credits_reserved",
+                Some(&persisted_job_id),
+                Some(&request.device_id),
+                None,
+                serde_json::json!({
+                    "credit_model": "consumption_v1",
+                    "model_id": request.model_id,
+                    "prompt_tokens": prompt_tokens.len(),
+                    "requested_completion_tokens": request.max_tokens,
+                    "reserved_credits": prepared_submission.consumption_quote.total_credits,
+                    "model_size_factor": prepared_submission.consumption_quote.model_size_factor,
+                }),
+            )?;
 
-        insert_ledger_event(
-            &tx,
-            &request.network_id,
-            "job_started",
-            Some(&persisted_job_id),
-            Some(&request.device_id),
-            None,
-            serde_json::json!({
-                "model_id": request.model_id,
-                "ring_worker_count": workers.len(),
-                "max_tokens": request.max_tokens,
-                "reserved_credits": consumption_quote.total_credits,
-                "model_size_factor": consumption_quote.model_size_factor,
-            }),
-        )?;
+            insert_ledger_event(
+                &tx,
+                &request.network_id,
+                "job_started",
+                Some(&persisted_job_id),
+                Some(&request.device_id),
+                None,
+                serde_json::json!({
+                    "model_id": request.model_id,
+                    "ring_worker_count": workers.len(),
+                    "max_tokens": request.max_tokens,
+                    "reserved_credits": prepared_submission.consumption_quote.total_credits,
+                    "model_size_factor": prepared_submission.consumption_quote.model_size_factor,
+                }),
+            )?;
 
-        for (worker, assignment_metadata) in workers.iter().zip(device_metadata.iter()) {
-            let assignment_id = Uuid::new_v4().to_string();
-            let backend_contract_json = serde_json::to_string(&assignment_metadata.backend_contract)
-                .map_err(|e| {
-                    ApiError::Internal(format!(
-                        "Failed to serialize backend contract for assignment: {}",
-                        e
-                    ))
-                })?;
-            tx.execute(
-                r#"
+            for (worker, assignment_metadata) in
+                workers.iter().zip(prepared_submission.device_metadata.iter())
+            {
+                let assignment_id = Uuid::new_v4().to_string();
+                let backend_contract_json =
+                    serde_json::to_string(&assignment_metadata.backend_contract).map_err(|e| {
+                        ApiError::Internal(format!(
+                            "Failed to serialize backend contract for assignment: {}",
+                            e
+                        ))
+                    })?;
+                tx.execute(
+                    r#"
                 INSERT INTO inference_job_assignments (
                     assignment_id, job_id, network_id, device_id, ring_position, status, assigned_at,
                     shard_column_start, shard_column_end, assigned_capacity_units, execution_provider,
@@ -752,7 +707,7 @@ pub async fn submit_inference(
                     &request.network_id,
                     &worker.device_id,
                     worker.position as i64,
-                    if initial_participants.contains(&worker.device_id) {
+                    if prepared_submission.initial_participants.contains(&worker.device_id) {
                         "pending"
                     } else {
                         "waiting"
@@ -764,23 +719,32 @@ pub async fn submit_inference(
                     assignment_metadata.backend_contract.provider.as_str(),
                     backend_contract_json,
                     &assignment_metadata.backend_contract.contract_hash,
-                    if initial_participants.contains(&worker.device_id) {
-                        Some(execution_plan.initial_segment_id.as_str())
+                    if prepared_submission.initial_participants.contains(&worker.device_id) {
+                        Some(prepared_submission.execution_plan.initial_segment_id.as_str())
                     } else {
                         None
                     },
                 ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        }
-
-            tx.commit()
+                )
                 .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            }
+
+            if let Err(e) = tx.commit() {
+                let error = ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e)));
+                if is_locked_api_error(&error) {
+                    error!(
+                        job_id = %persisted_job_id,
+                        device_id = %request.device_id,
+                        "SQLite lock while submitting inference job"
+                    );
+                }
+                return Err(error);
+            }
 
             Ok::<_, ApiError>((
-                consumption_quote.total_credits,
+                prepared_submission.consumption_quote.total_credits,
                 request.max_tokens,
-                execution_plan,
+                prepared_submission.execution_plan.clone(),
             ))
         });
         if let Err(err) = &result {
@@ -814,6 +778,90 @@ pub async fn submit_inference(
         execution_plan: Some(reservation.2),
         error: None,
     }))
+}
+
+fn prepare_inference_submission(
+    db: &crate::db::Database,
+    request: &SubmitInferenceRequest,
+    topology: &crate::services::ring_manager::RingTopology,
+    prompt_tokens: &[u32],
+    manifest: &model_assets::ModelManifest,
+) -> ApiResult<PreparedInferenceSubmission> {
+    let conn = db.get_conn()?;
+
+    let device_exists: Option<String> = conn
+        .query_row(
+            "SELECT device_id FROM devices WHERE device_id = ? AND network_id = ?",
+            params![&request.device_id, &request.network_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    if device_exists.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "Device {} not found in network {}",
+            request.device_id, request.network_id
+        )));
+    }
+
+    let prompt_tokens_json = serde_json::to_string(prompt_tokens)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize prompt tokens: {}", e)))?;
+    let consumption_quote = quote_consumption(ConsumptionQuoteInput {
+        prompt_tokens: prompt_tokens.len() as u32,
+        requested_completion_tokens: request.max_tokens,
+        total_model_bytes: manifest.total_model_bytes,
+    });
+    let scheduling_policy =
+        network_service::load_network_settings(db, &request.network_id)?.scheduling_policy;
+    let device_metadata = topology
+        .workers
+        .iter()
+        .map(|worker| {
+            load_device_assignment_metadata_from_connection(
+                &conn,
+                &request.network_id,
+                &worker.device_id,
+                &request.model_id,
+                &scheduling_policy,
+            )
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    let execution_plan = ExecutionPlanner::plan(
+        request,
+        prompt_tokens,
+        topology,
+        &scheduling_policy,
+        &device_metadata,
+    )?;
+    let execution_plan_json = serde_json::to_string(&execution_plan)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize execution plan: {}", e)))?;
+    let initial_participants = execution_plan
+        .segments
+        .iter()
+        .find(|segment| segment.segment_id == execution_plan.initial_segment_id)
+        .map(|segment| {
+            segment
+                .participant_device_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "Initial segment {} missing from execution plan {}",
+                execution_plan.initial_segment_id, execution_plan.plan_id
+            ))
+        })?;
+
+    Ok(PreparedInferenceSubmission {
+        prompt_tokens_json,
+        consumption_quote,
+        execution_plan,
+        execution_plan_json,
+        initial_participants,
+        device_metadata,
+    })
 }
 
 #[instrument(skip(state))]
@@ -4640,6 +4688,15 @@ fn acknowledge_assignment(
     let mut step = "open_transaction";
     let result = (|| -> ApiResult<()> {
         let mut conn = db.get_conn()?;
+        step = "load_active_segment";
+        let (phase, active_segment_id, group_id, network_id, batch_group_key) =
+            load_acknowledge_context(&conn, job_id)?;
+        let session_status = match phase {
+            crate::api::types::ExecutionPhase::Prefill => "prefill_active",
+            crate::api::types::ExecutionPhase::Decode => "decode_active",
+        };
+
+        step = "open_transaction";
         let tx = begin_immediate_transaction(&mut conn)?;
         let now = now_rfc3339()?;
 
@@ -4675,190 +4732,157 @@ fn acknowledge_assignment(
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
 
-        step = "load_active_segment";
-        let (execution_plan_json, active_segment_id): (Option<String>, Option<String>) = tx
-        .query_row(
-            "SELECT execution_plan_json, active_segment_id FROM inference_jobs WHERE job_id = ?",
-            params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        step = "update_session_status";
+        tx.execute(
+            r#"
+        UPDATE inference_sessions
+        SET status = ?, active_segment_id = ?, updated_at = ?
+        WHERE job_id = ?
+        "#,
+            params![session_status, &active_segment_id, &now, job_id],
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        if let (Some(execution_plan_json), Some(active_segment_id)) =
-            (execution_plan_json, active_segment_id)
-        {
-            let execution_plan = load_execution_plan_json(&execution_plan_json)?;
-            let phase = active_segment(&execution_plan, &active_segment_id)?.phase;
-            let session_status = match phase {
-                crate::api::types::ExecutionPhase::Prefill => "prefill_active",
-                crate::api::types::ExecutionPhase::Decode => "decode_active",
-            };
-            step = "update_session_status";
+        step = "update_replica_status";
+        tx.execute(
+            r#"
+        UPDATE inference_session_replicas
+        SET status = ?, active_segment_id = ?, updated_at = ?, last_error = NULL
+        WHERE job_id = ? AND device_id = ?
+        "#,
+            params![session_status, &active_segment_id, &now, job_id, device_id],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        step = "update_serving_groups";
+        tx.execute(
+            r#"
+        UPDATE inference_serving_groups
+        SET status = CASE
+                WHEN device_id = ? THEN ?
+                ELSE status
+            END,
+            lease_owner_device_id = CASE
+                WHEN ? = 'decode' THEN ?
+                ELSE lease_owner_device_id
+            END,
+            lease_expires_at = NULL,
+            updated_at = ?,
+            last_error = NULL
+        WHERE job_id = ? AND group_id = ? AND phase = ?
+        "#,
+            params![
+                device_id,
+                session_status,
+                match phase {
+                    crate::api::types::ExecutionPhase::Prefill => "prefill",
+                    crate::api::types::ExecutionPhase::Decode => "decode",
+                },
+                device_id,
+                &now,
+                job_id,
+                &group_id,
+                match phase {
+                    crate::api::types::ExecutionPhase::Prefill => "prefill",
+                    crate::api::types::ExecutionPhase::Decode => "decode",
+                }
+            ],
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+        if matches!(phase, crate::api::types::ExecutionPhase::Decode) {
+            let batch_group_key = batch_group_key.ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "Decode batch group key missing for job {} segment {}",
+                    job_id, active_segment_id
+                ))
+            })?;
+            let network_id = network_id.ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "Decode network id missing for job {}",
+                    job_id
+                ))
+            })?;
+            step = "update_decode_queue_active";
+            tx.execute(
+                r#"
+            UPDATE inference_decode_queue
+            SET status = 'active',
+                lease_owner_device_id = ?,
+                lease_expires_at = NULL,
+                last_error = NULL,
+                updated_at = ?
+            WHERE network_id = ?
+              AND COALESCE(batch_group_key, group_id) = ?
+              AND lease_owner_device_id = ?
+              AND status IN ('leased', 'active')
+            "#,
+                params![device_id, &now, &network_id, &batch_group_key, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "fanout_decode_sessions";
             tx.execute(
                 r#"
             UPDATE inference_sessions
-            SET status = ?, active_segment_id = ?, updated_at = ?
-            WHERE job_id = ?
-            "#,
-                params![session_status, &active_segment_id, &now, job_id],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            step = "update_replica_status";
-            tx.execute(
-                r#"
-            UPDATE inference_session_replicas
-            SET status = ?, active_segment_id = ?, updated_at = ?, last_error = NULL
-            WHERE job_id = ? AND device_id = ?
-            "#,
-                params![session_status, &active_segment_id, &now, job_id, device_id],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            let group_id = active_segment(&execution_plan, &active_segment_id)?
-                .execution_group_id
-                .clone();
-            step = "update_serving_groups";
-            tx.execute(
-                r#"
-            UPDATE inference_serving_groups
-            SET status = CASE
-                    WHEN device_id = ? THEN ?
-                    ELSE status
-                END,
-                lease_owner_device_id = CASE
-                    WHEN ? = 'decode' THEN ?
-                    ELSE lease_owner_device_id
-                END,
-                lease_expires_at = NULL,
-                updated_at = ?,
-                last_error = NULL
-            WHERE job_id = ? AND group_id = ? AND phase = ?
-            "#,
-                params![
-                    device_id,
-                    match phase {
-                        crate::api::types::ExecutionPhase::Prefill => "prefill_active",
-                        crate::api::types::ExecutionPhase::Decode => "decode_active",
-                    },
-                    match phase {
-                        crate::api::types::ExecutionPhase::Prefill => "prefill",
-                        crate::api::types::ExecutionPhase::Decode => "decode",
-                    },
-                    device_id,
-                    &now,
-                    job_id,
-                    &group_id,
-                    match phase {
-                        crate::api::types::ExecutionPhase::Prefill => "prefill",
-                        crate::api::types::ExecutionPhase::Decode => "decode",
-                    }
-                ],
-            )
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-            if matches!(phase, crate::api::types::ExecutionPhase::Decode) {
-                step = "load_network_id";
-                let network_id: String = tx
-                    .query_row(
-                        "SELECT network_id FROM inference_jobs WHERE job_id = ?",
-                        params![job_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-                step = "update_decode_queue_active";
-                tx.execute(
-                    r#"
-                UPDATE inference_decode_queue
-                SET status = 'active',
-                    lease_owner_device_id = ?,
-                    lease_expires_at = NULL,
-                    last_error = NULL,
-                    updated_at = ?
+            SET status = 'decode_active',
+                active_segment_id = ?,
+                updated_at = ?
+            WHERE session_id IN (
+                SELECT session_id
+                FROM inference_decode_queue
                 WHERE network_id = ?
                   AND COALESCE(batch_group_key, group_id) = ?
                   AND lease_owner_device_id = ?
-                  AND status IN ('leased', 'active')
-                "#,
-                    params![
-                        device_id,
-                        &now,
-                        &network_id,
-                        &decode_batch_group_key(&execution_plan, &active_segment_id)?,
-                        device_id
-                    ],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-                let batch_group_key = decode_batch_group_key(&execution_plan, &active_segment_id)?;
-                step = "fanout_decode_sessions";
-                tx.execute(
-                    r#"
-                UPDATE inference_sessions
-                SET status = 'decode_active',
-                    active_segment_id = ?,
-                    updated_at = ?
-                WHERE session_id IN (
-                    SELECT session_id
-                    FROM inference_decode_queue
-                    WHERE network_id = ?
-                      AND COALESCE(batch_group_key, group_id) = ?
-                      AND lease_owner_device_id = ?
-                      AND status = 'active'
-                )
-                "#,
-                    params![
-                        &active_segment_id,
-                        &now,
-                        &network_id,
-                        &batch_group_key,
-                        device_id
-                    ],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-                step = "fanout_decode_replicas";
-                tx.execute(
-                    r#"
-                UPDATE inference_session_replicas
-                SET status = 'decode_active',
-                    active_segment_id = ?,
-                    updated_at = ?,
-                    last_error = NULL
-                WHERE session_id IN (
-                    SELECT session_id
-                    FROM inference_decode_queue
-                    WHERE network_id = ?
-                      AND COALESCE(batch_group_key, group_id) = ?
-                      AND lease_owner_device_id = ?
-                      AND status = 'active'
-                )
-                  AND device_id = ?
-                "#,
-                    params![
-                        &active_segment_id,
-                        &now,
-                        &network_id,
-                        &batch_group_key,
-                        device_id,
-                        device_id
-                    ],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-                step = "fanout_decode_serving_groups";
-                tx.execute(
-                    r#"
-                UPDATE inference_serving_groups
-                SET status = 'decode_active',
-                    lease_owner_device_id = ?,
-                    lease_expires_at = NULL,
-                    updated_at = ?,
-                    last_error = NULL
+                  AND status = 'active'
+            )
+            "#,
+                params![&active_segment_id, &now, &network_id, &batch_group_key, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "fanout_decode_replicas";
+            tx.execute(
+                r#"
+            UPDATE inference_session_replicas
+            SET status = 'decode_active',
+                active_segment_id = ?,
+                updated_at = ?,
+                last_error = NULL
+            WHERE session_id IN (
+                SELECT session_id
+                FROM inference_decode_queue
                 WHERE network_id = ?
-                  AND group_id = ?
-                  AND phase = 'decode'
+                  AND COALESCE(batch_group_key, group_id) = ?
                   AND lease_owner_device_id = ?
-                "#,
-                    params![device_id, &now, &network_id, &group_id, device_id],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-                step = "refresh_decode_targets";
-                refresh_decode_batch_targets(&tx, &network_id, &batch_group_key, &group_id)?;
-            }
+                  AND status = 'active'
+            )
+              AND device_id = ?
+            "#,
+                params![
+                    &active_segment_id,
+                    &now,
+                    &network_id,
+                    &batch_group_key,
+                    device_id,
+                    device_id
+                ],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "fanout_decode_serving_groups";
+            tx.execute(
+                r#"
+            UPDATE inference_serving_groups
+            SET status = 'decode_active',
+                lease_owner_device_id = ?,
+                lease_expires_at = NULL,
+                updated_at = ?,
+                last_error = NULL
+            WHERE network_id = ?
+              AND group_id = ?
+              AND phase = 'decode'
+              AND lease_owner_device_id = ?
+            "#,
+                params![device_id, &now, &network_id, &group_id, device_id],
+            )
+            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            step = "refresh_decode_targets";
+            refresh_decode_batch_targets(&tx, &network_id, &batch_group_key, &group_id)?;
         }
 
         step = "commit";
@@ -4886,6 +4910,42 @@ fn acknowledge_assignment(
     }
 
     result
+}
+
+fn load_acknowledge_context(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+) -> ApiResult<(
+    crate::api::types::ExecutionPhase,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
+    let (execution_plan_json, active_segment_id, network_id): (Option<String>, Option<String>, String) =
+        conn.query_row(
+            "SELECT execution_plan_json, active_segment_id, network_id FROM inference_jobs WHERE job_id = ?",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let (execution_plan_json, active_segment_id) = execution_plan_json
+        .zip(active_segment_id)
+        .ok_or_else(|| ApiError::Conflict(format!("Job {} has no active segment to acknowledge", job_id)))?;
+    let execution_plan = load_execution_plan_json(&execution_plan_json)?;
+    let segment = active_segment(&execution_plan, &active_segment_id)?;
+    let batch_group_key = if matches!(segment.phase, crate::api::types::ExecutionPhase::Decode) {
+        Some(decode_batch_group_key(&execution_plan, &active_segment_id)?)
+    } else {
+        None
+    };
+    Ok((
+        segment.phase,
+        active_segment_id,
+        segment.execution_group_id.clone(),
+        Some(network_id),
+        batch_group_key,
+    ))
 }
 
 fn report_assignment_result(
