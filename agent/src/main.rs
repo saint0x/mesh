@@ -4892,6 +4892,7 @@ async fn cmd_inference(
     // Create inference request payload
     #[derive(serde::Serialize)]
     struct InferenceJobRequest {
+        request_id: String,
         device_id: String,
         network_id: String,
         model_id: String,
@@ -4902,6 +4903,7 @@ async fn cmd_inference(
     }
 
     let request = InferenceJobRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
         device_id: config.device_id.to_string(),
         network_id: config.network_id.clone(),
         model_id: model_id.clone(),
@@ -4916,38 +4918,53 @@ async fn cmd_inference(
     let client = control_plane_client();
     let url = control_plane_url(&config, "/api/inference/submit");
 
-    match client.post(&url).json(&request).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                let submit = response
-                    .json::<serde_json::Value>()
-                    .await
-                    .context("Failed to parse inference submit response")?;
-                let job_id = submit
-                    .get("job_id")
-                    .and_then(|value| value.as_str())
-                    .context("Inference submit response did not include job_id")?;
+    let started_at = std::time::Instant::now();
+    let submit_response = loop {
+        let response = client.post(&url).json(&request).send().await?;
+        if response.status().is_success() {
+            break response;
+        }
 
-                println!("\n{}", "✓ Inference submitted".green().bold());
-                println!("  Job ID:          {}", job_id);
-                println!("{}", "Watching distributed job...".dimmed());
-                cmd_job_status(job_id, true, 2_000).await?;
-            } else {
-                println!(
-                    "  {}",
-                    format!("Inference failed (HTTP {})", response.status()).red()
-                );
-                if let Ok(body) = response.text().await {
-                    println!("  Error: {}", body);
-                }
-                anyhow::bail!("Inference job failed");
-            }
+        let status = response.status();
+        let is_retryable = status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            || response.headers().contains_key("x-meshnet-db-locked");
+        if !is_retryable {
+            break response;
         }
-        Err(e) => {
-            println!("  {}", format!("Connection failed: {}", e).red());
-            println!("  {}", "Make sure the control plane is running.".yellow());
-            return Err(e.into());
+
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        if elapsed_ms >= 10_000 {
+            break response;
         }
+
+        let remaining_ms = 10_000u64.saturating_sub(elapsed_ms);
+        let backoff_ms = 250u64.min(remaining_ms);
+        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+    };
+
+    if submit_response.status().is_success() {
+        let submit = submit_response
+            .json::<serde_json::Value>()
+            .await
+            .context("Failed to parse inference submit response")?;
+        let job_id = submit
+            .get("job_id")
+            .and_then(|value| value.as_str())
+            .context("Inference submit response did not include job_id")?;
+
+        println!("\n{}", "✓ Inference submitted".green().bold());
+        println!("  Job ID:          {}", job_id);
+        println!("{}", "Watching distributed job...".dimmed());
+        cmd_job_status(job_id, true, 2_000).await?;
+    } else {
+        println!(
+            "  {}",
+            format!("Inference failed (HTTP {})", submit_response.status()).red()
+        );
+        if let Ok(body) = submit_response.text().await {
+            println!("  Error: {}", body);
+        }
+        anyhow::bail!("Inference job failed");
     }
 
     println!();

@@ -527,6 +527,8 @@ pub struct InferenceExecutionPlan {
 /// Request to submit a distributed inference job
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitInferenceRequest {
+    /// Stable client-generated request identifier for idempotent retries.
+    pub request_id: String,
     /// Device ID submitting the job
     pub device_id: String,
     /// Network ID

@@ -1673,6 +1673,7 @@ mod tests {
 
         let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-authoritative".to_string(),
@@ -1722,6 +1723,7 @@ mod tests {
 
         let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-shrink".to_string(),
@@ -1833,6 +1835,7 @@ mod tests {
 
         let err = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-provider-guard".to_string(),
@@ -1928,6 +1931,7 @@ mod tests {
 
         let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-hybrid-supported".to_string(),
@@ -2030,6 +2034,7 @@ mod tests {
 
         let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-provider-variant".to_string(),
@@ -2126,6 +2131,7 @@ mod tests {
 
         let original = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-refresh".to_string(),
@@ -2175,6 +2181,7 @@ mod tests {
 
         let original = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
                 network_id: "net".to_string(),
                 model_id: "planner-refresh-stable-layout".to_string(),

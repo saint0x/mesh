@@ -366,12 +366,25 @@ struct PreparedInferenceSubmission {
     device_metadata: Vec<PlannerDeviceMetadata>,
 }
 
+#[derive(Clone)]
+struct ExistingSubmittedJob {
+    job_id: String,
+    reserved_credits: f64,
+    available_completion_tokens: u32,
+    execution_plan: InferenceExecutionPlan,
+}
+
 #[instrument(skip(state))]
 pub async fn submit_inference(
     State(state): State<AppState>,
     Json(req): Json<SubmitInferenceRequest>,
 ) -> ApiResult<Json<SubmitInferenceResponse>> {
     validate_submit_request(&req)?;
+    if req.request_id.is_empty() {
+        return Err(ApiError::BadRequest(
+            "request_id must be provided".to_string(),
+        ));
+    }
 
     info!(
         device_id = %req.device_id,
@@ -445,6 +458,14 @@ pub async fn submit_inference(
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             let mut conn = db.get_conn()?;
+            if let Some(existing) = load_existing_submitted_job(&conn, &request.request_id)? {
+                return Ok((
+                    existing.job_id,
+                    existing.reserved_credits,
+                    existing.available_completion_tokens,
+                    existing.execution_plan,
+                ));
+            }
             let now = now_rfc3339()?;
             let tx = begin_immediate_transaction(&mut conn)?;
 
@@ -460,14 +481,15 @@ pub async fn submit_inference(
             tx.execute(
                 r#"
             INSERT INTO inference_jobs (
-                job_id, network_id, submitted_by_device_id, model_id, prompt, prompt_tokens,
+                job_id, request_id, network_id, submitted_by_device_id, model_id, prompt, prompt_tokens,
                 max_tokens, temperature, top_p, status, ring_worker_count, created_at, updated_at,
                 reserved_credits, available_completion_tokens, model_size_factor, execution_plan_json,
                 active_segment_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 &persisted_job_id,
+                &request.request_id,
                 &request.network_id,
                 &request.device_id,
                 &request.model_id,
@@ -693,6 +715,7 @@ pub async fn submit_inference(
             }
 
             Ok::<_, ApiError>((
+                persisted_job_id.clone(),
                 prepared_submission.consumption_quote.total_credits,
                 request.max_tokens,
                 prepared_submission.execution_plan.clone(),
@@ -712,6 +735,7 @@ pub async fn submit_inference(
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
+    let job_id = reservation.0;
     info!(
         job_id = %job_id,
         workers = topology.workers.len(),
@@ -724,11 +748,48 @@ pub async fn submit_inference(
         completion: None,
         completion_tokens: 0,
         execution_time_ms: 0,
-        reserved_credits: reservation.0,
-        available_completion_tokens: reservation.1,
-        execution_plan: Some(reservation.2),
+        reserved_credits: reservation.1,
+        available_completion_tokens: reservation.2,
+        execution_plan: Some(reservation.3),
         error: None,
     }))
+}
+
+fn load_existing_submitted_job(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+) -> ApiResult<Option<ExistingSubmittedJob>> {
+    let row = conn
+        .query_row(
+            r#"
+            SELECT job_id, reserved_credits, available_completion_tokens, execution_plan_json
+            FROM inference_jobs
+            WHERE request_id = ?
+            "#,
+            params![request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    row.map(
+        |(job_id, reserved_credits, available_completion_tokens, execution_plan_json)| {
+            Ok(ExistingSubmittedJob {
+                job_id,
+                reserved_credits,
+                available_completion_tokens,
+                execution_plan: load_execution_plan_json(&execution_plan_json)?,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn prepare_inference_submission(
@@ -7776,6 +7837,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -7851,6 +7913,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -7969,6 +8032,7 @@ mod tests {
         let result = submit_inference(
             State(state),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -7996,6 +8060,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -8068,6 +8133,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -8343,6 +8409,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -8505,6 +8572,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -8716,6 +8784,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -8981,6 +9050,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -9120,6 +9190,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -9351,6 +9422,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -9610,6 +9682,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -9864,6 +9937,7 @@ mod tests {
             let submit = submit_inference(
                 State(state.clone()),
                 Json(SubmitInferenceRequest {
+                    request_id: Uuid::new_v4().to_string(),
                     device_id: "worker-1".into(),
                     network_id: network_id.into(),
                     model_id: "llama-70b".into(),
@@ -10158,6 +10232,7 @@ mod tests {
             let submit = submit_inference(
                 State(state.clone()),
                 Json(SubmitInferenceRequest {
+                    request_id: Uuid::new_v4().to_string(),
                     device_id: "worker-1".into(),
                     network_id: network_id.into(),
                     model_id: "llama-70b".into(),
@@ -10474,6 +10549,7 @@ mod tests {
             let submit = submit_inference(
                 State(state.clone()),
                 Json(SubmitInferenceRequest {
+                    request_id: Uuid::new_v4().to_string(),
                     device_id: "worker-1".into(),
                     network_id: network_id.into(),
                     model_id: "llama-70b".into(),
@@ -10697,6 +10773,7 @@ mod tests {
             let submit = submit_inference(
                 State(state.clone()),
                 Json(SubmitInferenceRequest {
+                    request_id: Uuid::new_v4().to_string(),
                     device_id: "worker-1".into(),
                     network_id: network_id.into(),
                     model_id: "llama-70b".into(),
@@ -10986,6 +11063,7 @@ mod tests {
             let submit = submit_inference(
                 State(state.clone()),
                 Json(SubmitInferenceRequest {
+                    request_id: Uuid::new_v4().to_string(),
                     device_id: "worker-1".into(),
                     network_id: network_id.into(),
                     model_id: "llama-70b".into(),
@@ -11297,6 +11375,7 @@ mod tests {
         let first_submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11313,6 +11392,7 @@ mod tests {
         let second_submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11350,6 +11430,7 @@ mod tests {
         let third_submit = submit_inference(
             State(state),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11371,6 +11452,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11455,6 +11537,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11501,6 +11584,7 @@ mod tests {
         let submit = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11583,6 +11667,7 @@ mod tests {
         let submit_a = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11599,6 +11684,7 @@ mod tests {
         let submit_b = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11655,6 +11741,7 @@ mod tests {
         let submit_a = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11671,6 +11758,7 @@ mod tests {
         let submit_b = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11727,6 +11815,7 @@ mod tests {
         let submit_a1 = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11743,6 +11832,7 @@ mod tests {
         let submit_a2 = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11759,6 +11849,7 @@ mod tests {
         let submit_b1 = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "llama-70b".into(),
@@ -11832,6 +11923,7 @@ mod tests {
         let model_x_first = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -11848,6 +11940,7 @@ mod tests {
         let model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -11864,6 +11957,7 @@ mod tests {
         let model_y = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
                 model_id: "model-y".into(),
@@ -11937,6 +12031,7 @@ mod tests {
         let model_x_first = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -11953,6 +12048,7 @@ mod tests {
         let model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -12019,6 +12115,7 @@ mod tests {
         let model_x_first = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -12035,6 +12132,7 @@ mod tests {
         let model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -12051,6 +12149,7 @@ mod tests {
         let model_y = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-3".into(),
                 network_id: network_id.into(),
                 model_id: "model-y".into(),
@@ -12151,6 +12250,7 @@ mod tests {
         let model_x_first = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -12192,6 +12292,7 @@ mod tests {
         let model_y_first = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "model-y".into(),
@@ -12233,6 +12334,7 @@ mod tests {
         let model_x_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 model_id: "model-x".into(),
@@ -12248,6 +12350,7 @@ mod tests {
         let model_y_second = submit_inference(
             State(state.clone()),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "worker-2".into(),
                 network_id: network_id.into(),
                 model_id: "model-y".into(),
@@ -12292,6 +12395,7 @@ mod tests {
         let result = submit_inference(
             State(state),
             Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
                 device_id: "test-device-1".into(),
                 network_id: "test-network".into(),
                 model_id: "llama-70b".into(),

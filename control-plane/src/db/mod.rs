@@ -434,6 +434,7 @@ fn migration_is_already_effective(conn: &rusqlite::Connection, filename: &str) -
         "040_add_support_group_regroup_events.sql" => {
             column_exists(conn, "inference_regroup_events", "support_role")?
         }
+        "042_add_submit_request_id.sql" => column_exists(conn, "inference_jobs", "request_id")?,
         _ => false,
     })
 }
