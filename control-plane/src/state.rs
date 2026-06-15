@@ -1,5 +1,7 @@
+use crate::connectivity::InferenceSchedulingPolicy;
 use crate::api::error::{ApiError, ApiResult};
 use crate::db::Database;
+use crate::services::network_service;
 use crate::services::certificate::ControlPlaneKeypair;
 use crate::services::ring_manager::RingTopologyManager;
 use crate::services::topology_notifier::TopologyNotifier;
@@ -15,6 +17,8 @@ pub struct AppState {
     pub keypair: Arc<ControlPlaneKeypair>,
     /// Ring managers per network (lazily created)
     ring_managers: Arc<RwLock<HashMap<String, Arc<RingTopologyManager>>>>,
+    /// Stable network-level scheduling config cached out of the SQLite hot path.
+    network_scheduling_policies: Arc<RwLock<HashMap<String, InferenceSchedulingPolicy>>>,
     /// Topology notifier for worker notifications
     pub topology_notifier: Arc<TopologyNotifier>,
     /// SQLite is a single-writer database; serialize inference mutations explicitly.
@@ -30,9 +34,37 @@ impl AppState {
             db,
             keypair,
             ring_managers: Arc::new(RwLock::new(HashMap::new())),
+            network_scheduling_policies: Arc::new(RwLock::new(HashMap::new())),
             topology_notifier,
             inference_write_gate,
         }
+    }
+
+    pub fn get_network_scheduling_policy(
+        &self,
+        network_id: &str,
+    ) -> ApiResult<InferenceSchedulingPolicy> {
+        {
+            let policies = self.network_scheduling_policies.read().map_err(|_| {
+                ApiError::Internal(
+                    "Failed to acquire network_scheduling_policies read lock".to_string(),
+                )
+            })?;
+            if let Some(policy) = policies.get(network_id) {
+                return Ok(policy.clone());
+            }
+        }
+
+        let policy = network_service::load_network_settings(&self.db, network_id)?.scheduling_policy;
+        let mut policies = self.network_scheduling_policies.write().map_err(|_| {
+            ApiError::Internal(
+                "Failed to acquire network_scheduling_policies write lock".to_string(),
+            )
+        })?;
+        let entry = policies
+            .entry(network_id.to_string())
+            .or_insert_with(|| policy.clone());
+        Ok(entry.clone())
     }
 
     /// Get or create a ring manager for a network

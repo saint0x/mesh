@@ -6,7 +6,7 @@ use axum::{
 };
 use tracing::instrument;
 
-use crate::api::error::{ApiError, ApiResult};
+use crate::api::error::{execute_with_db_lock_retry, ApiError, ApiResult};
 use crate::api::types::{
     CreateNetworkRequest, CreateNetworkResponse, HeartbeatRequest, HeartbeatResponse,
     ListNetworksResponse, RegisterDeviceRequest, RegisterDeviceResponse,
@@ -31,16 +31,18 @@ pub async fn register_device(
     let keypair = state.keypair.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        device_service::register_device(
-            &db,
-            &keypair,
-            req.device_id,
-            req.network_id,
-            req.name,
-            req.public_key,
-            req.peer_id,
-            req.capabilities,
-        )
+        execute_with_db_lock_retry(|| {
+            device_service::register_device(
+                &db,
+                &keypair,
+                req.device_id.clone(),
+                req.network_id.clone(),
+                req.name.clone(),
+                req.public_key.clone(),
+                req.peer_id.clone(),
+                req.capabilities.clone(),
+            )
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -61,14 +63,16 @@ pub async fn create_network(
 ) -> ApiResult<Json<CreateNetworkResponse>> {
     let db = state.db.clone();
     let network = tokio::task::spawn_blocking(move || {
-        network_service::create_network(
-            &db,
-            req.network_id,
-            req.name,
-            req.owner_user_id,
-            req.connectivity,
-            req.scheduling_policy,
-        )
+        execute_with_db_lock_retry(|| {
+            network_service::create_network(
+                &db,
+                req.network_id.clone(),
+                req.name.clone(),
+                req.owner_user_id.clone(),
+                req.connectivity.clone(),
+                req.scheduling_policy.clone(),
+            )
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -82,7 +86,9 @@ pub async fn create_network(
 #[instrument(skip(state))]
 pub async fn list_networks(State(state): State<AppState>) -> ApiResult<Json<ListNetworksResponse>> {
     let db = state.db.clone();
-    let networks = tokio::task::spawn_blocking(move || network_service::list_networks(&db))
+    let networks = tokio::task::spawn_blocking(move || {
+        execute_with_db_lock_retry(|| network_service::list_networks(&db))
+    })
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
@@ -103,13 +109,15 @@ pub async fn heartbeat(
     let db = state.db.clone();
 
     let last_seen = tokio::task::spawn_blocking(move || {
-        device_service::update_heartbeat(
-            &db,
-            device_id,
-            req.connectivity_state,
-            req.listen_addrs,
-            req.direct_candidates,
-        )
+        execute_with_db_lock_retry(|| {
+            device_service::update_heartbeat(
+                &db,
+                device_id.clone(),
+                req.connectivity_state.clone(),
+                req.listen_addrs.clone(),
+                req.direct_candidates.clone(),
+            )
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;

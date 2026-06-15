@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use tracing::instrument;
 
-use crate::api::error::{ApiError, ApiResult};
+use crate::api::error::{execute_with_db_lock_retry, ApiError, ApiResult};
 use crate::api::types::{
     CreateHandoffRequest, CreateHandoffResponse, HandoffInfo, ListHandoffsResponse, PeerPunchPlan,
     PunchPathReason, PunchPathStrategy, RegisterCallbackRequest, RegisterCallbackResponse,
@@ -50,7 +50,9 @@ pub async fn join_ring(
         return Err(ApiError::BadRequest("model_id cannot be empty".to_string()));
     }
 
-    network_service::require_network_exists(&state.db, &req.network_id)?;
+    execute_with_db_lock_retry(|| {
+        network_service::require_network_exists(&state.db, &req.network_id)
+    })?;
 
     // Get or create ring manager for this network
     let ring_manager = state.get_ring_manager(&req.network_id)?;
@@ -66,7 +68,9 @@ pub async fn join_ring(
     };
 
     // Execute blocking database operation in thread pool
-    let position = tokio::task::spawn_blocking(move || ring_manager.add_worker(worker))
+    let position = tokio::task::spawn_blocking(move || {
+        execute_with_db_lock_retry(|| ring_manager.add_worker(worker.clone()))
+    })
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
@@ -122,16 +126,18 @@ pub async fn get_topology(
     let network_id = query.network_id.clone();
 
     let network_exists = tokio::task::spawn_blocking(move || {
-        let conn = db.get_conn()?;
-        let exists: Option<String> = conn
-            .query_row(
-                "SELECT network_id FROM networks WHERE network_id = ?",
-                rusqlite::params![&network_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        Ok::<_, ApiError>(exists.is_some())
+        execute_with_db_lock_retry(|| {
+            let conn = db.get_conn()?;
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT network_id FROM networks WHERE network_id = ?",
+                    rusqlite::params![&network_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            Ok::<_, ApiError>(exists.is_some())
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -148,7 +154,9 @@ pub async fn get_topology(
     let network_id = query.network_id.clone();
 
     // Execute blocking database operation in thread pool
-    let topology = tokio::task::spawn_blocking(move || ring_manager.get_topology(&network_id))
+    let topology = tokio::task::spawn_blocking(move || {
+        execute_with_db_lock_retry(|| ring_manager.get_topology(&network_id))
+    })
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
@@ -234,16 +242,18 @@ pub async fn leave_ring(
     let device_id_clone = device_id.clone();
 
     let network_id: Option<String> = tokio::task::spawn_blocking(move || {
-        let conn = db.get_conn()?;
-        let network: Option<String> = conn
-            .query_row(
-                "SELECT network_id FROM devices WHERE device_id = ?",
-                rusqlite::params![&device_id_clone],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        Ok::<_, ApiError>(network)
+        execute_with_db_lock_retry(|| {
+            let conn = db.get_conn()?;
+            let network: Option<String> = conn
+                .query_row(
+                    "SELECT network_id FROM devices WHERE device_id = ?",
+                    rusqlite::params![&device_id_clone],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+            Ok::<_, ApiError>(network)
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -256,7 +266,9 @@ pub async fn leave_ring(
 
     // Execute blocking database operation in thread pool
     let device_id_clone = device_id.clone();
-    tokio::task::spawn_blocking(move || ring_manager.handle_worker_failure(device_id_clone))
+    tokio::task::spawn_blocking(move || {
+        execute_with_db_lock_retry(|| ring_manager.handle_worker_failure(device_id_clone.clone()))
+    })
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 

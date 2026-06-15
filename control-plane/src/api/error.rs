@@ -5,8 +5,12 @@ use axum::{
 };
 use serde_json::json;
 use thiserror::Error;
+use std::thread;
+use std::time::Duration;
 
 pub(crate) const DB_LOCKED_HEADER: HeaderName = HeaderName::from_static("x-meshnet-db-locked");
+const DB_LOCK_RETRY_MAX_WAIT_MS: u64 = 10_000;
+const DB_LOCK_RETRY_BACKOFF_STEP_MS: u64 = 100;
 
 /// API error types
 #[derive(Error, Debug)]
@@ -73,6 +77,38 @@ fn is_locked_database_error(error: &(dyn std::error::Error + Send + Sync + 'stat
         current = err.source();
     }
     false
+}
+
+pub(crate) fn is_locked_api_error(error: &ApiError) -> bool {
+    let ApiError::Database(db_error) = error else {
+        return false;
+    };
+    is_locked_database_error(db_error.as_ref())
+}
+
+pub(crate) fn execute_with_db_lock_retry<T>(
+    mut op: impl FnMut() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let started_at = std::time::Instant::now();
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_locked_api_error(&error) => {
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                if elapsed_ms >= DB_LOCK_RETRY_MAX_WAIT_MS {
+                    return Err(error);
+                }
+                attempt += 1;
+                let remaining_ms = DB_LOCK_RETRY_MAX_WAIT_MS.saturating_sub(elapsed_ms);
+                let backoff_ms = (DB_LOCK_RETRY_BACKOFF_STEP_MS * attempt as u64)
+                    .min(DB_LOCK_RETRY_BACKOFF_STEP_MS * 10)
+                    .min(remaining_ms);
+                thread::sleep(Duration::from_millis(backoff_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Convert ApiError into HTTP response

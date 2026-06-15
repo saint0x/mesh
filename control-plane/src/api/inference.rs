@@ -2,14 +2,15 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use rusqlite::{params, ErrorCode, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
-use std::thread;
 use time::{Duration, OffsetDateTime};
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
-use crate::api::error::{ApiError, ApiResult};
+use crate::api::error::{
+    execute_with_db_lock_retry, is_locked_api_error, ApiError, ApiResult,
+};
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DecodeLeaseStatus,
@@ -37,87 +38,18 @@ use crate::model_assets;
 use crate::provider::{BackendContractDescriptor, ExecutionProviderKind};
 use crate::services::planner::adjusted_capacity_units;
 use crate::services::{
-    device_metadata_from_capabilities, network_service, refresh_decode_plan_for_job,
-    select_claim_assignment_id, ExecutionPlanner, PlannerDeviceMetadata,
+    device_metadata_from_capabilities, refresh_decode_plan_for_job, select_claim_assignment_id,
+    ExecutionPlanner, PlannerDeviceMetadata,
 };
 use crate::state::AppState;
 
 const ASSIGNMENT_LEASE_SECS: i64 = 60;
-const DB_LOCK_RETRY_MAX_WAIT_MS: u64 = 10_000;
-const DB_LOCK_RETRY_BACKOFF_STEP_MS: u64 = 100;
-
 #[derive(Clone, Default)]
 struct DeviceRuntimeTelemetry {
     observed_tokens_per_second: Option<f64>,
     observed_deferred_ratio: Option<f64>,
     observed_fill_ratio: Option<f64>,
     instability_score: u32,
-}
-
-fn execute_with_db_lock_retry<T>(mut op: impl FnMut() -> ApiResult<T>) -> ApiResult<T> {
-    let started_at = std::time::Instant::now();
-    let mut attempt = 0usize;
-    loop {
-        match op() {
-            Ok(value) => return Ok(value),
-            Err(error) if is_locked_api_error(&error) => {
-                let elapsed_ms = started_at.elapsed().as_millis() as u64;
-                if elapsed_ms >= DB_LOCK_RETRY_MAX_WAIT_MS {
-                    return Err(error);
-                }
-                attempt += 1;
-                let remaining_ms = DB_LOCK_RETRY_MAX_WAIT_MS.saturating_sub(elapsed_ms);
-                let backoff_ms = (DB_LOCK_RETRY_BACKOFF_STEP_MS * attempt as u64)
-                    .min(DB_LOCK_RETRY_BACKOFF_STEP_MS * 10)
-                    .min(remaining_ms);
-                thread::sleep(std::time::Duration::from_millis(backoff_ms));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn is_locked_sqlite_error(error: &(dyn std::error::Error + 'static)) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("database is locked") || message.contains("database is busy") {
-        return true;
-    }
-
-    if let Some(db_error) = error.downcast_ref::<crate::db::DbError>() {
-        if matches!(
-            db_error,
-            crate::db::DbError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-                if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked
-        ) {
-            return true;
-        }
-    }
-
-    if let Some(sqlite_error) = error.downcast_ref::<rusqlite::Error>() {
-        if matches!(
-            sqlite_error,
-            rusqlite::Error::SqliteFailure(code, _)
-                if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked
-        ) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn is_locked_api_error(error: &ApiError) -> bool {
-    let ApiError::Database(db_error) = error else {
-        return false;
-    };
-    let mut current = Some(db_error.as_ref() as &(dyn std::error::Error + 'static));
-    while let Some(err) = current {
-        if is_locked_sqlite_error(err) {
-            return true;
-        }
-        current = err.source();
-    }
-    false
 }
 
 pub(crate) fn log_locked_route_error(
@@ -446,10 +378,15 @@ pub async fn submit_inference(
 
     let ring_manager = state.get_ring_manager(&req.network_id)?;
     let topology_network_id = req.network_id.clone();
-    let topology =
-        tokio::task::spawn_blocking(move || ring_manager.get_topology(&topology_network_id))
-            .await
-            .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
+    let inference_write_gate = state.inference_write_gate.clone();
+    let topology = tokio::task::spawn_blocking(move || {
+        let _write_guard = inference_write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
+        execute_with_db_lock_retry(|| ring_manager.get_topology(&topology_network_id))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
     if topology.workers.is_empty() {
         return Err(ApiError::BadRequest(
@@ -464,18 +401,27 @@ pub async fn submit_inference(
 
     let prompt_tokens = model_assets::tokenize_prompt(&req.model_id, &req.prompt)?;
     let manifest = model_assets::load_model_manifest(&req.model_id)?;
+    let scheduling_policy = state.get_network_scheduling_policy(&req.network_id)?;
     let db = state.db.clone();
     let request = req.clone();
     let topology_for_prepare = topology.clone();
     let prompt_tokens_for_prepare = prompt_tokens.clone();
+    let scheduling_policy_for_prepare = scheduling_policy.clone();
+    let inference_write_gate = state.inference_write_gate.clone();
     let prepared_submission = tokio::task::spawn_blocking(move || {
-        prepare_inference_submission(
-            &db,
-            &request,
-            &topology_for_prepare,
-            &prompt_tokens_for_prepare,
-            &manifest,
-        )
+        let _write_guard = inference_write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
+        execute_with_db_lock_retry(|| {
+            prepare_inference_submission(
+                &db,
+                &request,
+                &topology_for_prepare,
+                &prompt_tokens_for_prepare,
+                &manifest,
+                &scheduling_policy_for_prepare,
+            )
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -786,6 +732,7 @@ fn prepare_inference_submission(
     topology: &crate::services::ring_manager::RingTopology,
     prompt_tokens: &[u32],
     manifest: &model_assets::ModelManifest,
+    scheduling_policy: &InferenceSchedulingPolicy,
 ) -> ApiResult<PreparedInferenceSubmission> {
     let conn = db.get_conn()?;
 
@@ -812,8 +759,6 @@ fn prepare_inference_submission(
         requested_completion_tokens: request.max_tokens,
         total_model_bytes: manifest.total_model_bytes,
     });
-    let scheduling_policy =
-        network_service::load_network_settings(db, &request.network_id)?.scheduling_policy;
     let device_metadata = topology
         .workers
         .iter()
@@ -823,15 +768,15 @@ fn prepare_inference_submission(
                 &request.network_id,
                 &worker.device_id,
                 &request.model_id,
-                &scheduling_policy,
-            )
+            scheduling_policy,
+        )
         })
         .collect::<ApiResult<Vec<_>>>()?;
     let execution_plan = ExecutionPlanner::plan(
         request,
         prompt_tokens,
         topology,
-        &scheduling_policy,
+        scheduling_policy,
         &device_metadata,
     )?;
     let execution_plan_json = serde_json::to_string(&execution_plan)
@@ -875,16 +820,7 @@ pub async fn claim_inference_assignment(
         ));
     }
 
-    let scheduling_policy = {
-        let db = state.db.clone();
-        let network_id = req.network_id.clone();
-        tokio::task::spawn_blocking(move || {
-            network_service::load_network_settings(&db, &network_id)
-                .map(|settings| settings.scheduling_policy)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??
-    };
+    let scheduling_policy = state.get_network_scheduling_policy(&req.network_id)?;
 
     let db = state.db.clone();
     let inference_write_gate = state.inference_write_gate.clone();
@@ -918,7 +854,11 @@ pub async fn claim_inference_assignment(
         let db = state.db.clone();
         let network_id = req.network_id.clone();
         let device_id = req.device_id.clone();
+        let inference_write_gate = state.inference_write_gate.clone();
         match tokio::task::spawn_blocking(move || {
+            let _write_guard = inference_write_gate
+                .lock()
+                .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
             execute_with_db_lock_retry(|| {
                 load_queue_observation(&db, &network_id, &device_id, active_session_id.clone())
             })
@@ -972,7 +912,11 @@ pub async fn observe_decode_queue_state(
 
     let db = state.db.clone();
     let query_clone = query.clone();
+    let inference_write_gate = state.inference_write_gate.clone();
     let observation = tokio::task::spawn_blocking(move || {
+        let _write_guard = inference_write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             load_queue_observation(&db, &query_clone.network_id, &query_clone.device_id, None)
         });
@@ -1009,7 +953,11 @@ pub async fn observe_pending_kv_transfers(
 
     let db = state.db.clone();
     let query_clone = query.clone();
+    let inference_write_gate = state.inference_write_gate.clone();
     let transfers = tokio::task::spawn_blocking(move || {
+        let _write_guard = inference_write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             let conn = db.get_conn()?;
             load_pending_kv_transfers(&conn, &query_clone.network_id, &query_clone.device_id)
@@ -3722,7 +3670,11 @@ pub async fn download_inference_session_checkpoint(
 
     let db = state.db.clone();
     let session_id_for_log = session_id.clone();
+    let inference_write_gate = state.inference_write_gate.clone();
     let checkpoint = tokio::task::spawn_blocking(move || {
+        let _write_guard = inference_write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             load_latest_session_checkpoint_payload(&db, &job_id, &session_id)
         });
@@ -3757,7 +3709,11 @@ pub async fn get_inference_job_status(
 
     let db = state.db.clone();
     let job_id_for_log = job_id.clone();
+    let inference_write_gate = state.inference_write_gate.clone();
     let status = tokio::task::spawn_blocking(move || {
+        let _write_guard = inference_write_gate
+            .lock()
+            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| load_job_status(&db, &job_id));
         if let Err(err) = &result {
             log_locked_route_error(
@@ -4622,7 +4578,7 @@ fn claim_assignment(
             return Err(error);
         }
 
-        row.map(|assignment| enrich_claimed_assignment(db, assignment))
+        row.map(|assignment| enrich_claimed_assignment(&conn, assignment))
             .transpose()
     })();
 
@@ -4641,10 +4597,9 @@ fn claim_assignment(
 }
 
 fn enrich_claimed_assignment(
-    db: &crate::db::Database,
+    conn: &rusqlite::Connection,
     mut assignment: PersistedLeaseRecord,
 ) -> ApiResult<PersistedAssignment> {
-    let conn = db.get_conn()?;
     let checkpoint = load_latest_session_checkpoint_status(&conn, &assignment.session_id)?;
     assignment.kv_checkpoint_device_id = checkpoint
         .as_ref()
@@ -5420,8 +5375,7 @@ fn report_assignment_progress(
         crate::api::types::ProgressEventKind::PrefillComplete
     );
     let scheduling_policy = if prefill_complete {
-        let db = state.db.clone();
-        let conn = db.get_conn()?;
+        let conn = state.db.get_conn()?;
         let network_id: String = conn
             .query_row(
                 "SELECT network_id FROM inference_jobs WHERE job_id = ?",
@@ -5429,7 +5383,7 @@ fn report_assignment_progress(
                 |row| row.get(0),
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-        Some(network_service::load_network_settings(&db, &network_id)?.scheduling_policy)
+        Some(state.get_network_scheduling_policy(&network_id)?)
     } else {
         None
     };
