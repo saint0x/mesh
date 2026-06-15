@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::future::Future;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -122,6 +123,34 @@ pub(crate) fn execute_with_db_lock_retry<T>(
     }
 }
 
+pub(crate) async fn execute_with_db_lock_retry_async<T, Fut>(
+    mut op: impl FnMut() -> Fut,
+) -> Result<T, ApiError>
+where
+    Fut: Future<Output = Result<T, ApiError>>,
+{
+    let started_at = std::time::Instant::now();
+    let mut attempt = 0usize;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_locked_api_error(&error) => {
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                if elapsed_ms >= DB_LOCK_RETRY_MAX_WAIT_MS {
+                    return Err(error);
+                }
+                attempt += 1;
+                let remaining_ms = DB_LOCK_RETRY_MAX_WAIT_MS.saturating_sub(elapsed_ms);
+                let backoff_ms = (DB_LOCK_RETRY_BACKOFF_STEP_MS * attempt as u64)
+                    .min(DB_LOCK_RETRY_BACKOFF_STEP_MS * 10)
+                    .min(remaining_ms);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(crate) fn log_locked_route_error(route: &'static str, error: &ApiError) {
     if is_locked_api_error(error) {
         tracing::error!(route, "SQLite lock surfaced through API route");
@@ -171,3 +200,60 @@ impl IntoResponse for ApiError {
 
 /// Result type for API handlers
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn locked_error() -> ApiError {
+        ApiError::Database(Box::new(io::Error::other("database is locked")))
+    }
+
+    #[tokio::test]
+    async fn async_retry_retries_locked_errors_until_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = execute_with_db_lock_retry_async({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Err(locked_error())
+                    } else {
+                        Ok::<_, ApiError>("ok")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("locked retry should eventually succeed");
+
+        assert_eq!(result, "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn async_retry_does_not_retry_non_locked_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = execute_with_db_lock_retry_async({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(ApiError::Internal("boom".to_string()))
+                }
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Internal(message)) if message == "boom"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+}

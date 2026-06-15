@@ -353,7 +353,9 @@ fn classify_candidate(
                         .map(|owner| owner != requesting_device_id)
                         .unwrap_or(false)
                         && lease_expires_at.map(|expiry| expiry > now).unwrap_or(false);
-                    if held_by_peer {
+                    let can_attach_to_peer_owned_cohort =
+                        candidate.group_status.as_str() == "decode_member";
+                    if held_by_peer && !can_attach_to_peer_owned_cohort {
                         Err(SchedulerBlockedReason::LeaseHeldByPeer)
                     } else if candidate.group_status == "decode_pending_transfer" {
                         Err(SchedulerBlockedReason::WaitingForTransfer)
@@ -377,11 +379,13 @@ fn classify_candidate(
                         .map(|owner| owner != requesting_device_id)
                         .unwrap_or(false)
                         && candidate
-                            .group_lease_expires_at
-                            .as_deref()
-                            .map(|expiry| expiry > now)
-                            .unwrap_or(false);
-                    if held_by_peer {
+                        .group_lease_expires_at
+                        .as_deref()
+                        .map(|expiry| expiry > now)
+                        .unwrap_or(false);
+                    let can_attach_to_peer_owned_cohort =
+                        candidate.group_status.as_str() == "decode_member";
+                    if held_by_peer && !can_attach_to_peer_owned_cohort {
                         return Err(SchedulerBlockedReason::LeaseHeldByPeer);
                     }
                     if candidate.group_status == "decode_pending_transfer" {
@@ -2031,6 +2035,20 @@ mod tests {
 
         let same_owner = classify_candidate(&candidate, "worker-peer", "2026-01-01T00:05:00Z");
         assert_eq!(same_owner, Ok("2026-01-01T00:00:01Z".into()));
+    }
+
+    #[test]
+    fn decode_member_can_join_peer_owned_leased_cohort() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_member".into();
+        candidate.decode_queue_status = Some("leased".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.group_lease_owner_device_id = Some("worker-peer".into());
+        candidate.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+
+        let runnable = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
+        assert_eq!(runnable, Ok("2026-01-01T00:00:01Z".into()));
     }
 
     #[test]

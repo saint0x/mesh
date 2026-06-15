@@ -8,7 +8,10 @@ use time::{Duration, OffsetDateTime};
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
-use crate::api::error::{execute_with_db_lock_retry, is_locked_api_error, ApiError, ApiResult};
+use crate::api::error::{
+    execute_with_db_lock_retry, execute_with_db_lock_retry_async, is_locked_api_error, ApiError,
+    ApiResult,
+};
 use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DecodeLeaseStatus,
@@ -378,6 +381,18 @@ struct ExistingSubmittedJob {
 pub async fn submit_inference(
     State(state): State<AppState>,
     Json(req): Json<SubmitInferenceRequest>,
+) -> ApiResult<Json<SubmitInferenceResponse>> {
+    execute_with_db_lock_retry_async(|| {
+        let state = state.clone();
+        let req = req.clone();
+        async move { submit_inference_once(state, req).await }
+    })
+    .await
+}
+
+async fn submit_inference_once(
+    state: AppState,
+    req: SubmitInferenceRequest,
 ) -> ApiResult<Json<SubmitInferenceResponse>> {
     validate_submit_request(&req)?;
     if req.request_id.is_empty() {
@@ -4564,16 +4579,14 @@ fn claim_assignment(
                     },
                 )?;
             } else {
-                step = "mark_assignment_leased";
-                tx.execute(
-                    r#"
-                UPDATE inference_job_assignments
-                SET status = 'leased', lease_expires_at = ?
-                WHERE assignment_id = ?
-                "#,
-                    params![&lease_expires, &assignment.lease_id],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                step = "lease_decode_group_assignments";
+                lease_decode_group_assignments(
+                    &tx,
+                    &assignment.job_id,
+                    &active.segment_id,
+                    &active.execution_group_id,
+                    &lease_expires,
+                )?;
                 step = "update_serving_group";
                 tx.execute(
                     r#"
@@ -4727,6 +4740,41 @@ fn lease_prefill_group_assignments(
                 WHERE sg.job_id = ?
                   AND sg.group_id = ?
                   AND sg.phase = 'prefill'
+          )
+        "#,
+        params![
+            lease_expires_at,
+            job_id,
+            active_segment_id,
+            job_id,
+            group_id
+        ],
+    )
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(())
+}
+
+fn lease_decode_group_assignments(
+    conn: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    active_segment_id: &str,
+    group_id: &str,
+    lease_expires_at: &str,
+) -> ApiResult<()> {
+    conn.execute(
+        r#"
+        UPDATE inference_job_assignments
+        SET status = 'leased',
+            lease_expires_at = ?
+        WHERE job_id = ?
+          AND active_segment_id = ?
+          AND status IN ('pending', 'leased')
+          AND device_id IN (
+                SELECT sg.device_id
+                FROM inference_serving_groups sg
+                WHERE sg.job_id = ?
+                  AND sg.group_id = ?
+                  AND sg.phase = 'decode'
           )
         "#,
         params![
@@ -7861,39 +7909,45 @@ mod tests {
     ) {
         let _ = drive_job_to_decode_ready(state, job_id, network_id, plan).await;
 
-        for (device_id, execution_time_ms, completion_tokens) in decode_results {
-            let claim = claim_inference_assignment(
-                State(state.clone()),
-                Json(ClaimInferenceAssignmentRequest {
-                    device_id: (*device_id).to_string(),
-                    network_id: network_id.to_string(),
-                    claim_mode: crate::api::types::WorkClaimMode::Any,
-                    include_queue_state: false,
-                    include_serving_session: false,
-                }),
-            )
-            .await
-            .unwrap()
-            .0
-            .assignment
-            .expect("expected decode assignment");
+        let (owner_device_id, _, _) = decode_results
+            .first()
+            .copied()
+            .expect("expected at least one decode result");
+        let decode_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: owner_device_id.to_string(),
+                network_id: network_id.to_string(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected decode assignment");
 
+        for (device_id, _, _) in decode_results {
             let _ = acknowledge_inference_assignment(
                 State(state.clone()),
-                Path(claim.job_id.clone()),
+                Path(decode_claim.job_id.clone()),
                 Json(AcknowledgeInferenceAssignmentRequest {
                     device_id: (*device_id).to_string(),
                 }),
             )
             .await
             .unwrap();
+        }
 
+        for (device_id, execution_time_ms, completion_tokens) in decode_results {
             let _ = report_inference_result(
                 State(state.clone()),
-                Path(claim.job_id.clone()),
+                Path(decode_claim.job_id.clone()),
                 Json(ReportInferenceAssignmentRequest {
                     device_id: (*device_id).to_string(),
-                    segment_id: claim.active_segment.segment_id.clone(),
+                    segment_id: decode_claim.active_segment.segment_id.clone(),
                     success: true,
                     completion: Some(format!("completion-from-{}", device_id)),
                     completion_tokens: Some(*completion_tokens),
@@ -8462,27 +8516,27 @@ mod tests {
             .unwrap();
         }
 
+        let decode_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected decode assignment");
+
+        assert_eq!(decode_claim.active_segment.segment_id, decode_segment_id);
+        assert_eq!(decode_claim.session.lease_target_session_count, Some(1));
+        assert_eq!(decode_claim.session.lease_target_batch_size, Some(1));
+
         for device_id in ["worker-1", "worker-2"] {
-            let decode_claim = claim_inference_assignment(
-                State(state.clone()),
-                Json(ClaimInferenceAssignmentRequest {
-                    device_id: device_id.into(),
-                    network_id: network_id.into(),
-                    claim_mode: crate::api::types::WorkClaimMode::Any,
-                    include_queue_state: false,
-                    include_serving_session: false,
-                }),
-            )
-            .await
-            .unwrap()
-            .0
-            .assignment
-            .expect("expected decode assignment");
-
-            assert_eq!(decode_claim.active_segment.segment_id, decode_segment_id);
-            assert_eq!(decode_claim.session.lease_target_session_count, Some(1));
-            assert_eq!(decode_claim.session.lease_target_batch_size, Some(1));
-
             let _ = acknowledge_inference_assignment(
                 State(state.clone()),
                 Path(decode_claim.job_id.clone()),
@@ -11945,7 +11999,7 @@ mod tests {
         let first_claim = claim_inference_assignment(
             State(state.clone()),
             Json(ClaimInferenceAssignmentRequest {
-                device_id: "worker-3".into(),
+                device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 claim_mode: crate::api::types::WorkClaimMode::Any,
                 include_queue_state: false,
@@ -12019,7 +12073,7 @@ mod tests {
         let first_claim = claim_inference_assignment(
             State(state.clone()),
             Json(ClaimInferenceAssignmentRequest {
-                device_id: "worker-3".into(),
+                device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 claim_mode: crate::api::types::WorkClaimMode::Any,
                 include_queue_state: false,
@@ -12110,7 +12164,7 @@ mod tests {
         let first_claim = claim_inference_assignment(
             State(state.clone()),
             Json(ClaimInferenceAssignmentRequest {
-                device_id: "worker-3".into(),
+                device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 claim_mode: crate::api::types::WorkClaimMode::Any,
                 include_queue_state: false,
@@ -12218,7 +12272,7 @@ mod tests {
         let first_claim = claim_inference_assignment(
             State(state.clone()),
             Json(ClaimInferenceAssignmentRequest {
-                device_id: "worker-3".into(),
+                device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 claim_mode: crate::api::types::WorkClaimMode::Any,
                 include_queue_state: false,
@@ -12309,7 +12363,7 @@ mod tests {
         let first_claim = claim_inference_assignment(
             State(state.clone()),
             Json(ClaimInferenceAssignmentRequest {
-                device_id: "worker-3".into(),
+                device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 claim_mode: crate::api::types::WorkClaimMode::Any,
                 include_queue_state: false,
@@ -12410,7 +12464,7 @@ mod tests {
         let first_claim = claim_inference_assignment(
             State(state.clone()),
             Json(ClaimInferenceAssignmentRequest {
-                device_id: "worker-3".into(),
+                device_id: "worker-1".into(),
                 network_id: network_id.into(),
                 claim_mode: crate::api::types::WorkClaimMode::Any,
                 include_queue_state: false,
