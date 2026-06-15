@@ -264,11 +264,8 @@ pub struct CheckpointRecoveryPoint {
 }
 
 impl CheckpointRecoveryPoint {
-    pub fn from_checkpoint(mut checkpoint: Checkpoint) -> Result<Self, String> {
+    pub fn from_checkpoint(checkpoint: Checkpoint) -> Result<Self, String> {
         checkpoint.validate()?;
-        checkpoint.kv_handoff = checkpoint.kv_handoff()?;
-        checkpoint.kv_cache_state = None;
-        checkpoint.sequence_position = None;
         Ok(Self { checkpoint })
     }
 
@@ -451,14 +448,6 @@ pub struct Checkpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_handoff: Option<KVCacheHandoff>,
 
-    /// Legacy inline KV payload for backwards-compatible deserialization only.
-    #[serde(default, skip_serializing)]
-    pub kv_cache_state: Option<Vec<u8>>,
-
-    /// Legacy sequence position for backwards-compatible deserialization only.
-    #[serde(default, skip_serializing)]
-    pub sequence_position: Option<u32>,
-
     /// RNG state for reproducibility
     pub rng_state: Option<Vec<u8>>,
 }
@@ -541,38 +530,7 @@ impl Checkpoint {
             kv_handoff.validate()?;
             return Ok(Some(kv_handoff.clone()));
         }
-
-        match (&self.kv_cache_state, self.sequence_position) {
-            (Some(bytes), Some(sequence_position)) => {
-                let blob = KVCacheBlob {
-                    encoding: KVCacheEncoding::FullSnapshotCbor,
-                    bytes: bytes.clone(),
-                };
-                let sequence = KVSequenceState::new(sequence_position, sequence_position)
-                    .map_err(|err| err.to_string())?;
-                let handoff = KVCacheHandoff {
-                    residency: KVCacheResidency::CheckpointStore,
-                    owner_worker_id: self.metadata.worker_id.clone(),
-                    source_worker_id: self.metadata.worker_id.clone(),
-                    sequence,
-                    payload_ref: KVPayloadRef::Inline {
-                        encoding: KVCacheEncoding::FullSnapshotCbor,
-                        size_bytes: bytes.len() as u64,
-                    },
-                    payload: Some(blob),
-                };
-                handoff.validate()?;
-                Ok(Some(handoff))
-            }
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(
-                "Checkpoint contains legacy KV payload bytes without a sequence position"
-                    .to_string(),
-            ),
-            (None, Some(_)) => Err(
-                "Checkpoint contains legacy sequence position without KV payload bytes".to_string(),
-            ),
-        }
+        Ok(None)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -670,8 +628,6 @@ mod tests {
                 total_layers: 70,
             },
             kv_handoff: None,
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state: None,
         };
 
@@ -718,8 +674,6 @@ mod tests {
                 total_layers: 70,
             },
             kv_handoff: None,
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state: None,
         };
 
@@ -768,8 +722,6 @@ mod tests {
                 total_layers: 70,
             },
             kv_handoff: None,
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state: None,
         };
 
@@ -828,64 +780,12 @@ mod tests {
                 snapshot,
                 "worker".to_string(),
             )),
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state: None,
         };
 
         let handoff = checkpoint.kv_handoff().unwrap().unwrap();
         assert_eq!(handoff.sequence.next_position, 1);
         assert_eq!(handoff.sequence.cached_tokens, 1);
-    }
-
-    #[test]
-    fn test_checkpoint_upgrades_legacy_kv_fields() {
-        let cache = KVCache::new(crate::inference::kv_cache::KVCacheConfig {
-            num_layers: 1,
-            num_heads: 2,
-            head_dim: 4,
-            max_seq_len: 8,
-        });
-        let bytes = cache.to_bytes().unwrap();
-        let checkpoint = Checkpoint {
-            metadata: CheckpointMetadata::new(
-                Uuid::new_v4(),
-                10,
-                5,
-                "model".to_string(),
-                "worker".to_string(),
-                0,
-                "".to_string(),
-            ),
-            request: CheckpointedRequest {
-                job_id: Uuid::new_v4(),
-                session_id: Uuid::new_v4(),
-                network_id: "net".to_string(),
-                model_id: "model".to_string(),
-                prompt_tokens: vec![1, 2, 3],
-                executor_id: "exec".to_string(),
-                phase: ExecutionPhase::Decode,
-            },
-            generated_tokens: vec![],
-            config: CheckpointedConfig {
-                max_tokens: 100,
-                temperature: 0.7,
-                top_p: 0.9,
-                stop_sequences: vec![],
-                stream: false,
-                checkpoint_interval: 50,
-                total_layers: 70,
-            },
-            kv_handoff: None,
-            kv_cache_state: Some(bytes),
-            sequence_position: Some(0),
-            rng_state: None,
-        };
-
-        let handoff = checkpoint.kv_handoff().unwrap().unwrap();
-        assert_eq!(handoff.owner_worker_id, "worker");
-        assert_eq!(handoff.sequence.next_position, 0);
-        assert_eq!(handoff.sequence.cached_tokens, 0);
     }
 
     #[test]
@@ -938,8 +838,6 @@ mod tests {
                 snapshot.clone(),
                 "worker".to_string(),
             )),
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state: None,
         };
 
@@ -1005,8 +903,6 @@ mod tests {
                 KVCacheHandoff::checkpoint_resident(snapshot, "worker-source".to_string())
                     .imported_for("worker-target".to_string()),
             ),
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state: None,
         };
 

@@ -116,7 +116,7 @@ impl BackendMicrobatchExecutor {
         }
 
         if !Self::can_use_accelerated_decode_batch(requests) {
-            return Self::decode_step_batch_fallback(requests, worker_ring).await;
+            return Self::decode_step_batch_serial(requests, worker_ring).await;
         }
 
         let profile = requests
@@ -126,7 +126,7 @@ impl BackendMicrobatchExecutor {
 
         match profile {
             BackendOptimizationProfile::CpuSerial => {
-                Self::decode_step_batch_fallback(requests, worker_ring).await
+                Self::decode_step_batch_serial(requests, worker_ring).await
             }
             BackendOptimizationProfile::MetalVectorized => {
                 Self::decode_step_batch_fast_path(requests, worker_ring).await
@@ -159,7 +159,7 @@ impl BackendMicrobatchExecutor {
         })
     }
 
-    async fn decode_step_batch_fallback(
+    async fn decode_step_batch_serial(
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
@@ -189,13 +189,15 @@ impl BackendMicrobatchExecutor {
         {
             return Ok(outputs);
         }
-        Self::decode_step_batch_fallback(requests, worker_ring).await
+        Err(crate::errors::AgentError::Execution(
+            "Fast-path decode batch could not be materialized for the requested provider contract"
+                .to_string(),
+        ))
     }
 }
 
-/// The shared Candle backend still carries two intentionally different roles:
-/// a narrowly scoped legacy fallback for single-session correctness/recovery-safe
-/// execution, and the provider-gated fast path for serious decode serving.
+/// Shared backend used by the canonical single-session path and provider-gated
+/// fast-path decode serving.
 pub struct CandleExecutionBackend {
     pub(crate) model_id: String,
     pub(crate) provider: ExecutionProviderKind,
@@ -411,9 +413,7 @@ impl ExecutionBackend for CandleExecutionBackend {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<BackendLogits> {
-        self.forward_pass
-            .fallback_prefill(tokens, worker_ring, job_id)
-            .await
+        self.forward_pass.prefill(tokens, worker_ring, job_id).await
     }
 
     async fn decode_step(
@@ -423,7 +423,7 @@ impl ExecutionBackend for CandleExecutionBackend {
         job_id: Uuid,
     ) -> Result<BackendLogits> {
         self.forward_pass
-            .fallback_decode_step(token, worker_ring, job_id)
+            .decode_step(token, worker_ring, job_id)
             .await
     }
 

@@ -44,16 +44,11 @@ advertised_addrs = [
   "/dns4/relay.example.com/udp/4001/quic-v1",
 ]
 
-[auth]
-auth_token = "CHANGE_ME_IN_PRODUCTION"
-auth_enabled = false                # Enable for production
-
 [logging]
 level = "info"                      # trace, debug, info, warn, error
 log_format = "pretty"               # or "json"
 ```
 
-**⚠️ IMPORTANT:** Change `auth_token` before enabling authentication in production!
 **⚠️ IMPORTANT:** `advertised_addrs` must contain the real externally reachable relay addresses that reservations should hand back to peers. Binding `0.0.0.0` without authoritative advertised addresses is not a valid production setup.
 
 ### 3. Start the Relay Server
@@ -97,15 +92,6 @@ Listening on: /ip4/127.0.0.1/udp/4001/quic-v1
 | `tcp_listen_addr` | `/ip4/0.0.0.0/tcp/4001` | TCP listen multiaddr |
 | `quic_listen_addr` | `/ip4/0.0.0.0/udp/4001/quic-v1` | QUIC listen multiaddr |
 | `advertised_addrs` | `["/ip4/127.0.0.1/tcp/4001", "/ip4/127.0.0.1/udp/4001/quic-v1"]` | Authoritative reservation addresses the relay returns to peers |
-
-### Authentication Settings
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `auth_token` | `CHANGE_ME_IN_PRODUCTION` | Shared secret for token validation |
-| `auth_enabled` | `false` | Enable token authentication |
-
-**Note:** Token auth is the current built-in auth mechanism in this repo. If mTLS or tighter control-plane-issued credentials are introduced later, they should be documented as new work rather than implied as already present.
 
 ### Logging Settings
 

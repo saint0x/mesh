@@ -1125,7 +1125,9 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::{DeviceCapabilities, Tier};
-    use crate::provider::{BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel};
+    use crate::provider::{
+        BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
+    };
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::device_service;
 

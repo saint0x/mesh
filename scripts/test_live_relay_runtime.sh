@@ -69,10 +69,6 @@ tcp_listen_addr = "/ip4/127.0.0.1/tcp/${RELAY_PORT}"
 quic_listen_addr = "/ip4/127.0.0.1/udp/${RELAY_PORT}/quic-v1"
 advertised_addrs = ["/ip4/127.0.0.1/tcp/${RELAY_PORT}", "/ip4/127.0.0.1/udp/${RELAY_PORT}/quic-v1"]
 
-[auth]
-auth_token = "CHANGE_ME_IN_PRODUCTION"
-auth_enabled = false
-
 [logging]
 level = "info"
 log_to_file = false

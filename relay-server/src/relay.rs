@@ -198,24 +198,53 @@ fn load_or_generate_keypair() -> Result<libp2p::identity::Keypair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    struct HomeGuard {
+        original_home: Option<std::ffi::OsString>,
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.original_home.take() {
+                Some(home) => unsafe { std::env::set_var("HOME", home) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn scoped_home() -> HomeGuard {
+        let temp_home = tempfile::tempdir().expect("temp relay home");
+        let path = temp_home.keep();
+        let original_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &path);
+        }
+        HomeGuard {
+            original_home,
+            path,
+        }
+    }
 
     #[tokio::test]
+    #[serial]
     async fn test_build_swarm() {
+        let _home = scoped_home();
         let config = Config::default();
         let swarm_result = build_swarm(&config).await;
         assert!(swarm_result.is_ok(), "Swarm should build successfully");
     }
 
     #[test]
+    #[serial]
     fn test_keypair_generation() {
-        // Clean up any existing keypair from previous test runs
+        let _home = scoped_home();
         let keypair_path = dirs::home_dir()
             .expect("Cannot find home directory")
             .join(".meshnet")
             .join("relay_keypair.bin");
-
-        // Remove existing keypair file to ensure clean state
-        let _ = std::fs::remove_file(&keypair_path);
 
         // First call should generate keypair
         let keypair1 = load_or_generate_keypair().unwrap();

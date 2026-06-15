@@ -9,14 +9,13 @@ use thiserror::Error;
 pub mod models;
 
 use crate::api::types::{
-    ComputeNearKvHint, DecodeQueueEntryStatus, ExecutionPhase,
-    InferenceSessionCheckpointStatus, JobSchedulerStatusResponse, KvReplicaResidencyStatus,
-    KvResidencyKind, KvResidencySliceStatus, KvResidencySummary, KvTransferPolicy,
-    KvTransferStatus, NetworkSchedulerStatusResponse, PromptCacheEntryStatus,
-    RegroupEventStatus, RingProtocolClass, SchedulerBatchMetrics, SchedulerEventStatus,
-    SchedulerJobSummary, SchedulerReadinessStatus, SchedulerReadinessThresholds,
-    ServingGroupLeaseStatus, ServingGroupMemberStatus, ServingGroupStatus,
-    ServingGroupWorkloadStatus, SupportGroupRole,
+    ComputeNearKvHint, DecodeQueueEntryStatus, ExecutionPhase, InferenceSessionCheckpointStatus,
+    JobSchedulerStatusResponse, KvReplicaResidencyStatus, KvResidencyKind, KvResidencySliceStatus,
+    KvResidencySummary, KvTransferPolicy, KvTransferStatus, NetworkSchedulerStatusResponse,
+    PromptCacheEntryStatus, RegroupEventStatus, RingProtocolClass, SchedulerBatchMetrics,
+    SchedulerEventStatus, SchedulerJobSummary, SchedulerReadinessStatus,
+    SchedulerReadinessThresholds, ServingGroupLeaseStatus, ServingGroupMemberStatus,
+    ServingGroupStatus, ServingGroupWorkloadStatus, SupportGroupRole,
 };
 use crate::provider::{
     BackendContractDescriptor, ExecutionProviderKind, ProviderCompatibilityClass,
@@ -208,6 +207,18 @@ impl Database {
 
         Ok(db_dir.join("control-plane.db"))
     }
+}
+
+pub fn find_ambiguous_local_db_files() -> Vec<PathBuf> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+
+    ["control-plane.db", "mesh_control_plane.db"]
+        .into_iter()
+        .map(|name| cwd.join(name))
+        .filter(|path| path.exists())
+        .collect()
 }
 
 fn locate_migrations_dir() -> Result<PathBuf> {
@@ -2376,7 +2387,9 @@ fn parse_execution_phase(value: &str) -> Result<ExecutionPhase> {
 }
 
 fn parse_optional_execution_phase(value: Option<String>) -> Result<Option<ExecutionPhase>> {
-    value.map(|value| parse_execution_phase(value.as_str())).transpose()
+    value
+        .map(|value| parse_execution_phase(value.as_str()))
+        .transpose()
 }
 
 fn parse_support_role(value: &str) -> Result<SupportGroupRole> {
@@ -2394,7 +2407,9 @@ fn parse_support_role(value: &str) -> Result<SupportGroupRole> {
 }
 
 fn parse_optional_support_role(value: Option<String>) -> Result<Option<SupportGroupRole>> {
-    value.map(|value| parse_support_role(value.as_str())).transpose()
+    value
+        .map(|value| parse_support_role(value.as_str()))
+        .transpose()
 }
 
 fn parse_kv_transfer_policy(value: &str) -> Result<KvTransferPolicy> {
@@ -2453,9 +2468,7 @@ fn parse_ring_protocol_class(value: &str) -> Result<RingProtocolClass> {
     })
 }
 
-fn default_protocol_class(
-    compatibility_class: ProviderCompatibilityClass,
-) -> RingProtocolClass {
+fn default_protocol_class(compatibility_class: ProviderCompatibilityClass) -> RingProtocolClass {
     match compatibility_class {
         ProviderCompatibilityClass::HeterogeneousPortable => {
             RingProtocolClass::ProviderHeterogeneousPortableRing
@@ -2473,7 +2486,10 @@ fn parse_backend_contract(
 ) -> Result<BackendContractDescriptor> {
     if let Some(json) = backend_contract_json {
         return serde_json::from_str(json).map_err(|e| {
-            DbError::Data(format!("Invalid backend contract in persisted state: {}", e))
+            DbError::Data(format!(
+                "Invalid backend contract in persisted state: {}",
+                e
+            ))
         });
     }
 

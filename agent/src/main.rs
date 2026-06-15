@@ -42,8 +42,8 @@ use agent::{
     api::types::{
         ClaimInferenceAssignmentRequest, DecodeLeaseStatus, ExecutionGroupMember,
         ExecutionPhase as ApiExecutionPhase, InferenceExecutionLease, InferenceJobStatusResponse,
-        InferenceSchedulerQueueState, PeerPunchPlan, PendingKvTransferStatus,
-        ProgressEventKind, ReleaseDecodeLeaseRequest, RenewDecodeLeaseRequest,
+        InferenceSchedulerQueueState, PeerPunchPlan, PendingKvTransferStatus, ProgressEventKind,
+        ReleaseDecodeLeaseRequest, RenewDecodeLeaseRequest,
         ReportInferenceAssignmentProgressRequest, RingTopologyResponse, ServingSessionMetadata,
         UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode, WorkerInfo,
     },
@@ -948,7 +948,9 @@ async fn publish_pending_kv_transfer_payload(
     let job_id = Uuid::parse_str(&transfer.job_id)
         .with_context(|| format!("invalid job id {}", transfer.job_id))?;
     let payload_bytes = if coordinator.has_session(session_id) {
-        coordinator.export_session_checkpoint_bytes(session_id).await?
+        coordinator
+            .export_session_checkpoint_bytes(session_id)
+            .await?
     } else {
         let manager = coordinator
             .checkpoint_manager()
@@ -996,10 +998,7 @@ async fn consume_pending_kv_transfer_payload(
     let imported_sequence_position = match payload_transfer.transfer_kind.as_str() {
         "live_kv_handoff" => {
             coordinator
-                .hydrate_session_from_transfer_bundle(
-                    &payload_bytes,
-                    local_device_id.to_string(),
-                )
+                .hydrate_session_from_transfer_bundle(&payload_bytes, local_device_id.to_string())
                 .await?;
             transfer
                 .kv_sequence_position
@@ -1060,8 +1059,13 @@ async fn maybe_serve_live_kv_transfer_request(
         Err(_) => return Ok(()),
     };
     let request: LiveKvTransferPlaneRequest = decode_plane_message(request_frame.payload_bytes())?;
-    let target_addr = parse_data_plane_endpoint(&request.target_remote_access_uri)
-        .with_context(|| format!("invalid target dataplane URI {}", request.target_remote_access_uri))?;
+    let target_addr =
+        parse_data_plane_endpoint(&request.target_remote_access_uri).with_context(|| {
+            format!(
+                "invalid target dataplane URI {}",
+                request.target_remote_access_uri
+            )
+        })?;
     let session_id = Uuid::parse_str(&transfer.session_id)
         .with_context(|| format!("invalid session id {}", transfer.session_id))?;
     let payload = coordinator
@@ -1141,7 +1145,8 @@ async fn consume_live_kv_transfer_from_source(
     )
     .await
     .context("timed out waiting for remote live KV response")??;
-    let response: LiveKvTransferPlaneResponse = decode_plane_message(response_frame.payload_bytes())?;
+    let response: LiveKvTransferPlaneResponse =
+        decode_plane_message(response_frame.payload_bytes())?;
     coordinator
         .hydrate_session_from_transfer_bundle(&response.payload, local_device_id.to_string())
         .await?;
@@ -1155,7 +1160,9 @@ async fn consume_live_kv_transfer_from_source(
                 session_id: transfer.session_id.clone(),
                 segment_id: transfer.segment_id.clone(),
                 status: "completed".to_string(),
-                kv_sequence_position: response.kv_sequence_position.or(transfer.kv_sequence_position),
+                kv_sequence_position: response
+                    .kv_sequence_position
+                    .or(transfer.kv_sequence_position),
                 bytes_total: Some(response.bytes_total),
                 bytes_transferred: Some(response.bytes_total),
                 remote_access_uri: Some(source_remote_access_uri),
@@ -1192,9 +1199,7 @@ async fn drain_pending_kv_transfers(
         if transfer.source_device_id == local_device_id.to_string()
             && transfer.transfer_kind == "live_kv_handoff"
         {
-            if let Err(error) =
-                maybe_serve_live_kv_transfer_request(coordinator, &transfer).await
-            {
+            if let Err(error) = maybe_serve_live_kv_transfer_request(coordinator, &transfer).await {
                 warn!(
                     transfer_id = %transfer.transfer_id,
                     session_id = %transfer.session_id,
@@ -4065,6 +4070,7 @@ async fn cmd_ledger_events(job_id: Option<&str>, limit: usize) -> Result<()> {
 
 async fn cmd_doctor() -> Result<()> {
     use colored::Colorize;
+    use control_plane::{db::find_ambiguous_local_db_files, Database};
 
     println!("\n{}", "Mesh Doctor".bold().cyan());
     println!("{}", "===========".cyan());
@@ -4133,6 +4139,26 @@ async fn cmd_doctor() -> Result<()> {
         load_observed_reachability_addrs().unwrap_or_default().len(),
         load_local_listen_addrs().len()
     );
+    let authoritative_db = Database::default_path()?;
+    let ambiguous_db_files = find_ambiguous_local_db_files();
+    if ambiguous_db_files.is_empty() {
+        println!(
+            "  {} control-plane db {}",
+            "OK".green().bold(),
+            authoritative_db.display()
+        );
+    } else {
+        println!(
+            "  {} ambiguous local db artifacts found: {}",
+            "FAIL".red().bold(),
+            ambiguous_db_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("    authoritative path: {}", authoritative_db.display());
+    }
     println!();
     Ok(())
 }

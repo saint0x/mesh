@@ -2,10 +2,9 @@ use uuid::Uuid;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::types::{
-    ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment,
-    InferenceExecutionPlan, InferenceRuntimeMode, KvTransferPolicy, PunchPathReason,
-    PunchPathStrategy, RingProtocolClass, ShardInfo, SubmitInferenceRequest, SupportGroup,
-    SupportGroupRole, TransportCapabilityTier,
+    ExecutionGroup, ExecutionGroupMember, ExecutionPhase, ExecutionSegment, InferenceExecutionPlan,
+    InferenceRuntimeMode, KvTransferPolicy, PunchPathReason, PunchPathStrategy, RingProtocolClass,
+    ShardInfo, SubmitInferenceRequest, SupportGroup, SupportGroupRole, TransportCapabilityTier,
 };
 use crate::connectivity::{ConnectivityPath, DeviceConnectivityState, InferenceSchedulingPolicy};
 use crate::device::{DeviceCapabilities, Tier};
@@ -101,8 +100,10 @@ impl ExecutionPlanner {
         let decode_group_id = format!("group-{}-decode", plan_id);
         let prefill_segment_id = format!("segment-{}-prefill", session_id);
         let decode_segment_id = format!("segment-{}-decode", session_id);
-        let prefill_island = classify_execution_island(&req.model_id, ExecutionPhase::Prefill, &prefill_members);
-        let decode_island = classify_execution_island(&req.model_id, ExecutionPhase::Decode, &decode_members);
+        let prefill_island =
+            classify_execution_island(&req.model_id, ExecutionPhase::Prefill, &prefill_members);
+        let decode_island =
+            classify_execution_island(&req.model_id, ExecutionPhase::Decode, &decode_members);
         let peer_punch_plans = topology
             .peer_punch_plans
             .iter()
@@ -283,7 +284,8 @@ impl ExecutionPlanner {
             .iter()
             .map(|member| member.device_id.clone())
             .collect::<Vec<_>>();
-        let decode_island = classify_execution_island(&model_id, ExecutionPhase::Decode, &decode_members);
+        let decode_island =
+            classify_execution_island(&model_id, ExecutionPhase::Decode, &decode_members);
 
         let mut refreshed = plan.clone();
         refreshed.runtime_mode = runtime_mode;
@@ -444,7 +446,11 @@ fn select_support_members(
         right
             .contributed_memory
             .cmp(&left.contributed_memory)
-            .then_with(|| right.assigned_capacity_units.cmp(&left.assigned_capacity_units))
+            .then_with(|| {
+                right
+                    .assigned_capacity_units
+                    .cmp(&left.assigned_capacity_units)
+            })
             .then_with(|| left.ring_position.cmp(&right.ring_position))
     });
     ranked.truncate(max_members.max(1).min(ranked.len()));
@@ -695,8 +701,10 @@ fn build_execution_islands(
     }
 
     let mut islands = Vec::new();
-    let mut grouped: std::collections::BTreeMap<(ProviderCompatibilityClass, String), Vec<ExecutionGroupMember>> =
-        std::collections::BTreeMap::new();
+    let mut grouped: std::collections::BTreeMap<
+        (ProviderCompatibilityClass, String),
+        Vec<ExecutionGroupMember>,
+    > = std::collections::BTreeMap::new();
     for member in members {
         if member.backend_contract.fast_path_eligible {
             grouped
@@ -1479,11 +1487,9 @@ fn is_homogeneous_provider_group(members: &[ExecutionGroupMember]) -> bool {
     members
         .first()
         .map(|first| {
-            members
-                .iter()
-                .all(|member| {
-                    member.backend_contract.contract_hash == first.backend_contract.contract_hash
-                })
+            members.iter().all(|member| {
+                member.backend_contract.contract_hash == first.backend_contract.contract_hash
+            })
         })
         .unwrap_or(true)
 }

@@ -17,6 +17,7 @@ use control_plane::{
     connectivity::InferenceSchedulingPolicy,
     consumption_policy::{quote_consumption, ConsumptionQuoteInput},
     credit_policy::{compute_credit_policy, AssignmentCreditInput, CreditPolicyInput},
+    db::find_ambiguous_local_db_files,
     model_assets, Database,
 };
 use serde::{Deserialize, Serialize};
@@ -2313,6 +2314,9 @@ fn load_pool_status(pool_id_hex: &str) -> Result<Value> {
 async fn build_doctor_report() -> Result<UiDoctorReport> {
     let generated_at = chrono::Utc::now().to_rfc3339();
     let config_path = DeviceConfig::default_path()?;
+    let mesh_home = dirs::home_dir()
+        .ok_or_else(|| anyhow!("Could not determine home directory"))?
+        .join(".meshnet");
     let mut checks = Vec::new();
 
     let config_check_start = std::time::Instant::now();
@@ -2402,6 +2406,100 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
             Some("Run device init first.".into())
         },
         duration_ms: reachability_start.elapsed().as_millis() as u64,
+    });
+
+    let db_start = std::time::Instant::now();
+    let authoritative_db = Database::default_path()?;
+    let ambiguous_db_files = find_ambiguous_local_db_files();
+    checks.push(UiDoctorCheck {
+        id: "control_plane_db_path".into(),
+        label: "Control-plane DB".into(),
+        status: if ambiguous_db_files.is_empty() {
+            "ok".into()
+        } else {
+            "fail".into()
+        },
+        detail: if ambiguous_db_files.is_empty() {
+            format!(
+                "Authoritative control-plane DB is {}",
+                authoritative_db.display()
+            )
+        } else {
+            format!(
+                "Found ambiguous repo-local DB artifacts: {}. Authoritative DB is {}",
+                ambiguous_db_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                authoritative_db.display()
+            )
+        },
+        hint: if ambiguous_db_files.is_empty() {
+            None
+        } else {
+            Some("Remove repo-local SQLite artifacts and use the Mesh home database only.".into())
+        },
+        duration_ms: db_start.elapsed().as_millis() as u64,
+    });
+
+    let artifact_start = std::time::Instant::now();
+    let models_dir = mesh_home.join("models");
+    let mut incomplete_models = Vec::new();
+    let mut discovered_models = 0usize;
+    if models_dir.exists() {
+        for entry in fs::read_dir(&models_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            discovered_models += 1;
+            let model_dir = entry.path();
+            let manifest_ready = model_dir.join("model.json").exists();
+            let tokenizer_ready = model_dir.join("tokenizer.json").exists()
+                && model_dir.join("tokenizer_config.json").exists();
+            let has_weights = count_matching_files(&model_dir, ".safetensors")? > 0;
+            let has_manifests = count_matching_files(&model_dir, ".manifest.json")? > 0;
+            if !(manifest_ready && tokenizer_ready && has_weights && has_manifests) {
+                incomplete_models.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    checks.push(UiDoctorCheck {
+        id: "model_artifacts".into(),
+        label: "Model artifacts".into(),
+        status: if !incomplete_models.is_empty() {
+            "fail".into()
+        } else if discovered_models == 0 {
+            "warn".into()
+        } else {
+            "ok".into()
+        },
+        detail: if !incomplete_models.is_empty() {
+            format!(
+                "Incomplete production model artifact sets: {}",
+                incomplete_models.join(", ")
+            )
+        } else if discovered_models == 0 {
+            format!("No model artifacts found under {}", models_dir.display())
+        } else {
+            format!(
+                "Validated {} model artifact set(s) under {}",
+                discovered_models,
+                models_dir.display()
+            )
+        },
+        hint: if !incomplete_models.is_empty() {
+            Some(
+                "Install complete manifests, tokenizers, and safetensors shards before serving."
+                    .into(),
+            )
+        } else if discovered_models == 0 {
+            Some("Install a real model artifact set under ~/.meshnet/models before serving.".into())
+        } else {
+            None
+        },
+        duration_ms: artifact_start.elapsed().as_millis() as u64,
     });
 
     let overall = if checks.iter().any(|check| check.status == "fail") {

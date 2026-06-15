@@ -191,7 +191,9 @@ mod tests {
     };
     use crate::db::create_test_db;
     use crate::device::Tier;
-    use crate::provider::{BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel};
+    use crate::provider::{
+        BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
+    };
     use crate::services::network_service;
 
     fn test_connectivity() -> NetworkConnectivity {

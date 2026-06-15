@@ -103,11 +103,9 @@ async fn main() -> Result<()> {
         "Network configuration"
     );
 
-    if config.auth.auth_enabled {
-        tracing::warn!("Token authentication enabled");
-    } else {
-        tracing::info!("Token authentication disabled (public relay)");
-    }
+    tracing::info!(
+        "Relay access control is delegated to network membership and deployment topology"
+    );
 
     // Build relay swarm
     let mut swarm = relay::build_swarm(&config).await?;

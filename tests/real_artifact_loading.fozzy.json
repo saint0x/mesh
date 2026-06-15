@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "real-artifact-loading",
+  "steps": [
+    {
+      "name": "real safetensors shard loads into shared residency",
+      "type": "proc_when",
+      "cmd": "bash",
+      "args": [
+        "scripts/test_real_artifact_loading.sh"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

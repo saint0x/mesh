@@ -132,7 +132,9 @@ mod tests {
     };
     use crate::connectivity::{InferenceSchedulingPolicy, NetworkConnectivity};
     use crate::device::{DeviceCapabilities, Tier};
-    use crate::provider::{BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel};
+    use crate::provider::{
+        BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
+    };
     use crate::services::certificate::ControlPlaneKeypair;
     use crate::services::network_service;
     use std::sync::Arc;

@@ -480,8 +480,7 @@ provider_contracts = [
 ]
 default_provider_contract_hash = "{cuda_hash}"
 memory_model = "discrete_vram"
-"#
-            ,
+"#,
             cpu_hash = cpu_contract.contract_hash,
             metal_hash = metal_contract.contract_hash,
             cuda_hash = cuda_contract.contract_hash

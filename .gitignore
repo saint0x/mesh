@@ -30,6 +30,8 @@ PLAN.md
 *.tmp
 *.log
 *.bak
+/control-plane.db
+/mesh_control_plane.db
 
 # Environment files
 .env

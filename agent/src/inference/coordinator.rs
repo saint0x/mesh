@@ -853,7 +853,9 @@ impl InferenceCoordinator {
                         session.backend.optimization_profile(),
                         session.backend.executor_contract().clone(),
                     ));
-                    if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
+                    if session.job.request.fast_path_permitted
+                        && session.backend.is_fast_path_backend()
+                    {
                         primary_decode_token_ceiling =
                             FastPathPlanner::decode_token_ceiling_for_context(
                                 &session.backend.fast_path_context(),
@@ -930,7 +932,8 @@ impl InferenceCoordinator {
                     session.backend.optimization_profile(),
                     session.backend.executor_contract().clone(),
                 ));
-                if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
+                if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend()
+                {
                     primary_decode_token_ceiling =
                         FastPathPlanner::decode_token_ceiling_for_context(
                             &session.backend.fast_path_context(),
@@ -1025,7 +1028,10 @@ impl InferenceCoordinator {
                 .iter()
                 .filter_map(|slot| self.sessions.get(&slot.session_id))
                 .collect::<Vec<_>>();
-            if sessions.iter().any(|session| !session.job.request.fast_path_permitted) {
+            if sessions
+                .iter()
+                .any(|session| !session.job.request.fast_path_permitted)
+            {
                 None
             } else if sessions
                 .iter()
@@ -1164,7 +1170,10 @@ impl InferenceCoordinator {
             })
     }
 
-    pub async fn export_session_live_transfer_bytes(&mut self, session_id: Uuid) -> Result<Vec<u8>> {
+    pub async fn export_session_live_transfer_bytes(
+        &mut self,
+        session_id: Uuid,
+    ) -> Result<Vec<u8>> {
         let session = self.sessions.get(&session_id).ok_or_else(|| {
             AgentError::Execution(format!(
                 "Session {} is not active for live KV transfer export",

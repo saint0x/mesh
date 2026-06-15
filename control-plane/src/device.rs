@@ -33,7 +33,9 @@ impl DeviceCapabilities {
             .iter()
             .find(|contract| contract.contract_hash == self.default_provider_contract_hash)
             .cloned()
-            .unwrap_or_else(|| BackendContractDescriptor::for_provider(self.default_execution_provider))
+            .unwrap_or_else(|| {
+                BackendContractDescriptor::for_provider(self.default_execution_provider)
+            })
     }
 }
 

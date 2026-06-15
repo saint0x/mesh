@@ -4068,6 +4068,7 @@ dependencies = [
  "futures",
  "libp2p",
  "serde",
+ "serial_test",
  "shellexpand",
  "tempfile",
  "thiserror 2.0.17",

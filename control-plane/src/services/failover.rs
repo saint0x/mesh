@@ -1330,7 +1330,11 @@ fn dataplane_uri_for_member(plan: &InferenceExecutionPlan, device_id: &str) -> O
     plan.execution_groups
         .iter()
         .flat_map(|group| group.members.iter())
-        .chain(plan.support_groups.iter().flat_map(|group| group.members.iter()))
+        .chain(
+            plan.support_groups
+                .iter()
+                .flat_map(|group| group.members.iter()),
+        )
         .find(|member| member.device_id == device_id)
         .and_then(|member| {
             member
@@ -2470,12 +2474,10 @@ fn live_kv_transfer_possible(
 
     kv_members.contains(session.kv_owner_device_id.as_str())
         && dataplane_uri_for_member(plan, session.kv_owner_device_id.as_str()).is_some()
-        && target_participants
-            .iter()
-            .all(|device_id| {
-                recovery_members.contains(device_id.as_str())
-                    && dataplane_uri_for_member(plan, device_id.as_str()).is_some()
-            })
+        && target_participants.iter().all(|device_id| {
+            recovery_members.contains(device_id.as_str())
+                && dataplane_uri_for_member(plan, device_id.as_str()).is_some()
+        })
 }
 
 fn select_transfer_source_device_id(

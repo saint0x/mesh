@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub relay: RelayConfig,
     pub network: NetworkConfig,
-    pub auth: AuthConfig,
     pub logging: LoggingConfig,
 }
 
@@ -28,13 +27,6 @@ pub struct NetworkConfig {
     pub tcp_listen_addr: String,
     pub quic_listen_addr: String,
     pub advertised_addrs: Vec<String>,
-}
-
-/// Authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthConfig {
-    pub auth_token: String,
-    pub auth_enabled: bool,
 }
 
 /// Logging configuration
@@ -90,10 +82,6 @@ impl Config {
                     "/ip4/127.0.0.1/udp/4001/quic-v1".to_string(),
                 ],
             },
-            auth: AuthConfig {
-                auth_token: "CHANGE_ME_IN_PRODUCTION".to_string(),
-                auth_enabled: false,
-            },
             logging: LoggingConfig {
                 level: "info".to_string(),
                 log_to_file: false,
@@ -105,13 +93,6 @@ impl Config {
 
     /// Validate configuration
     fn validate(&self) -> Result<()> {
-        // Validate auth token if auth is enabled
-        if self.auth.auth_enabled && self.auth.auth_token == "CHANGE_ME_IN_PRODUCTION" {
-            return Err(RelayError::Config(
-                "CRITICAL: auth_token is default value. Generate a secure token before enabling auth!".into()
-            ));
-        }
-
         // Validate reservation limits
         if self.relay.max_reservations == 0 || self.relay.max_reservations > 10000 {
             return Err(RelayError::Config(
@@ -259,7 +240,6 @@ mod tests {
                 "/ip4/127.0.0.1/udp/4001/quic-v1".to_string()
             ]
         );
-        assert!(!config.auth.auth_enabled);
         assert_eq!(config.logging.level, "info");
     }
 
@@ -267,14 +247,6 @@ mod tests {
     fn test_config_validation() {
         let config = Config::default();
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_invalid_auth_token() {
-        let mut config = Config::default();
-        config.auth.auth_enabled = true;
-        // Token is default value, should fail
-        assert!(config.validate().is_err());
     }
 
     #[test]

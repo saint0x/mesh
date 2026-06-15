@@ -50,7 +50,7 @@ use candle_core::{DType, Tensor as CandleTensor};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
@@ -1212,11 +1212,8 @@ impl ForwardPass {
         })
     }
 
-    /// Legacy per-layer executor kept only for fallback correctness paths.
-    ///
-    /// This remains the CPU-safe and recovery-safe implementation, but it is no
-    /// longer the intended high-throughput serving path.
-    async fn fallback_forward_layer(
+    /// Execute a single layer of the canonical forward pass implementation.
+    async fn forward_layer(
         &mut self,
         hidden: &CandleTensor,
         layer_idx: usize,
@@ -1350,46 +1347,33 @@ impl ForwardPass {
                         .and_then(|idx| idx.to_vec1::<u32>())
                         .map_err(device_error)
                         .or_else(|device_err| {
-                            let host_logits = Tensor1D::new(
-                                logits
-                                    .flatten_all()
-                                    .map_err(device_error)?
-                                    .to_vec1::<f32>()
-                                    .map_err(device_error)?,
-                            );
-                            warn!(
-                                error = %device_err,
-                                "device argmax sampling failed, falling back to host logits"
-                            );
-                            Ok::<Vec<u32>, AgentError>(vec![sample_greedy(&host_logits)])
+                            let _ = logits
+                                .flatten_all()
+                                .map_err(device_error)?
+                                .to_vec1::<f32>()
+                                .map_err(device_error)?;
+                            Err::<Vec<u32>, AgentError>(AgentError::Execution(format!(
+                                "Device argmax sampling failed after logits materialization: {}",
+                                device_err
+                            )))
                         })?;
                     token_ids.into_iter().next().ok_or_else(|| {
                         AgentError::Execution("Device argmax produced no token ids".to_string())
                     })
                 } else {
-                    sample_token_device(logits, temperature, top_p, seed).or_else(|device_err| {
-                        let host_logits = Tensor1D::new(
-                            logits
-                                .flatten_all()
-                                .map_err(device_error)?
-                                .to_vec1::<f32>()
-                                .map_err(device_error)?,
-                        );
-                        warn!(
-                            error = %device_err,
-                            "device stochastic sampling failed, falling back to host logits"
-                        );
-                        Ok(sample_token(&host_logits, temperature, top_p, seed))
+                    sample_token_device(logits, temperature, top_p, seed).map_err(|device_err| {
+                        AgentError::Execution(format!(
+                            "Device stochastic sampling failed: {}",
+                            device_err
+                        ))
                     })
                 }
             }
         }
     }
 
-    /// Fallback single-session prefill path retained for correctness and
-    /// recovery-safe execution. Serious serving should prefer the explicit
-    /// fast-path bucket/runtime flow around this method.
-    pub async fn fallback_prefill(
+    /// Canonical single-session prefill path.
+    pub async fn prefill(
         &mut self,
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
@@ -1413,9 +1397,8 @@ impl ForwardPass {
         self.compute_logits(&hidden)
     }
 
-    /// Fallback single-session decode step retained for CPU execution and any
-    /// path that cannot satisfy fast-path invariants.
-    pub async fn fallback_decode_step(
+    /// Canonical single-session decode step.
+    pub async fn decode_step(
         &mut self,
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
@@ -1708,13 +1691,7 @@ impl ForwardPass {
 
         for layer_idx in 0..self.config.num_layers {
             hidden = self
-                .fallback_forward_layer(
-                    &hidden,
-                    layer_idx,
-                    &absolute_positions,
-                    worker_ring,
-                    job_id,
-                )
+                .forward_layer(&hidden, layer_idx, &absolute_positions, worker_ring, job_id)
                 .await?;
         }
 
@@ -2658,12 +2635,12 @@ mod tests {
         let prompt = vec![1, 2, 3];
         backend_a
             .forward_pass
-            .fallback_prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
             .await
             .unwrap();
         backend_b
             .forward_pass
-            .fallback_prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
             .await
             .unwrap();
 

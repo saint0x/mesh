@@ -188,6 +188,8 @@ mesh ledger events
 mesh ui
 ```
 
+`mesh doctor` now treats repo-local `control-plane.db` and `mesh_control_plane.db` files as ambiguous artifacts. The authoritative control-plane database path is `~/.meshnet/control-plane.db`.
+
 For local UI development, `mesh-ui`'s existing `dev` command now boots the real local Mesh UI API first and then starts Vite, so the dashboard talks to live Mesh state instead of a frontend-only server.
 
 ## Model Assets
@@ -215,19 +217,22 @@ Mesh uses Fozzy first for system validation.
 
 ```bash
 fozzy doctor --deep --scenario tests/production_dispatch.fozzy.json --runs 5 --seed 424242 --json
-fozzy test --det --strict tests/production_dispatch.fozzy.json tests/live_relay_runtime.fozzy.json --json
+fozzy test --det --strict tests/production_dispatch.fozzy.json tests/live_relay_runtime.fozzy.json tests/real_artifact_loading.fozzy.json --json
 fozzy run tests/production_dispatch.fozzy.json --det --record /tmp/production_dispatch_trace.fozzy --json
 fozzy trace verify /tmp/production_dispatch_trace.fozzy --strict --json
 fozzy replay /tmp/production_dispatch_trace.fozzy --json
 fozzy ci /tmp/production_dispatch_trace.fozzy --json
+bash scripts/test_real_artifact_loading.sh
 cargo test --workspace
 ```
+
+`bash scripts/test_real_artifact_loading.sh` is the explicit host-backed artifact residency gate. It loads a real shard set from `~/.meshnet/models` and can take minutes on multi-gigabyte artifacts; `cargo test --workspace` does not turn that path on by itself.
 
 For provider work, validate both the runtime and the provider contract:
 
 ```bash
 fozzy doctor --deep --scenario tests/production_dispatch.fozzy.json --runs 5 --seed 424242 --json
-fozzy test --det --strict tests/production_dispatch.fozzy.json tests/live_relay_runtime.fozzy.json --json
+fozzy test --det --strict tests/production_dispatch.fozzy.json tests/live_relay_runtime.fozzy.json tests/real_artifact_loading.fozzy.json --json
 fozzy run tests/production_dispatch.fozzy.json --det --record /tmp/production_dispatch_trace.fozzy --json
 fozzy trace verify /tmp/production_dispatch_trace.fozzy --strict --json
 fozzy replay /tmp/production_dispatch_trace.fozzy --json

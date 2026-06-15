@@ -411,8 +411,6 @@ impl CheckpointManager {
             generated_tokens: job.generated_tokens.clone(),
             config,
             kv_handoff,
-            kv_cache_state: None,
-            sequence_position: None,
             rng_state,
         };
 
