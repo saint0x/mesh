@@ -84,6 +84,26 @@ fn is_locked_api_error(error: &ApiError) -> bool {
     )
 }
 
+pub(crate) fn log_locked_route_error(
+    route: &'static str,
+    job_id: Option<&str>,
+    device_id: Option<&str>,
+    segment_id: Option<&str>,
+    error: &ApiError,
+) {
+    if !is_locked_api_error(error) {
+        return;
+    }
+
+    error!(
+        route,
+        job_id = job_id.unwrap_or("-"),
+        device_id = device_id.unwrap_or("-"),
+        segment_id = segment_id.unwrap_or("-"),
+        "SQLite lock surfaced through inference route"
+    );
+}
+
 fn begin_immediate_transaction<'conn>(
     conn: &'conn mut rusqlite::Connection,
 ) -> ApiResult<rusqlite::Transaction<'conn>> {
@@ -407,11 +427,12 @@ pub async fn submit_inference(
     let job_id = Uuid::new_v4().to_string();
 
     let persisted_job_id = job_id.clone();
+    let job_id_for_log = job_id.clone();
     let reservation = tokio::task::spawn_blocking(move || {
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| {
+        let result = execute_with_db_lock_retry(|| {
             let mut conn = db.get_conn()?;
 
             let device_exists: Option<String> = conn
@@ -725,7 +746,17 @@ pub async fn submit_inference(
                 request.max_tokens,
                 execution_plan,
             ))
-        })
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "submit_inference",
+                Some(&job_id_for_log),
+                Some(&request.device_id),
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -767,7 +798,17 @@ pub async fn claim_inference_assignment(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| claim_assignment(&db, &req_clone))
+        let result = execute_with_db_lock_retry(|| claim_assignment(&db, &req_clone));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "claim_inference_assignment",
+                None,
+                Some(&req_clone.device_id),
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -822,9 +863,19 @@ pub async fn observe_decode_queue_state(
     let db = state.db.clone();
     let query_clone = query.clone();
     let observation = tokio::task::spawn_blocking(move || {
-        execute_with_db_lock_retry(|| {
+        let result = execute_with_db_lock_retry(|| {
             load_queue_observation(&db, &query_clone.network_id, &query_clone.device_id, None)
-        })
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "observe_decode_queue_state",
+                None,
+                Some(&query_clone.device_id),
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -849,10 +900,20 @@ pub async fn observe_pending_kv_transfers(
     let db = state.db.clone();
     let query_clone = query.clone();
     let transfers = tokio::task::spawn_blocking(move || {
-        execute_with_db_lock_retry(|| {
+        let result = execute_with_db_lock_retry(|| {
             let conn = db.get_conn()?;
             load_pending_kv_transfers(&conn, &query_clone.network_id, &query_clone.device_id)
-        })
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "observe_pending_kv_transfers",
+                None,
+                Some(&query_clone.device_id),
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -889,7 +950,19 @@ pub async fn renew_decode_lease(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| renew_decode_lease_state(&db, &lease_id_clone, &req_clone))
+        let result = execute_with_db_lock_retry(|| {
+            renew_decode_lease_state(&db, &lease_id_clone, &req_clone)
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "renew_decode_lease",
+                None,
+                Some(&req_clone.device_id),
+                Some(&req_clone.segment_id),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -929,7 +1002,19 @@ pub async fn release_decode_lease(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| release_decode_lease_state(&db, &lease_id_clone, &req_clone))
+        let result = execute_with_db_lock_retry(|| {
+            release_decode_lease_state(&db, &lease_id_clone, &req_clone)
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "release_decode_lease",
+                None,
+                Some(&req_clone.device_id),
+                Some(&req_clone.segment_id),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3256,7 +3341,18 @@ pub async fn acknowledge_inference_assignment(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| acknowledge_assignment(&db, &job_id, &req.device_id))
+        let result =
+            execute_with_db_lock_retry(|| acknowledge_assignment(&db, &job_id, &req.device_id));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "acknowledge_inference_assignment",
+                Some(&job_id),
+                Some(&req.device_id),
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3283,7 +3379,18 @@ pub async fn report_inference_result(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| report_assignment_result(&db, &job_id, &request))
+        let result =
+            execute_with_db_lock_retry(|| report_assignment_result(&db, &job_id, &request));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "report_inference_result",
+                Some(&job_id),
+                Some(&request.device_id),
+                Some(&request.segment_id),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3315,14 +3422,13 @@ pub async fn report_inference_progress(
             report_assignment_progress(&app_state, &job_id, &request)
         });
         if let Err(err) = &result {
-            if is_locked_api_error(err) {
-                error!(
-                    job_id = %job_id_for_log,
-                    device_id = %request.device_id,
-                    segment_id = %request.segment_id,
-                    "SQLite lock surfaced through report_inference_progress route"
-                );
-            }
+            log_locked_route_error(
+                "report_inference_progress",
+                Some(&job_id_for_log),
+                Some(&request.device_id),
+                Some(&request.segment_id),
+                err,
+            );
         }
         result
     })
@@ -3351,7 +3457,18 @@ pub async fn upload_inference_session_checkpoint(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| store_session_checkpoint(&db, &job_id, &request))
+        let result =
+            execute_with_db_lock_retry(|| store_session_checkpoint(&db, &job_id, &request));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "upload_inference_session_checkpoint",
+                Some(&job_id),
+                Some(&request.device_id),
+                Some(&request.segment_id),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3378,7 +3495,18 @@ pub async fn report_inference_session_kv_transfer(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| store_session_kv_transfer_report(&db, &job_id, &request))
+        let result =
+            execute_with_db_lock_retry(|| store_session_kv_transfer_report(&db, &job_id, &request));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "report_inference_session_kv_transfer",
+                Some(&job_id),
+                Some(&request.device_id),
+                Some(&request.segment_id),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3411,7 +3539,19 @@ pub async fn upload_inference_session_kv_transfer_payload(
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| store_session_kv_transfer_payload(&db, &job_id, &request))
+        let result = execute_with_db_lock_retry(|| {
+            store_session_kv_transfer_payload(&db, &job_id, &request)
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "upload_inference_session_kv_transfer_payload",
+                Some(&job_id),
+                Some(&request.device_id),
+                Some(&request.segment_id),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3433,10 +3573,21 @@ pub async fn download_inference_session_kv_transfer_payload(
 
     let db = state.db.clone();
     let device_id = query.device_id.clone();
+    let transfer_id_for_log = transfer_id.clone();
     let payload = tokio::task::spawn_blocking(move || {
-        execute_with_db_lock_retry(|| {
+        let result = execute_with_db_lock_retry(|| {
             load_session_kv_transfer_payload(&db, &job_id, &transfer_id, &device_id)
-        })
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "download_inference_session_kv_transfer_payload",
+                Some(&job_id),
+                Some(&device_id),
+                Some(&transfer_id_for_log),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3460,10 +3611,21 @@ pub async fn download_inference_session_checkpoint(
     }
 
     let db = state.db.clone();
+    let session_id_for_log = session_id.clone();
     let checkpoint = tokio::task::spawn_blocking(move || {
-        execute_with_db_lock_retry(|| {
+        let result = execute_with_db_lock_retry(|| {
             load_latest_session_checkpoint_payload(&db, &job_id, &session_id)
-        })
+        });
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "download_inference_session_checkpoint",
+                Some(&job_id),
+                None,
+                Some(&session_id_for_log),
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3484,8 +3646,19 @@ pub async fn get_inference_job_status(
     }
 
     let db = state.db.clone();
+    let job_id_for_log = job_id.clone();
     let status = tokio::task::spawn_blocking(move || {
-        execute_with_db_lock_retry(|| load_job_status(&db, &job_id))
+        let result = execute_with_db_lock_retry(|| load_job_status(&db, &job_id));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "get_inference_job_status",
+                Some(&job_id_for_log),
+                None,
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -3575,11 +3748,22 @@ pub async fn cancel_inference_job(
 
     let db = state.db.clone();
     let inference_write_gate = state.inference_write_gate.clone();
+    let job_id_for_log = job_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _write_guard = inference_write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-        execute_with_db_lock_retry(|| cancel_job(&db, &job_id))
+        let result = execute_with_db_lock_retry(|| cancel_job(&db, &job_id));
+        if let Err(err) = &result {
+            log_locked_route_error(
+                "cancel_inference_job",
+                Some(&job_id_for_log),
+                None,
+                None,
+                err,
+            );
+        }
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
@@ -5309,27 +5493,6 @@ fn report_assignment_progress(
             )
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
         }
-
-        let settlement_state = load_job_settlement_state(&tx, job_id)?;
-        let relevant_participants = job_context
-            .execution_plan
-            .as_ref()
-            .map(|plan| participants_for_segment(plan, &req.segment_id))
-            .transpose()?
-            .unwrap_or_else(|| {
-                load_assignment_states(&tx, job_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(device_id, _, _)| device_id)
-                    .collect()
-            });
-        reconcile_realtime_job_accounting(
-            &tx,
-            job_id,
-            &job_context,
-            &settlement_state,
-            &relevant_participants,
-        )?;
 
         tx.commit()
             .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
@@ -7803,7 +7966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_realtime_progress_advances_frontier_only_after_all_assignments_report() {
+    async fn test_realtime_progress_records_batch_telemetry_without_midflight_settlement() {
         let network_id = "test-network-realtime-progress";
         let state = joined_state(&["worker-1", "worker-2"], network_id).await;
 
@@ -7954,8 +8117,8 @@ mod tests {
                 .await
                 .unwrap()
                 .0;
-        assert_eq!(status_after_first_progress.completion_tokens, 1);
-        assert!(status_after_first_progress.settled_credits > 0.0);
+        assert_eq!(status_after_first_progress.completion_tokens, 0);
+        assert_eq!(status_after_first_progress.settled_credits, 0.0);
 
         let _ = report_inference_progress(
             State(state.clone()),
@@ -7985,8 +8148,8 @@ mod tests {
                 .await
                 .unwrap()
                 .0;
-        assert_eq!(status_after_frontier.completion_tokens, 3);
-        assert!(status_after_frontier.settled_credits > 0.0);
+        assert_eq!(status_after_frontier.completion_tokens, 0);
+        assert_eq!(status_after_frontier.settled_credits, 0.0);
         assert_eq!(
             status_after_frontier
                 .session
@@ -8065,7 +8228,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == "credits_earned")
                 .count(),
-            4
+            0
         );
         assert_eq!(
             events
@@ -8073,7 +8236,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == "credits_burned")
                 .count(),
-            2
+            0
         );
     }
 

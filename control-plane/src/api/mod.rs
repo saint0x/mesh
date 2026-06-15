@@ -7,6 +7,9 @@ pub mod status;
 pub mod types;
 
 use axum::{
+    extract::Request,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, patch, post},
     Router,
 };
@@ -14,6 +17,24 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
+
+async fn log_locked_db_route(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let response = next.run(req).await;
+    if response
+        .headers()
+        .contains_key(&crate::api::error::DB_LOCKED_HEADER)
+    {
+        tracing::error!(
+            %method,
+            %path,
+            status = %response.status(),
+            "SQLite lock response attributed to route"
+        );
+    }
+    response
+}
 
 /// Create the API router with all endpoints
 pub fn create_router(state: AppState) -> Router {
@@ -126,5 +147,6 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
         // Middleware
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(log_locked_db_route))
         .layer(TraceLayer::new_for_http())
 }
