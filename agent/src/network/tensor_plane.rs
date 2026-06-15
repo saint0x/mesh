@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -301,28 +301,18 @@ impl ServingFrameBytes {
     }
 }
 
-#[derive(Debug, Default)]
-struct SlotMailboxState {
-    queue: VecDeque<InboundServingFrame>,
-    waiter_count: usize,
-}
-
-#[derive(Debug, Default)]
-struct SlotMailbox {
-    state: Mutex<SlotMailboxState>,
-    notify: Notify,
-}
-
 #[derive(Debug)]
 struct ServingInboundState {
-    slots: RwLock<HashMap<ServingSlotKey, Arc<SlotMailbox>>>,
+    slots: Mutex<HashMap<ServingSlotKey, VecDeque<InboundServingFrame>>>,
+    notify: Notify,
     queued_messages: AtomicUsize,
 }
 
 impl Default for ServingInboundState {
     fn default() -> Self {
         Self {
-            slots: RwLock::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
+            notify: Notify::new(),
             queued_messages: AtomicUsize::new(0),
         }
     }
@@ -929,17 +919,31 @@ impl TensorPlane {
                                             continue;
                                         }
                                         let slot = frame.header.slot_key();
-                                        let mailbox =
-                                            get_or_create_slot_mailbox(&inbound, slot).await;
-                                        let notify_waiter = {
-                                            let mut mailbox_state = mailbox.state.lock().await;
-                                            mailbox_state.queue.push_back(InboundServingFrame {
+                                        let header = frame.header;
+                                        let queue_len = {
+                                            let mut slots = inbound.slots.lock().await;
+                                            let queue = slots.entry(slot).or_insert_with(VecDeque::new);
+                                            queue.push_back(InboundServingFrame {
                                                 frame,
                                                 queued_at: Instant::now(),
                                                 _queued_bytes_permit: Some(permit),
                                             });
-                                            mailbox_state.waiter_count > 0
+                                            queue.len()
                                         };
+                                        tracing::info!(
+                                            remote_addr = %remote_addr,
+                                            collective_id = %header.collective_id,
+                                            collective_seq = header.collective_seq,
+                                            sender_position = header.sender_position,
+                                            lane = ?header.lane,
+                                            layer_idx = header.layer_idx,
+                                            step = header.step,
+                                            slot = header.slot,
+                                            stream_id = header.stream_id,
+                                            queued_elements = header.element_count,
+                                            queue_len,
+                                            "Enqueued serving dataplane frame"
+                                        );
 
                                         state
                                             .metrics
@@ -958,9 +962,7 @@ impl TensorPlane {
                                                     as usize)
                                                 as u64,
                                         );
-                                        if notify_waiter {
-                                            mailbox.notify.notify_one();
-                                        }
+                                        inbound.notify.notify_waiters();
                                     }
                                     Ok(Err(error)) => {
                                         if !matches!(
@@ -1579,23 +1581,33 @@ async fn recv_slot(
     };
 
     loop {
-        let mailbox = get_or_create_slot_mailbox(inbound, slot_key).await;
         let delivered = {
-            let mut mailbox_state = mailbox.state.lock().await;
-            if let Some(message) = mailbox_state.queue.pop_front() {
-                let should_remove =
-                    mailbox_state.queue.is_empty() && mailbox_state.waiter_count == 0;
-                Some((message, should_remove))
-            } else {
-                mailbox_state.waiter_count += 1;
-                None
-            }
-        };
-        if let Some((message, should_remove)) = delivered {
-            inbound.queued_messages.fetch_sub(1, Ordering::Relaxed);
+            let mut slots = inbound.slots.lock().await;
+            let mut should_remove = false;
+            let delivered = slots.get_mut(&slot_key).and_then(|queue| {
+                let message = queue.pop_front()?;
+                should_remove = queue.is_empty();
+                Some(message)
+            });
             if should_remove {
-                remove_slot_mailbox_if_idle(inbound, slot_key, &mailbox).await;
+                slots.remove(&slot_key);
             }
+            delivered
+        };
+        if let Some(message) = delivered {
+            tracing::info!(
+                collective_id = %slot_key.collective_id,
+                collective_seq = slot_key.collective_seq,
+                sender_position = slot_key.sender_position,
+                lane = ?slot_key.lane,
+                layer_idx = slot_key.layer_idx,
+                step = slot_key.step,
+                slot = slot_key.slot,
+                stream_id = slot_key.stream_id,
+                queued_elements = message.frame.element_count(),
+                "Delivered serving dataplane frame from mailbox"
+            );
+            inbound.queued_messages.fetch_sub(1, Ordering::Relaxed);
             state.metrics.receive_count.fetch_add(1, Ordering::Relaxed);
             let wait_ms = message.queued_at.elapsed().as_millis() as u64;
             state
@@ -1608,15 +1620,18 @@ async fn recv_slot(
                 .fetch_add(wait_ms, Ordering::Relaxed);
             return Ok(message.frame);
         }
-        mailbox.notify.notified().await;
-        let should_remove = {
-            let mut mailbox_state = mailbox.state.lock().await;
-            mailbox_state.waiter_count = mailbox_state.waiter_count.saturating_sub(1);
-            mailbox_state.waiter_count == 0 && mailbox_state.queue.is_empty()
-        };
-        if should_remove {
-            remove_slot_mailbox_if_idle(inbound, slot_key, &mailbox).await;
-        }
+        tracing::info!(
+            collective_id = %slot_key.collective_id,
+            collective_seq = slot_key.collective_seq,
+            sender_position = slot_key.sender_position,
+            lane = ?slot_key.lane,
+            layer_idx = slot_key.layer_idx,
+            step = slot_key.step,
+            slot = slot_key.slot,
+            stream_id = slot_key.stream_id,
+                "Waiting for serving dataplane frame"
+        );
+        inbound.notify.notified().await;
     }
 }
 
@@ -1634,40 +1649,6 @@ fn try_reserve_inbound_message_slot(inbound: &ServingInboundState, capacity: usi
         ) {
             Ok(_) => return true,
             Err(observed) => current = observed,
-        }
-    }
-}
-
-async fn get_or_create_slot_mailbox(
-    inbound: &Arc<ServingInboundState>,
-    slot_key: ServingSlotKey,
-) -> Arc<SlotMailbox> {
-    if let Some(mailbox) = inbound.slots.read().await.get(&slot_key).cloned() {
-        return mailbox;
-    }
-
-    let mut slots = inbound.slots.write().await;
-    Arc::clone(
-        slots
-            .entry(slot_key)
-            .or_insert_with(|| Arc::new(SlotMailbox::default())),
-    )
-}
-
-async fn remove_slot_mailbox_if_idle(
-    inbound: &Arc<ServingInboundState>,
-    slot_key: ServingSlotKey,
-    mailbox: &Arc<SlotMailbox>,
-) {
-    let mut slots = inbound.slots.write().await;
-    if let Some(current) = slots.get(&slot_key) {
-        if !Arc::ptr_eq(current, mailbox) {
-            return;
-        }
-        let mailbox_state = mailbox.state.lock().await;
-        if mailbox_state.waiter_count == 0 && mailbox_state.queue.is_empty() {
-            drop(mailbox_state);
-            slots.remove(&slot_key);
         }
     }
 }
