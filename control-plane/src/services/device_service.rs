@@ -194,22 +194,29 @@ fn execute_with_locked_retry<T>(
     conn: &rusqlite::Connection,
     mut op: impl FnMut(&rusqlite::Connection) -> rusqlite::Result<T>,
 ) -> rusqlite::Result<T> {
-    const MAX_ATTEMPTS: usize = 6;
-    const BASE_BACKOFF_MS: u64 = 25;
+    const MAX_WAIT_MS: u64 = 10_000;
+    const BACKOFF_STEP_MS: u64 = 100;
 
-    for attempt in 0..MAX_ATTEMPTS {
+    let started_at = std::time::Instant::now();
+    let mut attempt = 0usize;
+    loop {
         match op(conn) {
             Ok(value) => return Ok(value),
-            Err(error) if is_locked_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    BASE_BACKOFF_MS * (attempt as u64 + 1),
-                ));
+            Err(error) if is_locked_error(&error) => {
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                if elapsed_ms >= MAX_WAIT_MS {
+                    return Err(error);
+                }
+                attempt += 1;
+                let remaining_ms = MAX_WAIT_MS.saturating_sub(elapsed_ms);
+                let backoff_ms = (BACKOFF_STEP_MS * attempt as u64)
+                    .min(BACKOFF_STEP_MS * 10)
+                    .min(remaining_ms);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             }
             Err(error) => return Err(error),
         }
     }
-
-    unreachable!("retry loop must return or error")
 }
 
 fn is_locked_error(error: &rusqlite::Error) -> bool {

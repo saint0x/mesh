@@ -43,8 +43,8 @@ use crate::services::{
 use crate::state::AppState;
 
 const ASSIGNMENT_LEASE_SECS: i64 = 60;
-const DB_LOCK_RETRY_ATTEMPTS: usize = 6;
-const DB_LOCK_RETRY_BASE_BACKOFF_MS: u64 = 25;
+const DB_LOCK_RETRY_MAX_WAIT_MS: u64 = 10_000;
+const DB_LOCK_RETRY_BACKOFF_STEP_MS: u64 = 100;
 
 #[derive(Clone, Default)]
 struct DeviceRuntimeTelemetry {
@@ -55,33 +55,69 @@ struct DeviceRuntimeTelemetry {
 }
 
 fn execute_with_db_lock_retry<T>(mut op: impl FnMut() -> ApiResult<T>) -> ApiResult<T> {
-    for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
+    let started_at = std::time::Instant::now();
+    let mut attempt = 0usize;
+    loop {
         match op() {
             Ok(value) => return Ok(value),
-            Err(error) if is_locked_api_error(&error) && attempt + 1 < DB_LOCK_RETRY_ATTEMPTS => {
-                thread::sleep(std::time::Duration::from_millis(
-                    DB_LOCK_RETRY_BASE_BACKOFF_MS * (attempt as u64 + 1),
-                ));
+            Err(error) if is_locked_api_error(&error) => {
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                if elapsed_ms >= DB_LOCK_RETRY_MAX_WAIT_MS {
+                    return Err(error);
+                }
+                attempt += 1;
+                let remaining_ms = DB_LOCK_RETRY_MAX_WAIT_MS.saturating_sub(elapsed_ms);
+                let backoff_ms = (DB_LOCK_RETRY_BACKOFF_STEP_MS * attempt as u64)
+                    .min(DB_LOCK_RETRY_BACKOFF_STEP_MS * 10)
+                    .min(remaining_ms);
+                thread::sleep(std::time::Duration::from_millis(backoff_ms));
             }
             Err(error) => return Err(error),
         }
     }
+}
 
-    unreachable!("db retry loop must return or error")
+fn is_locked_sqlite_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("database is locked") || message.contains("database is busy") {
+        return true;
+    }
+
+    if let Some(db_error) = error.downcast_ref::<crate::db::DbError>() {
+        if matches!(
+            db_error,
+            crate::db::DbError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked
+        ) {
+            return true;
+        }
+    }
+
+    if let Some(sqlite_error) = error.downcast_ref::<rusqlite::Error>() {
+        if matches!(
+            sqlite_error,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked
+        ) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn is_locked_api_error(error: &ApiError) -> bool {
     let ApiError::Database(db_error) = error else {
         return false;
     };
-    let Some(db_error) = db_error.downcast_ref::<crate::db::DbError>() else {
-        return false;
-    };
-    matches!(
-        db_error,
-        crate::db::DbError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-            if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked
-    )
+    let mut current = Some(db_error.as_ref() as &(dyn std::error::Error + 'static));
+    while let Some(err) = current {
+        if is_locked_sqlite_error(err) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 pub(crate) fn log_locked_route_error(
@@ -821,15 +857,28 @@ pub async fn claim_inference_assignment(
         let db = state.db.clone();
         let network_id = req.network_id.clone();
         let device_id = req.device_id.clone();
-        Some(
-            tokio::task::spawn_blocking(move || {
-                execute_with_db_lock_retry(|| {
-                    load_queue_observation(&db, &network_id, &device_id, active_session_id.clone())
-                })
+        match tokio::task::spawn_blocking(move || {
+            execute_with_db_lock_retry(|| {
+                load_queue_observation(&db, &network_id, &device_id, active_session_id.clone())
             })
-            .await
-            .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??,
-        )
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))? {
+            Ok(observation) => Some(observation),
+            Err(err) if is_locked_api_error(&err) => {
+                error!(
+                    route = "claim_inference_assignment",
+                    job_id = execution_lease
+                        .as_ref()
+                        .map(|lease| lease.job_id.as_str())
+                        .unwrap_or("-"),
+                    device_id = %req.device_id,
+                    "Skipping ancillary queue observation after successful assignment because SQLite remained locked"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        }
     } else {
         None
     };

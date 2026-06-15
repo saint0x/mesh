@@ -2341,7 +2341,6 @@ async fn cmd_runtime() -> Result<()> {
         }
 
         // Claim and execute inference assignments
-        let mut explicit_decode_claim_supported = true;
         let mut idle_claim_polls = 0u32;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)).await;
@@ -2372,90 +2371,36 @@ async fn cmd_runtime() -> Result<()> {
                 &network_id,
             )
             .await;
-            let mut claim_response = None;
             let include_idle_queue_observation =
                 idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
-
-            if explicit_decode_claim_supported {
-                match registration_client
-                    .claim_decode_work(
-                        device_id,
-                        &network_id,
-                        include_idle_queue_observation,
-                        false,
-                    )
-                    .await
-                {
-                    Ok(Some(response)) => {
-                        if let Some(assignment) = response.assignment.as_ref() {
-                            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
-                            {
-                                claim_response = Some(response);
-                            } else {
-                                warn!(
-                                    job_id = %assignment.job_id,
-                                    lease_id = %assignment.lease_id,
-                                    phase = ?assignment.active_segment.phase,
-                                    "Explicit decode claim returned non-decode work; disabling decode-only claim path until control plane is upgraded"
-                                );
-                                explicit_decode_claim_supported = false;
-                            }
-                        } else {
-                            if include_idle_queue_observation {
-                                if let Some(queue_state) = response.queue_state.as_ref() {
-                                    debug!(
-                                        queue_status = queue_state.status.as_deref(),
-                                        ready_sessions = queue_state.ready_sessions,
-                                        blocked_sessions = queue_state.blocked_sessions,
-                                        local_ready_sessions = queue_state.local_ready_sessions,
-                                        "No decode work claimed; scheduler queue state observed"
-                                    );
-                                }
-                            }
-                            claim_response = Some(response);
+            let claim_response = match registration_client
+                .claim_inference_work(ClaimInferenceAssignmentRequest {
+                    device_id: device_id.to_string(),
+                    network_id: network_id.clone(),
+                    claim_mode: WorkClaimMode::Any,
+                    include_queue_state: include_idle_queue_observation,
+                    include_serving_session: false,
+                })
+                .await
+            {
+                Ok(response) => {
+                    if response.assignment.is_none() && include_idle_queue_observation {
+                        if let Some(queue_state) = response.queue_state.as_ref() {
+                            debug!(
+                                queue_status = queue_state.status.as_deref(),
+                                ready_sessions = queue_state.ready_sessions,
+                                blocked_sessions = queue_state.blocked_sessions,
+                                local_ready_sessions = queue_state.local_ready_sessions,
+                                "No inference work claimed; scheduler queue state observed"
+                            );
                         }
                     }
-                    Ok(None) => {
-                        debug!("Explicit decode claim endpoint unavailable");
-                        explicit_decode_claim_supported = false;
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "Explicit decode claim failed");
-                    }
+                    response
                 }
-            }
-
-            let claim_response = match claim_response {
-                Some(response) if response.assignment.is_some() => response,
-                _ => match registration_client
-                    .claim_inference_work(ClaimInferenceAssignmentRequest {
-                        device_id: device_id.to_string(),
-                        network_id: network_id.clone(),
-                        claim_mode: WorkClaimMode::Any,
-                        include_queue_state: include_idle_queue_observation,
-                        include_serving_session: false,
-                    })
-                    .await
-                {
-                    Ok(response) => {
-                        if response.assignment.is_none() && include_idle_queue_observation {
-                            if let Some(queue_state) = response.queue_state.as_ref() {
-                                debug!(
-                                    queue_status = queue_state.status.as_deref(),
-                                    ready_sessions = queue_state.ready_sessions,
-                                    blocked_sessions = queue_state.blocked_sessions,
-                                    local_ready_sessions = queue_state.local_ready_sessions,
-                                    "No inference work claimed; scheduler queue state observed"
-                                );
-                            }
-                        }
-                        response
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "Inference assignment claim failed");
-                        continue;
-                    }
-                },
+                Err(e) => {
+                    debug!(error = %e, "Inference assignment claim failed");
+                    continue;
+                }
             };
 
             let queue_state = claim_response.queue_state.clone();

@@ -695,9 +695,13 @@ struct FailoverSessionContext {
 }
 
 pub fn reconcile_failover_state(db: &Database, lost_device_ids: &[String]) -> ApiResult<usize> {
+    let write_gate = db.write_gate();
+    let _write_guard = write_gate
+        .lock()
+        .map_err(|_| ApiError::Internal("Database write gate lock poisoned".to_string()))?;
     let mut conn = db.get_conn().map_err(|e| ApiError::Database(Box::new(e)))?;
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     let now = now_rfc3339()?;
     let mut changed_sessions = 0usize;

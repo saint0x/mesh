@@ -15,6 +15,7 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use tracing::Span;
 
 use crate::state::AppState;
 
@@ -159,5 +160,24 @@ pub fn create_router(state: AppState) -> Router {
         // Middleware
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn(log_locked_db_route))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path()
+                    )
+                })
+                .on_response(|response: &Response, latency: std::time::Duration, span: &Span| {
+                    if response.status().is_server_error() {
+                        tracing::error!(
+                            parent: span,
+                            status = %response.status(),
+                            latency_ms = latency.as_millis(),
+                            "HTTP request completed with server error"
+                        );
+                    }
+                }),
+        )
 }
