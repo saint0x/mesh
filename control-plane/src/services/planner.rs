@@ -65,17 +65,24 @@ impl ExecutionPlanner {
             .zip(device_metadata.iter())
             .map(|(worker, metadata)| build_member(worker, metadata))
             .collect::<Vec<_>>();
-        let runtime_mode = derive_runtime_mode(scheduling_policy, &available_members);
+        let production_members = production_serving_members(&available_members);
+        if production_members.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "no production-serving workers are available for model {}",
+                req.model_id
+            )));
+        }
+        let runtime_mode = derive_runtime_mode(scheduling_policy, &production_members);
         let prefill_members = select_execution_members(
             &req.model_id,
             ExecutionPhase::Prefill,
-            &available_members,
+            &production_members,
             runtime_mode,
         )?;
         let decode_members = select_execution_members(
             &req.model_id,
             ExecutionPhase::Decode,
-            &available_members,
+            &production_members,
             runtime_mode,
         )?;
         let total_capacity_units = prefill_members
@@ -149,7 +156,7 @@ impl ExecutionPlanner {
         let support_groups = build_support_groups(
             &plan_id,
             &req.model_id,
-            &available_members,
+            &production_members,
             &prefill_members,
             &decode_members,
             &topology.peer_punch_plans,
@@ -211,17 +218,24 @@ impl ExecutionPlanner {
             .zip(device_metadata.iter())
             .map(|(worker, metadata)| build_member(worker, metadata))
             .collect::<Vec<_>>();
-        let runtime_mode = derive_runtime_mode(scheduling_policy, &available_members);
         let model_id = phase_model_id(plan, ExecutionPhase::Decode).ok_or_else(|| {
             ApiError::Internal(format!(
                 "Execution plan {} is missing a decode group",
                 plan.plan_id
             ))
         })?;
+        let production_members = production_serving_members(&available_members);
+        if production_members.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "live topology no longer has any production-serving workers for model {}",
+                model_id
+            )));
+        }
+        let runtime_mode = derive_runtime_mode(scheduling_policy, &production_members);
         let mut decode_members = select_execution_members(
             &model_id,
             ExecutionPhase::Decode,
-            &available_members,
+            &production_members,
             runtime_mode,
         )
         .map_err(|err| {
@@ -231,7 +245,7 @@ impl ExecutionPlanner {
             ))
         })?;
         if let Some(current_decode_members) =
-            current_valid_decode_members(plan, &model_id, &available_members)?
+            current_valid_decode_members(plan, &model_id, &production_members)?
         {
             if decode_members.len() > current_decode_members.len()
                 && is_full_replica_group(&current_decode_members)
@@ -348,7 +362,7 @@ impl ExecutionPlanner {
         refreshed.support_groups = build_support_groups(
             &refreshed.plan_id,
             &model_id,
-            &available_members,
+            &production_members,
             &prefill_members,
             &decode_members,
             &topology.peer_punch_plans,
@@ -367,6 +381,19 @@ fn build_support_groups(
     peer_punch_plans: &[crate::services::ring_manager::PeerPunchPlan],
 ) -> Vec<SupportGroup> {
     let mut support_groups = Vec::new();
+    let contract_aligned_members = decode_members
+        .first()
+        .map(|decode_member| {
+            all_members
+                .iter()
+                .filter(|member| {
+                    member.backend_contract.contract_hash
+                        == decode_member.backend_contract.contract_hash
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let decode_ids = decode_members
         .iter()
         .map(|member| member.device_id.as_str())
@@ -375,13 +402,13 @@ fn build_support_groups(
         .iter()
         .map(|member| member.device_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let non_decode_members = all_members
+    let non_decode_members = contract_aligned_members
         .iter()
         .filter(|member| !decode_ids.contains(member.device_id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
 
-    let kv_members = select_support_members(all_members, &non_decode_members, 2);
+    let kv_members = select_support_members(&contract_aligned_members, &non_decode_members, 2);
     support_groups.push(build_support_group(
         plan_id,
         model_id,
@@ -408,7 +435,7 @@ fn build_support_groups(
         peer_punch_plans,
     ));
 
-    let overflow_seed = all_members
+    let overflow_seed = contract_aligned_members
         .iter()
         .filter(|member| {
             !decode_ids.contains(member.device_id.as_str())
@@ -564,6 +591,14 @@ fn build_member(
     }
 }
 
+fn production_serving_members(members: &[ExecutionGroupMember]) -> Vec<ExecutionGroupMember> {
+    members
+        .iter()
+        .filter(|member| member.backend_contract.supports_production_serving())
+        .cloned()
+        .collect()
+}
+
 fn classify_transport_tier(members: &[ExecutionGroupMember]) -> TransportCapabilityTier {
     if members.iter().all(|member| {
         member
@@ -612,6 +647,12 @@ fn select_execution_members(
     members: &[ExecutionGroupMember],
     runtime_mode: InferenceRuntimeMode,
 ) -> ApiResult<Vec<ExecutionGroupMember>> {
+    if members.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "no production-serving members are available for model {} phase {:?}",
+            model_id, phase
+        )));
+    }
     let manifest = model_assets::load_model_manifest(model_id)?;
     let candidates = candidate_groups(&manifest, phase, members, runtime_mode);
     let all_members = members.to_vec();
@@ -734,20 +775,6 @@ fn build_execution_islands(
             members: grouped_members,
         });
     }
-
-    islands.push(ExecutionIsland {
-        island_id: execution_island_id(
-            model_id,
-            phase,
-            ProviderCompatibilityClass::HeterogeneousPortable,
-            None,
-        ),
-        compatibility_class: ProviderCompatibilityClass::HeterogeneousPortable,
-        backend_contract_hash: None,
-        fast_path_eligible: false,
-        protocol_class: RingProtocolClass::ProviderHeterogeneousPortableRing,
-        members: members.to_vec(),
-    });
 
     islands
 }
@@ -1702,7 +1729,7 @@ mod tests {
                 }],
             },
             &InferenceSchedulingPolicy::default(),
-            &[planner_metadata(4, "metal"), planner_metadata(8, "cuda")],
+            &[planner_metadata(4, "metal"), planner_metadata(8, "metal")],
         )
         .unwrap();
 
@@ -1869,6 +1896,102 @@ mod tests {
             }
             other => panic!("expected conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn planner_rejects_cpu_only_topology_for_production_serving() {
+        model_assets::testsupport::ensure_test_model("planner-cpu-rejected", 20);
+        model_assets::clear_model_asset_cache();
+
+        let err = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-cpu-rejected".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-cpu-rejected", "a", 0, 0, 10),
+                    worker_with_model_range("planner-cpu-rejected", "b", 1, 10, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[planner_metadata(4, "cpu"), planner_metadata(4, "cpu")],
+        )
+        .unwrap_err();
+
+        match err {
+            ApiError::Conflict(message) => {
+                assert!(message.contains("no production-serving workers are available"));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planner_support_groups_stay_aligned_to_decode_contract() {
+        model_assets::testsupport::ensure_test_model("planner-support-contract", 20);
+        model_assets::clear_model_asset_cache();
+
+        let plan = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-support-contract".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-support-contract", "a", 0, 0, 10),
+                    worker_with_model_range("planner-support-contract", "b", 1, 10, 20),
+                    worker_with_model_range("planner-support-contract", "c", 2, 0, 20),
+                    worker_with_model_range("planner-support-contract", "d", 3, 0, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[
+                planner_metadata(4, "metal"),
+                planner_metadata(4, "metal"),
+                planner_metadata(16, "cuda"),
+                planner_metadata(12, "metal"),
+            ],
+        )
+        .unwrap();
+
+        let decode_group = plan
+            .execution_groups
+            .iter()
+            .find(|group| matches!(group.phase, ExecutionPhase::Decode))
+            .expect("expected decode group");
+        let decode_contract_hash = decode_group
+            .backend_contract_hash
+            .clone()
+            .expect("expected homogeneous decode contract");
+
+        assert!(!plan.support_groups.is_empty());
+        assert!(plan.support_groups.iter().all(|group| {
+            group.fast_path_eligible
+                && group.backend_contract_hash.as_deref() == Some(decode_contract_hash.as_str())
+                && group.members.iter().all(|member| {
+                    member.backend_contract.contract_hash == decode_contract_hash
+                        && member.backend_contract.supports_production_serving()
+                })
+        }));
     }
 
     #[test]
