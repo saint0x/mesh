@@ -325,26 +325,26 @@ struct QueuedDecodeTask {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DecodeBatchTelemetry {
-    kv_cache_seq_len: u32,
-    batch_size: u32,
-    active_decode_sessions: u32,
-    batch_kv_tokens: u32,
-    deferred_decode_sessions: u32,
+pub(crate) struct DecodeBatchTelemetry {
+    pub(crate) kv_cache_seq_len: u32,
+    pub(crate) batch_size: u32,
+    pub(crate) active_decode_sessions: u32,
+    pub(crate) batch_kv_tokens: u32,
+    pub(crate) deferred_decode_sessions: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SchedulerOwnedDecodeStep {
-    primary_completion_tokens: u32,
-    primary_time_to_first_token_ms: Option<u64>,
-    telemetry: DecodeBatchTelemetry,
+pub(crate) struct SchedulerOwnedDecodeStep {
+    pub(crate) primary_completion_tokens: u32,
+    pub(crate) primary_time_to_first_token_ms: Option<u64>,
+    pub(crate) telemetry: DecodeBatchTelemetry,
 }
 
 #[derive(Debug, Clone)]
-struct PrefillStepResult {
-    completion: InferenceJob,
-    execution_time_ms: u64,
-    kv_cache_seq_len: u32,
+pub(crate) struct PrefillStepResult {
+    pub(crate) completion: InferenceJob,
+    pub(crate) execution_time_ms: u64,
+    pub(crate) kv_cache_seq_len: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2047,7 +2047,7 @@ impl InferenceCoordinator {
         })
     }
 
-    async fn execute_prefill_step(
+    pub(crate) async fn execute_prefill_step(
         &mut self,
         request: &InferenceRequest,
         position: &WorkerPosition,
@@ -2403,7 +2403,7 @@ impl InferenceCoordinator {
         Ok((result, last_batch_telemetry, execution_time_ms as u32))
     }
 
-    async fn execute_scheduler_owned_decode_step(
+    pub(crate) async fn execute_scheduler_owned_decode_step(
         &mut self,
         request: &InferenceRequest,
         position: &WorkerPosition,
