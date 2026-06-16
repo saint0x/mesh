@@ -340,6 +340,13 @@ struct SchedulerOwnedDecodeStep {
     telemetry: DecodeBatchTelemetry,
 }
 
+#[derive(Debug, Clone)]
+struct PrefillStepResult {
+    completion: InferenceJob,
+    execution_time_ms: u64,
+    kv_cache_seq_len: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SessionMemoryFootprint {
     runtime_bytes: usize,
@@ -1979,7 +1986,6 @@ impl InferenceCoordinator {
             ));
         }
 
-        let segment_start = Instant::now();
         let job_snapshot = {
             let session = self.ensure_session_backend(request, position).await?;
             if !session.job.generated_tokens.is_empty() {
@@ -1995,6 +2001,58 @@ impl InferenceCoordinator {
             *active = Some(job_snapshot);
         }
 
+        let step = self.execute_prefill_step(request, position).await?;
+
+        on_progress(InferenceProgressUpdate {
+            phase: ExecutionPhase::Prefill,
+            completion_tokens: step.completion.current_token_idx,
+            execution_time_ms: step.execution_time_ms,
+            time_to_first_token_ms: step
+                .completion
+                .time_to_first_token()
+                .map(|d| d.as_millis() as u64),
+            kv_cache_seq_len: Some(step.kv_cache_seq_len),
+            batch_size: None,
+            active_decode_sessions: None,
+            batch_kv_tokens: None,
+            deferred_decode_sessions: None,
+        })
+        .await?;
+
+        if self.config.checkpointing_enabled {
+            self.checkpoint(&step.completion).await?;
+            if let Some(session) = self.sessions.get_mut(&request.session_id) {
+                session.job.mark_checkpointed();
+            }
+        }
+
+        {
+            let mut active = self.active_job.write().await;
+            *active = None;
+        }
+
+        self.record_generation_metrics(request.session_id, step.execution_time_ms);
+
+        Ok(SegmentExecutionResult::PrefillComplete {
+            job_id: request.job_id,
+            session_id: request.session_id,
+            completion_tokens: step.completion.current_token_idx,
+            execution_time_ms: step.execution_time_ms,
+            time_to_first_token_ms: step
+                .completion
+                .time_to_first_token()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(step.execution_time_ms),
+            kv_cache_seq_len: step.kv_cache_seq_len,
+        })
+    }
+
+    async fn execute_prefill_step(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> Result<PrefillStepResult> {
+        let step_start = Instant::now();
         let next_token = {
             let mut session = self.sessions.remove(&request.session_id).ok_or_else(|| {
                 AgentError::Execution(
@@ -2074,8 +2132,8 @@ impl InferenceCoordinator {
         };
         self.drain_swarm_events().await?;
 
-        let execution_time_ms = segment_start.elapsed().as_millis() as u64;
-        let completion_tokens = {
+        let execution_time_ms = step_start.elapsed().as_millis() as u64;
+        let completion = {
             let session = self.sessions.get_mut(&request.session_id).ok_or_else(|| {
                 AgentError::Execution("session state vanished after prefill".to_string())
             })?;
@@ -2090,44 +2148,9 @@ impl InferenceCoordinator {
             .map(|session| session.backend.cache_seq_len() as u32)
             .unwrap_or(request.prompt_tokens.len() as u32);
 
-        on_progress(InferenceProgressUpdate {
-            phase: ExecutionPhase::Prefill,
-            completion_tokens: completion_tokens.current_token_idx,
+        Ok(PrefillStepResult {
+            completion,
             execution_time_ms,
-            time_to_first_token_ms: completion_tokens
-                .time_to_first_token()
-                .map(|d| d.as_millis() as u64),
-            kv_cache_seq_len: Some(kv_cache_seq_len),
-            batch_size: None,
-            active_decode_sessions: None,
-            batch_kv_tokens: None,
-            deferred_decode_sessions: None,
-        })
-        .await?;
-
-        if self.config.checkpointing_enabled {
-            self.checkpoint(&completion_tokens).await?;
-            if let Some(session) = self.sessions.get_mut(&request.session_id) {
-                session.job.mark_checkpointed();
-            }
-        }
-
-        {
-            let mut active = self.active_job.write().await;
-            *active = None;
-        }
-
-        self.record_generation_metrics(request.session_id, execution_time_ms);
-
-        Ok(SegmentExecutionResult::PrefillComplete {
-            job_id: request.job_id,
-            session_id: request.session_id,
-            completion_tokens: completion_tokens.current_token_idx,
-            execution_time_ms,
-            time_to_first_token_ms: completion_tokens
-                .time_to_first_token()
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(execution_time_ms),
             kv_cache_seq_len,
         })
     }
