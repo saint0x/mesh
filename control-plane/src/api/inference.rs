@@ -8335,6 +8335,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prefill_peer_can_attach_after_leader_acknowledges_with_competing_work_waiting() {
+        let network_id = "test-network-prefill-active-attach";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit_a = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "first job".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let leader_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected leader prefill claim");
+        assert_eq!(leader_claim.job_id, submit_a.job_id);
+
+        let _ = acknowledge_inference_assignment(
+            State(state.clone()),
+            Path(submit_a.job_id.clone()),
+            Json(AcknowledgeInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let submit_b = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "second job".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let submit_c = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "third job".into(),
+                max_tokens: 16,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let conn = state.db.get_conn().unwrap();
+        let worker2_assignment_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, active_segment_id
+                FROM inference_job_assignments
+                WHERE job_id = ? AND device_id = 'worker-2'
+                "#,
+                params![submit_a.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let worker2_group_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, lease_owner_device_id
+                FROM inference_serving_groups
+                WHERE job_id = ? AND device_id = 'worker-2' AND phase = 'prefill'
+                "#,
+                params![submit_a.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(worker2_assignment_state.0, "leased");
+        assert!(worker2_assignment_state.1.is_some());
+        assert_eq!(worker2_group_state.0, "prefill_leased");
+        assert_eq!(worker2_group_state.1, None);
+
+        let follower_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected follower to attach to active prefill cohort");
+
+        assert_eq!(follower_claim.job_id, submit_a.job_id);
+        assert_ne!(follower_claim.job_id, submit_b.job_id);
+        assert_ne!(follower_claim.job_id, submit_c.job_id);
+    }
+
+    #[tokio::test]
     async fn test_inference_completion_records_ledger_events_and_credits() {
         let network_id = "test-network-ledger";
         let state = joined_state(&["worker-1", "worker-2"], network_id).await;

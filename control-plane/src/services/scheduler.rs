@@ -314,18 +314,19 @@ fn classify_candidate(
     requesting_device_id: &str,
     now: &str,
 ) -> Result<String, SchedulerBlockedReason> {
-    if candidate.foreign_transport_island_inflight_jobs > 0 {
-        return Err(SchedulerBlockedReason::LeaseHeldByPeer);
-    }
     match candidate.phase {
         SchedulerPhase::Prefill => match candidate.group_status.as_str() {
             "prefill_member" | "prefill_leased" => {
                 let inflight_members = candidate
                     .prefill_group_leased_members
                     .saturating_add(candidate.prefill_group_active_members);
-                if inflight_members == 0 && candidate.model_prefill_inflight_groups > 0 {
+                if inflight_members > 0 {
+                    Ok(candidate.created_at.clone())
+                } else if candidate.foreign_transport_island_inflight_jobs > 0 {
                     Err(SchedulerBlockedReason::LeaseHeldByPeer)
-                } else if inflight_members == 0 && candidate.ring_position != 0 {
+                } else if candidate.model_prefill_inflight_groups > 0 {
+                    Err(SchedulerBlockedReason::LeaseHeldByPeer)
+                } else if candidate.ring_position != 0 {
                     Err(SchedulerBlockedReason::LeaseHeldByPeer)
                 } else {
                     Ok(candidate.created_at.clone())
@@ -335,6 +336,9 @@ fn classify_candidate(
             _ => Err(SchedulerBlockedReason::NotEligible),
         },
         SchedulerPhase::Decode => {
+            if candidate.foreign_transport_island_inflight_jobs > 0 {
+                return Err(SchedulerBlockedReason::LeaseHeldByPeer);
+            }
             let queue_status = candidate
                 .decode_queue_status
                 .as_deref()
@@ -2163,6 +2167,16 @@ mod tests {
 
         let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
         assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+    }
+
+    #[test]
+    fn inflight_prefill_member_can_attach_despite_foreign_transport_island_pressure() {
+        let mut candidate = base_candidate(SchedulerPhase::Prefill);
+        candidate.foreign_transport_island_inflight_jobs = 1;
+        candidate.prefill_group_leased_members = 1;
+
+        let runnable = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(runnable, Ok("2026-01-01T00:00:00Z".into()));
     }
 
     #[test]
