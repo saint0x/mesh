@@ -1505,8 +1505,8 @@ impl ActiveDecodeAssignment {
     }
 }
 
-fn active_decode_cohort_session_ids(active: &ActiveDecodeAssignment) -> &[String] {
-    active.assignment.session.lease_session_ids.as_slice()
+fn active_decode_cohort_session_ids(active: &ActiveDecodeAssignment) -> &[Uuid] {
+    active.request.decode_batch_targets.session_ids.as_slice()
 }
 
 fn active_decode_depends_on_session(active: &ActiveDecodeAssignment, session_id: Uuid) -> bool {
@@ -1516,7 +1516,7 @@ fn active_decode_depends_on_session(active: &ActiveDecodeAssignment, session_id:
 
     active_decode_cohort_session_ids(active)
         .iter()
-        .any(|candidate| Uuid::parse_str(candidate).ok() == Some(session_id))
+        .any(|candidate| *candidate == session_id)
 }
 
 fn decode_progress_interval(request: &agent::inference::InferenceRequest) -> u32 {
@@ -1529,13 +1529,37 @@ fn decode_assignment_lease_expired(active: &ActiveDecodeAssignment) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_active_decode_cohort_materialization(
+    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    active: &ActiveDecodeAssignment,
+) -> Result<()> {
+    let cohort_session_ids = active_decode_cohort_session_ids(active);
+    if cohort_session_ids.len() <= 1 {
+        return Ok(());
+    }
+
+    let missing_sessions = cohort_session_ids
+        .iter()
+        .filter(|session_id| !coordinator.has_session(**session_id))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if missing_sessions.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "decode runtime cohort is not fully materialized locally; missing sessions: {}",
+        missing_sessions.join(", ")
+    );
+}
+
 fn activate_runnable_decode_assignments(
     coordinator: &agent::inference::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
 ) {
     for active in active_decode_assignments.values_mut() {
-        if validate_materialized_decode_cohort(coordinator, &active.assignment, None).is_err() {
+        if validate_active_decode_cohort_materialization(coordinator, active).is_err() {
             continue;
         }
         if active.started_at.is_none() {
@@ -1694,8 +1718,7 @@ async fn reconcile_active_decode_assignments(
                     continue;
                 };
                 snapshot.paused_detail.or_else(|| {
-                    if validate_materialized_decode_cohort(coordinator, &active.assignment, None)
-                        .is_err()
+                    if validate_active_decode_cohort_materialization(coordinator, active).is_err()
                         && decode_assignment_lease_expired(active)
                     {
                         Some(
@@ -1785,8 +1808,8 @@ async fn service_active_decode_assignments(
         if !active_decode_assignments.contains_key(&session_id) {
             continue;
         }
-        let assignment = &active_decode_assignments[&session_id].assignment;
-        if validate_materialized_decode_cohort(coordinator, assignment, None).is_err() {
+        let active = &active_decode_assignments[&session_id];
+        if validate_active_decode_cohort_materialization(coordinator, active).is_err() {
             active_decode_order.push_back(session_id);
             continue;
         }
@@ -1941,39 +1964,6 @@ async fn execute_assignment_segment_with_reporting(
     }
 
     execution_result
-}
-
-fn validate_materialized_decode_cohort(
-    coordinator: &agent::inference::coordinator::InferenceCoordinator,
-    assignment: &InferenceExecutionLease,
-    decode_lease: Option<&DecodeLeaseStatus>,
-) -> Result<()> {
-    if !matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-        return Ok(());
-    }
-
-    let cohort_session_ids = decode_lease
-        .map(|lease| lease.lease_session_ids.as_slice())
-        .unwrap_or(assignment.session.lease_session_ids.as_slice());
-    if cohort_session_ids.len() <= 1 {
-        return Ok(());
-    }
-
-    let missing_sessions = cohort_session_ids
-        .iter()
-        .filter_map(|session_id| match Uuid::parse_str(session_id) {
-            Ok(session_id) if coordinator.has_session(session_id) => None,
-            Ok(_) | Err(_) => Some(session_id.clone()),
-        })
-        .collect::<Vec<_>>();
-    if missing_sessions.is_empty() {
-        return Ok(());
-    }
-
-    anyhow::bail!(
-        "decode lease cohort is not fully materialized locally; missing sessions: {}",
-        missing_sessions.join(", ")
-    );
 }
 
 async fn handle_assignment_execution_outcome(
