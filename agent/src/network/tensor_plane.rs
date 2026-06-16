@@ -339,6 +339,7 @@ struct TensorPlaneState {
     priority_outbound_inflight_bytes: Arc<Semaphore>,
     bulk_outbound_inflight_bytes: Arc<Semaphore>,
     max_concurrent_outbound_streams_per_peer: usize,
+    inbound: Arc<ServingInboundState>,
     metrics: TensorPlaneMetrics,
     outbound_connections: Mutex<HashMap<SocketAddr, OutboundPeerChannels>>,
     peer_bulk_outbound_bytes: Mutex<HashMap<SocketAddr, Arc<Semaphore>>>,
@@ -384,7 +385,6 @@ pub struct ServingReceiveSpec {
 #[derive(Clone)]
 pub struct ServingSessionTransport {
     state: Arc<TensorPlaneState>,
-    inbound: Arc<ServingInboundState>,
     left_peer: SocketAddr,
     right_peer: SocketAddr,
     reduce_scatter_lane: BoundServingLane,
@@ -449,6 +449,10 @@ impl std::fmt::Debug for ServingSessionTransport {
 }
 
 impl ServingSessionTransport {
+    pub fn inbound_id(&self) -> usize {
+        Arc::as_ptr(&self.state.inbound) as usize
+    }
+
     fn lane_binding(&self, lane: CollectiveLane) -> &BoundServingLane {
         match lane {
             CollectiveLane::ReduceScatter => &self.reduce_scatter_lane,
@@ -702,7 +706,7 @@ impl ServingSessionTransport {
     }
 
     pub async fn recv_frame_bytes(&self, spec: ServingReceiveSpec) -> Result<ServingFrameBytes> {
-        recv_slot(&self.state, &self.inbound, spec).await
+        recv_slot(&self.state, &self.state.inbound, spec).await
     }
 
     async fn send_frame(
@@ -763,7 +767,6 @@ impl ServingSessionTransport {
 
 pub struct TensorPlane {
     state: Arc<TensorPlaneState>,
-    inbound: Arc<ServingInboundState>,
     _accept_task: tokio::task::JoinHandle<()>,
 }
 
@@ -839,6 +842,7 @@ impl TensorPlane {
             reserved_bulk_send_bandwidth(config.max_send_bandwidth_bytes_per_sec);
         let peer_bulk_outbound_byte_capacity =
             per_peer_bulk_outbound_budget(bulk_outbound_inflight_byte_capacity);
+        let inbound = Arc::new(ServingInboundState::default());
         let state = Arc::new(TensorPlaneState {
             profile: config.profile,
             local_addr,
@@ -860,19 +864,17 @@ impl TensorPlane {
             bulk_outbound_inflight_bytes,
             max_concurrent_outbound_streams_per_peer: config
                 .max_concurrent_outbound_streams_per_peer,
+            inbound: Arc::clone(&inbound),
             metrics: TensorPlaneMetrics::new(),
             outbound_connections: Mutex::new(HashMap::new()),
             peer_bulk_outbound_bytes: Mutex::new(HashMap::new()),
         });
-        let inbound = Arc::new(ServingInboundState::default());
         let accept_state = Arc::clone(&state);
-        let accept_inbound = Arc::clone(&inbound);
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((mut stream, remote_addr)) => {
                         let state = Arc::clone(&accept_state);
-                        let inbound = Arc::clone(&accept_inbound);
                         tokio::spawn(async move {
                             loop {
                                 match tokio::time::timeout(
@@ -909,7 +911,7 @@ impl TensorPlane {
                                         };
 
                                         if !try_reserve_inbound_message_slot(
-                                            &inbound,
+                                            &state.inbound,
                                             state.inbound_queue_message_capacity,
                                         ) {
                                             state
@@ -921,7 +923,7 @@ impl TensorPlane {
                                         let slot = frame.header.slot_key();
                                         let header = frame.header;
                                         let queue_len = {
-                                            let mut slots = inbound.slots.lock().await;
+                                            let mut slots = state.inbound.slots.lock().await;
                                             let queue =
                                                 slots.entry(slot).or_insert_with(VecDeque::new);
                                             queue.push_back(InboundServingFrame {
@@ -931,21 +933,43 @@ impl TensorPlane {
                                             });
                                             queue.len()
                                         };
-                                        debug!(
-                                            inbound_id = format_args!("{:p}", Arc::as_ptr(&inbound)),
-                                            remote_addr = %remote_addr,
-                                            collective_id = %header.collective_id,
-                                            collective_seq = header.collective_seq,
-                                            sender_position = header.sender_position,
-                                            lane = ?header.lane,
-                                            layer_idx = header.layer_idx,
-                                            step = header.step,
-                                            slot = header.slot,
-                                            stream_id = header.stream_id,
-                                            queued_elements = header.element_count,
-                                            queue_len,
-                                            "Enqueued serving dataplane frame"
-                                        );
+                                        if matches!(
+                                            header.lane,
+                                            CollectiveLane::ReduceScatter
+                                                | CollectiveLane::AllGather
+                                        ) {
+                                            info!(
+                                                inbound_id = format_args!("{:p}", Arc::as_ptr(&state.inbound)),
+                                                remote_addr = %remote_addr,
+                                                collective_id = %header.collective_id,
+                                                collective_seq = header.collective_seq,
+                                                sender_position = header.sender_position,
+                                                lane = ?header.lane,
+                                                layer_idx = header.layer_idx,
+                                                step = header.step,
+                                                slot = header.slot,
+                                                stream_id = header.stream_id,
+                                                queued_elements = header.element_count,
+                                                queue_len,
+                                                "Enqueued serving collective frame"
+                                            );
+                                        } else {
+                                            debug!(
+                                                inbound_id = format_args!("{:p}", Arc::as_ptr(&state.inbound)),
+                                                remote_addr = %remote_addr,
+                                                collective_id = %header.collective_id,
+                                                collective_seq = header.collective_seq,
+                                                sender_position = header.sender_position,
+                                                lane = ?header.lane,
+                                                layer_idx = header.layer_idx,
+                                                step = header.step,
+                                                slot = header.slot,
+                                                stream_id = header.stream_id,
+                                                queued_elements = header.element_count,
+                                                queue_len,
+                                                "Enqueued serving dataplane frame"
+                                            );
+                                        }
 
                                         state
                                             .metrics
@@ -964,7 +988,7 @@ impl TensorPlane {
                                                     as usize)
                                                 as u64,
                                         );
-                                        inbound.notify.notify_waiters();
+                                        state.inbound.notify.notify_waiters();
                                     }
                                     Ok(Err(error)) => {
                                         if !matches!(
@@ -1007,7 +1031,6 @@ impl TensorPlane {
 
         Ok(Self {
             state,
-            inbound,
             _accept_task: accept_task,
         })
     }
@@ -1257,46 +1280,59 @@ impl TensorPlane {
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
     ) -> Result<ServingSessionTransport> {
-        let reduce_scatter_plan = lane_plan(
+        reset_serving_connection_pool(&self.state, right_peer).await;
+        let mut reduce_scatter_plan = lane_plan(
             CollectiveLane::ReduceScatter,
             self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
-        let all_gather_plan = lane_plan(
+        let mut all_gather_plan = lane_plan(
             CollectiveLane::AllGather,
             self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
-        let control_plan = lane_plan(
+        let mut control_plan = lane_plan(
             CollectiveLane::Control,
             self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
-        let bulk_transfer_plan = lane_plan(
+        let mut bulk_transfer_plan = lane_plan(
             CollectiveLane::BulkTransfer,
             self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
-        let checkpoint_plan = lane_plan(
+        let mut checkpoint_plan = lane_plan(
             CollectiveLane::Checkpoint,
             self.state.profile,
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
+        if left_peer == right_peer {
+            // A two-worker ring collapses left/right onto the same peer. For that
+            // degenerate topology, multiplexing a single collective phase over
+            // multiple logical streams adds ambiguity without adding any real
+            // parallel transport path.
+            reduce_scatter_plan.desired_stream_count = 1;
+            all_gather_plan.desired_stream_count = 1;
+            control_plan.desired_stream_count = 1;
+            bulk_transfer_plan.desired_stream_count = 1;
+            checkpoint_plan.desired_stream_count = 1;
+        }
         info!(
             left_peer = %left_peer,
             right_peer = %right_peer,
             runtime_mode = ?runtime_mode,
             provider = ?provider,
+            inbound_id = format_args!("{:p}", Arc::as_ptr(&self.state.inbound)),
             reduce_scatter_streams = reduce_scatter_plan.desired_stream_count,
             all_gather_streams = all_gather_plan.desired_stream_count,
             control_streams = control_plan.desired_stream_count,
@@ -1306,7 +1342,6 @@ impl TensorPlane {
         );
         Ok(ServingSessionTransport {
             state: Arc::clone(&self.state),
-            inbound: Arc::clone(&self.inbound),
             left_peer,
             right_peer,
             reduce_scatter_lane: bind_serving_lane(&self.state, right_peer, reduce_scatter_plan)
@@ -1320,7 +1355,7 @@ impl TensorPlane {
     }
 
     pub async fn recv_frame_bytes(&self, spec: ServingReceiveSpec) -> Result<ServingFrameBytes> {
-        recv_slot(&self.state, &self.inbound, spec).await
+        recv_slot(&self.state, &self.state.inbound, spec).await
     }
 
     pub async fn recv_frame(&self, spec: ServingReceiveSpec) -> Result<ServingFrame> {
@@ -1640,19 +1675,38 @@ async fn recv_slot(
             (delivered, queued_slot_keys)
         };
         if let Some(message) = delivered {
-            debug!(
-                inbound_id = %inbound_id,
-                collective_id = %slot_key.collective_id,
-                collective_seq = slot_key.collective_seq,
-                sender_position = slot_key.sender_position,
-                lane = ?slot_key.lane,
-                layer_idx = slot_key.layer_idx,
-                step = slot_key.step,
-                slot = slot_key.slot,
-                stream_id = slot_key.stream_id,
-                queued_elements = message.frame.element_count(),
-                "Delivered serving dataplane frame from mailbox"
-            );
+            if matches!(
+                slot_key.lane,
+                CollectiveLane::ReduceScatter | CollectiveLane::AllGather
+            ) {
+                info!(
+                    inbound_id = %inbound_id,
+                    collective_id = %slot_key.collective_id,
+                    collective_seq = slot_key.collective_seq,
+                    sender_position = slot_key.sender_position,
+                    lane = ?slot_key.lane,
+                    layer_idx = slot_key.layer_idx,
+                    step = slot_key.step,
+                    slot = slot_key.slot,
+                    stream_id = slot_key.stream_id,
+                    queued_elements = message.frame.element_count(),
+                    "Delivered serving collective frame from mailbox"
+                );
+            } else {
+                debug!(
+                    inbound_id = %inbound_id,
+                    collective_id = %slot_key.collective_id,
+                    collective_seq = slot_key.collective_seq,
+                    sender_position = slot_key.sender_position,
+                    lane = ?slot_key.lane,
+                    layer_idx = slot_key.layer_idx,
+                    step = slot_key.step,
+                    slot = slot_key.slot,
+                    stream_id = slot_key.stream_id,
+                    queued_elements = message.frame.element_count(),
+                    "Delivered serving dataplane frame from mailbox"
+                );
+            }
             inbound.queued_messages.fetch_sub(1, Ordering::Relaxed);
             state.metrics.receive_count.fetch_add(1, Ordering::Relaxed);
             let wait_ms = message.queued_at.elapsed().as_millis() as u64;
@@ -1666,19 +1720,38 @@ async fn recv_slot(
                 .fetch_add(wait_ms, Ordering::Relaxed);
             return Ok(message.frame);
         }
-        debug!(
-            inbound_id = %inbound_id,
-            collective_id = %slot_key.collective_id,
-            collective_seq = slot_key.collective_seq,
-            sender_position = slot_key.sender_position,
-            lane = ?slot_key.lane,
-            layer_idx = slot_key.layer_idx,
-            step = slot_key.step,
-            slot = slot_key.slot,
-            stream_id = slot_key.stream_id,
-            queued_slot_keys = ?queued_slot_keys,
-            "Waiting for serving dataplane frame"
-        );
+        if matches!(
+            slot_key.lane,
+            CollectiveLane::ReduceScatter | CollectiveLane::AllGather
+        ) {
+            info!(
+                inbound_id = %inbound_id,
+                collective_id = %slot_key.collective_id,
+                collective_seq = slot_key.collective_seq,
+                sender_position = slot_key.sender_position,
+                lane = ?slot_key.lane,
+                layer_idx = slot_key.layer_idx,
+                step = slot_key.step,
+                slot = slot_key.slot,
+                stream_id = slot_key.stream_id,
+                queued_slot_keys = ?queued_slot_keys,
+                "Waiting for serving collective frame"
+            );
+        } else {
+            debug!(
+                inbound_id = %inbound_id,
+                collective_id = %slot_key.collective_id,
+                collective_seq = slot_key.collective_seq,
+                sender_position = slot_key.sender_position,
+                lane = ?slot_key.lane,
+                layer_idx = slot_key.layer_idx,
+                step = slot_key.step,
+                slot = slot_key.slot,
+                stream_id = slot_key.stream_id,
+                queued_slot_keys = ?queued_slot_keys,
+                "Waiting for serving dataplane frame"
+            );
+        }
         notified.await;
     }
 }
@@ -1803,6 +1876,18 @@ async fn evict_connection(state: &Arc<TensorPlaneState>, target: SocketAddr, lan
         if pool.lanes.is_empty() {
             connections.remove(&target);
         }
+    }
+}
+
+async fn reset_serving_connection_pool(state: &Arc<TensorPlaneState>, target: SocketAddr) {
+    for lane in [
+        CollectiveLane::ReduceScatter,
+        CollectiveLane::AllGather,
+        CollectiveLane::Control,
+        CollectiveLane::BulkTransfer,
+        CollectiveLane::Checkpoint,
+    ] {
+        evict_connection(state, target, lane).await;
     }
 }
 
@@ -2529,6 +2614,43 @@ mod tests {
         .await;
         let snapshot = plane.metrics_snapshot();
         assert_eq!(snapshot.current_outbound_connections, 5);
+    }
+
+    #[tokio::test]
+    async fn test_serving_transport_rebind_refreshes_existing_serving_channels() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let target = plane.local_addr();
+
+        plane
+            .serving_transport_for_neighbors(
+                target,
+                target,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        wait_for_metric(&plane, |snapshot| {
+            snapshot.current_outbound_connections >= 5
+        })
+        .await;
+
+        plane
+            .serving_transport_for_neighbors(
+                target,
+                target,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+
+        wait_for_metric(&plane, |snapshot| snapshot.connection_evict_count >= 5).await;
+        let snapshot = plane.metrics_snapshot();
+        assert_eq!(snapshot.current_outbound_connections, 5);
+        assert!(snapshot.connection_evict_count >= 5);
     }
 
     #[tokio::test]

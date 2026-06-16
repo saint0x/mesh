@@ -55,11 +55,9 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::tensor_ops::ReusableMetalCollectiveScratchPool;
 use super::tensor_ops::{
     apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
-    collective_buffer_from_candle_2d_with_scratch, embed_tokens, from_candle_2d, matmul, rms_norm,
+    collective_buffer_from_candle_2d, embed_tokens, from_candle_2d, matmul, rms_norm,
     rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
@@ -1134,8 +1132,6 @@ pub struct ForwardPass {
     allreduce_timeout: std::time::Duration,
     attention_layout: AttentionShardLayout,
     local_kv_head_indices: CandleTensor,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    collective_scratch: ReusableMetalCollectiveScratchPool,
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
@@ -1187,8 +1183,6 @@ impl ForwardPass {
             allreduce_timeout,
             attention_layout,
             local_kv_head_indices,
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            collective_scratch: ReusableMetalCollectiveScratchPool::default(),
             device_kv_cache: DeviceKVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -1508,8 +1502,6 @@ impl ForwardPass {
             )
         };
         let batch_job_id = collective_batch_job_id(job_ids);
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let mut batch_collective_scratch = ReusableMetalCollectiveScratchPool::default();
 
         let mut positions = Vec::with_capacity(backends.len());
         for backend in backends.iter() {
@@ -1572,10 +1564,6 @@ impl ForwardPass {
             })?;
             let o_full = Self::ring_allreduce_candle_batch(
                 &o_partial,
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                Some(&mut batch_collective_scratch),
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                None,
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
@@ -1600,10 +1588,6 @@ impl ForwardPass {
             })?;
             let down_full = Self::ring_allreduce_candle_batch(
                 &down_partial,
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                Some(&mut batch_collective_scratch),
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                None,
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
@@ -1642,15 +1626,20 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = run_in_blocking_region(|| {
-            collective_buffer_from_candle_2d_with_scratch(
-                tensor,
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                None,
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                None,
-            )
-        })?;
+        info!(
+            layer_idx,
+            collective_seq,
+            rows = tensor.dims()[0],
+            cols = tensor.dims()[1],
+            "Starting collective tensor staging"
+        );
+        let flat = run_in_blocking_region(|| collective_buffer_from_candle_2d(tensor))?;
+        info!(
+            layer_idx,
+            collective_seq,
+            elements = flat.len(),
+            "Collective tensor staging complete; entering ring all-reduce"
+        );
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(
                 flat,
@@ -1667,10 +1656,6 @@ impl ForwardPass {
 
     async fn ring_allreduce_candle_batch(
         tensor: &CandleTensor,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))] _scratch: Option<
-            &mut ReusableMetalCollectiveScratchPool,
-        >,
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] _scratch: Option<&mut ()>,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
@@ -1681,15 +1666,20 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = run_in_blocking_region(|| {
-            collective_buffer_from_candle_2d_with_scratch(
-                tensor,
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                None,
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                None,
-            )
-        })?;
+        info!(
+            layer_idx,
+            collective_seq,
+            rows = tensor.dims()[0],
+            cols = tensor.dims()[1],
+            "Starting batch collective tensor staging"
+        );
+        let flat = run_in_blocking_region(|| collective_buffer_from_candle_2d(tensor))?;
+        info!(
+            layer_idx,
+            collective_seq,
+            elements = flat.len(),
+            "Batch collective tensor staging complete; entering ring all-reduce"
+        );
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(
                 flat,
@@ -1707,8 +1697,6 @@ impl ForwardPass {
     pub fn clear_cache(&mut self) {
         self.device_kv_cache.clear();
         self.position = 0;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        self.collective_scratch.clear();
     }
 
     /// Get current KV cache memory usage

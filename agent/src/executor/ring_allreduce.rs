@@ -605,16 +605,22 @@ impl<'a> WorkerRing<'a> {
             provider = ?self.provider,
             "Preparing serving dataplane channels for worker ring"
         );
-        self.serving_transport = Some(
-            self.tensor_plane
-                .serving_transport_for_neighbors(
-                    self.left_tensor_addr,
-                    self.right_tensor_addr,
-                    self.runtime_mode,
-                    self.provider,
-                )
-                .await?,
+        let transport = self
+            .tensor_plane
+            .serving_transport_for_neighbors(
+                self.left_tensor_addr,
+                self.right_tensor_addr,
+                self.runtime_mode,
+                self.provider,
+            )
+            .await?;
+        info!(
+            worker_position = self.my_position,
+            total_workers = self.total_workers,
+            inbound_id = format_args!("0x{:x}", transport.inbound_id()),
+            "Bound fresh serving transport for worker ring"
         );
+        self.serving_transport = Some(transport);
         info!(
             worker_position = self.my_position,
             total_workers = self.total_workers,
@@ -650,23 +656,6 @@ impl<'a> WorkerRing<'a> {
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
-        }
-        if self.total_workers == 2 {
-            info!(
-                worker_position = self.my_position,
-                total_workers = self.total_workers,
-                collective_id = %job_id,
-                layer_idx,
-                collective_seq,
-                "Using pairwise fast path for tensor all-reduce"
-            );
-            let original_shape = partial_result.shape.clone();
-            let work_buffer = partial_result.data;
-            let (reduced, run_metrics) = self
-                .pairwise_all_reduce_tensor(work_buffer, job_id, layer_idx, collective_seq)
-                .await?;
-            self.last_run_metrics = run_metrics;
-            return Ok(Tensor::new(reduced, original_shape));
         }
         let n = self.total_workers as usize;
         let original_shape = partial_result.shape.clone();
@@ -806,23 +795,6 @@ impl<'a> WorkerRing<'a> {
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
-        }
-        if self.total_workers == 2 {
-            info!(
-                worker_position = self.my_position,
-                total_workers = self.total_workers,
-                collective_id = %job_id,
-                layer_idx,
-                collective_seq,
-                rows = partial_result.rows,
-                cols = partial_result.cols,
-                "Using pairwise fast path for matrix all-reduce"
-            );
-            let (reduced, run_metrics) = self
-                .pairwise_all_reduce_matrix_impl(partial_result, job_id, layer_idx, collective_seq)
-                .await?;
-            self.last_run_metrics = run_metrics;
-            return Ok(reduced);
         }
         let n = self.total_workers as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
@@ -1218,298 +1190,6 @@ impl<'a> WorkerRing<'a> {
         );
 
         Ok((inbound, send_wait_ms, receive_wait_ms))
-    }
-
-    async fn pairwise_all_reduce_tensor(
-        &mut self,
-        mut work_buffer: Vec<f32>,
-        collective_id: Uuid,
-        layer_idx: u32,
-        collective_seq: u32,
-    ) -> Result<(Vec<f32>, RingAllReduceMetrics)> {
-        let mut run_metrics = RingAllReduceMetrics::default();
-        run_metrics.collective_operations = 1;
-        run_metrics.collective_worker_participants = 2;
-        run_metrics.pairwise_fast_path_operations = 1;
-        let local_len = work_buffer.len();
-
-        if self.my_position == 0 {
-            let recv_started = std::time::Instant::now();
-            let peer = self
-                .recv_pairwise_collective_frame(
-                    CollectiveLane::ReduceScatter,
-                    collective_id,
-                    collective_seq,
-                    layer_idx,
-                    0,
-                    0,
-                )
-                .await?;
-            run_metrics.reduce_scatter_step_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.receive_wait_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_received += peer.payload_bytes().len() as u64;
-            if peer.element_count() != local_len {
-                return Err(AgentError::Execution(format!(
-                    "Received pairwise all-reduce chunk len {} but expected {}",
-                    peer.element_count(),
-                    local_len
-                )));
-            }
-            accumulate_wire_f32_bytes_into_slice(&mut work_buffer, peer.payload_bytes());
-
-            let send_started = std::time::Instant::now();
-            self.send_pairwise_collective_frame(
-                CollectiveLane::AllGather,
-                collective_id,
-                collective_seq,
-                layer_idx,
-                0,
-                0,
-                &work_buffer,
-            )
-            .await?;
-            run_metrics.all_gather_step_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.send_wait_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_sent += (local_len * std::mem::size_of::<f32>()) as u64;
-            Ok((work_buffer, run_metrics))
-        } else {
-            let send_started = std::time::Instant::now();
-            self.send_pairwise_collective_frame(
-                CollectiveLane::ReduceScatter,
-                collective_id,
-                collective_seq,
-                layer_idx,
-                0,
-                0,
-                &work_buffer,
-            )
-            .await?;
-            run_metrics.reduce_scatter_step_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.send_wait_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_sent += (local_len * std::mem::size_of::<f32>()) as u64;
-
-            let recv_started = std::time::Instant::now();
-            let reduced = self
-                .recv_pairwise_collective_frame(
-                    CollectiveLane::AllGather,
-                    collective_id,
-                    collective_seq,
-                    layer_idx,
-                    0,
-                    0,
-                )
-                .await?;
-            run_metrics.all_gather_step_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.receive_wait_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_received += reduced.payload_bytes().len() as u64;
-            if reduced.element_count() != local_len {
-                return Err(AgentError::Execution(format!(
-                    "Received pairwise reduced chunk len {} but expected {}",
-                    reduced.element_count(),
-                    local_len
-                )));
-            }
-            copy_wire_f32_bytes_into_slice(&mut work_buffer, reduced.payload_bytes());
-            Ok((work_buffer, run_metrics))
-        }
-    }
-
-    async fn pairwise_all_reduce_matrix_impl(
-        &mut self,
-        mut partial_result: CollectiveMatrix,
-        collective_id: Uuid,
-        layer_idx: u32,
-        collective_seq: u32,
-    ) -> Result<(CollectiveMatrix, RingAllReduceMetrics)> {
-        let mut run_metrics = RingAllReduceMetrics::default();
-        run_metrics.collective_operations = 1;
-        run_metrics.collective_worker_participants = 2;
-        run_metrics.pairwise_fast_path_operations = 1;
-        let total_len = partial_result.len();
-
-        if self.my_position == 0 {
-            let recv_started = std::time::Instant::now();
-            let peer = self
-                .recv_pairwise_collective_frame(
-                    CollectiveLane::ReduceScatter,
-                    collective_id,
-                    collective_seq,
-                    layer_idx,
-                    0,
-                    0,
-                )
-                .await?;
-            run_metrics.reduce_scatter_step_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.receive_wait_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_received += peer.payload_bytes().len() as u64;
-            if peer.element_count() != total_len {
-                return Err(AgentError::Execution(format!(
-                    "Received pairwise all-reduce matrix chunk len {} but expected {}",
-                    peer.element_count(),
-                    total_len
-                )));
-            }
-            partial_result.accumulate_range_from_wire_bytes(0..total_len, peer.payload_bytes());
-
-            let send_started = std::time::Instant::now();
-            let reduced = partial_result.to_host_vec();
-            self.send_pairwise_collective_frame(
-                CollectiveLane::AllGather,
-                collective_id,
-                collective_seq,
-                layer_idx,
-                0,
-                0,
-                &reduced,
-            )
-            .await?;
-            run_metrics.all_gather_step_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.send_wait_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_sent += (total_len * std::mem::size_of::<f32>()) as u64;
-            Ok((partial_result, run_metrics))
-        } else {
-            let send_started = std::time::Instant::now();
-            self.send_pairwise_collective_frame(
-                CollectiveLane::ReduceScatter,
-                collective_id,
-                collective_seq,
-                layer_idx,
-                0,
-                0,
-                partial_result.host_range(0..total_len),
-            )
-            .await?;
-            run_metrics.reduce_scatter_step_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.send_wait_time_ms += send_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_sent += (total_len * std::mem::size_of::<f32>()) as u64;
-
-            let recv_started = std::time::Instant::now();
-            let reduced = self
-                .recv_pairwise_collective_frame(
-                    CollectiveLane::AllGather,
-                    collective_id,
-                    collective_seq,
-                    layer_idx,
-                    0,
-                    0,
-                )
-                .await?;
-            run_metrics.all_gather_step_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.receive_wait_time_ms += recv_started.elapsed().as_millis() as u64;
-            run_metrics.bytes_received += reduced.payload_bytes().len() as u64;
-            if reduced.element_count() != total_len {
-                return Err(AgentError::Execution(format!(
-                    "Received pairwise reduced matrix chunk len {} but expected {}",
-                    reduced.element_count(),
-                    total_len
-                )));
-            }
-            partial_result.copy_range_from_wire_bytes(0..total_len, reduced.payload_bytes());
-            Ok((partial_result, run_metrics))
-        }
-    }
-
-    async fn send_pairwise_collective_frame(
-        &self,
-        lane: CollectiveLane,
-        collective_id: Uuid,
-        collective_seq: u32,
-        layer_idx: u32,
-        step: u32,
-        slot: u32,
-        chunk_data: &[f32],
-    ) -> Result<()> {
-        let transport = self.serving_transport()?;
-        let stream_id = transport.stream_id_for(lane, step, slot);
-        info!(
-            worker_position = self.my_position,
-            total_workers = self.total_workers,
-            lane = ?lane,
-            collective_id = %collective_id,
-            collective_seq,
-            layer_idx,
-            step,
-            slot,
-            stream_id,
-            chunk_len = chunk_data.len(),
-            target_tensor_addr = %self.right_tensor_addr,
-            "Starting pairwise collective send"
-        );
-        match lane {
-            CollectiveLane::ReduceScatter => {
-                transport
-                    .send_reduce_scatter_chunk(
-                        collective_id,
-                        collective_seq,
-                        layer_idx,
-                        step,
-                        slot,
-                        stream_id,
-                        self.my_position,
-                        chunk_data,
-                    )
-                    .await
-            }
-            CollectiveLane::AllGather => {
-                transport
-                    .send_all_gather_chunk(
-                        collective_id,
-                        collective_seq,
-                        layer_idx,
-                        step,
-                        slot,
-                        stream_id,
-                        self.my_position,
-                        chunk_data,
-                    )
-                    .await
-            }
-            other => Err(AgentError::Execution(format!(
-                "Unsupported pairwise collective lane {:?}",
-                other
-            ))),
-        }
-    }
-
-    async fn recv_pairwise_collective_frame(
-        &self,
-        lane: CollectiveLane,
-        collective_id: Uuid,
-        collective_seq: u32,
-        layer_idx: u32,
-        step: u32,
-        slot: u32,
-    ) -> Result<ServingFrameBytes> {
-        let transport = self.serving_transport()?;
-        let stream_id = transport.stream_id_for(lane, step, slot);
-        let expected_sender_position =
-            (self.my_position + self.total_workers - 1) % self.total_workers;
-        info!(
-            worker_position = self.my_position,
-            total_workers = self.total_workers,
-            lane = ?lane,
-            collective_id = %collective_id,
-            collective_seq,
-            layer_idx,
-            step,
-            slot,
-            stream_id,
-            expected_sender_position,
-            source_tensor_addr = %self.left_tensor_addr,
-            "Waiting for pairwise collective receive"
-        );
-        transport
-            .recv_frame_bytes(ServingReceiveSpec {
-                collective_id,
-                collective_seq,
-                lane,
-                layer_idx,
-                step,
-                slot,
-                stream_id,
-                expected_sender_position,
-            })
-            .await
     }
 
     pub fn last_run_metrics(&self) -> RingAllReduceMetrics {
@@ -2070,8 +1750,10 @@ mod tests {
 
         assert_eq!(result_a.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
         assert_eq!(result_b.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
-        assert_eq!(ring_a.last_run_metrics().pairwise_fast_path_operations, 1);
-        assert_eq!(ring_b.last_run_metrics().pairwise_fast_path_operations, 1);
+        assert_eq!(ring_a.last_run_metrics().pairwise_fast_path_operations, 0);
+        assert_eq!(ring_b.last_run_metrics().pairwise_fast_path_operations, 0);
+        assert_eq!(ring_a.last_run_metrics().larger_ring_operations, 1);
+        assert_eq!(ring_b.last_run_metrics().larger_ring_operations, 1);
     }
 
     #[tokio::test]

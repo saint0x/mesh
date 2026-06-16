@@ -9,10 +9,7 @@
 
 use crate::errors::{AgentError, Result};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use candle_core::{
-    backend::BackendStorage, CustomOp1, DType, Device, Layout, Shape, Storage,
-    Tensor as CandleTensor, D,
-};
+use candle_core::{CustomOp1, DType, Device, Layout, Shape, Tensor as CandleTensor, D};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use candle_core::{MetalStorage, Result as CandleResult};
 use candle_nn::ops as candle_ops;
@@ -922,53 +919,8 @@ pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
     Tensor2D::new(data, dims[0], dims[1])
 }
 
-#[cfg(test)]
 pub(crate) fn collective_buffer_from_candle_2d(
     tensor: &CandleTensor,
-) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
-    collective_buffer_from_candle_2d_with_scratch(tensor, None)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
-struct ReusableMetalCollectiveScratchSlot {
-    storage: Option<MetalStorage>,
-    capacity_elements: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) struct ReusableMetalCollectiveScratchPool {
-    slots: [ReusableMetalCollectiveScratchSlot; 2],
-    next_slot: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Default for ReusableMetalCollectiveScratchPool {
-    fn default() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| ReusableMetalCollectiveScratchSlot::default()),
-            next_slot: 0,
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl ReusableMetalCollectiveScratchPool {
-    pub(crate) fn clear(&mut self) {
-        for slot in &mut self.slots {
-            slot.storage = None;
-            slot.capacity_elements = 0;
-        }
-        self.next_slot = 0;
-    }
-}
-
-pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
-    tensor: &CandleTensor,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
-        &mut ReusableMetalCollectiveScratchPool,
-    >,
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] _scratch: Option<&mut ()>,
 ) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
     let dims = tensor.dims();
     if dims.len() != 2 {
@@ -976,61 +928,6 @@ pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
             "Expected 2D GPU tensor for collective buffer conversion, got shape {:?}",
             dims
         )));
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        let (storage, layout) = tensor.storage_and_layout();
-        if let Storage::Metal(storage) = &*storage {
-            if tensor.dtype() == DType::F32 && layout.is_contiguous() {
-                let device = storage.device().clone();
-                let element_count = dims[0] * dims[1];
-                let shared_storage = if let Some(scratch) = scratch {
-                    let slot_idx = scratch.next_slot % scratch.slots.len();
-                    scratch.next_slot = (scratch.next_slot + 1) % scratch.slots.len();
-                    let slot = &mut scratch.slots[slot_idx];
-                    if slot.capacity_elements < element_count || slot.storage.is_none() {
-                        let shared_buffer = device
-                            .allocate_buffer(element_count * std::mem::size_of::<f32>())
-                            .map_err(candle_error)?;
-                        slot.storage = Some(MetalStorage::new(
-                            shared_buffer,
-                            device.clone(),
-                            element_count,
-                            DType::F32,
-                        ));
-                        slot.capacity_elements = element_count;
-                    }
-                    slot.storage
-                        .as_ref()
-                        .expect("metal collective scratch must be initialized")
-                        .clone()
-                } else {
-                    let shared_buffer = device
-                        .allocate_buffer(element_count * std::mem::size_of::<f32>())
-                        .map_err(candle_error)?;
-                    MetalStorage::new(shared_buffer, device.clone(), element_count, DType::F32)
-                };
-                {
-                    let blit = device.blit_command_encoder().map_err(candle_error)?;
-                    blit.copy_from_buffer(
-                        storage.buffer(),
-                        layout.start_offset() * std::mem::size_of::<f32>(),
-                        shared_storage.buffer(),
-                        0,
-                        element_count * std::mem::size_of::<f32>(),
-                    );
-                }
-                device.wait_until_completed().map_err(candle_error)?;
-                return Ok(
-                    crate::executor::ring_allreduce::CollectiveMatrix::from_shared_metal(
-                        shared_storage,
-                        dims[0],
-                        dims[1],
-                    ),
-                );
-            }
-        }
     }
 
     let flattened = tensor
