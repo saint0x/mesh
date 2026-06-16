@@ -773,12 +773,12 @@ impl RingTopologyManager {
     ///
     /// Marks worker as offline, removes from ring, and triggers redistribution.
     pub fn handle_worker_failure(&self, failed_worker_id: DeviceId) -> ApiResult<()> {
-        let _mutation_guard = self
+        let mutation_guard = self
             .mutation_lock
             .lock()
             .map_err(|_| ApiError::Internal("Failed to acquire ring mutation lock".to_string()))?;
         let write_gate = self.db.write_gate();
-        let _write_guard = write_gate
+        let write_guard = write_gate
             .lock()
             .map_err(|_| ApiError::Internal("Database write gate lock poisoned".to_string()))?;
 
@@ -788,97 +788,107 @@ impl RingTopologyManager {
             ));
         }
 
-        let conn = self.db.get_conn()?;
+        let mut remaining_workers_for_log = None;
+        {
+            let conn = self.db.get_conn()?;
 
-        // Acquire write locks
-        let mut workers_map = self
-            .workers
-            .write()
-            .map_err(|_| ApiError::Internal("Failed to acquire workers write lock".to_string()))?;
-        let mut ring_seq = self.ring_sequence.write().map_err(|_| {
-            ApiError::Internal("Failed to acquire ring_sequence write lock".to_string())
-        })?;
+            // Acquire write locks
+            let mut workers_map = self.workers.write().map_err(|_| {
+                ApiError::Internal("Failed to acquire workers write lock".to_string())
+            })?;
+            let mut ring_seq = self.ring_sequence.write().map_err(|_| {
+                ApiError::Internal("Failed to acquire ring_sequence write lock".to_string())
+            })?;
 
-        // Check if worker exists in ring
-        if !workers_map.contains_key(&failed_worker_id) {
-            // Worker not in ring, just mark as offline in DB
-            let rows_affected = conn
-                .execute(
-                    "UPDATE devices SET status = 'offline' WHERE device_id = ?",
+            // Check if worker exists in ring
+            if !workers_map.contains_key(&failed_worker_id) {
+                // Worker not in ring, just mark as offline in DB
+                let rows_affected = conn
+                    .execute(
+                        "UPDATE devices SET status = 'offline' WHERE device_id = ?",
+                        params![&failed_worker_id],
+                    )
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+                if rows_affected == 0 {
+                    return Err(ApiError::NotFound(format!(
+                        "Device {} not found",
+                        failed_worker_id
+                    )));
+                }
+            } else {
+                // Remove from in-memory structures
+                workers_map.remove(&failed_worker_id);
+                ring_seq.retain(|id| id != &failed_worker_id);
+
+                let remaining_workers = ring_seq.len() as u32;
+
+                // Begin transaction
+                conn.execute("BEGIN TRANSACTION", [])
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+                // Mark failed worker as offline and clear ring position
+                let update_result = conn.execute(
+                    r#"
+                    UPDATE devices SET
+                        status = 'offline',
+                        ring_position = NULL,
+                        shard_model_id = NULL,
+                        left_neighbor_id = NULL,
+                        right_neighbor_id = NULL,
+                        shard_worker_position = NULL,
+                        shard_total_workers = NULL,
+                        shard_column_start = NULL,
+                        shard_column_end = NULL
+                    WHERE device_id = ?
+                    "#,
                     params![&failed_worker_id],
-                )
-                .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+                );
 
-            if rows_affected == 0 {
-                return Err(ApiError::NotFound(format!(
-                    "Device {} not found",
-                    failed_worker_id
-                )));
+                if let Err(e) = update_result {
+                    conn.execute("ROLLBACK", []).ok();
+                    return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
+                        e,
+                    ))));
+                }
+
+                // Update ring connections for remaining workers
+                if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq) {
+                    conn.execute("ROLLBACK", []).ok();
+                    return Err(e);
+                }
+
+                // Commit transaction
+                conn.execute("COMMIT", [])
+                    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+                warn!(
+                    device_id = %failed_worker_id,
+                    remaining_workers = remaining_workers,
+                    "Worker removed from ring due to failure"
+                );
+
+                info!(
+                    remaining_workers = remaining_workers,
+                    "Shard redistribution completed for surviving workers"
+                );
+
+                Self::sync_workers_map_positions(&mut workers_map, &ring_seq);
+                remaining_workers_for_log = Some(remaining_workers);
             }
-            reconcile_failover_state(&self.db, std::slice::from_ref(&failed_worker_id))?;
-            return Ok(());
         }
 
-        // Remove from in-memory structures
-        workers_map.remove(&failed_worker_id);
-        ring_seq.retain(|id| id != &failed_worker_id);
-
-        let remaining_workers = ring_seq.len() as u32;
-
-        // Begin transaction
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-        // Mark failed worker as offline and clear ring position
-        let update_result = conn.execute(
-            r#"
-            UPDATE devices SET
-                status = 'offline',
-                ring_position = NULL,
-                shard_model_id = NULL,
-                left_neighbor_id = NULL,
-                right_neighbor_id = NULL,
-                shard_worker_position = NULL,
-                shard_total_workers = NULL,
-                shard_column_start = NULL,
-                shard_column_end = NULL
-            WHERE device_id = ?
-            "#,
-            params![&failed_worker_id],
-        );
-
-        if let Err(e) = update_result {
-            conn.execute("ROLLBACK", []).ok();
-            return Err(ApiError::Database(Box::new(crate::db::DbError::Rusqlite(
-                e,
-            ))));
-        }
-
-        // Update ring connections for remaining workers
-        if let Err(e) = self.update_ring_connections_internal(&conn, &ring_seq) {
-            conn.execute("ROLLBACK", []).ok();
-            return Err(e);
-        }
-
-        // Commit transaction
-        conn.execute("COMMIT", [])
-            .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
-
-        warn!(
-            device_id = %failed_worker_id,
-            remaining_workers = remaining_workers,
-            "Worker removed from ring due to failure"
-        );
-
-        info!(
-            remaining_workers = remaining_workers,
-            "Shard redistribution completed for surviving workers"
-        );
-
-        Self::sync_workers_map_positions(&mut workers_map, &ring_seq);
-        drop(ring_seq);
-        drop(workers_map);
+        drop(write_guard);
         reconcile_failover_state(&self.db, std::slice::from_ref(&failed_worker_id))?;
+        drop(mutation_guard);
+
+        if let Some(remaining_workers) = remaining_workers_for_log {
+            info!(
+                remaining_workers = remaining_workers,
+                device_id = %failed_worker_id,
+                "Failover reconciliation completed after worker removal"
+            );
+        }
 
         Ok(())
     }

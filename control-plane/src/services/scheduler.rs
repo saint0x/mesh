@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_ready_candidate_is_blocked_when_group_lease_is_held_by_peer() {
+    fn decode_ready_candidate_can_join_peer_owned_ready_cohort() {
         let mut candidate = base_candidate(SchedulerPhase::Decode);
         candidate.group_status = "decode_ready".into();
         candidate.decode_queue_status = Some("ready".into());
@@ -2053,8 +2053,8 @@ mod tests {
         candidate.group_lease_owner_device_id = Some("worker-peer".into());
         candidate.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
 
-        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
-        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+        let runnable = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
+        assert_eq!(runnable, Ok("2026-01-01T00:00:01Z".into()));
 
         let same_owner = classify_candidate(&candidate, "worker-peer", "2026-01-01T00:05:00Z");
         assert_eq!(same_owner, Ok("2026-01-01T00:00:01Z".into()));

@@ -50,6 +50,7 @@ use candle_core::{DType, Tensor as CandleTensor};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -63,6 +64,15 @@ use super::tensor_ops::{
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
 use crate::inference::backend::BackendLogits;
+
+fn run_in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
+    match Handle::try_current() {
+        Ok(handle) if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 /// Weights for a single transformer layer (sharded)
 ///
@@ -1240,7 +1250,7 @@ impl ForwardPass {
         let hidden_rows = hidden_dims[0];
         let hidden_cols = hidden_dims[1];
 
-        let o_partial = tokio::task::block_in_place(|| -> Result<_> {
+        let o_partial = run_in_blocking_region(|| -> Result<_> {
             // These CPU-side tensor ops can run long enough under concurrent inference
             // to starve async control loops if they stay on Tokio worker threads.
             let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
@@ -1278,7 +1288,7 @@ impl ForwardPass {
             .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
             .await?;
 
-        let (post_attn, down_partial) = tokio::task::block_in_place(|| -> Result<_> {
+        let (post_attn, down_partial) = run_in_blocking_region(|| -> Result<_> {
             let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
@@ -1298,7 +1308,7 @@ impl ForwardPass {
             .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
             .await?;
 
-        let output = tokio::task::block_in_place(|| {
+        let output = run_in_blocking_region(|| {
             post_attn.broadcast_add(&down_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })
@@ -1700,7 +1710,7 @@ impl ForwardPass {
         let absolute_positions = build_positions(absolute_position_start, tokens.len());
         self.last_allreduce_metrics = RingAllReduceMetrics::default();
 
-        let mut hidden = tokio::task::block_in_place(|| self.embed(tokens))?;
+        let mut hidden = run_in_blocking_region(|| self.embed(tokens))?;
         let hidden_dims = hidden.dims();
         debug!(
             "Embedded {} tokens -> {:?} at positions {}..{}",
@@ -1716,7 +1726,7 @@ impl ForwardPass {
                 .await?;
         }
 
-        hidden = tokio::task::block_in_place(|| {
+        hidden = run_in_blocking_region(|| {
             rms_norm_candle(
                 &hidden,
                 &self.device_weights.final_norm,
