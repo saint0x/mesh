@@ -127,32 +127,31 @@ run_agent_cli() {
     )
 }
 
-require_production_provider() {
+require_runtime_readiness() {
     local home_dir="$1"
     local output
-    output="$(run_agent_cli "$home_dir" doctor 2>&1 || true)"
+    output="$(
+        (
+            cd "$home_dir"
+            run_with_timeout 240s env \
+                HOME="$home_dir" \
+                MESHNET_HOME="$home_dir" \
+                MESHNET_MODEL_STORE="$MODEL_STORE" \
+                CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+                RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+                "$AGENT_BIN" doctor
+        ) 2>&1 || true
+    )"
     if ! grep -q "provider contract production-ready" <<<"$output"; then
         echo "device at $home_dir is not production-serving ready" >&2
         echo "$output" >&2
         return 1
     fi
-}
-
-require_assigned_shard_readiness() {
-    local home_dir="$1"
-    local output
-    output="$(run_agent_cli "$home_dir" doctor 2>&1 || true)"
     if ! grep -q "assigned shard production-ready" <<<"$output"; then
         echo "device at $home_dir does not have a production-ready assigned shard" >&2
         echo "$output" >&2
         return 1
     fi
-}
-
-require_local_real_artifact_materialization() {
-    local home_dir="$1"
-    local output
-    output="$(run_agent_cli "$home_dir" doctor 2>&1 || true)"
     if ! grep -q "local real artifact materialization ready" <<<"$output"; then
         echo "device at $home_dir cannot materialize a local real artifact on the selected provider" >&2
         echo "$output" >&2
@@ -233,9 +232,6 @@ fi
 run_agent_cli "$WORKER1_HOME" "${WORKER1_INIT_ARGS[@]}" >/dev/null
 run_agent_cli "$WORKER2_HOME" "${WORKER2_INIT_ARGS[@]}" >/dev/null
 
-require_production_provider "$WORKER1_HOME"
-require_production_provider "$WORKER2_HOME"
-
 WORKER1_DEVICE_ID="$(device_id_from_home "$WORKER1_HOME")"
 WORKER2_DEVICE_ID="$(device_id_from_home "$WORKER2_HOME")"
 
@@ -292,10 +288,16 @@ if ! wait_for_topology 180; then
     exit 1
 fi
 
-require_assigned_shard_readiness "$WORKER1_HOME"
-require_assigned_shard_readiness "$WORKER2_HOME"
-require_local_real_artifact_materialization "$WORKER1_HOME"
-require_local_real_artifact_materialization "$WORKER2_HOME"
+require_runtime_readiness "$WORKER1_HOME"
+require_runtime_readiness "$WORKER2_HOME"
+
+if ! wait_for_topology 180; then
+    echo "workers did not remain ring-stable after runtime readiness validation" >&2
+    cat "$CONTROL_LOG" >&2 || true
+    cat "$WORKER1_LOG" >&2 || true
+    cat "$WORKER2_LOG" >&2 || true
+    exit 1
+fi
 
 curl -fsS "http://127.0.0.1:${CONTROL_PORT}/api/ring/topology?network_id=${NETWORK_ID}" \
     >"$TOPOLOGY_LOG"
