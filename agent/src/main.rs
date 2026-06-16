@@ -1505,6 +1505,47 @@ impl ActiveDecodeAssignment {
     }
 }
 
+fn active_decode_assignment_shape(
+    active: &ActiveDecodeAssignment,
+) -> (Vec<Uuid>, Option<u32>, Option<u32>) {
+    (
+        active.request.decode_batch_targets.session_ids.clone(),
+        active.request.decode_batch_targets.target_session_count,
+        active.request.decode_batch_targets.target_batch_size,
+    )
+}
+
+fn runtime_decode_assignment_shape(
+    request: &agent::inference::InferenceRequest,
+) -> (Vec<Uuid>, Option<u32>, Option<u32>) {
+    (
+        request.decode_batch_targets.session_ids.clone(),
+        request.decode_batch_targets.target_session_count,
+        request.decode_batch_targets.target_batch_size,
+    )
+}
+
+fn update_active_decode_assignment(
+    active: &mut ActiveDecodeAssignment,
+    assignment: InferenceExecutionLease,
+    request: agent::inference::InferenceRequest,
+    job_id: Uuid,
+    device_id: Uuid,
+    active_segment_id: String,
+) {
+    if let Some(handle) = active.lease_renew_handle.take() {
+        handle.abort();
+    }
+    active.assignment = assignment;
+    active.request = request;
+    active.job_id = job_id;
+    active.device_id = device_id;
+    active.active_segment_id = active_segment_id;
+    if active.last_reported_completion_tokens == 0 {
+        active.started_at = None;
+    }
+}
+
 fn active_decode_cohort_session_ids(active: &ActiveDecodeAssignment) -> &[Uuid] {
     active.request.decode_batch_targets.session_ids.as_slice()
 }
@@ -4201,20 +4242,54 @@ async fn cmd_runtime() -> Result<()> {
             }
 
             if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-                if active_decode_assignments.contains_key(&request.session_id) {
-                    warn!(
-                        job_id = %job_id,
-                        session_id = %request.session_id,
-                        lease_id = %assignment.lease_id,
-                        "Duplicate decode lease claimed for already-active local session"
+                if let Some(active) = active_decode_assignments.get_mut(&request.session_id) {
+                    if active.job_id != job_id {
+                        warn!(
+                            job_id = %job_id,
+                            active_job_id = %active.job_id,
+                            session_id = %request.session_id,
+                            lease_id = %assignment.lease_id,
+                            "Rejected conflicting decode lease for already-active local session"
+                        );
+                        release_decode_setup_failure(
+                            &registration_client,
+                            &assignment,
+                            "conflicting_local_decode_lease",
+                            "conflicting decode lease claimed for already-active local session",
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    let old_shape = active_decode_assignment_shape(active);
+                    let new_shape = runtime_decode_assignment_shape(&request);
+                    let shape_changed = old_shape != new_shape
+                        || active.assignment.lease_id != assignment.lease_id
+                        || active.active_segment_id != active_segment_id;
+                    update_active_decode_assignment(
+                        active,
+                        assignment,
+                        request,
+                        job_id,
+                        device_id,
+                        active_segment_id,
                     );
-                    release_decode_setup_failure(
-                        &registration_client,
-                        &assignment,
-                        "duplicate_local_decode_lease",
-                        "duplicate decode lease claimed for already-active local session",
-                    )
-                    .await;
+                    if shape_changed {
+                        info!(
+                            job_id = %job_id,
+                            session_id = %active.session_id(),
+                            target_session_count = ?active.request.decode_batch_targets.target_session_count,
+                            target_batch_size = ?active.request.decode_batch_targets.target_batch_size,
+                            cohort_size = active.request.decode_batch_targets.session_ids.len(),
+                            "Updated active decode assignment with authoritative cohort refresh"
+                        );
+                    } else {
+                        debug!(
+                            job_id = %job_id,
+                            session_id = %active.session_id(),
+                            "Refreshed active decode assignment without cohort shape change"
+                        );
+                    }
                     continue;
                 }
 
