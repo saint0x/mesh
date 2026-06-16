@@ -209,6 +209,16 @@ async fn validate_worker_position_runtime_readiness(
     Ok(())
 }
 
+async fn join_validated_ring_position(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    config: &DeviceConfig,
+    position: agent::inference::coordinator::WorkerPosition,
+) -> Result<agent::inference::coordinator::WorkerPosition> {
+    validate_worker_position_runtime_readiness(config, &position).await?;
+    coordinator.join_ring(position.clone())?;
+    Ok(position)
+}
+
 fn validate_execution_assignment_artifacts(
     lease: &InferenceExecutionLease,
     device_id: &Uuid,
@@ -3487,17 +3497,18 @@ async fn cmd_runtime() -> Result<()> {
         let mut ring_position = None;
         match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
             Ok(position) => {
-                if let Err(e) =
-                    validate_worker_position_runtime_readiness(&inference_config_task, &position)
-                        .await
+                if let Err(e) = join_validated_ring_position(
+                    &mut coordinator,
+                    &inference_config_task,
+                    position.clone(),
+                )
+                .await
                 {
                     error!(
                         error = %e,
                         model_id = %position.model_id,
                         "Inference runtime is not ready for the assigned production shard"
                     );
-                } else if let Err(e) = coordinator.join_ring(position.clone()) {
-                    error!(error = %e, "Failed to join ring in coordinator");
                 } else {
                     info!(
                         model_id = %position.model_id,
@@ -3551,9 +3562,10 @@ async fn cmd_runtime() -> Result<()> {
             if ring_position.is_none() {
                 match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
                     Ok(position) => {
-                        if let Err(e) = validate_worker_position_runtime_readiness(
+                        if let Err(e) = join_validated_ring_position(
+                            &mut coordinator,
                             &inference_config_task,
-                            &position,
+                            position.clone(),
                         )
                         .await
                         {
@@ -3562,8 +3574,6 @@ async fn cmd_runtime() -> Result<()> {
                                 model_id = %position.model_id,
                                 "Inference runtime is still not ready for the assigned production shard"
                             );
-                        } else if let Err(e) = coordinator.join_ring(position.clone()) {
-                            error!(error = %e, "Failed to join ring in coordinator");
                         } else {
                             info!(
                                 model_id = %position.model_id,
@@ -3610,6 +3620,15 @@ async fn cmd_runtime() -> Result<()> {
             }
             last_claim_poll_at = Instant::now();
             let observe_idle_queue = idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
+            if ring_position.is_none() {
+                if observe_idle_queue {
+                    warn!(
+                        "Skipping inference claim because the local runtime has not passed production readiness gating for its assigned shard"
+                    );
+                }
+                idle_claim_polls = idle_claim_polls.saturating_add(1);
+                continue;
+            }
             let claim_response = match registration_client
                 .claim_inference_work(ClaimInferenceAssignmentRequest {
                     device_id: device_id.to_string(),
@@ -3736,8 +3755,15 @@ async fn cmd_runtime() -> Result<()> {
             let lease_topology = topology_from_execution_lease(&assignment);
             match build_worker_position_from_topology(&lease_topology, &device_id) {
                 Ok(position) => {
-                    if let Err(e) = coordinator.join_ring(position.clone()) {
-                        error!(error = %e, "Failed to apply ring position from execution lease");
+                    if let Err(e) =
+                        join_validated_ring_position(&mut coordinator, &config, position.clone())
+                            .await
+                    {
+                        error!(
+                            error = %e,
+                            model_id = %position.model_id,
+                            "Failed to apply production-ready ring position from execution lease"
+                        );
                     } else {
                         ring_position = Some(position);
                     }
@@ -3747,10 +3773,17 @@ async fn cmd_runtime() -> Result<()> {
                     match fetch_worker_position_from_control_plane(&topology_url, &device_id).await
                     {
                         Ok(position) => {
-                            if let Err(join_error) = coordinator.join_ring(position.clone()) {
+                            if let Err(join_error) = join_validated_ring_position(
+                                &mut coordinator,
+                                &config,
+                                position.clone(),
+                            )
+                            .await
+                            {
                                 error!(
                                     error = %join_error,
-                                    "Failed to recover ring position from topology refresh"
+                                    model_id = %position.model_id,
+                                    "Failed to recover production-ready ring position from topology refresh"
                                 );
                             } else {
                                 info!(
