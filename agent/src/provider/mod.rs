@@ -102,6 +102,31 @@ impl BackendContractDescriptor {
         descriptor
     }
 
+    pub fn supports_production_serving(&self) -> bool {
+        self.fast_path_eligible
+            && self.supports_decode_microbatch
+            && self.supports_paged_kv
+            && self.supports_device_sampling
+    }
+
+    pub fn production_readiness_summary(&self) -> String {
+        if self.supports_production_serving() {
+            format!(
+                "provider {} satisfies fast-path serving requirements",
+                self.provider.as_str()
+            )
+        } else {
+            format!(
+                "provider {} is not production serving ready (fast_path_eligible={}, supports_decode_microbatch={}, supports_paged_kv={}, supports_device_sampling={})",
+                self.provider.as_str(),
+                self.fast_path_eligible,
+                self.supports_decode_microbatch,
+                self.supports_paged_kv,
+                self.supports_device_sampling
+            )
+        }
+    }
+
     fn compute_contract_hash(&self) -> String {
         let mut hasher = DefaultHasher::new();
         self.provider.hash(&mut hasher);

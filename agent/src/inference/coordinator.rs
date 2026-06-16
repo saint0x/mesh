@@ -185,6 +185,9 @@ impl RecoveryGovernor {
 /// Ring position and shard information for this worker
 #[derive(Debug, Clone)]
 pub struct WorkerPosition {
+    /// Model assigned to this worker's current shard.
+    pub model_id: String,
+
     /// This worker's position in the ring (0-indexed)
     pub position: u32,
 
@@ -2197,8 +2200,8 @@ impl InferenceCoordinator {
             {
                 use tokio::signal::unix::{signal, SignalKind};
 
-                let mut terminate = signal(SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler");
+                let mut terminate =
+                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = terminate.recv() => {}
@@ -2513,6 +2516,7 @@ mod tests {
     fn test_worker_position() {
         let _peer_id = PeerId::random();
         let position = WorkerPosition {
+            model_id: "test-model".to_string(),
             position: 3,
             total_workers: 10,
             left_neighbor: PeerId::random(),

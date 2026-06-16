@@ -79,6 +79,91 @@ const LIVE_KV_RESPONSE_TIMEOUT_SECS: u64 = 5;
 const CONTROL_PLANE_WRITE_RETRY_MAX_WAIT_SECS: u64 = 30;
 const CONTROL_PLANE_WRITE_RETRY_STEP_MS: u64 = 250;
 
+fn local_backend_contract(
+    config: &DeviceConfig,
+) -> Result<agent::provider::BackendContractDescriptor> {
+    Ok(agent::provider::BackendContractDescriptor::for_provider(
+        config.resolve_execution_provider()?,
+    ))
+}
+
+fn validate_local_production_provider(config: &DeviceConfig) -> Result<()> {
+    let contract = local_backend_contract(config)?;
+    if !contract.supports_production_serving() {
+        anyhow::bail!("{}", contract.production_readiness_summary());
+    }
+    Ok(())
+}
+
+fn validate_production_artifact_assignment(
+    model_id: &str,
+    shard_worker_position: u32,
+    shard_total_workers: u32,
+    shard_column_range: (u32, u32),
+) -> Result<()> {
+    let manifest = agent::model_assets::load_model_manifest(model_id)?;
+    let model_dir = agent::model_assets::model_dir(model_id);
+    let tokenizer_ready = model_dir.join(&manifest.tokenizer_file).exists()
+        && model_dir.join("tokenizer_config.json").exists();
+    if !tokenizer_ready {
+        anyhow::bail!(
+            "model {} is missing tokenizer assets under {}",
+            model_id,
+            model_dir.display()
+        );
+    }
+
+    let assignment = agent::model::ShardAssignment::from_column_range(
+        model_id.to_string(),
+        shard_worker_position,
+        shard_total_workers,
+        shard_column_range.0,
+        shard_column_range.1,
+    );
+    if !agent::inference::artifact_loader::artifact_exists(
+        &agent::model_assets::model_store_dir(),
+        &assignment,
+    ) {
+        anyhow::bail!(
+            "model {} is missing the exact shard artifact package for worker {}/{} columns {}..{}",
+            model_id,
+            shard_worker_position,
+            shard_total_workers,
+            shard_column_range.0,
+            shard_column_range.1
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_worker_position_runtime_readiness(
+    config: &DeviceConfig,
+    position: &agent::inference::coordinator::WorkerPosition,
+) -> Result<()> {
+    validate_local_production_provider(config)?;
+    validate_production_artifact_assignment(
+        &position.model_id,
+        position.shard_worker_position,
+        position.shard_total_workers,
+        position.shard_column_range,
+    )?;
+    Ok(())
+}
+
+fn validate_execution_assignment_artifacts(
+    lease: &InferenceExecutionLease,
+    device_id: &Uuid,
+) -> Result<()> {
+    let member = assigned_member(lease, device_id)?;
+    validate_production_artifact_assignment(
+        &member.shard.model_id,
+        member.shard_worker_position,
+        member.shard_total_workers,
+        (member.shard.column_start, member.shard.column_end),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LiveKvTransferPlaneRequest {
     transfer_id: String,
@@ -515,6 +600,21 @@ pub(crate) async fn cmd_init(
         config.capabilities.default_execution_provider.as_str()
     );
     println!("   Selected Provider: {}", selected_provider.as_str());
+    let selected_contract = local_backend_contract(&config)?;
+    println!(
+        "   Production Serving: {}",
+        if selected_contract.supports_production_serving() {
+            "ready"
+        } else {
+            "not ready"
+        }
+    );
+    if !selected_contract.supports_production_serving() {
+        println!(
+            "   Readiness Detail: {}",
+            selected_contract.production_readiness_summary()
+        );
+    }
 
     // Save configuration
     let config_path = DeviceConfig::default_path()?;
@@ -820,6 +920,7 @@ fn build_worker_position_from_topology(
     let right_punch_plan = find_peer_punch_plan(topology, device_id, &right_worker.device_id);
 
     Ok(agent::inference::coordinator::WorkerPosition {
+        model_id: self_worker.shard.model_id.clone(),
         position: self_worker.position,
         total_workers: topology.workers.len() as u32,
         left_neighbor: left_peer_id,
@@ -912,6 +1013,10 @@ fn validate_execution_group_contract(
     let local_contract =
         agent::provider::BackendContractDescriptor::for_provider(selected_provider);
 
+    if !local_contract.supports_production_serving() {
+        anyhow::bail!("{}", local_contract.production_readiness_summary());
+    }
+
     if member.backend_contract.contract_hash != local_contract.contract_hash {
         anyhow::bail!(
             "lease contract {} does not match local contract {}",
@@ -920,19 +1025,24 @@ fn validate_execution_group_contract(
         );
     }
 
-    if group.fast_path_eligible {
-        let required_hash = group
-            .backend_contract_hash
-            .as_deref()
-            .context("fast-path execution group missing backend contract hash")?;
-        if required_hash != local_contract.contract_hash {
-            anyhow::bail!(
-                "fast-path group {} requires contract {}, local contract is {}",
-                group.execution_island_id,
-                required_hash,
-                local_contract.contract_hash
-            );
-        }
+    if !group.fast_path_eligible || !member.backend_contract.supports_production_serving() {
+        anyhow::bail!(
+            "execution group {} is not production serving ready",
+            group.execution_island_id
+        );
+    }
+
+    let required_hash = group
+        .backend_contract_hash
+        .as_deref()
+        .context("fast-path execution group missing backend contract hash")?;
+    if required_hash != local_contract.contract_hash {
+        anyhow::bail!(
+            "fast-path group {} requires contract {}, local contract is {}",
+            group.execution_island_id,
+            required_hash,
+            local_contract.contract_hash
+        );
     }
 
     Ok(())
@@ -2249,6 +2359,14 @@ async fn cmd_runtime() -> Result<()> {
                 }
             };
 
+        if let Err(e) = validate_local_production_provider(&inference_config_task) {
+            error!(
+                error = %e,
+                "Inference runtime disabled because the selected provider is not production serving ready"
+            );
+            return;
+        }
+
         info!("Initializing inference coordinator");
 
         let mut inference_runtime_config = InferenceConfig::default();
@@ -2408,10 +2526,19 @@ async fn cmd_runtime() -> Result<()> {
         let mut ring_position = None;
         match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
             Ok(position) => {
-                if let Err(e) = coordinator.join_ring(position.clone()) {
+                if let Err(e) =
+                    validate_worker_position_runtime_readiness(&inference_config_task, &position)
+                {
+                    error!(
+                        error = %e,
+                        model_id = %position.model_id,
+                        "Inference runtime is not ready for the assigned production shard"
+                    );
+                } else if let Err(e) = coordinator.join_ring(position.clone()) {
                     error!(error = %e, "Failed to join ring in coordinator");
                 } else {
                     info!(
+                        model_id = %position.model_id,
                         position = position.position,
                         total_workers = position.total_workers,
                         shard_range = ?position.shard_column_range,
@@ -2451,10 +2578,20 @@ async fn cmd_runtime() -> Result<()> {
             if ring_position.is_none() {
                 match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
                     Ok(position) => {
-                        if let Err(e) = coordinator.join_ring(position.clone()) {
+                        if let Err(e) = validate_worker_position_runtime_readiness(
+                            &inference_config_task,
+                            &position,
+                        ) {
+                            error!(
+                                error = %e,
+                                model_id = %position.model_id,
+                                "Inference runtime is still not ready for the assigned production shard"
+                            );
+                        } else if let Err(e) = coordinator.join_ring(position.clone()) {
                             error!(error = %e, "Failed to join ring in coordinator");
                         } else {
                             info!(
+                                model_id = %position.model_id,
                                 position = position.position,
                                 total_workers = position.total_workers,
                                 shard_range = ?position.shard_column_range,
@@ -2672,6 +2809,38 @@ async fn cmd_runtime() -> Result<()> {
                     &registration_client,
                     &assignment,
                     "incompatible_backend_contract",
+                    Some(e.to_string()),
+                )
+                .await;
+                let _ = registration_client
+                    .report_inference_result(
+                        job_id,
+                        agent::api::types::ReportInferenceAssignmentRequest {
+                            device_id: device_id.to_string(),
+                            segment_id: assignment.active_segment.segment_id.clone(),
+                            success: false,
+                            completion: None,
+                            completion_tokens: None,
+                            execution_time_ms: 0,
+                            time_to_first_token_ms: None,
+                            kv_cache_seq_len: None,
+                            error: Some(e.to_string()),
+                        },
+                    )
+                    .await;
+                continue;
+            }
+
+            if let Err(e) = validate_execution_assignment_artifacts(&assignment, &device_id) {
+                error!(
+                    job_id = %job_id,
+                    error = %e,
+                    "Assignment rejected because the exact production shard artifacts are unavailable"
+                );
+                release_decode_lease_if_needed(
+                    &registration_client,
+                    &assignment,
+                    "artifact_assignment_not_ready",
                     Some(e.to_string()),
                 )
                 .await;
@@ -4432,6 +4601,19 @@ async fn cmd_doctor() -> Result<()> {
         "OK".green().bold(),
         provider.as_str()
     );
+    let provider_contract = local_backend_contract(&config)?;
+    if provider_contract.supports_production_serving() {
+        println!(
+            "  {} provider contract production-ready",
+            "OK".green().bold()
+        );
+    } else {
+        println!(
+            "  {} provider contract not production-ready: {}",
+            "FAIL".red().bold(),
+            provider_contract.production_readiness_summary()
+        );
+    }
 
     match fetch_ring_topology(&config).await {
         Ok(topology) => {
@@ -4483,6 +4665,25 @@ async fn cmd_doctor() -> Result<()> {
                 .join(", ")
         );
         println!("    authoritative path: {}", authoritative_db.display());
+    }
+
+    if let Ok(topology) = fetch_ring_topology(&config).await {
+        if let Ok(position) = build_worker_position_from_topology(&topology, &config.device_id) {
+            match validate_worker_position_runtime_readiness(&config, &position) {
+                Ok(()) => println!(
+                    "  {} assigned shard production-ready for {} {}..{}",
+                    "OK".green().bold(),
+                    position.model_id,
+                    position.shard_column_range.0,
+                    position.shard_column_range.1
+                ),
+                Err(error) => println!(
+                    "  {} assigned shard not production-ready: {}",
+                    "FAIL".red().bold(),
+                    error
+                ),
+            }
+        }
     }
     println!();
     Ok(())

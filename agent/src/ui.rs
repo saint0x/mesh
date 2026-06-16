@@ -1,4 +1,5 @@
 use agent::{
+    api::types::RingTopologyResponse as AgentRingTopologyResponse,
     pki::{MembershipRole, PeerCache, PoolConfig, PoolId},
     resource_manager::ResourceManager,
     DeviceCapabilities, DeviceConfig, DeviceConnectivityState, DirectPeerCandidate,
@@ -13,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use control_plane::{
-    api::types::RingTopologyResponse,
+    api::types::RingTopologyResponse as ControlPlaneRingTopologyResponse,
     connectivity::InferenceSchedulingPolicy,
     consumption_policy::{quote_consumption, ConsumptionQuoteInput},
     credit_policy::{compute_credit_policy, AssignmentCreditInput, CreditPolicyInput},
@@ -1728,7 +1729,7 @@ async fn load_topologies(
             let url = format!("{base_url}/api/ring/topology?network_id={}", network.id);
             if let Ok(response) = client.get(&url).send().await {
                 if let Ok(topology) = response.error_for_status() {
-                    if let Ok(body) = topology.json::<RingTopologyResponse>().await {
+                    if let Ok(body) = topology.json::<ControlPlaneRingTopologyResponse>().await {
                         topologies.push(from_live_topology(network.id.clone(), body, devices));
                         continue;
                     }
@@ -1778,7 +1779,7 @@ async fn load_topologies(
 
 fn from_live_topology(
     network_id: String,
-    topology: RingTopologyResponse,
+    topology: ControlPlaneRingTopologyResponse,
     devices: &[UiDevice],
 ) -> UiTopology {
     let devices_by_id: HashMap<&str, &UiDevice> = devices
@@ -2215,7 +2216,7 @@ async fn load_ring_status(state: &UiState) -> Result<Value> {
     }))?)
 }
 
-async fn load_live_topology(state: &UiState) -> Result<RingTopologyResponse> {
+async fn load_live_topology(state: &UiState) -> Result<ControlPlaneRingTopologyResponse> {
     let config =
         load_local_device_config()?.ok_or_else(|| anyhow!("Device is not initialized."))?;
     let url = control_plane_url(
@@ -2223,7 +2224,7 @@ async fn load_live_topology(state: &UiState) -> Result<RingTopologyResponse> {
         &format!("/api/ring/topology?network_id={}", config.network_id),
     );
     let response = state.client.get(url).send().await?.error_for_status()?;
-    Ok(response.json::<RingTopologyResponse>().await?)
+    Ok(response.json::<ControlPlaneRingTopologyResponse>().await?)
 }
 
 async fn load_local_shards() -> Result<Value> {
@@ -2372,6 +2373,42 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         duration_ms: cert_start.elapsed().as_millis() as u64,
     });
 
+    let provider_start = std::time::Instant::now();
+    let provider_contract: Option<Result<agent::provider::BackendContractDescriptor>> =
+        match config.as_ref() {
+            Some(config) => Some(crate::local_backend_contract(config)),
+            None => None,
+        };
+    checks.push(UiDoctorCheck {
+        id: "execution_provider_contract".into(),
+        label: "Execution provider".into(),
+        status: match &provider_contract {
+            Some(Ok(contract)) if contract.supports_production_serving() => "ok".into(),
+            Some(Ok(_)) | Some(Err(_)) | None => "fail".into(),
+        },
+        detail: match &provider_contract {
+            Some(Ok(contract)) if contract.supports_production_serving() => format!(
+                "Selected provider {} satisfies production fast-path serving requirements.",
+                contract.provider.as_str()
+            ),
+            Some(Ok(contract)) => contract.production_readiness_summary(),
+            Some(Err(error)) => format!("Could not resolve execution provider: {error}"),
+            None => "Device config missing, so execution provider could not be checked.".into(),
+        },
+        hint: match &provider_contract {
+            Some(Ok(contract)) if contract.supports_production_serving() => None,
+            Some(Ok(_)) => Some(
+                "Select a fast-path accelerator provider before treating this device as production-ready."
+                    .into(),
+            ),
+            Some(Err(_)) => Some(
+                "Fix the configured execution provider or re-run device init.".into(),
+            ),
+            None => Some("Run device init first.".into()),
+        },
+        duration_ms: provider_start.elapsed().as_millis() as u64,
+    });
+
     let reachability_start = std::time::Instant::now();
     let control_plane_result = if let Some(config) = config.as_ref() {
         Some(
@@ -2394,7 +2431,7 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
             Some(Err(_)) => "fail".into(),
             None => "fail".into(),
         },
-        detail: match control_plane_result {
+        detail: match &control_plane_result {
             Some(Ok(ref response)) => {
                 format!("Control plane reachable (HTTP {}).", response.status())
             }
@@ -2451,6 +2488,77 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
             )
         },
         duration_ms: db_start.elapsed().as_millis() as u64,
+    });
+
+    let shard_readiness_start = std::time::Instant::now();
+    let assigned_shard_readiness = match (config.as_ref(), control_plane_result.as_ref()) {
+        (Some(config), Some(Ok(response))) if response.status().is_success() => {
+            match reqwest::Client::new()
+                .get(control_plane_url(
+                    config,
+                    &format!("/api/ring/topology?network_id={}", config.network_id),
+                ))
+                .send()
+                .await
+            {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match response.json::<AgentRingTopologyResponse>().await {
+                        Ok(topology) => match crate::build_worker_position_from_topology(
+                            &topology,
+                            &config.device_id,
+                        ) {
+                            Ok(position) => Some((
+                                position.model_id.clone(),
+                                position.shard_column_range,
+                                crate::validate_worker_position_runtime_readiness(
+                                    config, &position,
+                                ),
+                            )),
+                            Err(error) => Some((
+                                String::new(),
+                                (0, 0),
+                                Err(error.context("could not resolve assigned worker position")),
+                            )),
+                        },
+                        Err(error) => Some((String::new(), (0, 0), Err(error.into()))),
+                    },
+                    Err(error) => Some((String::new(), (0, 0), Err(error.into()))),
+                },
+                Err(error) => Some((String::new(), (0, 0), Err(error.into()))),
+            }
+        }
+        _ => None,
+    };
+    checks.push(UiDoctorCheck {
+        id: "assigned_shard_readiness".into(),
+        label: "Assigned shard".into(),
+        status: match &assigned_shard_readiness {
+            Some((_, _, Ok(()))) => "ok".into(),
+            Some((_, _, Err(_))) => "fail".into(),
+            None => "warn".into(),
+        },
+        detail: match &assigned_shard_readiness {
+            Some((model_id, shard_range, Ok(()))) => format!(
+                "Assigned shard for model {} columns {}..{} is production-ready.",
+                model_id, shard_range.0, shard_range.1
+            ),
+            Some((_, _, Err(error))) => {
+                format!("Assigned shard is not production-ready: {error}")
+            }
+            None => "No live assigned shard could be validated from current ring topology.".into(),
+        },
+        hint: match &assigned_shard_readiness {
+            Some((_, _, Ok(()))) => None,
+            Some((_, _, Err(_))) => Some(
+                "Install the exact assigned shard package and tokenizer assets, and use a fast-path provider before serving."
+                    .into(),
+            ),
+            None => Some(
+                "Join the device to a live ring so the exact assigned shard can be validated."
+                    .into(),
+            ),
+        },
+        duration_ms: shard_readiness_start.elapsed().as_millis() as u64,
     });
 
     let artifact_start = std::time::Instant::now();

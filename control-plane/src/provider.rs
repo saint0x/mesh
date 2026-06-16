@@ -101,6 +101,13 @@ impl BackendContractDescriptor {
         descriptor
     }
 
+    pub fn supports_production_serving(&self) -> bool {
+        self.fast_path_eligible
+            && self.supports_decode_microbatch
+            && self.supports_paged_kv
+            && self.supports_device_sampling
+    }
+
     fn compute_contract_hash(&self) -> String {
         let mut hasher = DefaultHasher::new();
         self.provider.hash(&mut hasher);
