@@ -360,6 +360,32 @@ for job_log in "$JOB2_LOG" "$JOB3_LOG" "$JOB4_LOG"; do
     fi
 done
 
+SCHEDULER_STATUS_JSON="$(
+    curl -fsS "http://127.0.0.1:${CONTROL_PORT}/api/status/networks/${NETWORK_ID}/scheduler"
+)"
+
+python3 - "$SCHEDULER_STATUS_JSON" <<'PY'
+import json
+import sys
+
+status = json.loads(sys.argv[1])
+readiness = status.get("readiness") or {}
+metrics = status.get("metrics") or {}
+
+if not readiness.get("ready", False):
+    blockers = readiness.get("blockers") or []
+    raise SystemExit(
+        "scheduler readiness was not green after real concurrent serving: "
+        + ", ".join(str(blocker) for blocker in blockers)
+    )
+
+peak_batch_size = metrics.get("peak_batch_size") or 0
+if peak_batch_size < 2:
+    raise SystemExit(
+        f"scheduler peak_batch_size did not prove pooled decode serving: {peak_batch_size}"
+    )
+PY
+
 STATS_SUMMARY="$(python3 - "$WORKER1_HOME/.meshnet/inference_stats.json" "$WORKER2_HOME/.meshnet/inference_stats.json" <<'PY'
 import json
 import sys
