@@ -155,6 +155,49 @@ require_production_readiness() {
     )
 }
 
+wait_for_production_scheduler_readiness() {
+    local attempts="${1:-120}"
+    local status_url="http://127.0.0.1:${CONTROL_PORT}/api/status/networks/${NETWORK_ID}/scheduler"
+    local last_status=""
+    for _ in $(seq 1 "$attempts"); do
+        if last_status="$(curl -fsS "$status_url")" && python3 - "$last_status" <<'PY'
+import json
+import sys
+
+status = json.loads(sys.argv[1])
+readiness = status.get("readiness") or {}
+metrics = status.get("metrics") or {}
+
+if readiness.get("ready", False) and (metrics.get("peak_batch_size") or 0) >= 2:
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+        then
+            return 0
+        fi
+        sleep 1
+    done
+
+    python3 - "$last_status" <<'PY'
+import json
+import sys
+
+status = json.loads(sys.argv[1]) if sys.argv[1] else {}
+readiness = status.get("readiness") or {}
+metrics = status.get("metrics") or {}
+blockers = readiness.get("blockers") or ["unknown scheduler readiness blocker"]
+
+raise SystemExit(
+    "scheduler never reached production decode pooling readiness after concurrent serving: "
+    + ", ".join(str(blocker) for blocker in blockers)
+    + f" (peak_batch_size={metrics.get('peak_batch_size') or 0}, "
+    + f"blocked_on_prefill_sessions={metrics.get('blocked_on_prefill_sessions') or 0}, "
+    + f"active_sessions={metrics.get('active_sessions') or 0})"
+)
+PY
+}
+
 device_id_from_home() {
     local home_dir="$1"
     awk -F'"' '/^device_id = / { print $2; exit }' "$home_dir/.meshnet/device.toml"
@@ -344,6 +387,8 @@ run_with_timeout 300s bash -lc \
     >"$JOB4_LOG" 2>&1 &
 JOB4_PID=$!
 
+wait_for_production_scheduler_readiness 120
+
 wait "$JOB2_PID"
 wait "$JOB3_PID"
 wait "$JOB4_PID"
@@ -400,6 +445,35 @@ max_multi_session_rate = max(float(item.get("multi_session_batch_rate", 0.0)) fo
 max_decode_batch = max(float(item.get("avg_decode_batch_size", 0.0)) for item in stats)
 max_peak_decode_batch = max(int(item.get("decode_batch_size_peak", 0)) for item in stats)
 ttft_values = [item.get("time_to_first_token_ms") for item in stats if item.get("time_to_first_token_ms") is not None]
+
+for index, item in enumerate(stats, start=1):
+    worker_name = f"worker{index}"
+    worker_allreduce_ops = int(item.get("allreduce_operations", 0))
+    worker_tensor_bytes_sent = int(item.get("tensor_bytes_sent", 0))
+    worker_decode_microbatches = int(item.get("decode_microbatches_executed", 0))
+    worker_peak_decode_batch = int(item.get("decode_batch_size_peak", 0))
+    worker_multi_session_rate = float(item.get("multi_session_batch_rate", 0.0))
+
+    if worker_allreduce_ops <= 0:
+        raise SystemExit(
+            f"{worker_name} did not participate in collective inference; allreduce_operations={worker_allreduce_ops}"
+        )
+    if worker_tensor_bytes_sent <= 0:
+        raise SystemExit(
+            f"{worker_name} did not emit tensor-plane traffic; tensor_bytes_sent={worker_tensor_bytes_sent}"
+        )
+    if worker_decode_microbatches <= 0:
+        raise SystemExit(
+            f"{worker_name} did not execute decode work; decode_microbatches_executed={worker_decode_microbatches}"
+        )
+    if worker_peak_decode_batch < 2:
+        raise SystemExit(
+            f"{worker_name} never observed pooled decode locally; decode_batch_size_peak={worker_peak_decode_batch}"
+        )
+    if worker_multi_session_rate <= 0.0:
+        raise SystemExit(
+            f"{worker_name} never observed a multi-session decode microbatch; multi_session_batch_rate={worker_multi_session_rate:.3f}"
+        )
 
 if total_tokens <= 0:
     raise SystemExit("total_tokens_generated was not positive")
