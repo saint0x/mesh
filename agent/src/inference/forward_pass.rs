@@ -1250,6 +1250,15 @@ impl ForwardPass {
         let hidden_rows = hidden_dims[0];
         let hidden_cols = hidden_dims[1];
 
+        info!(
+            layer_idx,
+            seq_len = hidden_rows,
+            hidden_dim = hidden_cols,
+            position_start = absolute_positions.first().copied().unwrap_or_default(),
+            position_end = absolute_positions.last().copied().unwrap_or_default(),
+            "Starting forward layer"
+        );
+
         let o_partial = run_in_blocking_region(|| -> Result<_> {
             // These CPU-side tensor ops can run long enough under concurrent inference
             // to starve async control loops if they stay on Tokio worker threads.
@@ -1266,6 +1275,11 @@ impl ForwardPass {
                 q_partial.dims()[1]
             );
 
+            info!(
+                layer_idx,
+                "Layer attention partials prepared; entering KV/attention path"
+            );
+
             let attn_output = attention_output_device(
                 &mut self.device_kv_cache,
                 &config,
@@ -1278,15 +1292,28 @@ impl ForwardPass {
                 v_partial,
             )?;
 
+            info!(
+                layer_idx,
+                "Layer attention output materialized; projecting local O partial"
+            );
+
             let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
 
             Ok(o_partial)
         })?;
+        info!(
+            layer_idx,
+            "Layer O partial ready; entering first ring all-reduce"
+        );
         let o_full = self
             .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
             .await?;
+        info!(
+            layer_idx,
+            "Layer first ring all-reduce complete; entering MLP preparation"
+        );
 
         let (post_attn, down_partial) = run_in_blocking_region(|| -> Result<_> {
             let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
@@ -1304,9 +1331,17 @@ impl ForwardPass {
             })?;
             Ok((post_attn, down_partial))
         })?;
+        info!(
+            layer_idx,
+            "Layer MLP down partial ready; entering second ring all-reduce"
+        );
         let down_full = self
             .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
             .await?;
+        info!(
+            layer_idx,
+            "Layer second ring all-reduce complete; finalizing layer output"
+        );
 
         let output = run_in_blocking_region(|| {
             post_attn.broadcast_add(&down_full).map_err(|e| {
@@ -1607,13 +1642,15 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = collective_buffer_from_candle_2d_with_scratch(
-            tensor,
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Some(&mut self.collective_scratch),
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            None,
-        )?;
+        let flat = run_in_blocking_region(|| {
+            collective_buffer_from_candle_2d_with_scratch(
+                tensor,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                None,
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                None,
+            )
+        })?;
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(
                 flat,
@@ -1630,10 +1667,10 @@ impl ForwardPass {
 
     async fn ring_allreduce_candle_batch(
         tensor: &CandleTensor,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))] _scratch: Option<
             &mut ReusableMetalCollectiveScratchPool,
         >,
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] scratch: Option<&mut ()>,
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] _scratch: Option<&mut ()>,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
@@ -1644,7 +1681,15 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = collective_buffer_from_candle_2d_with_scratch(tensor, scratch)?;
+        let flat = run_in_blocking_region(|| {
+            collective_buffer_from_candle_2d_with_scratch(
+                tensor,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                None,
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                None,
+            )
+        })?;
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(
                 flat,
@@ -1710,6 +1755,13 @@ impl ForwardPass {
         let absolute_positions = build_positions(absolute_position_start, tokens.len());
         self.last_allreduce_metrics = RingAllReduceMetrics::default();
 
+        info!(
+            token_count = tokens.len(),
+            position_start = absolute_position_start,
+            position_end = absolute_position_start + tokens.len() - 1,
+            "Starting forward token segment"
+        );
+
         let mut hidden = run_in_blocking_region(|| self.embed(tokens))?;
         let hidden_dims = hidden.dims();
         debug!(
@@ -1719,8 +1771,16 @@ impl ForwardPass {
             absolute_position_start,
             absolute_position_start + tokens.len() - 1
         );
+        info!(
+            rows = hidden_dims[0],
+            cols = hidden_dims[1],
+            "Token embedding materialized; entering transformer layers"
+        );
 
         for layer_idx in 0..self.config.num_layers {
+            if layer_idx == 0 {
+                info!("Entering first transformer layer of forward token segment");
+            }
             hidden = self
                 .forward_layer(&hidden, layer_idx, &absolute_positions, worker_ring, job_id)
                 .await?;

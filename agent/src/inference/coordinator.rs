@@ -1792,12 +1792,43 @@ impl InferenceCoordinator {
                 None,
                 self.tensor_plane_mut(),
             );
+            info!(
+                job_id = %request.job_id,
+                session_id = %request.session_id,
+                worker_position = position.position,
+                total_workers = position.total_workers,
+                provider = ?session.backend.provider_kind(),
+                runtime_mode = ?session.job.request.runtime_mode,
+                prompt_tokens = request.prompt_tokens.len(),
+                "Starting prefill serving transport preparation"
+            );
             worker_ring.prepare_serving_group_channels().await?;
+            info!(
+                job_id = %request.job_id,
+                session_id = %request.session_id,
+                worker_position = position.position,
+                total_workers = position.total_workers,
+                "Prefill serving transport prepared"
+            );
             session.engine_state.assignment.phase = ExecutionPhase::Prefill;
+            info!(
+                job_id = %request.job_id,
+                session_id = %request.session_id,
+                worker_position = position.position,
+                total_workers = position.total_workers,
+                "Starting distributed prefill execution"
+            );
             let logits = session
                 .backend
                 .prefill(&request.prompt_tokens, &mut worker_ring, request.job_id)
                 .await?;
+            info!(
+                job_id = %request.job_id,
+                session_id = %request.session_id,
+                worker_position = position.position,
+                total_workers = position.total_workers,
+                "Distributed prefill execution produced logits"
+            );
             let seed = request.job_id.as_u128() as u64 ^ session.backend.sequence_position() as u64;
             let next_token = session.backend.sample(
                 &logits,

@@ -596,6 +596,15 @@ impl<'a> WorkerRing<'a> {
         if self.serving_transport.is_some() {
             return Ok(());
         }
+        info!(
+            worker_position = self.my_position,
+            total_workers = self.total_workers,
+            left_tensor_addr = %self.left_tensor_addr,
+            right_tensor_addr = %self.right_tensor_addr,
+            runtime_mode = ?self.runtime_mode,
+            provider = ?self.provider,
+            "Preparing serving dataplane channels for worker ring"
+        );
         self.serving_transport = Some(
             self.tensor_plane
                 .serving_transport_for_neighbors(
@@ -605,6 +614,13 @@ impl<'a> WorkerRing<'a> {
                     self.provider,
                 )
                 .await?,
+        );
+        info!(
+            worker_position = self.my_position,
+            total_workers = self.total_workers,
+            left_tensor_addr = %self.left_tensor_addr,
+            right_tensor_addr = %self.right_tensor_addr,
+            "Serving dataplane channels prepared for worker ring"
         );
         Ok(())
     }

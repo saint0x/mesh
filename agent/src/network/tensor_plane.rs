@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::errors::{AgentError, Result};
@@ -1291,6 +1291,18 @@ impl TensorPlane {
             runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
+        );
+        info!(
+            left_peer = %left_peer,
+            right_peer = %right_peer,
+            runtime_mode = ?runtime_mode,
+            provider = ?provider,
+            reduce_scatter_streams = reduce_scatter_plan.desired_stream_count,
+            all_gather_streams = all_gather_plan.desired_stream_count,
+            control_streams = control_plan.desired_stream_count,
+            bulk_streams = bulk_transfer_plan.desired_stream_count,
+            checkpoint_streams = checkpoint_plan.desired_stream_count,
+            "Binding serving transport for tensor-plane neighbors"
         );
         Ok(ServingSessionTransport {
             state: Arc::clone(&self.state),
