@@ -828,6 +828,55 @@ fn runtime_heartbeat_interval() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(2))
 }
 
+fn spawn_runtime_heartbeat_thread(config: DeviceConfig) {
+    let thread_name = format!("mesh-heartbeat-{}", config.device_id);
+    let builder = std::thread::Builder::new().name(thread_name);
+    let spawn_result = builder.spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to build dedicated heartbeat runtime");
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let client = match RegistrationClient::new(config.control_plane_url.clone()) {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to create heartbeat client (non-fatal)");
+                    return;
+                }
+            };
+
+            // Wait briefly for the dedicated tensor plane to publish its endpoint
+            // so the first post-restart heartbeat does not erase neighbor routing
+            // with an empty listen-address set. Fall back to a best-effort heartbeat
+            // if startup is unusually slow so workers still reassert liveness.
+            for _ in 0..40 {
+                if local_dataplane_uri().is_some() {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+
+            loop {
+                if let Err(error) = client.heartbeat(&config).await {
+                    tracing::warn!(error = %error, "Heartbeat failed (control plane may be offline)");
+                }
+                tokio::time::sleep(runtime_heartbeat_interval()).await;
+            }
+        });
+    });
+
+    if let Err(error) = spawn_result {
+        tracing::warn!(error = %error, "Failed to spawn dedicated heartbeat thread");
+    }
+}
+
 fn live_kv_collective_id(transfer_id: &str) -> Result<Uuid> {
     Uuid::parse_str(transfer_id).with_context(|| format!("invalid transfer id {}", transfer_id))
 }
@@ -2309,34 +2358,7 @@ async fn cmd_runtime() -> Result<()> {
         // Always heartbeat when the agent is started from a registered device config.
         // Pools enable LAN discovery, but control-plane deployments still require
         // periodic endpoint and tensor-plane updates for ring coordination.
-        let heartbeat_config = config.clone();
-        tokio::spawn(async move {
-            let client = match RegistrationClient::new(heartbeat_config.control_plane_url.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to create heartbeat client (non-fatal)");
-                    return;
-                }
-            };
-
-            // Wait briefly for the dedicated tensor plane to publish its endpoint
-            // so the first post-restart heartbeat does not erase neighbor routing
-            // with an empty listen-address set. Fall back to a best-effort heartbeat
-            // if startup is unusually slow so workers still reassert liveness.
-            for _ in 0..40 {
-                if local_dataplane_uri().is_some() {
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-
-            loop {
-                if let Err(e) = client.heartbeat(&heartbeat_config).await {
-                    tracing::warn!(error = %e, "Heartbeat failed (control plane may be offline)");
-                }
-                tokio::time::sleep(runtime_heartbeat_interval()).await;
-            }
-        });
+        spawn_runtime_heartbeat_thread(config.clone());
     }
 
     // Start inference coordinator (in background)
@@ -3462,40 +3484,49 @@ async fn cmd_runtime() -> Result<()> {
                 }
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "Inference job failed");
-                    release_decode_lease_if_needed(
-                        &registration_client,
-                        &assignment,
-                        "segment_execution_failed",
-                        Some(e.to_string()),
-                    )
-                    .await;
-                    let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
-                        device_id: device_id.to_string(),
-                        segment_id: active_segment_id.clone(),
-                        success: false,
-                        completion: None,
-                        completion_tokens: None,
-                        execution_time_ms: 0,
-                        time_to_first_token_ms: None,
-                        kv_cache_seq_len: None,
-                        error: Some(e.to_string()),
-                    };
-                    let _ = retry_control_plane_write(
-                        "report_inference_result",
-                        job_id,
-                        Some(&active_segment_id),
-                        || {
-                            let registration_client = registration_client.clone();
-                            let request = failure_request.clone();
-                            Box::pin(async move {
-                                registration_client
-                                    .report_inference_result(job_id, request)
-                                    .await
-                                    .map_err(|error| error.to_string())
-                            })
-                        },
-                    )
-                    .await;
+                    if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+                        info!(
+                            job_id = %job_id,
+                            segment_id = %active_segment_id,
+                            error = %e,
+                            "Decode segment failed; releasing lease for retry instead of reporting terminal failure"
+                        );
+                        release_decode_lease_if_needed(
+                            &registration_client,
+                            &assignment,
+                            "segment_execution_failed",
+                            Some(e.to_string()),
+                        )
+                        .await;
+                    } else {
+                        let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
+                            device_id: device_id.to_string(),
+                            segment_id: active_segment_id.clone(),
+                            success: false,
+                            completion: None,
+                            completion_tokens: None,
+                            execution_time_ms: 0,
+                            time_to_first_token_ms: None,
+                            kv_cache_seq_len: None,
+                            error: Some(e.to_string()),
+                        };
+                        let _ = retry_control_plane_write(
+                            "report_inference_result",
+                            job_id,
+                            Some(&active_segment_id),
+                            || {
+                                let registration_client = registration_client.clone();
+                                let request = failure_request.clone();
+                                Box::pin(async move {
+                                    registration_client
+                                        .report_inference_result(job_id, request)
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                })
+                            },
+                        )
+                        .await;
+                    }
                 }
             }
         }
