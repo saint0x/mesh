@@ -1498,6 +1498,20 @@ impl ActiveDecodeAssignment {
     }
 }
 
+fn active_decode_cohort_session_ids(active: &ActiveDecodeAssignment) -> &[String] {
+    active.assignment.session.lease_session_ids.as_slice()
+}
+
+fn active_decode_depends_on_session(active: &ActiveDecodeAssignment, session_id: Uuid) -> bool {
+    if active.session_id() == session_id {
+        return true;
+    }
+
+    active_decode_cohort_session_ids(active)
+        .iter()
+        .any(|candidate| Uuid::parse_str(candidate).ok() == Some(session_id))
+}
+
 fn decode_progress_interval(request: &agent::inference::InferenceRequest) -> u32 {
     request.config.progress_report_interval.max(1)
 }
@@ -1632,6 +1646,7 @@ async fn reconcile_active_decode_assignments(
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     active_decode_order: &mut VecDeque<Uuid>,
 ) {
+    let mut cohort_failures = Vec::<(Uuid, String)>::new();
     let session_ids = active_decode_assignments
         .keys()
         .copied()
@@ -1649,6 +1664,26 @@ async fn reconcile_active_decode_assignments(
             error = %error_message,
             "Active decode assignment became unrunnable after local admission"
         );
+        cohort_failures.push((session_id, error_message));
+    }
+
+    let mut sessions_to_fail = BTreeMap::<Uuid, String>::new();
+    for (failed_session_id, error_message) in cohort_failures {
+        for (active_session_id, active) in active_decode_assignments.iter() {
+            if active_decode_depends_on_session(active, failed_session_id) {
+                sessions_to_fail
+                    .entry(*active_session_id)
+                    .or_insert_with(|| {
+                        format!(
+                            "decode cohort became unrunnable because session {} failed locally: {}",
+                            failed_session_id, error_message
+                        )
+                    });
+            }
+        }
+    }
+
+    for (session_id, error_message) in sessions_to_fail {
         fail_single_active_decode_assignment(
             coordinator,
             registration_client,
