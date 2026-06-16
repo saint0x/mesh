@@ -7,10 +7,12 @@ use uuid::Uuid;
 
 use super::engine::{ExecutionPhase, InferenceRuntimeMode};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DecodeBatchTargets {
     pub target_session_count: Option<u32>,
     pub target_batch_size: Option<u32>,
+    #[serde(default)]
+    pub session_ids: Vec<Uuid>,
 }
 
 /// Configuration for text generation

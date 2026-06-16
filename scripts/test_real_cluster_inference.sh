@@ -239,53 +239,6 @@ for device_id in "$WORKER1_DEVICE_ID" "$WORKER2_DEVICE_ID"; do
         }" >/dev/null
 done
 
-(
-    cd "$WORKER1_HOME"
-    env \
-        HOME="$WORKER1_HOME" \
-        MESHNET_HOME="$WORKER1_HOME" \
-        MESHNET_MODEL_STORE="$MODEL_STORE" \
-        RUST_LOG="$TEST_RUST_LOG" \
-        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-        "$AGENT_BIN" device start --log-level info >"$WORKER1_LOG" 2>&1
-) &
-WORKER1_PID=$!
-
-(
-    cd "$WORKER2_HOME"
-    env \
-        HOME="$WORKER2_HOME" \
-        MESHNET_HOME="$WORKER2_HOME" \
-        MESHNET_MODEL_STORE="$MODEL_STORE" \
-        RUST_LOG="$TEST_RUST_LOG" \
-        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-        "$AGENT_BIN" device start --log-level info >"$WORKER2_LOG" 2>&1
-) &
-WORKER2_PID=$!
-
-if ! wait_for_local_tensor_endpoint "$WORKER1_HOME" 120; then
-    echo "worker1 failed to publish a tensor-plane endpoint" >&2
-    cat "$WORKER1_LOG" >&2 || true
-    exit 1
-fi
-
-if ! wait_for_local_tensor_endpoint "$WORKER2_HOME" 120; then
-    echo "worker2 failed to publish a tensor-plane endpoint" >&2
-    cat "$WORKER2_LOG" >&2 || true
-    exit 1
-fi
-
-sleep 6
-
-kill "$WORKER1_PID" 2>/dev/null || true
-wait "$WORKER1_PID" 2>/dev/null || true
-unset WORKER1_PID
-kill "$WORKER2_PID" 2>/dev/null || true
-wait "$WORKER2_PID" 2>/dev/null || true
-unset WORKER2_PID
-
 run_agent_cli "$WORKER1_HOME" ring join --model-id "$MODEL_ID" --memory 1GB >/dev/null
 run_agent_cli "$WORKER2_HOME" ring join --model-id "$MODEL_ID" --memory 1GB >/dev/null
 
@@ -298,7 +251,7 @@ run_agent_cli "$WORKER2_HOME" ring join --model-id "$MODEL_ID" --memory 1GB >/de
         RUST_LOG="$TEST_RUST_LOG" \
         CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
         RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-        "$AGENT_BIN" device start --log-level info >"$WORKER1_LOG" 2>&1
+        "$AGENT_BIN" device runtime --log-level info >"$WORKER1_LOG" 2>&1
 ) &
 WORKER1_PID=$!
 
@@ -311,7 +264,7 @@ WORKER1_PID=$!
         RUST_LOG="$TEST_RUST_LOG" \
         CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
         RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-        "$AGENT_BIN" device start --log-level info >"$WORKER2_LOG" 2>&1
+        "$AGENT_BIN" device runtime --log-level info >"$WORKER2_LOG" 2>&1
 ) &
 WORKER2_PID=$!
 

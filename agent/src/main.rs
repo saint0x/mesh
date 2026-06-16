@@ -2489,6 +2489,8 @@ async fn cmd_runtime() -> Result<()> {
             warn!(error = %e, "Failed to persist tensor data-plane endpoint");
         } else {
             info!(
+                tensor_plane_instance = tensor_plane.instance_id(),
+                tensor_plane_state = format_args!("0x{:x}", tensor_plane.state_ptr()),
                 endpoint = %tensor_plane.advertised_endpoint(),
                 local_addr = %tensor_plane.local_addr(),
                 "Dedicated tensor data plane ready"
@@ -2899,6 +2901,32 @@ async fn cmd_runtime() -> Result<()> {
                 continue;
             }
 
+            let decode_batch_session_ids = match decode_lease
+                .as_ref()
+                .map(|lease| lease.lease_session_ids.as_slice())
+                .unwrap_or(assignment.session.lease_session_ids.as_slice())
+                .iter()
+                .map(|session_id| {
+                    Uuid::parse_str(session_id).map_err(|error| {
+                        anyhow::anyhow!("invalid decode lease session_id {}: {}", session_id, error)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(session_ids) => session_ids,
+                Err(error) => {
+                    error!(job_id = %job_id, error = %error, "Failed to parse decode lease cohort");
+                    release_decode_lease_if_needed(
+                        &registration_client,
+                        &assignment,
+                        "invalid_decode_lease_cohort",
+                        Some(error.to_string()),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+
             let request = InferenceRequest {
                 job_id,
                 network_id: assignment.network_id.clone(),
@@ -2927,6 +2955,7 @@ async fn cmd_runtime() -> Result<()> {
                         .as_ref()
                         .and_then(|lease| lease.lease_target_batch_size)
                         .or(assignment.session.lease_target_batch_size),
+                    session_ids: decode_batch_session_ids,
                 },
                 runtime_mode: match assignment.execution_plan.runtime_mode {
                     agent::api::types::InferenceRuntimeMode::FitFirst => {

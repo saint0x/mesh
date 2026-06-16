@@ -617,6 +617,8 @@ impl<'a> WorkerRing<'a> {
         info!(
             worker_position = self.my_position,
             total_workers = self.total_workers,
+            tensor_plane_instance = transport.instance_id(),
+            tensor_plane_state = format_args!("0x{:x}", transport.state_ptr()),
             inbound_id = format_args!("0x{:x}", transport.inbound_id()),
             "Bound fresh serving transport for worker ring"
         );

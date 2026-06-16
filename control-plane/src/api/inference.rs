@@ -232,6 +232,7 @@ struct PersistedSessionStatus {
     latest_active_decode_sessions: Option<u32>,
     latest_batch_kv_tokens: Option<u32>,
     latest_deferred_decode_sessions: Option<u32>,
+    lease_session_ids: Vec<String>,
     lease_target_session_count: Option<u32>,
     lease_target_batch_size: Option<u32>,
     pooled_batch_group_key: Option<String>,
@@ -291,6 +292,7 @@ struct DecodeLeaseCohortStatus {
     pooled_blocked_sessions: Option<u32>,
     pooled_leased_sessions: Option<u32>,
     pooled_active_sessions: Option<u32>,
+    lease_session_ids: Vec<String>,
 }
 
 struct SchedulerEventRecord<'a> {
@@ -918,7 +920,14 @@ pub async fn claim_inference_assignment(
     .await
     .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))??;
 
-    let execution_lease = assignment.clone().map(build_execution_lease).transpose()?;
+    let execution_lease = if let Some(assignment) = assignment.clone() {
+        let conn = state.db.get_conn()?;
+        let lease_session_ids =
+            load_decode_lease_member_session_ids(&conn, &assignment.assignment.session_id)?;
+        Some(build_execution_lease(assignment, lease_session_ids)?)
+    } else {
+        None
+    };
     let queue_observation = if req.include_queue_state || req.include_serving_session {
         let active_session_id = execution_lease
             .as_ref()
@@ -1145,7 +1154,10 @@ pub async fn release_decode_lease(
     }))
 }
 
-fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExecutionLease> {
+fn build_execution_lease(
+    record: PersistedAssignment,
+    lease_session_ids: Vec<String>,
+) -> ApiResult<InferenceExecutionLease> {
     let PersistedAssignment {
         assignment,
         checkpoint,
@@ -1186,6 +1198,7 @@ fn build_execution_lease(record: PersistedAssignment) -> ApiResult<InferenceExec
             latest_active_decode_sessions: assignment.latest_active_decode_sessions,
             latest_batch_kv_tokens: assignment.latest_batch_kv_tokens,
             latest_deferred_decode_sessions: assignment.latest_deferred_decode_sessions,
+            lease_session_ids,
             lease_target_session_count: assignment.lease_target_session_count,
             lease_target_batch_size: assignment.lease_target_batch_size,
             pooled_batch_group_key: assignment.pooled_batch_group_key,
@@ -1391,6 +1404,7 @@ fn load_serving_session_metadata(
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
                     latest_batch_kv_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
                     latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                    lease_session_ids: Vec::new(),
                     lease_target_session_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
                     lease_target_batch_size: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
                     pooled_batch_group_key: None,
@@ -1426,6 +1440,7 @@ fn load_serving_session_metadata(
         )?;
     session.lease_target_session_count = lease_target_session_count;
     session.lease_target_batch_size = lease_target_batch_size;
+    session.lease_session_ids = cohort.lease_session_ids.clone();
     session.pooled_batch_group_key = cohort.pooled_batch_group_key;
     session.pooled_total_sessions = cohort.pooled_total_sessions;
     session.pooled_ready_sessions = cohort.pooled_ready_sessions;
@@ -1599,6 +1614,7 @@ fn load_decode_lease_status(
                 pooled_blocked_sessions: cohort.pooled_blocked_sessions,
                 pooled_leased_sessions: cohort.pooled_leased_sessions,
                 pooled_active_sessions: cohort.pooled_active_sessions,
+                lease_session_ids: cohort.lease_session_ids.clone(),
                 last_renewed_at: row.get(11)?,
                 last_error: row.get(12)?,
             })
@@ -3169,6 +3185,7 @@ fn load_decode_lease_cohort_status(
     };
 
     let pooled_group_key = batch_group_key.unwrap_or(group_id);
+    let lease_session_ids = load_decode_lease_member_session_ids(conn, session_id)?;
     let cohort = conn
         .query_row(
             r#"
@@ -3191,11 +3208,75 @@ fn load_decode_lease_cohort_status(
                     pooled_blocked_sessions: Some(row.get::<_, i64>(2)? as u32),
                     pooled_leased_sessions: Some(row.get::<_, i64>(3)? as u32),
                     pooled_active_sessions: Some(row.get::<_, i64>(4)? as u32),
+                    lease_session_ids: lease_session_ids.clone(),
                 })
             },
         )
         .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
     Ok(cohort)
+}
+
+fn load_decode_lease_member_session_ids(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> ApiResult<Vec<String>> {
+    let queue_row = conn
+        .query_row(
+            r#"
+            SELECT network_id, group_id, batch_group_key, lease_owner_device_id, status
+            FROM inference_decode_queue
+            WHERE session_id = ?
+            "#,
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+
+    let Some((network_id, group_id, batch_group_key, lease_owner_device_id, status)) = queue_row
+    else {
+        return Ok(Vec::new());
+    };
+
+    let Some(lease_owner_device_id) = lease_owner_device_id else {
+        return Ok(Vec::new());
+    };
+
+    if !matches!(status.as_str(), "leased" | "active") {
+        return Ok(Vec::new());
+    }
+
+    let pooled_group_key = batch_group_key.unwrap_or(group_id);
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT session_id
+            FROM inference_decode_queue
+            WHERE network_id = ?
+              AND COALESCE(batch_group_key, group_id) = ?
+              AND lease_owner_device_id = ?
+              AND status IN ('leased', 'active')
+            ORDER BY COALESCE(ready_at, updated_at) ASC, session_id ASC
+            "#,
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    let session_ids = stmt
+        .query_map(
+            params![network_id, pooled_group_key, lease_owner_device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))?;
+    Ok(session_ids)
 }
 
 fn record_scheduler_event(
@@ -3795,6 +3876,7 @@ pub async fn get_inference_job_status(
                 latest_active_decode_sessions: session.latest_active_decode_sessions,
                 latest_batch_kv_tokens: session.latest_batch_kv_tokens,
                 latest_deferred_decode_sessions: session.latest_deferred_decode_sessions,
+                lease_session_ids: session.lease_session_ids,
                 lease_target_session_count: session.lease_target_session_count,
                 lease_target_batch_size: session.lease_target_batch_size,
                 pooled_batch_group_key: session.pooled_batch_group_key,
@@ -6375,6 +6457,7 @@ fn load_job_status(db: &crate::db::Database, job_id: &str) -> ApiResult<Persiste
                     latest_active_decode_sessions: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
                     latest_batch_kv_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
                     latest_deferred_decode_sessions: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                    lease_session_ids: Vec::new(),
                     lease_target_session_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
                     lease_target_batch_size: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
                     pooled_batch_group_key: None,
@@ -10699,6 +10782,12 @@ mod tests {
 
         let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
         assert_eq!(scheduler.decode_queue.len(), 2);
+        let mut expected_session_ids = scheduler
+            .decode_queue
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>();
+        expected_session_ids.sort();
         let first_batch_group_key = scheduler.decode_queue[0].batch_group_key.clone();
         assert!(first_batch_group_key.is_some());
         assert_eq!(
@@ -10764,6 +10853,13 @@ mod tests {
                     .and_then(|session| session.pooled_active_sessions),
                 Some(0)
             );
+            assert_eq!(
+                status
+                    .session
+                    .as_ref()
+                    .map(|session| session.lease_session_ids.clone()),
+                Some(Vec::new())
+            );
         }
 
         let decode_claim = claim_inference_assignment(
@@ -10783,6 +10879,9 @@ mod tests {
         .expect("expected decode assignment");
         assert_eq!(decode_claim.session.lease_target_session_count, Some(2));
         assert_eq!(decode_claim.session.lease_target_batch_size, Some(2));
+        let mut claimed_session_ids = decode_claim.session.lease_session_ids.clone();
+        claimed_session_ids.sort();
+        assert_eq!(claimed_session_ids, expected_session_ids);
 
         let scheduler = state.db.load_network_scheduler_status(network_id).unwrap();
         assert_eq!(scheduler.decode_queue.len(), 2);

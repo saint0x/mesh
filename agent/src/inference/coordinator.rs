@@ -877,7 +877,11 @@ impl InferenceCoordinator {
         &mut self,
         primary_session_id: Uuid,
         targets: DecodeBatchTargets,
-    ) -> DecodeBatchPlan {
+    ) -> Result<DecodeBatchPlan> {
+        if !targets.session_ids.is_empty() {
+            return self.build_explicit_decode_batch(primary_session_id, targets);
+        }
+
         let policy = self.decode_batch_policy_for_targets(targets);
         let mut total_kv_tokens = 0_usize;
         let mut slots = Vec::new();
@@ -1118,7 +1122,7 @@ impl InferenceCoordinator {
             }
         };
 
-        DecodeBatchPlan {
+        Ok(DecodeBatchPlan {
             slots,
             deferred,
             total_kv_tokens,
@@ -1126,7 +1130,222 @@ impl InferenceCoordinator {
             deferred_for_kv_budget,
             deferred_for_guardrail,
             fast_path,
+        })
+    }
+
+    fn build_explicit_decode_batch(
+        &mut self,
+        primary_session_id: Uuid,
+        targets: DecodeBatchTargets,
+    ) -> Result<DecodeBatchPlan> {
+        if !targets.session_ids.contains(&primary_session_id) {
+            return Err(AgentError::Execution(format!(
+                "decode lease cohort does not include primary session {}",
+                primary_session_id
+            )));
         }
+
+        let policy = self.decode_batch_policy_for_targets(targets.clone());
+        let mut total_kv_tokens = 0_usize;
+        let mut slots = Vec::with_capacity(targets.session_ids.len());
+        let mut batch_min_kv_tokens = None::<usize>;
+        let mut batch_max_kv_tokens = None::<usize>;
+        let mut primary_batch_class = None::<(
+            InferenceRuntimeMode,
+            crate::provider::ExecutionProviderKind,
+            super::engine::BackendOptimizationProfile,
+            super::engine::LocalExecutorContract,
+        )>;
+        let mut primary_decode_token_ceiling = None::<usize>;
+
+        for session_id in &targets.session_ids {
+            let task = self
+                .decode_queue_index
+                .get(session_id)
+                .copied()
+                .ok_or_else(|| {
+                    AgentError::Execution(format!(
+                        "decode lease cohort session {} is not queued locally",
+                        session_id
+                    ))
+                })?;
+            let session = self.sessions.get(session_id).ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "decode lease cohort session {} is not loaded locally",
+                    session_id
+                ))
+            })?;
+
+            if session.job.is_complete() || !session.queued_for_decode {
+                return Err(AgentError::Execution(format!(
+                    "decode lease cohort session {} is not decode-ready locally",
+                    session_id
+                )));
+            }
+
+            if let Some((runtime_mode, provider, optimization_profile, executor_contract)) =
+                primary_batch_class.as_ref()
+            {
+                let same_class = match runtime_mode {
+                    InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst => {
+                        session.backend.provider_kind() == *provider
+                            && session.backend.optimization_profile() == *optimization_profile
+                            && session.backend.executor_contract() == executor_contract
+                    }
+                    InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
+                };
+                if !same_class {
+                    return Err(AgentError::Execution(format!(
+                        "decode lease cohort mixes incompatible backend classes for session {}",
+                        session_id
+                    )));
+                }
+            } else {
+                primary_batch_class = Some((
+                    session.job.request.runtime_mode,
+                    session.backend.provider_kind(),
+                    session.backend.optimization_profile(),
+                    session.backend.executor_contract().clone(),
+                ));
+                if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend()
+                {
+                    primary_decode_token_ceiling =
+                        FastPathPlanner::decode_token_ceiling_for_context(
+                            &session.backend.fast_path_context(),
+                        );
+                }
+            }
+
+            let kv_tokens = Self::session_decode_kv_tokens(session);
+            if let Some((runtime_mode, _, _, _)) = primary_batch_class.as_ref() {
+                if Self::requires_fast_path_bucket_cohesion(*runtime_mode) {
+                    if let Some(expected_token_ceiling) = primary_decode_token_ceiling {
+                        let observed_token_ceiling =
+                            FastPathPlanner::decode_token_ceiling_for_context(
+                                &session.backend.fast_path_context(),
+                            );
+                        if observed_token_ceiling != Some(expected_token_ceiling) {
+                            return Err(AgentError::Execution(format!(
+                                "decode lease cohort spans incompatible fast-path buckets for session {}",
+                                session_id
+                            )));
+                        }
+                    }
+                }
+
+                let prospective_min = batch_min_kv_tokens
+                    .map(|current| current.min(kv_tokens))
+                    .unwrap_or(kv_tokens);
+                let prospective_max = batch_max_kv_tokens
+                    .map(|current| current.max(kv_tokens))
+                    .unwrap_or(kv_tokens);
+                if !Self::allows_batch_sequence_skew(
+                    *runtime_mode,
+                    prospective_min,
+                    prospective_max,
+                ) {
+                    return Err(AgentError::Execution(format!(
+                        "decode lease cohort exceeds runtime skew guardrail for session {}",
+                        session_id
+                    )));
+                }
+            }
+
+            if slots.len() >= policy.max_batch_size {
+                return Err(AgentError::Execution(format!(
+                    "decode lease cohort exceeds runtime batch capacity: {} > {}",
+                    targets.session_ids.len(),
+                    policy.max_batch_size
+                )));
+            }
+            if !slots.is_empty()
+                && total_kv_tokens.saturating_add(kv_tokens) > policy.max_total_kv_tokens
+            {
+                return Err(AgentError::Execution(format!(
+                    "decode lease cohort exceeds runtime KV budget: {} > {}",
+                    total_kv_tokens.saturating_add(kv_tokens),
+                    policy.max_total_kv_tokens
+                )));
+            }
+
+            slots.push(DecodeBatchSlot {
+                session_id: *session_id,
+                fairness_epoch: task.fairness_epoch,
+                kv_tokens,
+            });
+            batch_min_kv_tokens = Some(
+                batch_min_kv_tokens
+                    .map(|current| current.min(kv_tokens))
+                    .unwrap_or(kv_tokens),
+            );
+            batch_max_kv_tokens = Some(
+                batch_max_kv_tokens
+                    .map(|current| current.max(kv_tokens))
+                    .unwrap_or(kv_tokens),
+            );
+            total_kv_tokens = total_kv_tokens.saturating_add(kv_tokens);
+        }
+
+        for slot in &slots {
+            self.remove_decode_task(slot.session_id);
+        }
+        for slot in &slots {
+            if let Some(session) = self.sessions.get_mut(&slot.session_id) {
+                session.queued_for_decode = false;
+            }
+        }
+
+        let fast_path = if slots.is_empty() {
+            None
+        } else {
+            let sessions = slots
+                .iter()
+                .filter_map(|slot| self.sessions.get(&slot.session_id))
+                .collect::<Vec<_>>();
+            if sessions
+                .iter()
+                .any(|session| !session.job.request.fast_path_permitted)
+            {
+                None
+            } else if sessions
+                .iter()
+                .any(|session| !session.backend.is_fast_path_backend())
+            {
+                None
+            } else {
+                let contexts = sessions
+                    .iter()
+                    .map(|session| session.backend.fast_path_context())
+                    .collect::<Vec<_>>();
+                let max_sequence_len = contexts
+                    .iter()
+                    .map(|context| context.logical_kv_tokens)
+                    .max()
+                    .unwrap_or(total_kv_tokens);
+
+                contexts.first().and_then(|context| {
+                    let plan = FastPathPlanner::plan_decode(
+                        context,
+                        slots.len(),
+                        total_kv_tokens,
+                        max_sequence_len,
+                    )
+                    .ok()?;
+                    FastPathPlanner::validate_decode_contexts(&plan, &contexts).ok()?;
+                    Some(plan)
+                })
+            }
+        };
+
+        Ok(DecodeBatchPlan {
+            slots,
+            deferred: Vec::new(),
+            total_kv_tokens,
+            deferred_for_capacity: 0,
+            deferred_for_kv_budget: 0,
+            deferred_for_guardrail: 0,
+            fast_path,
+        })
     }
 
     fn allows_batch_sequence_skew(
@@ -1169,13 +1388,20 @@ impl InferenceCoordinator {
 
     fn decode_batch_policy_for_targets(&self, targets: DecodeBatchTargets) -> DecodeBatchPolicy {
         let base = self.decode_batch_policy();
-        let mut max_batch_size = base.max_batch_size;
+        let mut max_batch_size = if targets.session_ids.is_empty() {
+            1
+        } else {
+            base.max_batch_size
+        };
 
         if let Some(target_batch_size) = targets.target_batch_size {
             max_batch_size = max_batch_size.min(target_batch_size.max(1) as usize);
         }
         if let Some(target_session_count) = targets.target_session_count {
             max_batch_size = max_batch_size.min(target_session_count.max(1) as usize);
+        }
+        if !targets.session_ids.is_empty() {
+            max_batch_size = max_batch_size.min(targets.session_ids.len());
         }
 
         DecodeBatchPolicy {
@@ -2095,8 +2321,10 @@ impl InferenceCoordinator {
             self.enforce_runtime_memory_budget(Some(request.session_id))
                 .await?;
 
-            let batch =
-                self.build_next_decode_batch(request.session_id, request.decode_batch_targets);
+            let batch = self.build_next_decode_batch(
+                request.session_id,
+                request.decode_batch_targets.clone(),
+            )?;
             if batch.is_empty() {
                 return Err(AgentError::Execution(
                     "decode runtime had no admitted work despite active queued sessions"
@@ -2798,7 +3026,15 @@ mod tests {
         coordinator.enqueue_decode_task(session_a).unwrap();
         coordinator.enqueue_decode_task(session_b).unwrap();
 
-        let batch = coordinator.build_next_decode_batch(session_b, DecodeBatchTargets::default());
+        let batch = coordinator
+            .build_next_decode_batch(
+                session_b,
+                DecodeBatchTargets {
+                    session_ids: vec![session_a, session_b],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap();
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.total_kv_tokens, 20);
         assert!(batch.deferred.is_empty());
@@ -2808,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_next_decode_batch_defers_sessions_when_kv_budget_is_exhausted() {
+    fn test_build_next_decode_batch_rejects_explicit_cohort_when_kv_budget_is_exhausted() {
         let mut coordinator = test_coordinator(InferenceConfig {
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 10,
@@ -2825,22 +3061,17 @@ mod tests {
         coordinator.enqueue_decode_task(session_b).unwrap();
         coordinator.enqueue_decode_task(session_c).unwrap();
 
-        let batch = coordinator.build_next_decode_batch(session_b, DecodeBatchTargets::default());
-        assert_eq!(batch.slots.len(), 2);
-        assert_eq!(batch.total_kv_tokens, 9);
-        assert_eq!(batch.deferred.len(), 1);
-        assert_eq!(batch.deferred_for_capacity, 0);
-        assert_eq!(batch.deferred_for_kv_budget, 1);
-        assert_eq!(batch.deferred[0].session_id, session_c);
-        assert_eq!(coordinator.decode_queue.len(), 1);
-        assert_eq!(
-            coordinator
-                .decode_queue
-                .iter()
-                .next()
-                .map(|task| task.session_id),
-            Some(session_c)
-        );
+        let error = coordinator
+            .build_next_decode_batch(
+                session_b,
+                DecodeBatchTargets {
+                    session_ids: vec![session_a, session_b, session_c],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds runtime KV budget"));
+        assert_eq!(coordinator.decode_queue.len(), 3);
     }
 
     #[test]
@@ -2868,7 +3099,9 @@ mod tests {
         coordinator.enqueue_decode_task(session_a).unwrap();
         coordinator.enqueue_decode_task(session_b).unwrap();
 
-        let batch = coordinator.build_next_decode_batch(session_b, DecodeBatchTargets::default());
+        let batch = coordinator
+            .build_next_decode_batch(session_b, DecodeBatchTargets::default())
+            .unwrap();
         assert_eq!(batch.slots.len(), 1);
         assert_eq!(batch.slots[0].session_id, session_b);
         assert_eq!(batch.deferred.len(), 1);
@@ -2894,21 +3127,32 @@ mod tests {
         coordinator.enqueue_decode_task(session_b).unwrap();
         coordinator.enqueue_decode_task(session_c).unwrap();
 
-        let batch = coordinator.build_next_decode_batch(
-            session_a,
-            DecodeBatchTargets {
-                target_session_count: Some(2),
-                target_batch_size: Some(2),
-            },
-        );
+        let batch = coordinator
+            .build_next_decode_batch(
+                session_a,
+                DecodeBatchTargets {
+                    target_session_count: Some(2),
+                    target_batch_size: Some(2),
+                    session_ids: vec![session_a, session_b],
+                },
+            )
+            .unwrap();
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.slots[0].session_id, session_a);
-        assert_eq!(batch.deferred.len(), 1);
-        assert_eq!(batch.deferred_for_capacity, 1);
+        assert!(batch.deferred.is_empty());
+        assert_eq!(coordinator.decode_queue.len(), 1);
+        assert_eq!(
+            coordinator
+                .decode_queue
+                .iter()
+                .next()
+                .map(|task| task.session_id),
+            Some(session_c)
+        );
     }
 
     #[test]
-    fn test_throughput_batch_guardrail_defers_extreme_kv_skew() {
+    fn test_throughput_batch_guardrail_rejects_explicit_extreme_kv_skew() {
         let mut coordinator = test_coordinator(InferenceConfig {
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 16_384,
@@ -2940,17 +3184,24 @@ mod tests {
         coordinator.enqueue_decode_task(short_session).unwrap();
         coordinator.enqueue_decode_task(long_session).unwrap();
 
-        let batch =
-            coordinator.build_next_decode_batch(short_session, DecodeBatchTargets::default());
-        assert_eq!(batch.slots.len(), 1);
-        assert_eq!(batch.slots[0].session_id, short_session);
-        assert_eq!(batch.deferred.len(), 1);
-        assert_eq!(batch.deferred[0].session_id, long_session);
-        assert_eq!(batch.deferred_for_guardrail, 1);
+        let error = coordinator
+            .build_next_decode_batch(
+                short_session,
+                DecodeBatchTargets {
+                    session_ids: vec![short_session, long_session],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("exceeds runtime skew guardrail")
+                || message.contains("incompatible fast-path buckets")
+        );
     }
 
     #[test]
-    fn test_throughput_batch_guardrail_defers_cross_bucket_fast_path_sessions() {
+    fn test_throughput_batch_guardrail_rejects_cross_bucket_fast_path_sessions() {
         let mut coordinator = test_coordinator(InferenceConfig {
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 16_384,
@@ -2982,13 +3233,16 @@ mod tests {
         coordinator.enqueue_decode_task(lower_bucket).unwrap();
         coordinator.enqueue_decode_task(higher_bucket).unwrap();
 
-        let batch =
-            coordinator.build_next_decode_batch(lower_bucket, DecodeBatchTargets::default());
-        assert_eq!(batch.slots.len(), 1);
-        assert_eq!(batch.slots[0].session_id, lower_bucket);
-        assert_eq!(batch.deferred.len(), 1);
-        assert_eq!(batch.deferred[0].session_id, higher_bucket);
-        assert_eq!(batch.deferred_for_guardrail, 1);
+        let error = coordinator
+            .build_next_decode_batch(
+                lower_bucket,
+                DecodeBatchTargets {
+                    session_ids: vec![lower_bucket, higher_bucket],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("incompatible fast-path buckets"));
     }
 
     #[test]
@@ -3024,8 +3278,15 @@ mod tests {
         coordinator.enqueue_decode_task(short_session).unwrap();
         coordinator.enqueue_decode_task(long_session).unwrap();
 
-        let batch =
-            coordinator.build_next_decode_batch(short_session, DecodeBatchTargets::default());
+        let batch = coordinator
+            .build_next_decode_batch(
+                short_session,
+                DecodeBatchTargets {
+                    session_ids: vec![short_session, long_session],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap();
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.deferred_for_guardrail, 0);
     }
@@ -3055,13 +3316,16 @@ mod tests {
         coordinator.enqueue_decode_task(session_a).unwrap();
         coordinator.enqueue_decode_task(session_b).unwrap();
 
-        let batch = coordinator.build_next_decode_batch(
-            session_a,
-            DecodeBatchTargets {
-                target_session_count: Some(1),
-                target_batch_size: Some(1),
-            },
-        );
+        let batch = coordinator
+            .build_next_decode_batch(
+                session_a,
+                DecodeBatchTargets {
+                    target_session_count: Some(1),
+                    target_batch_size: Some(1),
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap();
         assert_eq!(batch.slots.len(), 1);
         assert_eq!(batch.slots[0].session_id, session_a);
         assert_eq!(batch.deferred.len(), 1);
@@ -3070,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_throughput_batch_guardrail_defers_mixed_provider_sessions() {
+    fn test_throughput_batch_guardrail_rejects_mixed_provider_sessions() {
         let mut coordinator = test_coordinator(InferenceConfig {
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 1024,
@@ -3102,13 +3366,16 @@ mod tests {
         coordinator.enqueue_decode_task(session_metal).unwrap();
         coordinator.enqueue_decode_task(session_cpu).unwrap();
 
-        let batch =
-            coordinator.build_next_decode_batch(session_metal, DecodeBatchTargets::default());
-        assert_eq!(batch.slots.len(), 1);
-        assert_eq!(batch.slots[0].session_id, session_metal);
-        assert_eq!(batch.deferred.len(), 1);
-        assert_eq!(batch.deferred[0].session_id, session_cpu);
-        assert_eq!(batch.deferred_for_guardrail, 1);
+        let error = coordinator
+            .build_next_decode_batch(
+                session_metal,
+                DecodeBatchTargets {
+                    session_ids: vec![session_metal, session_cpu],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("incompatible backend classes"));
     }
 
     #[test]
@@ -3144,11 +3411,42 @@ mod tests {
         coordinator.enqueue_decode_task(session_metal).unwrap();
         coordinator.enqueue_decode_task(session_cpu).unwrap();
 
-        let batch =
-            coordinator.build_next_decode_batch(session_metal, DecodeBatchTargets::default());
+        let batch = coordinator
+            .build_next_decode_batch(
+                session_metal,
+                DecodeBatchTargets {
+                    session_ids: vec![session_metal, session_cpu],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap();
         assert_eq!(batch.slots.len(), 2);
         assert_eq!(batch.deferred_for_guardrail, 0);
         assert!(batch.fast_path.is_none());
+    }
+
+    #[test]
+    fn test_build_next_decode_batch_defaults_to_single_session_without_explicit_cohort() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_a, 4, 11);
+        insert_decode_session(&mut coordinator, session_b, 4, 22);
+
+        coordinator.enqueue_decode_task(session_a).unwrap();
+        coordinator.enqueue_decode_task(session_b).unwrap();
+
+        let batch = coordinator
+            .build_next_decode_batch(session_a, DecodeBatchTargets::default())
+            .unwrap();
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, session_a);
+        assert_eq!(batch.deferred.len(), 1);
+        assert_eq!(batch.deferred[0].session_id, session_b);
     }
 
     #[test]

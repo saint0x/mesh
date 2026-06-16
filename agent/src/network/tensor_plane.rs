@@ -28,6 +28,7 @@ pub const DEFAULT_MAX_INBOUND_MESSAGES: usize = 64;
 pub const DEFAULT_MAX_INBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_OUTBOUND_STREAMS_PER_PEER: usize = 3;
+static NEXT_TENSOR_PLANE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -320,6 +321,7 @@ impl Default for ServingInboundState {
 
 #[derive(Debug)]
 struct TensorPlaneState {
+    instance_id: u64,
     profile: TensorPlaneProfile,
     local_addr: SocketAddr,
     advertised_addr: SocketAddr,
@@ -449,6 +451,14 @@ impl std::fmt::Debug for ServingSessionTransport {
 }
 
 impl ServingSessionTransport {
+    pub fn instance_id(&self) -> u64 {
+        self.state.instance_id
+    }
+
+    pub fn state_ptr(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
     pub fn inbound_id(&self) -> usize {
         Arc::as_ptr(&self.state.inbound) as usize
     }
@@ -797,6 +807,14 @@ async fn bind_serving_lane(
 }
 
 impl TensorPlane {
+    pub fn instance_id(&self) -> u64 {
+        self.state.instance_id
+    }
+
+    pub fn state_ptr(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
     pub async fn bind(config: TensorPlaneConfig) -> Result<Self> {
         let config = sanitized_config(config);
         let listener = TcpListener::bind(config.bind_addr)
@@ -843,7 +861,9 @@ impl TensorPlane {
         let peer_bulk_outbound_byte_capacity =
             per_peer_bulk_outbound_budget(bulk_outbound_inflight_byte_capacity);
         let inbound = Arc::new(ServingInboundState::default());
+        let instance_id = NEXT_TENSOR_PLANE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let state = Arc::new(TensorPlaneState {
+            instance_id,
             profile: config.profile,
             local_addr,
             advertised_addr,
@@ -939,6 +959,8 @@ impl TensorPlane {
                                                 | CollectiveLane::AllGather
                                         ) {
                                             info!(
+                                                tensor_plane_instance = state.instance_id,
+                                                tensor_plane_state = format_args!("{:p}", Arc::as_ptr(&state)),
                                                 inbound_id = format_args!("{:p}", Arc::as_ptr(&state.inbound)),
                                                 remote_addr = %remote_addr,
                                                 collective_id = %header.collective_id,
@@ -955,6 +977,8 @@ impl TensorPlane {
                                             );
                                         } else {
                                             debug!(
+                                                tensor_plane_instance = state.instance_id,
+                                                tensor_plane_state = format_args!("{:p}", Arc::as_ptr(&state)),
                                                 inbound_id = format_args!("{:p}", Arc::as_ptr(&state.inbound)),
                                                 remote_addr = %remote_addr,
                                                 collective_id = %header.collective_id,
@@ -1328,6 +1352,8 @@ impl TensorPlane {
             checkpoint_plan.desired_stream_count = 1;
         }
         info!(
+            tensor_plane_instance = self.state.instance_id,
+            tensor_plane_state = format_args!("{:p}", Arc::as_ptr(&self.state)),
             left_peer = %left_peer,
             right_peer = %right_peer,
             runtime_mode = ?runtime_mode,
@@ -1680,6 +1706,8 @@ async fn recv_slot(
                 CollectiveLane::ReduceScatter | CollectiveLane::AllGather
             ) {
                 info!(
+                    tensor_plane_instance = state.instance_id,
+                    tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
                     inbound_id = %inbound_id,
                     collective_id = %slot_key.collective_id,
                     collective_seq = slot_key.collective_seq,
@@ -1694,6 +1722,8 @@ async fn recv_slot(
                 );
             } else {
                 debug!(
+                    tensor_plane_instance = state.instance_id,
+                    tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
                     inbound_id = %inbound_id,
                     collective_id = %slot_key.collective_id,
                     collective_seq = slot_key.collective_seq,
@@ -1725,6 +1755,8 @@ async fn recv_slot(
             CollectiveLane::ReduceScatter | CollectiveLane::AllGather
         ) {
             info!(
+                tensor_plane_instance = state.instance_id,
+                tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
                 inbound_id = %inbound_id,
                 collective_id = %slot_key.collective_id,
                 collective_seq = slot_key.collective_seq,
@@ -1739,6 +1771,8 @@ async fn recv_slot(
             );
         } else {
             debug!(
+                tensor_plane_instance = state.instance_id,
+                tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
                 inbound_id = %inbound_id,
                 collective_id = %slot_key.collective_id,
                 collective_seq = slot_key.collective_seq,

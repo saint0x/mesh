@@ -335,6 +335,16 @@ fn classify_candidate(
                 .decode_queue_status
                 .as_deref()
                 .ok_or(SchedulerBlockedReason::QueueMissing)?;
+            let peer_owned_active_decode_cohort = candidate.decode_cohort_active_sessions > 0
+                && !matches!(
+                    candidate.group_status.as_str(),
+                    "decode_member" | "decode_leased" | "decode_active"
+                );
+            let peer_owned_prefill_group_inflight = candidate.model_prefill_inflight_groups > 0
+                && !matches!(
+                    candidate.group_status.as_str(),
+                    "decode_member" | "decode_leased" | "decode_active"
+                );
             match queue_status {
                 "blocked_on_transfer" => Err(SchedulerBlockedReason::WaitingForTransfer),
                 "active" => {
@@ -365,6 +375,9 @@ fn classify_candidate(
                 }
                 "completed" | "failed" => Err(SchedulerBlockedReason::NotEligible),
                 "leased" => {
+                    if peer_owned_prefill_group_inflight || peer_owned_active_decode_cohort {
+                        return Err(SchedulerBlockedReason::LeaseHeldByPeer);
+                    }
                     let lease_owner_device_id = candidate
                         .group_lease_owner_device_id
                         .as_deref()
@@ -400,6 +413,9 @@ fn classify_candidate(
                     }
                 }
                 "ready" => {
+                    if peer_owned_prefill_group_inflight || peer_owned_active_decode_cohort {
+                        return Err(SchedulerBlockedReason::LeaseHeldByPeer);
+                    }
                     let held_by_peer = candidate
                         .group_lease_owner_device_id
                         .as_deref()
@@ -2058,6 +2074,32 @@ mod tests {
 
         let same_owner = classify_candidate(&candidate, "worker-peer", "2026-01-01T00:05:00Z");
         assert_eq!(same_owner, Ok("2026-01-01T00:00:01Z".into()));
+    }
+
+    #[test]
+    fn fresh_decode_ready_is_blocked_while_peer_prefill_group_is_inflight() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.model_prefill_inflight_groups = 1;
+
+        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
+        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+    }
+
+    #[test]
+    fn fresh_decode_ready_is_blocked_while_peer_decode_cohort_is_active() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_cohort_active_sessions = 1;
+
+        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
+        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
     }
 
     #[test]

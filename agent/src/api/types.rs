@@ -361,6 +361,8 @@ pub struct DecodeLeaseStatus {
     #[serde(default)]
     pub pooled_active_sessions: Option<u32>,
     #[serde(default)]
+    pub lease_session_ids: Vec<String>,
+    #[serde(default)]
     pub last_renewed_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -549,6 +551,8 @@ pub struct InferenceSessionLease {
     pub pooled_blocked_sessions: Option<u32>,
     pub pooled_leased_sessions: Option<u32>,
     pub pooled_active_sessions: Option<u32>,
+    #[serde(default)]
+    pub lease_session_ids: Vec<String>,
     pub kv_checkpoint_device_id: Option<String>,
     pub kv_checkpoint_created_at: Option<String>,
     pub updated_at: String,
@@ -736,6 +740,8 @@ pub struct InferenceSessionStatus {
     pub latest_active_decode_sessions: Option<u32>,
     pub latest_batch_kv_tokens: Option<u32>,
     pub latest_deferred_decode_sessions: Option<u32>,
+    #[serde(default)]
+    pub lease_session_ids: Vec<String>,
     pub kv_checkpoint_device_id: Option<String>,
     pub kv_checkpoint_created_at: Option<String>,
     pub updated_at: String,

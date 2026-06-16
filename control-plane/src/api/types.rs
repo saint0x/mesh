@@ -729,6 +729,8 @@ pub struct DecodeLeaseStatus {
     pub pooled_leased_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pooled_active_sessions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_session_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_renewed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -862,6 +864,8 @@ pub struct InferenceSessionStatus {
     pub latest_batch_kv_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_deferred_decode_sessions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_session_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_session_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -911,6 +915,8 @@ pub struct InferenceSessionLease {
     pub latest_batch_kv_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_deferred_decode_sessions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_session_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_session_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
