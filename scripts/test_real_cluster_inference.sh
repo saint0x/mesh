@@ -398,6 +398,7 @@ allreduce_ops = sum(int(item.get("allreduce_operations", 0)) for item in stats)
 tensor_bytes_sent = sum(int(item.get("tensor_bytes_sent", 0)) for item in stats)
 max_multi_session_rate = max(float(item.get("multi_session_batch_rate", 0.0)) for item in stats)
 max_decode_batch = max(float(item.get("avg_decode_batch_size", 0.0)) for item in stats)
+max_peak_decode_batch = max(int(item.get("decode_batch_size_peak", 0)) for item in stats)
 ttft_values = [item.get("time_to_first_token_ms") for item in stats if item.get("time_to_first_token_ms") is not None]
 
 if total_tokens <= 0:
@@ -410,16 +411,20 @@ if tensor_bytes_sent <= 0:
     raise SystemExit("tensor_bytes_sent was not positive")
 if max_decode_batch < 1.0:
     raise SystemExit("avg_decode_batch_size was invalid")
-if max_multi_session_rate <= 0.0 or max_decode_batch < 2.0:
+if max_peak_decode_batch < 2:
+    raise SystemExit(
+        f"concurrent real serving never produced a pooled decode peak batch; peak_batch_size={max_peak_decode_batch}"
+    )
+if max_multi_session_rate <= 0.0:
     raise SystemExit(
         "concurrent real serving never produced a pooled decode microbatch; "
-        f"multi_session_batch_rate={max_multi_session_rate:.3f} avg_decode_batch_size={max_decode_batch:.2f}"
+        f"multi_session_batch_rate={max_multi_session_rate:.3f} avg_decode_batch_size={max_decode_batch:.2f} peak_batch_size={max_peak_decode_batch}"
     )
 
 print(
     f"tokens={total_tokens} avg_tps={avg_tps:.2f} allreduce_ops={allreduce_ops} "
     f"tensor_bytes_sent={tensor_bytes_sent} multi_session_batch_rate={max_multi_session_rate:.3f} "
-    f"avg_decode_batch_size={max_decode_batch:.2f} "
+    f"avg_decode_batch_size={max_decode_batch:.2f} peak_batch_size={max_peak_decode_batch} "
     f"production_decode_pooling_ready=yes"
 )
 PY

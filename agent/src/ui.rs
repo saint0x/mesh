@@ -2664,12 +2664,14 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         },
         detail: match &decode_pooling {
             Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => format!(
-                "Observed pooled decode serving locally with avg batch size {:.2} and multi-session rate {:.1}%.",
+                "Observed pooled decode serving locally with peak batch size {}, avg batch size {:.2}, and multi-session rate {:.1}%.",
+                readiness.peak_decode_batch_size,
                 readiness.avg_decode_batch_size,
                 readiness.multi_session_batch_rate * 100.0
             ),
             Ok(Some(readiness)) if readiness.decode_microbatches_executed > 0 => format!(
-                "Observed only serialized decode locally: avg batch size {:.2}, multi-session rate {:.1}%, microbatches {}.",
+                "Observed only insufficient local decode pooling: peak batch size {}, avg batch size {:.2}, multi-session rate {:.1}%, microbatches {}.",
+                readiness.peak_decode_batch_size,
                 readiness.avg_decode_batch_size,
                 readiness.multi_session_batch_rate * 100.0,
                 readiness.decode_microbatches_executed

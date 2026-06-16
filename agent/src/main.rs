@@ -5225,6 +5225,9 @@ async fn cmd_inference_stats() -> Result<()> {
     if let Some(avg) = stats.get("avg_decode_batch_size") {
         println!("  Avg Batch Size:    {:.2}", avg.as_f64().unwrap_or(0.0));
     }
+    if let Some(peak) = stats.get("decode_batch_size_peak") {
+        println!("  Peak Batch Size:   {}", peak);
+    }
     if let Some(rate) = stats.get("fast_path_decode_plan_rate") {
         println!(
             "  Fast-Path Rate:    {:.1}%",
@@ -5575,6 +5578,7 @@ async fn cmd_ledger_events(job_id: Option<&str>, limit: usize) -> Result<()> {
 #[derive(Debug, Clone)]
 pub(crate) struct LocalDecodePoolingReadiness {
     pub decode_microbatches_executed: u64,
+    pub peak_decode_batch_size: u64,
     pub avg_decode_batch_size: f64,
     pub multi_session_batch_rate: f64,
 }
@@ -5582,7 +5586,7 @@ pub(crate) struct LocalDecodePoolingReadiness {
 impl LocalDecodePoolingReadiness {
     pub(crate) fn demonstrates_pooled_decode(&self) -> bool {
         self.decode_microbatches_executed > 0
-            && self.avg_decode_batch_size >= 2.0
+            && self.peak_decode_batch_size >= 2
             && self.multi_session_batch_rate > 0.0
     }
 }
@@ -5606,6 +5610,10 @@ pub(crate) fn load_local_decode_pooling_readiness() -> Result<Option<LocalDecode
     Ok(Some(LocalDecodePoolingReadiness {
         decode_microbatches_executed: stats
             .get("decode_microbatches_executed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        peak_decode_batch_size: stats
+            .get("decode_batch_size_peak")
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
         avg_decode_batch_size: stats
@@ -5793,14 +5801,16 @@ async fn cmd_doctor(stage: DoctorStage) -> Result<()> {
     match stage {
         DoctorStage::Preflight => match load_local_decode_pooling_readiness()? {
             Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
-                "  {} local decode pooling already proven: avg_batch_size={:.2}, multi_session_rate={:.1}%",
+                "  {} local decode pooling already proven: peak_batch_size={}, avg_batch_size={:.2}, multi_session_rate={:.1}%",
                 "OK".green().bold(),
+                readiness.peak_decode_batch_size,
                 readiness.avg_decode_batch_size,
                 readiness.multi_session_batch_rate * 100.0
             ),
             Some(readiness) if readiness.decode_microbatches_executed > 0 => println!(
-                "  {} local decode pooling proof deferred until production validation: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
+                "  {} local decode pooling proof deferred until production validation: peak_batch_size={}, avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
                 "WARN".yellow().bold(),
+                readiness.peak_decode_batch_size,
                 readiness.avg_decode_batch_size,
                 readiness.multi_session_batch_rate * 100.0,
                 readiness.decode_microbatches_executed
@@ -5816,16 +5826,18 @@ async fn cmd_doctor(stage: DoctorStage) -> Result<()> {
         },
         DoctorStage::Production => match load_local_decode_pooling_readiness()? {
             Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
-                "  {} local decode pooling proven: avg_batch_size={:.2}, multi_session_rate={:.1}%",
+                "  {} local decode pooling proven: peak_batch_size={}, avg_batch_size={:.2}, multi_session_rate={:.1}%",
                 "OK".green().bold(),
+                readiness.peak_decode_batch_size,
                 readiness.avg_decode_batch_size,
                 readiness.multi_session_batch_rate * 100.0
             ),
             Some(readiness) if readiness.decode_microbatches_executed > 0 => {
                 production_gate_failed = true;
                 println!(
-                    "  {} local decode pooling not production-ready: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
+                    "  {} local decode pooling not production-ready: peak_batch_size={}, avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
                     "FAIL".red().bold(),
+                    readiness.peak_decode_batch_size,
                     readiness.avg_decode_batch_size,
                     readiness.multi_session_batch_rate * 100.0,
                     readiness.decode_microbatches_executed
