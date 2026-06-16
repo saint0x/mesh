@@ -149,6 +149,17 @@ require_assigned_shard_readiness() {
     fi
 }
 
+require_local_real_artifact_materialization() {
+    local home_dir="$1"
+    local output
+    output="$(run_agent_cli "$home_dir" doctor 2>&1 || true)"
+    if ! grep -q "local real artifact materialization ready" <<<"$output"; then
+        echo "device at $home_dir cannot materialize a local real artifact on the selected provider" >&2
+        echo "$output" >&2
+        return 1
+    fi
+}
+
 device_id_from_home() {
     local home_dir="$1"
     awk -F'"' '/^device_id = / { print $2; exit }' "$home_dir/.meshnet/device.toml"
@@ -283,6 +294,8 @@ fi
 
 require_assigned_shard_readiness "$WORKER1_HOME"
 require_assigned_shard_readiness "$WORKER2_HOME"
+require_local_real_artifact_materialization "$WORKER1_HOME"
+require_local_real_artifact_materialization "$WORKER2_HOME"
 
 curl -fsS "http://127.0.0.1:${CONTROL_PORT}/api/ring/topology?network_id=${NETWORK_ID}" \
     >"$TOPOLOGY_LOG"

@@ -1,4 +1,7 @@
 use crate::errors::{AgentError, Result};
+use crate::inference::forward_pass::SharedModelResidency;
+use crate::inference::{ArtifactShardLoader, ShardLoader};
+use crate::model::{ShardAssignment, ShardRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +16,31 @@ pub struct ModelManifest {
     pub total_model_bytes: u64,
     #[serde(default = "default_tokenizer_file")]
     pub tokenizer_file: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductionArtifactProbeTarget {
+    pub model_id: String,
+    pub assignment: ShardAssignment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionArtifactProbeResult {
+    pub model_id: String,
+    pub worker_position: u32,
+    pub total_workers: u32,
+    pub column_start: u32,
+    pub column_end: u32,
+    pub resident_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShardArtifactManifest {
+    model_id: String,
+    worker_position: u32,
+    total_workers: u32,
+    column_start: u32,
+    column_end: u32,
 }
 
 fn default_tokenizer_file() -> String {
@@ -39,6 +67,160 @@ pub fn model_store_dir() -> PathBuf {
 
 pub fn model_dir(model_id: &str) -> PathBuf {
     model_store_dir().join(model_id)
+}
+
+fn first_shard_manifest_path(model_id: &str) -> Result<Option<PathBuf>> {
+    let dir = model_dir(model_id);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut manifests = fs::read_dir(&dir)
+        .map_err(|e| {
+            AgentError::Config(format!(
+                "Failed to read model artifact directory {}: {}",
+                dir.display(),
+                e
+            ))
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("shard-") && name.ends_with(".manifest.json"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    manifests.sort();
+    Ok(manifests.into_iter().next())
+}
+
+fn load_shard_probe_target(
+    model_id: &str,
+    manifest_path: &Path,
+) -> Result<ProductionArtifactProbeTarget> {
+    let bytes = fs::read(manifest_path).map_err(|e| {
+        AgentError::Config(format!(
+            "Failed to read shard manifest {}: {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
+    let manifest: ShardArtifactManifest = serde_json::from_slice(&bytes).map_err(|e| {
+        AgentError::Config(format!(
+            "Failed to parse shard manifest {}: {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
+    if manifest.model_id != model_id {
+        return Err(AgentError::Config(format!(
+            "Shard manifest {} declares model_id {}, expected {}",
+            manifest_path.display(),
+            manifest.model_id,
+            model_id
+        )));
+    }
+
+    Ok(ProductionArtifactProbeTarget {
+        model_id: model_id.to_string(),
+        assignment: ShardAssignment::from_column_range(
+            model_id.to_string(),
+            manifest.worker_position,
+            manifest.total_workers,
+            manifest.column_start,
+            manifest.column_end,
+        ),
+    })
+}
+
+pub fn discover_local_production_artifact_probe_target(
+    preferred_model_id: Option<&str>,
+) -> Result<Option<ProductionArtifactProbeTarget>> {
+    if let Some(model_id) = preferred_model_id {
+        return first_shard_manifest_path(model_id)?
+            .map(|path| load_shard_probe_target(model_id, &path))
+            .transpose();
+    }
+
+    let store = model_store_dir();
+    if !store.is_dir() {
+        return Ok(None);
+    }
+
+    let mut model_ids = fs::read_dir(&store)
+        .map_err(|e| {
+            AgentError::Config(format!(
+                "Failed to read model store {}: {}",
+                store.display(),
+                e
+            ))
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    model_ids.sort();
+
+    for model_id in model_ids {
+        if let Some(path) = first_shard_manifest_path(&model_id)? {
+            return load_shard_probe_target(&model_id, &path).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+pub async fn probe_local_production_artifact_materialization(
+    preferred_model_id: Option<&str>,
+) -> Result<Option<ProductionArtifactProbeResult>> {
+    let Some(target) = discover_local_production_artifact_probe_target(preferred_model_id)? else {
+        return Ok(None);
+    };
+
+    let probe_root = std::env::temp_dir().join(format!(
+        "meshnet-local-artifact-probe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&probe_root).map_err(|e| {
+        AgentError::Config(format!(
+            "Failed to create artifact probe temp directory {}: {}",
+            probe_root.display(),
+            e
+        ))
+    })?;
+    let registry = ShardRegistry::new(probe_root.join("registry"))?;
+    registry.assign_shard(target.assignment.clone()).await?;
+
+    let loader = ArtifactShardLoader::new(model_store_dir());
+    let weights = loader
+        .load_shard(&target.model_id, &target.assignment, &registry)
+        .await?;
+    let residency = SharedModelResidency::from_host(weights)?;
+    let resident_bytes = residency.resident_bytes();
+    if resident_bytes == 0 {
+        return Err(AgentError::Config(format!(
+            "Real artifact probe for model {} materialized zero resident bytes",
+            target.model_id
+        )));
+    }
+    let _ = fs::remove_dir_all(&probe_root);
+
+    Ok(Some(ProductionArtifactProbeResult {
+        model_id: target.model_id,
+        worker_position: target.assignment.worker_position,
+        total_workers: target.assignment.total_workers,
+        column_start: target.assignment.column_start,
+        column_end: target.assignment.column_end,
+        resident_bytes,
+    }))
 }
 
 fn validate_manifest(

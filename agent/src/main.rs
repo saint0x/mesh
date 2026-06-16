@@ -4822,6 +4822,29 @@ async fn cmd_doctor() -> Result<()> {
             }
         }
     }
+
+    match agent::model_assets::probe_local_production_artifact_materialization(None).await {
+        Ok(Some(probe)) => println!(
+            "  {} local real artifact materialization ready for {} shard {}/{} {}..{} ({} bytes resident)",
+            "OK".green().bold(),
+            probe.model_id,
+            probe.worker_position,
+            probe.total_workers,
+            probe.column_start,
+            probe.column_end,
+            probe.resident_bytes
+        ),
+        Ok(None) => println!(
+            "  {} local real artifact materialization unavailable: no local shard manifest set found under {}",
+            "WARN".yellow().bold(),
+            agent::model_assets::model_store_dir().display()
+        ),
+        Err(error) => println!(
+            "  {} local real artifact materialization failed: {}",
+            "FAIL".red().bold(),
+            error
+        ),
+    }
     println!();
     Ok(())
 }

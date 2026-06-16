@@ -2584,10 +2584,17 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
             }
         }
     }
+    let artifact_probe = if incomplete_models.is_empty() {
+        Some(agent::model_assets::probe_local_production_artifact_materialization(None).await)
+    } else {
+        None
+    };
     checks.push(UiDoctorCheck {
         id: "model_artifacts".into(),
         label: "Model artifacts".into(),
         status: if !incomplete_models.is_empty() {
+            "fail".into()
+        } else if matches!(artifact_probe, Some(Err(_))) {
             "fail".into()
         } else if discovered_models == 0 {
             "warn".into()
@@ -2599,8 +2606,20 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
                 "Incomplete production model artifact sets: {}",
                 incomplete_models.join(", ")
             )
+        } else if let Some(Err(error)) = artifact_probe.as_ref() {
+            format!("Real artifact materialization probe failed: {error}")
         } else if discovered_models == 0 {
             format!("No model artifacts found under {}", models_dir.display())
+        } else if let Some(Ok(Some(probe))) = artifact_probe.as_ref() {
+            format!(
+                "Materialized {} shard {}/{} {}..{} with {} resident bytes",
+                probe.model_id,
+                probe.worker_position,
+                probe.total_workers,
+                probe.column_start,
+                probe.column_end,
+                probe.resident_bytes
+            )
         } else {
             format!(
                 "Validated {} model artifact set(s) under {}",
@@ -2611,6 +2630,11 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         hint: if !incomplete_models.is_empty() {
             Some(
                 "Install complete manifests, tokenizers, and safetensors shards before serving."
+                    .into(),
+            )
+        } else if matches!(artifact_probe, Some(Err(_))) {
+            Some(
+                "Use a production fast-path provider and verify a local shard set can materialize on the selected device."
                     .into(),
             )
         } else if discovered_models == 0 {
