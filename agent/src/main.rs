@@ -1319,6 +1319,214 @@ async fn retry_control_plane_write(
     }
 }
 
+fn build_runtime_inference_request(
+    assignment: &InferenceExecutionLease,
+    decode_lease: Option<&DecodeLeaseStatus>,
+    device_id: Uuid,
+    job_id: Uuid,
+) -> Result<agent::inference::InferenceRequest> {
+    let decode_batch_session_ids = decode_lease
+        .map(|lease| lease.lease_session_ids.as_slice())
+        .unwrap_or(assignment.session.lease_session_ids.as_slice())
+        .iter()
+        .map(|session_id| {
+            Uuid::parse_str(session_id).map_err(|error| {
+                anyhow::anyhow!("invalid decode lease session_id {}: {}", session_id, error)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(agent::inference::InferenceRequest {
+        job_id,
+        network_id: assignment.network_id.clone(),
+        model_id: assignment.model_id.clone(),
+        prompt_tokens: assignment.active_segment.prompt_tokens.clone(),
+        config: agent::inference::GenerationConfig {
+            max_tokens: assignment
+                .available_completion_tokens
+                .min(assignment.active_segment.max_tokens),
+            temperature: assignment.active_segment.temperature,
+            top_p: assignment.active_segment.top_p,
+            ..Default::default()
+        },
+        session_id: Uuid::parse_str(&assignment.active_segment.session_id).unwrap_or(job_id),
+        phase: match assignment.active_segment.phase {
+            ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
+            ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
+        },
+        decode_batch_targets: agent::inference::DecodeBatchTargets {
+            target_session_count: decode_lease
+                .and_then(|lease| lease.lease_target_session_count)
+                .or(assignment.session.lease_target_session_count),
+            target_batch_size: decode_lease
+                .and_then(|lease| lease.lease_target_batch_size)
+                .or(assignment.session.lease_target_batch_size),
+            session_ids: decode_batch_session_ids,
+        },
+        runtime_mode: match assignment.execution_plan.runtime_mode {
+            agent::api::types::InferenceRuntimeMode::FitFirst => {
+                agent::inference::InferenceRuntimeMode::FitFirst
+            }
+            agent::api::types::InferenceRuntimeMode::ThroughputFirst => {
+                agent::inference::InferenceRuntimeMode::ThroughputFirst
+            }
+            agent::api::types::InferenceRuntimeMode::LatencyFirst => {
+                agent::inference::InferenceRuntimeMode::LatencyFirst
+            }
+            agent::api::types::InferenceRuntimeMode::ResilientEdge => {
+                agent::inference::InferenceRuntimeMode::ResilientEdge
+            }
+        },
+        fast_path_permitted: active_group(assignment)
+            .map(|group| group.fast_path_eligible)
+            .unwrap_or(false),
+        executor_id: device_id.to_string(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    })
+}
+
+async fn execute_assignment_segment_with_reporting(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    request: agent::inference::InferenceRequest,
+    job_id: Uuid,
+    device_id: Uuid,
+    active_segment_id: &str,
+) -> agent::errors::Result<agent::inference::SegmentExecutionResult> {
+    let lease_renew_handle = if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
+    {
+        let registration_client = registration_client.clone();
+        let lease_id = assignment.lease_id.clone();
+        let device_id = device_id.to_string();
+        let network_id = assignment.network_id.clone();
+        let session_id = assignment.active_segment.session_id.clone();
+        let segment_id = active_segment_id.to_string();
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(20));
+            loop {
+                tick.tick().await;
+                match registration_client
+                    .renew_decode_lease(
+                        &lease_id,
+                        RenewDecodeLeaseRequest {
+                            device_id: device_id.clone(),
+                            network_id: network_id.clone(),
+                            session_id: session_id.clone(),
+                            segment_id: segment_id.clone(),
+                            include_decode_lease: false,
+                            include_queue_state: false,
+                            include_serving_session: false,
+                            scheduler_queue: None,
+                        },
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        debug!(
+                            lease_id = %lease_id,
+                            lease_expires_at = response
+                                .decode_lease
+                                .as_ref()
+                                .and_then(|lease| lease.lease_expires_at.as_deref()),
+                            queue_status = response
+                                .queue_state
+                                .as_ref()
+                                .and_then(|state| state.status.as_deref()),
+                            "Renewed decode lease"
+                        );
+                    }
+                    Ok(None) => {
+                        debug!(lease_id = %lease_id, "Decode lease renew endpoint unavailable");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(lease_id = %lease_id, error = %e, "Decode lease renew failed");
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let decode_progress_reporter =
+        if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+            Some(DecodeProgressReporter::spawn(
+                registration_client.clone(),
+                job_id,
+                device_id,
+                active_segment_id.to_string(),
+            ))
+        } else {
+            None
+        };
+
+    let execution_result = coordinator
+        .process_segment_with_progress(request, |progress| {
+            let registration_client = registration_client.clone();
+            let device_id = device_id;
+            let segment_id = active_segment_id.to_string();
+            let decode_progress_reporter = decode_progress_reporter.as_ref();
+            async move {
+                if progress.phase == agent::inference::ExecutionPhase::Decode {
+                    if let Some(reporter) = decode_progress_reporter {
+                        reporter
+                            .update(progress)
+                            .map_err(|e| agent::errors::AgentError::Execution(e.to_string()))?;
+                        return Ok(());
+                    }
+                }
+
+                registration_client
+                    .report_inference_progress(
+                        job_id,
+                        ReportInferenceAssignmentProgressRequest {
+                            device_id: device_id.to_string(),
+                            segment_id: segment_id.clone(),
+                            phase: api_phase(progress.phase),
+                            event: if progress.phase == agent::inference::ExecutionPhase::Prefill {
+                                ProgressEventKind::PrefillComplete
+                            } else {
+                                ProgressEventKind::DecodeProgress
+                            },
+                            completion_tokens: progress.completion_tokens,
+                            execution_time_ms: progress.execution_time_ms,
+                            time_to_first_token_ms: progress.time_to_first_token_ms,
+                            kv_cache_seq_len: progress.kv_cache_seq_len,
+                            batch_size: progress.batch_size,
+                            active_decode_sessions: progress.active_decode_sessions,
+                            batch_kv_tokens: progress.batch_kv_tokens,
+                            deferred_decode_sessions: progress.deferred_decode_sessions,
+                            scheduler_queue: None,
+                            serving_session: None,
+                        },
+                    )
+                    .await
+            }
+        })
+        .await;
+
+    if let Some(reporter) = decode_progress_reporter.as_ref() {
+        if let Err(e) = reporter.flush().await {
+            warn!(job_id = %job_id, error = %e, "Final buffered decode progress flush failed");
+        }
+    }
+    if let Some(handle) = lease_renew_handle {
+        handle.abort();
+    }
+    if let Some(reporter) = decode_progress_reporter {
+        if let Err(e) = reporter.shutdown().await {
+            warn!(job_id = %job_id, error = %e, "Decode progress reporter shutdown failed");
+        }
+    }
+
+    execution_result
+}
+
 async fn publish_pending_kv_transfer_payload(
     registration_client: &RegistrationClient,
     coordinator: &mut agent::inference::InferenceCoordinator,
@@ -2423,7 +2631,6 @@ async fn cmd_runtime() -> Result<()> {
     let inference_task = tokio::spawn(async move {
         use agent::checkpoint::{CheckpointConfig, CheckpointManager};
         use agent::inference::coordinator::{InferenceConfig, InferenceCoordinator};
-        use agent::inference::job::{GenerationConfig, InferenceRequest};
         use uuid::Uuid;
 
         let network_id = inference_config_task.network_id.clone();
@@ -2982,21 +3189,15 @@ async fn cmd_runtime() -> Result<()> {
                 continue;
             }
 
-            let decode_batch_session_ids = match decode_lease
-                .as_ref()
-                .map(|lease| lease.lease_session_ids.as_slice())
-                .unwrap_or(assignment.session.lease_session_ids.as_slice())
-                .iter()
-                .map(|session_id| {
-                    Uuid::parse_str(session_id).map_err(|error| {
-                        anyhow::anyhow!("invalid decode lease session_id {}: {}", session_id, error)
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(session_ids) => session_ids,
+            let request = match build_runtime_inference_request(
+                &assignment,
+                decode_lease.as_ref(),
+                device_id,
+                job_id,
+            ) {
+                Ok(request) => request,
                 Err(error) => {
-                    error!(job_id = %job_id, error = %error, "Failed to parse decode lease cohort");
+                    error!(job_id = %job_id, error = %error, "Failed to build runtime inference request");
                     release_decode_lease_if_needed(
                         &registration_client,
                         &assignment,
@@ -3006,60 +3207,6 @@ async fn cmd_runtime() -> Result<()> {
                     .await;
                     continue;
                 }
-            };
-
-            let request = InferenceRequest {
-                job_id,
-                network_id: assignment.network_id.clone(),
-                model_id: assignment.model_id.clone(),
-                prompt_tokens: assignment.active_segment.prompt_tokens.clone(),
-                config: GenerationConfig {
-                    max_tokens: assignment
-                        .available_completion_tokens
-                        .min(assignment.active_segment.max_tokens),
-                    temperature: assignment.active_segment.temperature,
-                    top_p: assignment.active_segment.top_p,
-                    ..Default::default()
-                },
-                session_id: Uuid::parse_str(&assignment.active_segment.session_id)
-                    .unwrap_or(job_id),
-                phase: match assignment.active_segment.phase {
-                    ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
-                    ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
-                },
-                decode_batch_targets: agent::inference::DecodeBatchTargets {
-                    target_session_count: decode_lease
-                        .as_ref()
-                        .and_then(|lease| lease.lease_target_session_count)
-                        .or(assignment.session.lease_target_session_count),
-                    target_batch_size: decode_lease
-                        .as_ref()
-                        .and_then(|lease| lease.lease_target_batch_size)
-                        .or(assignment.session.lease_target_batch_size),
-                    session_ids: decode_batch_session_ids,
-                },
-                runtime_mode: match assignment.execution_plan.runtime_mode {
-                    agent::api::types::InferenceRuntimeMode::FitFirst => {
-                        agent::inference::InferenceRuntimeMode::FitFirst
-                    }
-                    agent::api::types::InferenceRuntimeMode::ThroughputFirst => {
-                        agent::inference::InferenceRuntimeMode::ThroughputFirst
-                    }
-                    agent::api::types::InferenceRuntimeMode::LatencyFirst => {
-                        agent::inference::InferenceRuntimeMode::LatencyFirst
-                    }
-                    agent::api::types::InferenceRuntimeMode::ResilientEdge => {
-                        agent::inference::InferenceRuntimeMode::ResilientEdge
-                    }
-                },
-                fast_path_permitted: active_group(&assignment)
-                    .map(|group| group.fast_path_eligible)
-                    .unwrap_or(false),
-                executor_id: device_id.to_string(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
             };
             let active_segment_id = assignment.active_segment.segment_id.clone();
             let local_replica = assignment.session.local_replica.clone();
@@ -3307,137 +3454,16 @@ async fn cmd_runtime() -> Result<()> {
                 }
             }
 
-            let lease_renew_handle = if matches!(
-                assignment.active_segment.phase,
-                ApiExecutionPhase::Decode
-            ) {
-                let registration_client = registration_client.clone();
-                let lease_id = assignment.lease_id.clone();
-                let device_id = device_id.to_string();
-                let network_id = assignment.network_id.clone();
-                let session_id = assignment.active_segment.session_id.clone();
-                let segment_id = active_segment_id.clone();
-                Some(tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(20));
-                    loop {
-                        tick.tick().await;
-                        match registration_client
-                            .renew_decode_lease(
-                                &lease_id,
-                                RenewDecodeLeaseRequest {
-                                    device_id: device_id.clone(),
-                                    network_id: network_id.clone(),
-                                    session_id: session_id.clone(),
-                                    segment_id: segment_id.clone(),
-                                    include_decode_lease: false,
-                                    include_queue_state: false,
-                                    include_serving_session: false,
-                                    scheduler_queue: None,
-                                },
-                            )
-                            .await
-                        {
-                            Ok(Some(response)) => {
-                                debug!(
-                                    lease_id = %lease_id,
-                                    lease_expires_at = response
-                                        .decode_lease
-                                        .as_ref()
-                                        .and_then(|lease| lease.lease_expires_at.as_deref()),
-                                    queue_status = response
-                                        .queue_state
-                                        .as_ref()
-                                        .and_then(|state| state.status.as_deref()),
-                                    "Renewed decode lease"
-                                );
-                            }
-                            Ok(None) => {
-                                debug!(lease_id = %lease_id, "Decode lease renew endpoint unavailable");
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(lease_id = %lease_id, error = %e, "Decode lease renew failed");
-                            }
-                        }
-                    }
-                }))
-            } else {
-                None
-            };
-
-            let decode_progress_reporter =
-                if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-                    Some(DecodeProgressReporter::spawn(
-                        registration_client.clone(),
-                        job_id,
-                        device_id,
-                        active_segment_id.clone(),
-                    ))
-                } else {
-                    None
-                };
-
-            let execution_result = coordinator
-                .process_segment_with_progress(request, |progress| {
-                    let registration_client = registration_client.clone();
-                    let device_id = device_id;
-                    let segment_id = active_segment_id.clone();
-                    let decode_progress_reporter = decode_progress_reporter.as_ref();
-                    async move {
-                        if progress.phase == agent::inference::ExecutionPhase::Decode {
-                            if let Some(reporter) = decode_progress_reporter {
-                                reporter.update(progress).map_err(|e| {
-                                    agent::errors::AgentError::Execution(e.to_string())
-                                })?;
-                                return Ok(());
-                            }
-                        }
-
-                        registration_client
-                            .report_inference_progress(
-                                job_id,
-                                ReportInferenceAssignmentProgressRequest {
-                                    device_id: device_id.to_string(),
-                                    segment_id: segment_id.clone(),
-                                    phase: api_phase(progress.phase),
-                                    event: if progress.phase
-                                        == agent::inference::ExecutionPhase::Prefill
-                                    {
-                                        ProgressEventKind::PrefillComplete
-                                    } else {
-                                        ProgressEventKind::DecodeProgress
-                                    },
-                                    completion_tokens: progress.completion_tokens,
-                                    execution_time_ms: progress.execution_time_ms,
-                                    time_to_first_token_ms: progress.time_to_first_token_ms,
-                                    kv_cache_seq_len: progress.kv_cache_seq_len,
-                                    batch_size: progress.batch_size,
-                                    active_decode_sessions: progress.active_decode_sessions,
-                                    batch_kv_tokens: progress.batch_kv_tokens,
-                                    deferred_decode_sessions: progress.deferred_decode_sessions,
-                                    scheduler_queue: None,
-                                    serving_session: None,
-                                },
-                            )
-                            .await
-                    }
-                })
-                .await;
-
-            if let Some(reporter) = decode_progress_reporter.as_ref() {
-                if let Err(e) = reporter.flush().await {
-                    warn!(job_id = %job_id, error = %e, "Final buffered decode progress flush failed");
-                }
-            }
-
-            if let Some(handle) = lease_renew_handle {
-                handle.abort();
-            }
-            if let Some(reporter) = decode_progress_reporter {
-                if let Err(e) = reporter.shutdown().await {
-                    warn!(job_id = %job_id, error = %e, "Decode progress reporter shutdown failed");
-                }
-            }
+            let execution_result = execute_assignment_segment_with_reporting(
+                &mut coordinator,
+                &registration_client,
+                &assignment,
+                request,
+                job_id,
+                device_id,
+                &active_segment_id,
+            )
+            .await;
 
             match execution_result {
                 Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
