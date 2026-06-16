@@ -1527,6 +1527,168 @@ async fn execute_assignment_segment_with_reporting(
     execution_result
 }
 
+async fn handle_assignment_execution_outcome(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    execution_result: agent::errors::Result<agent::inference::SegmentExecutionResult>,
+    job_id: Uuid,
+    device_id: Uuid,
+    active_segment_id: &str,
+) {
+    match execution_result {
+        Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
+            kv_cache_seq_len, ..
+        }) => {
+            if !matches!(
+                assignment.session.kv_transfer_policy,
+                agent::api::types::KvTransferPolicy::CoLocated
+            ) {
+                match coordinator
+                    .export_session_checkpoint_bytes(
+                        Uuid::parse_str(&assignment.active_segment.session_id).unwrap_or(job_id),
+                    )
+                    .await
+                {
+                    Ok(bytes) => {
+                        if let Err(error) = registration_client
+                            .upload_inference_session_checkpoint(
+                                job_id,
+                                agent::api::types::UploadInferenceSessionCheckpointRequest {
+                                    device_id: device_id.to_string(),
+                                    session_id: assignment.active_segment.session_id.clone(),
+                                    segment_id: active_segment_id.to_string(),
+                                    phase: ApiExecutionPhase::Prefill,
+                                    kv_sequence_position: kv_cache_seq_len,
+                                    checkpoint_hex: hex::encode(bytes),
+                                },
+                            )
+                            .await
+                        {
+                            error!(
+                                job_id = %job_id,
+                                segment_id = %active_segment_id,
+                                error = %error,
+                                "Failed to upload prefill session checkpoint"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        error!(
+                            job_id = %job_id,
+                            segment_id = %active_segment_id,
+                            error = %error,
+                            "Failed to export prefill session checkpoint"
+                        );
+                    }
+                }
+            }
+            info!(
+                job_id = %job_id,
+                segment_id = %active_segment_id,
+                "Prefill segment completed and session retained for decode handoff"
+            );
+        }
+        Ok(agent::inference::SegmentExecutionResult::Completed(result)) => {
+            let completion = result.generated_tokens.as_ref().and_then(|tokens| {
+                match agent::model_assets::decode_tokens(&assignment.model_id, tokens) {
+                    Ok(text) => Some(text),
+                    Err(error) => {
+                        warn!(
+                            job_id = %job_id,
+                            model_id = %assignment.model_id,
+                            error = %error,
+                            "Failed to decode generated tokens with model tokenizer"
+                        );
+                        None
+                    }
+                }
+            });
+
+            let result_request = agent::api::types::ReportInferenceAssignmentRequest {
+                device_id: device_id.to_string(),
+                segment_id: active_segment_id.to_string(),
+                success: result.success,
+                completion,
+                completion_tokens: Some(result.completion_tokens),
+                execution_time_ms: result.execution_time_ms,
+                time_to_first_token_ms: result.time_to_first_token_ms,
+                kv_cache_seq_len: None,
+                error: result.error.clone(),
+            };
+            if let Err(error) = retry_control_plane_write(
+                "report_inference_result",
+                job_id,
+                Some(active_segment_id),
+                || {
+                    let registration_client = registration_client.clone();
+                    let request = result_request.clone();
+                    Box::pin(async move {
+                        registration_client
+                            .report_inference_result(job_id, request)
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                },
+            )
+            .await
+            {
+                error!(
+                    job_id = %job_id,
+                    error = %error,
+                    "Failed to report inference result"
+                );
+            }
+        }
+        Err(error) => {
+            error!(job_id = %job_id, error = %error, "Inference job failed");
+            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+                info!(
+                    job_id = %job_id,
+                    segment_id = %active_segment_id,
+                    error = %error,
+                    "Decode segment failed; releasing lease for retry instead of reporting terminal failure"
+                );
+                release_decode_lease_if_needed(
+                    registration_client,
+                    assignment,
+                    "segment_execution_failed",
+                    Some(error.to_string()),
+                )
+                .await;
+            } else {
+                let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
+                    device_id: device_id.to_string(),
+                    segment_id: active_segment_id.to_string(),
+                    success: false,
+                    completion: None,
+                    completion_tokens: None,
+                    execution_time_ms: 0,
+                    time_to_first_token_ms: None,
+                    kv_cache_seq_len: None,
+                    error: Some(error.to_string()),
+                };
+                let _ = retry_control_plane_write(
+                    "report_inference_result",
+                    job_id,
+                    Some(active_segment_id),
+                    || {
+                        let registration_client = registration_client.clone();
+                        let request = failure_request.clone();
+                        Box::pin(async move {
+                            registration_client
+                                .report_inference_result(job_id, request)
+                                .await
+                                .map_err(|error| error.to_string())
+                        })
+                    },
+                )
+                .await;
+            }
+        }
+    }
+}
+
 async fn publish_pending_kv_transfer_payload(
     registration_client: &RegistrationClient,
     coordinator: &mut agent::inference::InferenceCoordinator,
@@ -3465,155 +3627,16 @@ async fn cmd_runtime() -> Result<()> {
             )
             .await;
 
-            match execution_result {
-                Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
-                    kv_cache_seq_len,
-                    ..
-                }) => {
-                    if !matches!(
-                        assignment.session.kv_transfer_policy,
-                        agent::api::types::KvTransferPolicy::CoLocated
-                    ) {
-                        match coordinator
-                            .export_session_checkpoint_bytes(
-                                Uuid::parse_str(&assignment.active_segment.session_id)
-                                    .unwrap_or(job_id),
-                            )
-                            .await
-                        {
-                            Ok(bytes) => {
-                                if let Err(e) = registration_client
-                                    .upload_inference_session_checkpoint(
-                                        job_id,
-                                        agent::api::types::UploadInferenceSessionCheckpointRequest {
-                                            device_id: device_id.to_string(),
-                                            session_id: assignment.active_segment.session_id.clone(),
-                                            segment_id: active_segment_id.clone(),
-                                            phase: ApiExecutionPhase::Prefill,
-                                            kv_sequence_position: kv_cache_seq_len,
-                                            checkpoint_hex: hex::encode(bytes),
-                                        },
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        job_id = %job_id,
-                                        segment_id = %active_segment_id,
-                                        error = %e,
-                                        "Failed to upload prefill session checkpoint"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    job_id = %job_id,
-                                    segment_id = %active_segment_id,
-                                    error = %e,
-                                    "Failed to export prefill session checkpoint"
-                                );
-                            }
-                        }
-                    }
-                    info!(
-                        job_id = %job_id,
-                        segment_id = %active_segment_id,
-                        "Prefill segment completed and session retained for decode handoff"
-                    );
-                }
-                Ok(agent::inference::SegmentExecutionResult::Completed(result)) => {
-                    let completion = result.generated_tokens.as_ref().and_then(|tokens| {
-                        match agent::model_assets::decode_tokens(&assignment.model_id, tokens) {
-                            Ok(text) => Some(text),
-                            Err(e) => {
-                                warn!(
-                                    job_id = %job_id,
-                                    model_id = %assignment.model_id,
-                                    error = %e,
-                                    "Failed to decode generated tokens with model tokenizer"
-                                );
-                                None
-                            }
-                        }
-                    });
-
-                    let result_request = agent::api::types::ReportInferenceAssignmentRequest {
-                        device_id: device_id.to_string(),
-                        segment_id: active_segment_id.clone(),
-                        success: result.success,
-                        completion,
-                        completion_tokens: Some(result.completion_tokens),
-                        execution_time_ms: result.execution_time_ms,
-                        time_to_first_token_ms: result.time_to_first_token_ms,
-                        kv_cache_seq_len: None,
-                        error: result.error.clone(),
-                    };
-                    if let Err(e) = retry_control_plane_write(
-                        "report_inference_result",
-                        job_id,
-                        Some(&active_segment_id),
-                        || {
-                            let registration_client = registration_client.clone();
-                            let request = result_request.clone();
-                            Box::pin(async move {
-                                registration_client
-                                    .report_inference_result(job_id, request)
-                                    .await
-                                    .map_err(|error| error.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        error!(job_id = %job_id, error = %e, "Failed to report inference result");
-                    }
-                }
-                Err(e) => {
-                    error!(job_id = %job_id, error = %e, "Inference job failed");
-                    if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-                        info!(
-                            job_id = %job_id,
-                            segment_id = %active_segment_id,
-                            error = %e,
-                            "Decode segment failed; releasing lease for retry instead of reporting terminal failure"
-                        );
-                        release_decode_lease_if_needed(
-                            &registration_client,
-                            &assignment,
-                            "segment_execution_failed",
-                            Some(e.to_string()),
-                        )
-                        .await;
-                    } else {
-                        let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
-                            device_id: device_id.to_string(),
-                            segment_id: active_segment_id.clone(),
-                            success: false,
-                            completion: None,
-                            completion_tokens: None,
-                            execution_time_ms: 0,
-                            time_to_first_token_ms: None,
-                            kv_cache_seq_len: None,
-                            error: Some(e.to_string()),
-                        };
-                        let _ = retry_control_plane_write(
-                            "report_inference_result",
-                            job_id,
-                            Some(&active_segment_id),
-                            || {
-                                let registration_client = registration_client.clone();
-                                let request = failure_request.clone();
-                                Box::pin(async move {
-                                    registration_client
-                                        .report_inference_result(job_id, request)
-                                        .await
-                                        .map_err(|error| error.to_string())
-                                })
-                            },
-                        )
-                        .await;
-                    }
-                }
-            }
+            handle_assignment_execution_outcome(
+                &mut coordinator,
+                &registration_client,
+                &assignment,
+                execution_result,
+                job_id,
+                device_id,
+                &active_segment_id,
+            )
+            .await;
 
             if let Err(error) = coordinator.persist_runtime_stats() {
                 warn!(
