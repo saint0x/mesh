@@ -24,7 +24,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -233,8 +233,8 @@ pub struct WorkerPosition {
 
 /// The main inference coordinator
 pub struct InferenceCoordinator {
-    /// Network swarm for P2P communication
-    swarm: MeshSwarm,
+    /// Background control for the inference swarm.
+    swarm_control: SwarmControl,
 
     /// Dedicated tensor data plane for the hot inference path.
     tensor_plane: TensorPlane,
@@ -278,6 +278,24 @@ pub struct InferenceCoordinator {
     /// Governs checkpoint recovery cadence and node-level recovery load.
     #[allow(dead_code)]
     recovery_governor: RecoveryGovernor,
+}
+
+struct SwarmControl {
+    command_tx: mpsc::UnboundedSender<SwarmCommand>,
+    event_rx: mpsc::UnboundedReceiver<crate::network::MeshEvent>,
+}
+
+#[derive(Clone)]
+enum SwarmCommand {
+    SetRingNeighbors {
+        left: PeerId,
+        left_addrs: Vec<libp2p::Multiaddr>,
+        left_plan: Option<PeerPunchPlan>,
+        right: PeerId,
+        right_addrs: Vec<libp2p::Multiaddr>,
+        right_plan: Option<PeerPunchPlan>,
+    },
+    ClearRingNeighbors,
 }
 
 struct ActiveSession {
@@ -332,6 +350,72 @@ struct RuntimeMemorySnapshot {
 }
 
 impl InferenceCoordinator {
+    fn spawn_swarm_driver(mut swarm: MeshSwarm) -> SwarmControl {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let driver = async move {
+            loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        match command {
+                            Some(SwarmCommand::SetRingNeighbors {
+                                left,
+                                left_addrs,
+                                left_plan,
+                                right,
+                                right_addrs,
+                                right_plan,
+                            }) => {
+                                swarm.set_ring_neighbors(
+                                    left,
+                                    &left_addrs,
+                                    left_plan.as_ref(),
+                                    right,
+                                    &right_addrs,
+                                    right_plan.as_ref(),
+                                );
+                            }
+                            Some(SwarmCommand::ClearRingNeighbors) => {
+                                swarm.clear_ring_neighbors();
+                            }
+                            None => break,
+                        }
+                    }
+                    event = swarm.next_event() => {
+                        match event {
+                            Some(event) => {
+                                if event_tx.send(event).is_err() {
+                                    break;
+                                }
+                            }
+                            None => {
+                                warn!("Inference swarm event stream ended");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(driver);
+        } else {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build fallback swarm driver runtime");
+                runtime.block_on(driver);
+            });
+        }
+
+        SwarmControl {
+            command_tx,
+            event_rx,
+        }
+    }
+
     fn checkpoint_segment_max_tokens(&self) -> Option<usize> {
         Some(self.config.checkpoint_segment_max_tokens.max(1))
     }
@@ -345,7 +429,7 @@ impl InferenceCoordinator {
         let loader: Arc<dyn ShardLoader> = Arc::new(ArtifactShardLoader::with_defaults());
 
         Self {
-            swarm,
+            swarm_control: Self::spawn_swarm_driver(swarm),
             tensor_plane,
             config,
             position: None,
@@ -395,6 +479,24 @@ impl InferenceCoordinator {
             max_total_kv_cache_bytes: self.config.max_total_kv_cache_bytes.max(1),
             max_total_runtime_bytes: self.config.max_total_runtime_bytes.max(1),
         }
+    }
+
+    async fn drain_swarm_events(&mut self) -> Result<()> {
+        loop {
+            match self.swarm_control.event_rx.try_recv() {
+                Ok(event) => self.handle_event(event).await?,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(AgentError::Execution(
+                        "inference swarm driver stopped unexpectedly".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub async fn pump_network_events(&mut self) -> Result<()> {
+        self.drain_swarm_events().await
     }
 
     fn session_memory_footprint(session: &ActiveSession) -> SessionMemoryFootprint {
@@ -1156,16 +1258,6 @@ impl InferenceCoordinator {
         self.checkpoint_manager.clone()
     }
 
-    /// Get reference to swarm
-    pub fn swarm(&self) -> &MeshSwarm {
-        &self.swarm
-    }
-
-    /// Get mutable reference to swarm
-    pub fn swarm_mut(&mut self) -> &mut MeshSwarm {
-        &mut self.swarm
-    }
-
     pub fn tensor_plane_mut(&mut self) -> &mut TensorPlane {
         &mut self.tensor_plane
     }
@@ -1258,15 +1350,21 @@ impl InferenceCoordinator {
             "Joining ring topology"
         );
 
-        // Set ring neighbors on the swarm
-        self.swarm.set_ring_neighbors(
-            position.left_neighbor,
-            &position.left_neighbor_addrs,
-            position.left_neighbor_punch_plan.as_ref(),
-            position.right_neighbor,
-            &position.right_neighbor_addrs,
-            position.right_neighbor_punch_plan.as_ref(),
-        );
+        self.swarm_control
+            .command_tx
+            .send(SwarmCommand::SetRingNeighbors {
+                left: position.left_neighbor,
+                left_addrs: position.left_neighbor_addrs.clone(),
+                left_plan: position.left_neighbor_punch_plan.clone(),
+                right: position.right_neighbor,
+                right_addrs: position.right_neighbor_addrs.clone(),
+                right_plan: position.right_neighbor_punch_plan.clone(),
+            })
+            .map_err(|_| {
+                AgentError::Execution(
+                    "inference swarm driver is not available to apply ring neighbors".to_string(),
+                )
+            })?;
 
         self.position = Some(position);
 
@@ -1279,7 +1377,10 @@ impl InferenceCoordinator {
     pub fn leave_ring(&mut self) {
         if self.position.is_some() {
             info!("Leaving ring topology");
-            self.swarm.clear_ring_neighbors();
+            let _ = self
+                .swarm_control
+                .command_tx
+                .send(SwarmCommand::ClearRingNeighbors);
             self.position = None;
         }
     }
@@ -1322,19 +1423,23 @@ impl InferenceCoordinator {
             max_tokens = request.config.max_tokens,
             "Starting execution segment"
         );
+        self.drain_swarm_events().await?;
 
         match request.phase {
             ExecutionPhase::Prefill => {
                 self.ensure_session_backend(&request, &position).await?;
+                self.drain_swarm_events().await?;
                 let result = self
                     .run_prefill_segment(&request, &position, &mut on_progress)
                     .await?;
+                self.drain_swarm_events().await?;
                 Ok(result)
             }
             ExecutionPhase::Decode => {
                 let result = self
                     .run_decode_segment(&request, &position, &mut on_progress)
                     .await?;
+                self.drain_swarm_events().await?;
                 Ok(result)
             }
         }
@@ -1361,6 +1466,7 @@ impl InferenceCoordinator {
             max_tokens = request.config.max_tokens,
             "Starting inference job"
         );
+        self.drain_swarm_events().await?;
 
         let start = Instant::now();
         self.ensure_session_backend(&request, &position).await?;
@@ -1702,6 +1808,7 @@ impl InferenceCoordinator {
             self.sessions.insert(request.session_id, session);
             next_token
         };
+        self.drain_swarm_events().await?;
 
         let execution_time_ms = segment_start.elapsed().as_millis() as u64;
         let completion_tokens = {
@@ -1929,6 +2036,7 @@ impl InferenceCoordinator {
         self.enqueue_decode_task(request.session_id)?;
 
         loop {
+            self.drain_swarm_events().await?;
             let Some(session) = self.sessions.get(&request.session_id) else {
                 return Err(AgentError::Execution(
                     "decode session vanished during execution".to_string(),
@@ -1977,6 +2085,7 @@ impl InferenceCoordinator {
             let deferred_decode_sessions = u32::try_from(batch.deferred.len()).unwrap_or(u32::MAX);
 
             let outcomes = self.execute_decode_microbatch(batch, position).await?;
+            self.drain_swarm_events().await?;
             let active_decode_sessions =
                 u32::try_from(self.active_decode_session_count()).unwrap_or(u32::MAX);
 
@@ -2145,25 +2254,22 @@ impl InferenceCoordinator {
     /// Run the coordinator event loop
     ///
     /// This listens for network events and processes them.
-    #[instrument(skip(self), fields(peer_id = %self.swarm.local_peer_id()))]
+    #[instrument(skip(self))]
     pub async fn run(mut self) -> Result<()> {
         info!("Starting inference coordinator");
 
         // Periodic stats saver
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut swarm_interval = tokio::time::interval(Duration::from_millis(50));
+        swarm_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut shutdown_signal = Box::pin(Self::shutdown_signal());
 
         loop {
             tokio::select! {
-                // Handle network events
-                event = self.swarm.next_event() => {
-                    if let Some(event) = event {
-                        if let Err(e) = self.handle_event(event).await {
-                            error!(error = %e, "Error handling event");
-                        }
-                    } else {
-                        warn!("Event stream ended");
+                _ = swarm_interval.tick() => {
+                    if let Err(e) = self.drain_swarm_events().await {
+                        error!(error = %e, "Error handling inference swarm events");
                         break;
                     }
                 }
@@ -2224,28 +2330,18 @@ impl InferenceCoordinator {
                 // Check if disconnected peer is a ring neighbor
                 if let Some(pos) = &self.position {
                     if peer_id == pos.left_neighbor || peer_id == pos.right_neighbor {
-                        error!(
-                            peer_id = %peer_id,
-                            "Ring neighbor disconnected! Ring topology broken."
-                        );
-                        let impacted_sessions = self
+                        let active_tensor_plane_sessions = self
                             .sessions
-                            .iter()
-                            .filter_map(|(session_id, session)| {
-                                if session.job.has_decode_context() && !session.job.is_complete() {
-                                    Some(*session_id)
-                                } else {
-                                    None
-                                }
+                            .values()
+                            .filter(|session| {
+                                session.job.has_decode_context() && !session.job.is_complete()
                             })
-                            .collect::<Vec<_>>();
-                        for session_id in impacted_sessions {
-                            self.pause_session(
-                                session_id,
-                                SessionPauseReason::Failover,
-                                format!("ring neighbor {} disconnected", peer_id),
-                            );
-                        }
+                            .count();
+                        warn!(
+                            peer_id = %peer_id,
+                            active_tensor_plane_sessions,
+                            "Ring neighbor control-swarm connectivity dropped while tensor-plane serving remains authoritative"
+                        );
                     }
                 }
             }
@@ -3090,6 +3186,55 @@ mod tests {
             SessionRuntimeStatus::Active
         ));
         assert!(resumed.engine_state.paused.is_none());
+    }
+
+    #[test]
+    fn test_control_swarm_neighbor_disconnect_does_not_pause_active_decode_session() {
+        let mut coordinator = test_coordinator(InferenceConfig::default());
+        let left_neighbor = PeerId::random();
+        let right_neighbor = PeerId::random();
+        coordinator.position = Some(WorkerPosition {
+            model_id: "test-model".to_string(),
+            position: 0,
+            total_workers: 2,
+            left_neighbor,
+            left_neighbor_addrs: vec![],
+            left_neighbor_punch_plan: None,
+            left_neighbor_tensor_addr: "127.0.0.1:5101".parse().unwrap(),
+            right_neighbor,
+            right_neighbor_addrs: vec![],
+            right_neighbor_punch_plan: None,
+            right_neighbor_tensor_addr: "127.0.0.1:5102".parse().unwrap(),
+            shard_column_range: (0, 1024),
+            shard_worker_position: 0,
+            shard_total_workers: 2,
+            shard_memory_bytes: 1_024,
+        });
+        let session_id = Uuid::new_v4();
+        insert_decode_session(&mut coordinator, session_id, 4, 11);
+        coordinator.enqueue_decode_task(session_id).unwrap();
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                coordinator
+                    .handle_event(crate::network::MeshEvent::PeerDisconnected {
+                        peer_id: left_neighbor,
+                    })
+                    .await
+                    .expect("control-swarm disconnect should be advisory");
+            });
+
+        let session = coordinator
+            .sessions
+            .get(&session_id)
+            .expect("active session");
+        assert!(matches!(
+            session.engine_state.runtime_status,
+            SessionRuntimeStatus::Active
+        ));
+        assert!(session.engine_state.paused.is_none());
+        assert_eq!(coordinator.decode_queue.len(), 1);
     }
 
     #[test]

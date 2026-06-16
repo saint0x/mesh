@@ -2575,6 +2575,10 @@ async fn cmd_runtime() -> Result<()> {
                     break;
                 }
             }
+            if let Err(e) = coordinator.pump_network_events().await {
+                error!(error = %e, "Failed to pump inference swarm events");
+                break;
+            }
             if ring_position.is_none() {
                 match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
                     Ok(position) => {
@@ -2887,6 +2891,11 @@ async fn cmd_runtime() -> Result<()> {
                     Some(e.to_string()),
                 )
                 .await;
+                continue;
+            }
+
+            if let Err(e) = coordinator.pump_network_events().await {
+                error!(job_id = %job_id, error = %e, "Failed to pump inference swarm events before execution");
                 continue;
             }
 
