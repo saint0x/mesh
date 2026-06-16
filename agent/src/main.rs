@@ -1532,16 +1532,19 @@ fn update_active_decode_assignment(
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: String,
+    reset_runtime_state: bool,
 ) {
-    if let Some(handle) = active.lease_renew_handle.take() {
-        handle.abort();
+    if reset_runtime_state {
+        if let Some(handle) = active.lease_renew_handle.take() {
+            handle.abort();
+        }
     }
     active.assignment = assignment;
     active.request = request;
     active.job_id = job_id;
     active.device_id = device_id;
     active.active_segment_id = active_segment_id;
-    if active.last_reported_completion_tokens == 0 {
+    if reset_runtime_state && active.last_reported_completion_tokens == 0 {
         active.started_at = None;
     }
 }
@@ -4273,6 +4276,7 @@ async fn cmd_runtime() -> Result<()> {
                         job_id,
                         device_id,
                         active_segment_id,
+                        shape_changed,
                     );
                     if shape_changed {
                         info!(
