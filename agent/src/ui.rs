@@ -2536,7 +2536,7 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         status: match &assigned_shard_readiness {
             Some((_, _, Ok(()))) => "ok".into(),
             Some((_, _, Err(_))) => "fail".into(),
-            None => "warn".into(),
+            None => "fail".into(),
         },
         detail: match &assigned_shard_readiness {
             Some((model_id, shard_range, Ok(()))) => format!(
@@ -2546,7 +2546,9 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
             Some((_, _, Err(error))) => {
                 format!("Assigned shard is not production-ready: {error}")
             }
-            None => "No live assigned shard could be validated from current ring topology.".into(),
+            None => {
+                "Production readiness is blocked because no live assigned shard could be validated from current ring topology.".into()
+            }
         },
         hint: match &assigned_shard_readiness {
             Some((_, _, Ok(()))) => None,
@@ -2555,7 +2557,7 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
                     .into(),
             ),
             None => Some(
-                "Join the device to a live ring so the exact assigned shard can be validated."
+                "Join the device to a live ring so the exact assigned shard can be validated before treating the node as production-ready."
                     .into(),
             ),
         },
@@ -2597,7 +2599,7 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         } else if matches!(artifact_probe, Some(Err(_))) {
             "fail".into()
         } else if discovered_models == 0 {
-            "warn".into()
+            "fail".into()
         } else {
             "ok".into()
         },
@@ -2638,7 +2640,10 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
                     .into(),
             )
         } else if discovered_models == 0 {
-            Some("Install a real model artifact set under ~/.meshnet/models before serving.".into())
+            Some(
+                "Production readiness is blocked until a real model artifact set is installed under ~/.meshnet/models."
+                    .into(),
+            )
         } else {
             None
         },
@@ -2653,9 +2658,9 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         status: match &decode_pooling {
             Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => "ok".into(),
             Ok(Some(readiness)) if readiness.decode_microbatches_executed > 0 => "fail".into(),
-            Ok(Some(_)) => "warn".into(),
-            Ok(None) => "warn".into(),
-            Err(_) => "warn".into(),
+            Ok(Some(_)) => "fail".into(),
+            Ok(None) => "fail".into(),
+            Err(_) => "fail".into(),
         },
         detail: match &decode_pooling {
             Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => format!(
@@ -2669,9 +2674,15 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
                 readiness.multi_session_batch_rate * 100.0,
                 readiness.decode_microbatches_executed
             ),
-            Ok(Some(_)) => "No local decode microbatch telemetry has been recorded yet.".into(),
-            Ok(None) => "No inference stats file exists yet for local decode batching proof.".into(),
-            Err(error) => format!("Could not read local decode batching telemetry: {error}"),
+            Ok(Some(_)) => {
+                "Production decode parity is blocked because no local decode microbatch telemetry has been recorded yet.".into()
+            }
+            Ok(None) => {
+                "Production decode parity is blocked because no inference stats file exists yet for local decode batching proof.".into()
+            }
+            Err(error) => format!(
+                "Production decode parity is blocked because local decode batching telemetry could not be read: {error}"
+            ),
         },
         hint: match &decode_pooling {
             Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => None,

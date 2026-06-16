@@ -5615,6 +5615,7 @@ async fn cmd_doctor() -> Result<()> {
 
     println!("\n{}", "Mesh Doctor".bold().cyan());
     println!("{}", "===========".cyan());
+    let mut production_gate_failed = false;
 
     let config_path = DeviceConfig::default_path()?;
     let config = match DeviceConfig::load(&config_path) {
@@ -5656,6 +5657,7 @@ async fn cmd_doctor() -> Result<()> {
             "OK".green().bold()
         );
     } else {
+        production_gate_failed = true;
         println!(
             "  {} provider contract not production-ready: {}",
             "FAIL".red().bold(),
@@ -5673,6 +5675,7 @@ async fn cmd_doctor() -> Result<()> {
             );
         }
         Err(error) => {
+            production_gate_failed = true;
             println!(
                 "  {} control plane unreachable: {}",
                 "FAIL".red().bold(),
@@ -5703,6 +5706,7 @@ async fn cmd_doctor() -> Result<()> {
             authoritative_db.display()
         );
     } else {
+        production_gate_failed = true;
         println!(
             "  {} repo-local shadow db artifacts found: {}",
             "FAIL".red().bold(),
@@ -5716,20 +5720,33 @@ async fn cmd_doctor() -> Result<()> {
     }
 
     if let Ok(topology) = fetch_ring_topology(&config).await {
-        if let Ok(position) = build_worker_position_from_topology(&topology, &config.device_id) {
-            match validate_worker_position_runtime_readiness(&config, &position).await {
-                Ok(()) => println!(
-                    "  {} assigned shard production-ready for {} {}..{}",
-                    "OK".green().bold(),
-                    position.model_id,
-                    position.shard_column_range.0,
-                    position.shard_column_range.1
-                ),
-                Err(error) => println!(
-                    "  {} assigned shard not production-ready: {}",
+        match build_worker_position_from_topology(&topology, &config.device_id) {
+            Ok(position) => {
+                match validate_worker_position_runtime_readiness(&config, &position).await {
+                    Ok(()) => println!(
+                        "  {} assigned shard production-ready for {} {}..{}",
+                        "OK".green().bold(),
+                        position.model_id,
+                        position.shard_column_range.0,
+                        position.shard_column_range.1
+                    ),
+                    Err(error) => {
+                        production_gate_failed = true;
+                        println!(
+                            "  {} assigned shard not production-ready: {}",
+                            "FAIL".red().bold(),
+                            error
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                production_gate_failed = true;
+                println!(
+                    "  {} assigned shard could not be validated from current ring topology: {}",
                     "FAIL".red().bold(),
                     error
-                ),
+                );
             }
         }
     }
@@ -5745,16 +5762,22 @@ async fn cmd_doctor() -> Result<()> {
             probe.column_end,
             probe.resident_bytes
         ),
-        Ok(None) => println!(
-            "  {} local real artifact materialization unavailable: no local shard manifest set found under {}",
-            "WARN".yellow().bold(),
-            agent::model_assets::model_store_dir().display()
-        ),
-        Err(error) => println!(
-            "  {} local real artifact materialization failed: {}",
-            "FAIL".red().bold(),
-            error
-        ),
+        Ok(None) => {
+            production_gate_failed = true;
+            println!(
+                "  {} local real artifact materialization unavailable: no local shard manifest set found under {}",
+                "FAIL".red().bold(),
+                agent::model_assets::model_store_dir().display()
+            )
+        }
+        Err(error) => {
+            production_gate_failed = true;
+            println!(
+                "  {} local real artifact materialization failed: {}",
+                "FAIL".red().bold(),
+                error
+            )
+        }
     }
     match load_local_decode_pooling_readiness()? {
         Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
@@ -5763,23 +5786,35 @@ async fn cmd_doctor() -> Result<()> {
             readiness.avg_decode_batch_size,
             readiness.multi_session_batch_rate * 100.0
         ),
-        Some(readiness) if readiness.decode_microbatches_executed > 0 => println!(
-            "  {} local decode pooling not production-ready: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
-            "FAIL".red().bold(),
-            readiness.avg_decode_batch_size,
-            readiness.multi_session_batch_rate * 100.0,
-            readiness.decode_microbatches_executed
-        ),
-        Some(_) => println!(
-            "  {} local decode pooling unproven: no decode microbatch telemetry recorded yet",
-            "WARN".yellow().bold()
-        ),
-        None => println!(
-            "  {} local decode pooling unproven: no inference stats recorded yet",
-            "WARN".yellow().bold()
-        ),
+        Some(readiness) if readiness.decode_microbatches_executed > 0 => {
+            production_gate_failed = true;
+            println!(
+                "  {} local decode pooling not production-ready: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
+                "FAIL".red().bold(),
+                readiness.avg_decode_batch_size,
+                readiness.multi_session_batch_rate * 100.0,
+                readiness.decode_microbatches_executed
+            )
+        }
+        Some(_) => {
+            production_gate_failed = true;
+            println!(
+                "  {} local decode pooling unproven: no decode microbatch telemetry recorded yet",
+                "FAIL".red().bold()
+            )
+        }
+        None => {
+            production_gate_failed = true;
+            println!(
+                "  {} local decode pooling unproven: no inference stats recorded yet",
+                "FAIL".red().bold()
+            )
+        }
     }
     println!();
+    if production_gate_failed {
+        anyhow::bail!("local production readiness gate failed");
+    }
     Ok(())
 }
 
