@@ -1468,15 +1468,20 @@ struct ActiveDecodeAssignment {
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: String,
-    started_at: Instant,
+    admitted_at: Instant,
+    started_at: Option<Instant>,
     last_reported_completion_tokens: u32,
-    lease_renew_handle: JoinHandle<()>,
+    lease_renew_handle: Option<JoinHandle<()>>,
     decode_progress_reporter: DecodeProgressReporter,
 }
 
 impl ActiveDecodeAssignment {
     fn session_id(&self) -> Uuid {
         self.request.session_id
+    }
+
+    fn execution_started_at(&self) -> Instant {
+        self.started_at.unwrap_or(self.admitted_at)
     }
 
     async fn shutdown(self) {
@@ -1487,7 +1492,9 @@ impl ActiveDecodeAssignment {
                 "Final buffered decode progress flush failed"
             );
         }
-        self.lease_renew_handle.abort();
+        if let Some(handle) = self.lease_renew_handle {
+            handle.abort();
+        }
         if let Err(error) = self.decode_progress_reporter.shutdown().await {
             warn!(
                 job_id = %self.job_id,
@@ -1516,6 +1523,35 @@ fn decode_progress_interval(request: &agent::inference::InferenceRequest) -> u32
     request.config.progress_report_interval.max(1)
 }
 
+fn decode_assignment_lease_expired(active: &ActiveDecodeAssignment) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&active.assignment.lease_expires_at)
+        .map(|lease_expires_at| lease_expires_at <= chrono::Utc::now())
+        .unwrap_or(false)
+}
+
+fn activate_runnable_decode_assignments(
+    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+) {
+    for active in active_decode_assignments.values_mut() {
+        if validate_materialized_decode_cohort(coordinator, &active.assignment, None).is_err() {
+            continue;
+        }
+        if active.started_at.is_none() {
+            active.started_at = Some(Instant::now());
+        }
+        if active.lease_renew_handle.is_none() {
+            active.lease_renew_handle = spawn_decode_lease_renew_task(
+                registration_client,
+                &active.assignment,
+                active.device_id,
+                &active.active_segment_id,
+            );
+        }
+    }
+}
+
 fn observe_active_decode_progress(
     coordinator: &agent::inference::coordinator::InferenceCoordinator,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
@@ -1538,7 +1574,7 @@ fn observe_active_decode_progress(
             .update(agent::inference::InferenceProgressUpdate {
                 phase: agent::inference::ExecutionPhase::Decode,
                 completion_tokens: snapshot.completion_tokens,
-                execution_time_ms: active.started_at.elapsed().as_millis() as u64,
+                execution_time_ms: active.execution_started_at().elapsed().as_millis() as u64,
                 time_to_first_token_ms: snapshot.time_to_first_token_ms,
                 kv_cache_seq_len: Some(snapshot.kv_cache_seq_len),
                 batch_size: Some(telemetry.batch_size),
@@ -1653,7 +1689,24 @@ async fn reconcile_active_decode_assignments(
         .collect::<Vec<_>>();
     for session_id in session_ids {
         let failure = match coordinator.session_progress_snapshot(session_id) {
-            Some(snapshot) => snapshot.paused_detail,
+            Some(snapshot) => {
+                let Some(active) = active_decode_assignments.get(&session_id) else {
+                    continue;
+                };
+                snapshot.paused_detail.or_else(|| {
+                    if validate_materialized_decode_cohort(coordinator, &active.assignment, None)
+                        .is_err()
+                        && decode_assignment_lease_expired(active)
+                    {
+                        Some(
+                            "decode cohort did not materialize before the control-plane lease expired"
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+            }
             None => Some("active decode session vanished after local admission".to_string()),
         };
         let Some(error_message) = failure else {
@@ -1717,6 +1770,11 @@ async fn service_active_decode_assignments(
     if active_decode_assignments.is_empty() {
         return true;
     }
+    activate_runnable_decode_assignments(
+        coordinator,
+        registration_client,
+        active_decode_assignments,
+    );
 
     let mut selected_session_id = None;
     let iterations = active_decode_order.len().max(1);
@@ -4197,13 +4255,6 @@ async fn cmd_runtime() -> Result<()> {
                     continue;
                 }
 
-                let lease_renew_handle = spawn_decode_lease_renew_task(
-                    &registration_client,
-                    &assignment,
-                    device_id,
-                    &active_segment_id,
-                )
-                .expect("decode assignments require a renew task");
                 let decode_progress_reporter = DecodeProgressReporter::spawn(
                     registration_client.clone(),
                     job_id,
@@ -4219,9 +4270,10 @@ async fn cmd_runtime() -> Result<()> {
                         job_id,
                         device_id,
                         active_segment_id,
-                        started_at: Instant::now(),
+                        admitted_at: Instant::now(),
+                        started_at: None,
                         last_reported_completion_tokens: 0,
-                        lease_renew_handle,
+                        lease_renew_handle: None,
                         decode_progress_reporter,
                     },
                 );
