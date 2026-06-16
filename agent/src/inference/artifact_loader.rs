@@ -21,7 +21,7 @@ pub trait ShardLoader: Send + Sync {
         registry: &ShardRegistry,
     ) -> Result<ModelWeights>;
 
-    async fn is_cached(&self, model_id: &str) -> bool;
+    async fn is_cached(&self, assignment: &ShardAssignment) -> bool;
 
     fn estimate_memory(&self, assignment: &ShardAssignment) -> u64;
 }
@@ -69,6 +69,10 @@ impl ArtifactShardLoader {
                 "shard-{}-of-{}.safetensors",
                 assignment.worker_position, assignment.total_workers
             ))
+    }
+
+    fn shard_artifact_complete(&self, assignment: &ShardAssignment) -> bool {
+        self.manifest_path(assignment).exists() && self.weights_path(assignment).exists()
     }
 
     fn load_manifest(&self, assignment: &ShardAssignment) -> Result<ShardArtifactManifest> {
@@ -239,8 +243,8 @@ impl ShardLoader for ArtifactShardLoader {
         Ok(weights)
     }
 
-    async fn is_cached(&self, model_id: &str) -> bool {
-        self.model_store_dir.join(model_id).exists()
+    async fn is_cached(&self, assignment: &ShardAssignment) -> bool {
+        self.shard_artifact_complete(assignment)
     }
 
     fn estimate_memory(&self, assignment: &ShardAssignment) -> u64 {
@@ -251,12 +255,22 @@ impl ShardLoader for ArtifactShardLoader {
 }
 
 pub fn artifact_exists(base_dir: &Path, assignment: &ShardAssignment) -> bool {
-    let path = base_dir.join(&assignment.model_id).join(format!(
+    let manifest_path = base_dir.join(&assignment.model_id).join(format!(
+        "shard-{}-of-{}.manifest.json",
+        assignment.worker_position, assignment.total_workers
+    ));
+    let weights_path = base_dir.join(&assignment.model_id).join(format!(
         "shard-{}-of-{}.safetensors",
         assignment.worker_position, assignment.total_workers
     ));
-    debug!(artifact = %path.display(), exists = path.exists(), "Checked shard artifact");
-    path.exists()
+    let exists = manifest_path.exists() && weights_path.exists();
+    debug!(
+        manifest = %manifest_path.display(),
+        artifact = %weights_path.display(),
+        exists,
+        "Checked shard artifact package"
+    );
+    exists
 }
 
 fn metadata_required<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
@@ -792,5 +806,20 @@ mod tests {
         assert_eq!(loaded.layers.len(), 2);
         assert_eq!(loaded.layers[0].w_q.rows, 8);
         assert_eq!(loaded.layers[0].w_q.cols, 4);
+    }
+
+    #[tokio::test]
+    async fn shard_cache_requires_manifest_and_weights_artifact() {
+        let temp_dir = TempDir::new().unwrap();
+        let assignment = ShardAssignment::new("tinyllama-1.1b".into(), 0, 2, 8);
+        let loader = ArtifactShardLoader::new(temp_dir.path().to_path_buf());
+
+        assert!(!loader.is_cached(&assignment).await);
+        assert!(!artifact_exists(temp_dir.path(), &assignment));
+
+        write_test_shard(temp_dir.path(), &assignment).unwrap();
+
+        assert!(loader.is_cached(&assignment).await);
+        assert!(artifact_exists(temp_dir.path(), &assignment));
     }
 }
