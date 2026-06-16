@@ -58,7 +58,7 @@ use agent::{
     TensorPlaneConfig,
 };
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use libp2p::{Multiaddr, PeerId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -299,7 +299,11 @@ enum Commands {
     },
 
     /// Verify local setup and control-plane reachability
-    Doctor,
+    Doctor {
+        /// Readiness stage to validate (`preflight` skips pooled-decode proof, `production` requires it)
+        #[arg(long, value_enum, default_value_t = DoctorStage::Production)]
+        stage: DoctorStage,
+    },
 
     /// Launch the local Mesh UI
     Ui {
@@ -487,6 +491,12 @@ enum PoolCommands {
     Status,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DoctorStage {
+    Preflight,
+    Production,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -602,8 +612,8 @@ async fn main() -> Result<()> {
                 cmd_pool_status().await?;
             }
         },
-        Commands::Doctor => {
-            cmd_doctor().await?;
+        Commands::Doctor { stage } => {
+            cmd_doctor(stage).await?;
         }
         Commands::Ui {
             port,
@@ -5609,12 +5619,13 @@ pub(crate) fn load_local_decode_pooling_readiness() -> Result<Option<LocalDecode
     }))
 }
 
-async fn cmd_doctor() -> Result<()> {
+async fn cmd_doctor(stage: DoctorStage) -> Result<()> {
     use colored::Colorize;
     use control_plane::{db::find_shadow_local_db_files, Database};
 
     println!("\n{}", "Mesh Doctor".bold().cyan());
     println!("{}", "===========".cyan());
+    println!("  readiness stage: {:?}", stage);
     let mut production_gate_failed = false;
 
     let config_path = DeviceConfig::default_path()?;
@@ -5779,41 +5790,72 @@ async fn cmd_doctor() -> Result<()> {
             )
         }
     }
-    match load_local_decode_pooling_readiness()? {
-        Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
-            "  {} local decode pooling proven: avg_batch_size={:.2}, multi_session_rate={:.1}%",
-            "OK".green().bold(),
-            readiness.avg_decode_batch_size,
-            readiness.multi_session_batch_rate * 100.0
-        ),
-        Some(readiness) if readiness.decode_microbatches_executed > 0 => {
-            production_gate_failed = true;
-            println!(
-                "  {} local decode pooling not production-ready: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
-                "FAIL".red().bold(),
+    match stage {
+        DoctorStage::Preflight => match load_local_decode_pooling_readiness()? {
+            Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
+                "  {} local decode pooling already proven: avg_batch_size={:.2}, multi_session_rate={:.1}%",
+                "OK".green().bold(),
+                readiness.avg_decode_batch_size,
+                readiness.multi_session_batch_rate * 100.0
+            ),
+            Some(readiness) if readiness.decode_microbatches_executed > 0 => println!(
+                "  {} local decode pooling proof deferred until production validation: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
+                "WARN".yellow().bold(),
                 readiness.avg_decode_batch_size,
                 readiness.multi_session_batch_rate * 100.0,
                 readiness.decode_microbatches_executed
-            )
-        }
-        Some(_) => {
-            production_gate_failed = true;
-            println!(
-                "  {} local decode pooling unproven: no decode microbatch telemetry recorded yet",
-                "FAIL".red().bold()
-            )
-        }
-        None => {
-            production_gate_failed = true;
-            println!(
-                "  {} local decode pooling unproven: no inference stats recorded yet",
-                "FAIL".red().bold()
-            )
-        }
+            ),
+            Some(_) => println!(
+                "  {} local decode pooling proof deferred until production validation: no decode microbatch telemetry recorded yet",
+                "WARN".yellow().bold()
+            ),
+            None => println!(
+                "  {} local decode pooling proof deferred until production validation: no inference stats recorded yet",
+                "WARN".yellow().bold()
+            ),
+        },
+        DoctorStage::Production => match load_local_decode_pooling_readiness()? {
+            Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
+                "  {} local decode pooling proven: avg_batch_size={:.2}, multi_session_rate={:.1}%",
+                "OK".green().bold(),
+                readiness.avg_decode_batch_size,
+                readiness.multi_session_batch_rate * 100.0
+            ),
+            Some(readiness) if readiness.decode_microbatches_executed > 0 => {
+                production_gate_failed = true;
+                println!(
+                    "  {} local decode pooling not production-ready: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
+                    "FAIL".red().bold(),
+                    readiness.avg_decode_batch_size,
+                    readiness.multi_session_batch_rate * 100.0,
+                    readiness.decode_microbatches_executed
+                )
+            }
+            Some(_) => {
+                production_gate_failed = true;
+                println!(
+                    "  {} local decode pooling unproven: no decode microbatch telemetry recorded yet",
+                    "FAIL".red().bold()
+                )
+            }
+            None => {
+                production_gate_failed = true;
+                println!(
+                    "  {} local decode pooling unproven: no inference stats recorded yet",
+                    "FAIL".red().bold()
+                )
+            }
+        },
     }
     println!();
     if production_gate_failed {
-        anyhow::bail!("local production readiness gate failed");
+        anyhow::bail!(
+            "{} readiness gate failed",
+            match stage {
+                DoctorStage::Preflight => "local preflight",
+                DoctorStage::Production => "local production",
+            }
+        );
     }
     Ok(())
 }

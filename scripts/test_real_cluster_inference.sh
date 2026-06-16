@@ -127,36 +127,32 @@ run_agent_cli() {
     )
 }
 
-require_runtime_readiness() {
+require_preflight_runtime_readiness() {
     local home_dir="$1"
-    local output
-    output="$(
-        (
-            cd "$home_dir"
-            run_with_timeout 240s env \
-                HOME="$home_dir" \
-                MESHNET_HOME="$home_dir" \
-                MESHNET_MODEL_STORE="$MODEL_STORE" \
-                CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-                RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-                "$AGENT_BIN" doctor
-        ) 2>&1 || true
-    )"
-    if ! grep -q "provider contract production-ready" <<<"$output"; then
-        echo "device at $home_dir is not production-serving ready" >&2
-        echo "$output" >&2
-        return 1
-    fi
-    if ! grep -q "assigned shard production-ready" <<<"$output"; then
-        echo "device at $home_dir does not have a production-ready assigned shard" >&2
-        echo "$output" >&2
-        return 1
-    fi
-    if ! grep -q "local real artifact materialization ready" <<<"$output"; then
-        echo "device at $home_dir cannot materialize a local real artifact on the selected provider" >&2
-        echo "$output" >&2
-        return 1
-    fi
+    (
+        cd "$home_dir"
+        run_with_timeout 240s env \
+            HOME="$home_dir" \
+            MESHNET_HOME="$home_dir" \
+            MESHNET_MODEL_STORE="$MODEL_STORE" \
+            CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+            "$AGENT_BIN" doctor --stage preflight
+    )
+}
+
+require_production_readiness() {
+    local home_dir="$1"
+    (
+        cd "$home_dir"
+        run_with_timeout 240s env \
+            HOME="$home_dir" \
+            MESHNET_HOME="$home_dir" \
+            MESHNET_MODEL_STORE="$MODEL_STORE" \
+            CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+            "$AGENT_BIN" doctor --stage production
+    )
 }
 
 device_id_from_home() {
@@ -288,8 +284,8 @@ if ! wait_for_topology 180; then
     exit 1
 fi
 
-require_runtime_readiness "$WORKER1_HOME"
-require_runtime_readiness "$WORKER2_HOME"
+require_preflight_runtime_readiness "$WORKER1_HOME"
+require_preflight_runtime_readiness "$WORKER2_HOME"
 
 if ! wait_for_topology 180; then
     echo "workers did not remain ring-stable after runtime readiness validation" >&2
@@ -428,6 +424,9 @@ print(
 )
 PY
 )"
+
+require_production_readiness "$WORKER1_HOME"
+require_production_readiness "$WORKER2_HOME"
 
 echo "real end-to-end inference test passed"
 echo "real serving dynamics test passed"
