@@ -1525,6 +1525,35 @@ fn runtime_decode_assignment_shape(
     )
 }
 
+fn decode_assignment_refresh_needs_runtime_reset(
+    active_shape: (Vec<Uuid>, Option<u32>, Option<u32>),
+    active_lease_id: &str,
+    active_segment_id: &str,
+    refreshed_shape: (Vec<Uuid>, Option<u32>, Option<u32>),
+    refreshed_lease_id: &str,
+    refreshed_segment_id: &str,
+) -> bool {
+    active_shape != refreshed_shape
+        || active_lease_id != refreshed_lease_id
+        || active_segment_id != refreshed_segment_id
+}
+
+fn decode_assignment_refresh_requires_runtime_reset(
+    active: &ActiveDecodeAssignment,
+    assignment: &InferenceExecutionLease,
+    request: &agent::inference::InferenceRequest,
+    active_segment_id: &str,
+) -> bool {
+    decode_assignment_refresh_needs_runtime_reset(
+        active_decode_assignment_shape(active),
+        &active.assignment.lease_id,
+        &active.active_segment_id,
+        runtime_decode_assignment_shape(request),
+        &assignment.lease_id,
+        active_segment_id,
+    )
+}
+
 fn update_active_decode_assignment(
     active: &mut ActiveDecodeAssignment,
     assignment: InferenceExecutionLease,
@@ -4264,11 +4293,12 @@ async fn cmd_runtime() -> Result<()> {
                         continue;
                     }
 
-                    let old_shape = active_decode_assignment_shape(active);
-                    let new_shape = runtime_decode_assignment_shape(&request);
-                    let shape_changed = old_shape != new_shape
-                        || active.assignment.lease_id != assignment.lease_id
-                        || active.active_segment_id != active_segment_id;
+                    let shape_changed = decode_assignment_refresh_requires_runtime_reset(
+                        active,
+                        &assignment,
+                        &request,
+                        &active_segment_id,
+                    );
                     update_active_decode_assignment(
                         active,
                         assignment,
@@ -5961,6 +5991,67 @@ mod tests {
             priority: 10,
             last_updated_ms: 1_700_000_000_000,
         }
+    }
+
+    #[test]
+    fn decode_refresh_without_shape_or_metadata_change_preserves_runtime_state() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+
+        assert!(!decode_assignment_refresh_needs_runtime_reset(
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-a",
+            "segment-a",
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-a",
+            "segment-a",
+        ));
+    }
+
+    #[test]
+    fn decode_refresh_with_new_lease_id_requires_runtime_reset() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+
+        assert!(decode_assignment_refresh_needs_runtime_reset(
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-a",
+            "segment-a",
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-b",
+            "segment-a",
+        ));
+    }
+
+    #[test]
+    fn decode_refresh_with_new_cohort_membership_requires_runtime_reset() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let session_c = Uuid::new_v4();
+
+        assert!(decode_assignment_refresh_needs_runtime_reset(
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-a",
+            "segment-a",
+            (vec![session_a, session_c], Some(2), Some(16)),
+            "lease-a",
+            "segment-a",
+        ));
+    }
+
+    #[test]
+    fn decode_refresh_with_new_segment_id_requires_runtime_reset() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+
+        assert!(decode_assignment_refresh_needs_runtime_reset(
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-a",
+            "segment-a",
+            (vec![session_a, session_b], Some(2), Some(16)),
+            "lease-a",
+            "segment-b",
+        ));
     }
 
     #[test]
