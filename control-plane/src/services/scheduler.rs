@@ -34,6 +34,7 @@ enum SchedulerPhase {
 pub enum SchedulerBlockedReason {
     QueueMissing,
     WaitingForTransfer,
+    WaitingForPrefillCohort,
     LeaseHeldByPeer,
     AlreadyRunning,
     NotEligible,
@@ -81,6 +82,7 @@ struct SchedulerCandidate {
     decode_lease_target_session_count: Option<u32>,
     decode_cohort_ready_sessions: u32,
     decode_cohort_blocked_sessions: u32,
+    decode_cohort_blocked_prefill_sessions: u32,
     decode_cohort_oldest_ready_at: Option<String>,
     decode_cohort_leased_sessions: u32,
     decode_cohort_active_sessions: u32,
@@ -121,6 +123,11 @@ pub fn select_claim_assignment_id(
 ) -> ApiResult<Option<String>> {
     if matches!(req.claim_mode, WorkClaimMode::Any | WorkClaimMode::Prefill) {
         if let Some(assignment_id) = select_inflight_prefill_assignment_id(conn, req)? {
+            return Ok(Some(assignment_id));
+        }
+        if let Some(assignment_id) =
+            select_prefill_assignment_id_for_waiting_decode_cohort(conn, req)?
+        {
             return Ok(Some(assignment_id));
         }
     }
@@ -309,6 +316,49 @@ fn select_inflight_prefill_assignment_id(
     .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
 }
 
+pub fn select_prefill_assignment_id_for_waiting_decode_cohort(
+    conn: &Transaction<'_>,
+    req: &ClaimInferenceAssignmentRequest,
+) -> ApiResult<Option<String>> {
+    conn.query_row(
+        r#"
+        WITH decode_cohort_stats AS (
+            SELECT
+                network_id,
+                COALESCE(batch_group_key, group_id) AS cohort_key,
+                SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready_sessions,
+                MIN(CASE WHEN status = 'ready' THEN ready_at END) AS oldest_ready_at
+            FROM inference_decode_queue
+            GROUP BY network_id, COALESCE(batch_group_key, group_id)
+        )
+        SELECT a.assignment_id
+        FROM inference_job_assignments a
+        INNER JOIN inference_jobs j ON j.job_id = a.job_id
+        INNER JOIN inference_serving_groups sg
+            ON sg.job_id = a.job_id AND sg.device_id = a.device_id
+        INNER JOIN inference_sessions s ON s.job_id = j.job_id
+        INNER JOIN inference_decode_queue dq ON dq.session_id = s.session_id
+        INNER JOIN decode_cohort_stats stats
+            ON stats.network_id = dq.network_id
+           AND stats.cohort_key = COALESCE(dq.batch_group_key, dq.group_id)
+        WHERE a.network_id = ?
+          AND a.device_id = ?
+          AND a.active_segment_id = j.active_segment_id
+          AND a.status IN ('pending', 'leased')
+          AND sg.phase = 'prefill'
+          AND sg.status IN ('prefill_member', 'prefill_leased')
+          AND dq.status = 'blocked_on_prefill'
+          AND stats.ready_sessions > 0
+        ORDER BY stats.oldest_ready_at ASC, j.created_at ASC, a.assignment_id ASC
+        LIMIT 1
+        "#,
+        params![&req.network_id, &req.device_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| ApiError::Database(Box::new(crate::db::DbError::Rusqlite(e))))
+}
+
 fn classify_candidate(
     candidate: &SchedulerCandidate,
     requesting_device_id: &str,
@@ -336,13 +386,20 @@ fn classify_candidate(
             _ => Err(SchedulerBlockedReason::NotEligible),
         },
         SchedulerPhase::Decode => {
-            if candidate.foreign_transport_island_inflight_jobs > 0 {
-                return Err(SchedulerBlockedReason::LeaseHeldByPeer);
-            }
             let queue_status = candidate
                 .decode_queue_status
                 .as_deref()
                 .ok_or(SchedulerBlockedReason::QueueMissing)?;
+            let attachable_peer_owned_decode_cohort = matches!(queue_status, "leased" | "active")
+                && matches!(
+                    candidate.group_status.as_str(),
+                    "decode_ready" | "decode_member" | "decode_leased" | "decode_active"
+                );
+            if candidate.foreign_transport_island_inflight_jobs > 0
+                && !attachable_peer_owned_decode_cohort
+            {
+                return Err(SchedulerBlockedReason::LeaseHeldByPeer);
+            }
             let peer_owned_active_decode_cohort = candidate.decode_cohort_active_sessions > 0
                 && !matches!(
                     candidate.group_status.as_str(),
@@ -353,6 +410,7 @@ fn classify_candidate(
                     candidate.group_status.as_str(),
                     "decode_member" | "decode_leased" | "decode_active"
                 );
+            let should_wait_for_prefill_cohort = should_wait_for_prefill_decode_cohort(candidate);
             match queue_status {
                 "blocked_on_transfer" => Err(SchedulerBlockedReason::WaitingForTransfer),
                 "active" => {
@@ -407,6 +465,8 @@ fn classify_candidate(
                         Err(SchedulerBlockedReason::LeaseHeldByPeer)
                     } else if candidate.group_status == "decode_pending_transfer" {
                         Err(SchedulerBlockedReason::WaitingForTransfer)
+                    } else if should_wait_for_prefill_cohort {
+                        Err(SchedulerBlockedReason::WaitingForPrefillCohort)
                     } else if matches!(
                         candidate.group_status.as_str(),
                         "decode_ready" | "decode_member" | "decode_leased"
@@ -443,6 +503,8 @@ fn classify_candidate(
                     }
                     if candidate.group_status == "decode_pending_transfer" {
                         Err(SchedulerBlockedReason::WaitingForTransfer)
+                    } else if should_wait_for_prefill_cohort {
+                        Err(SchedulerBlockedReason::WaitingForPrefillCohort)
                     } else if matches!(
                         candidate.group_status.as_str(),
                         "decode_ready" | "decode_member" | "decode_leased"
@@ -460,6 +522,31 @@ fn classify_candidate(
             }
         }
     }
+}
+
+fn should_wait_for_prefill_decode_cohort(candidate: &SchedulerCandidate) -> bool {
+    if !matches!(candidate.phase, SchedulerPhase::Decode) {
+        return false;
+    }
+
+    if candidate.decode_cohort_blocked_prefill_sessions == 0 {
+        return false;
+    }
+
+    let cohort_fill = candidate
+        .decode_cohort_ready_sessions
+        .saturating_add(candidate.decode_cohort_leased_sessions)
+        .saturating_add(candidate.decode_cohort_active_sessions);
+    let cohort_total = cohort_fill.saturating_add(candidate.decode_cohort_blocked_sessions);
+    let target = candidate
+        .decode_lease_target_session_count
+        .unwrap_or(0)
+        .max(cohort_total)
+        .max(1);
+
+    cohort_fill < target
+        && candidate.decode_cohort_leased_sessions == 0
+        && candidate.decode_cohort_active_sessions == 0
 }
 
 fn rank_candidate(
@@ -857,7 +944,14 @@ fn load_scheduler_candidates(
                     network_id,
                     COALESCE(batch_group_key, group_id) AS cohort_key,
                     SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready_sessions,
-                    SUM(CASE WHEN status = 'blocked_on_transfer' THEN 1 ELSE 0 END) AS blocked_sessions,
+                    SUM(CASE WHEN status = 'blocked_on_prefill' THEN 1 ELSE 0 END) AS blocked_prefill_sessions,
+                    SUM(CASE WHEN status = 'blocked_on_transfer' THEN 1 ELSE 0 END) AS blocked_transfer_sessions,
+                    SUM(
+                        CASE
+                            WHEN status IN ('blocked_on_prefill', 'blocked_on_transfer') THEN 1
+                            ELSE 0
+                        END
+                    ) AS blocked_sessions,
                     MIN(CASE WHEN status = 'ready' THEN ready_at END) AS oldest_ready_at,
                     SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END) AS leased_sessions,
                     SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_sessions
@@ -956,6 +1050,7 @@ fn load_scheduler_candidates(
                 COALESCE(transport_inflight.foreign_inflight_jobs, 0),
                 dq.lease_target_session_count,
                 COALESCE(stats.ready_sessions, 0),
+                COALESCE(stats.blocked_prefill_sessions, 0),
                 COALESCE(stats.blocked_sessions, 0),
                 stats.oldest_ready_at,
                 COALESCE(stats.leased_sessions, 0),
@@ -1033,10 +1128,11 @@ fn load_scheduler_candidates(
                 foreign_transport_island_inflight_jobs: row.get::<_, i64>(23)? as u32,
                 decode_lease_target_session_count: row.get::<_, Option<i64>>(24)?.map(|v| v as u32),
                 decode_cohort_ready_sessions: row.get::<_, i64>(25)? as u32,
-                decode_cohort_blocked_sessions: row.get::<_, i64>(26)? as u32,
-                decode_cohort_oldest_ready_at: row.get(27)?,
-                decode_cohort_leased_sessions: row.get::<_, i64>(28)? as u32,
-                decode_cohort_active_sessions: row.get::<_, i64>(29)? as u32,
+                decode_cohort_blocked_prefill_sessions: row.get::<_, i64>(26)? as u32,
+                decode_cohort_blocked_sessions: row.get::<_, i64>(27)? as u32,
+                decode_cohort_oldest_ready_at: row.get(28)?,
+                decode_cohort_leased_sessions: row.get::<_, i64>(29)? as u32,
+                decode_cohort_active_sessions: row.get::<_, i64>(30)? as u32,
                 decode_topology_rank: u32::MAX,
             },
         ))
@@ -1863,6 +1959,7 @@ mod tests {
             decode_lease_target_session_count: None,
             decode_cohort_ready_sessions: 0,
             decode_cohort_blocked_sessions: 0,
+            decode_cohort_blocked_prefill_sessions: 0,
             decode_cohort_oldest_ready_at: None,
             decode_cohort_leased_sessions: 0,
             decode_cohort_active_sessions: 0,
@@ -1878,6 +1975,70 @@ mod tests {
 
         let result = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
         assert_eq!(result, Err(SchedulerBlockedReason::WaitingForTransfer));
+    }
+
+    #[test]
+    fn fresh_decode_ready_waits_for_blocked_prefill_siblings_to_form_cohort() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_lease_target_session_count = Some(3);
+        candidate.decode_cohort_ready_sessions = 1;
+        candidate.decode_cohort_blocked_prefill_sessions = 2;
+        candidate.decode_cohort_blocked_sessions = 2;
+
+        let result = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(result, Err(SchedulerBlockedReason::WaitingForPrefillCohort));
+    }
+
+    #[test]
+    fn fresh_decode_ready_does_not_wait_for_transfer_blocked_siblings() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_lease_target_session_count = Some(3);
+        candidate.decode_cohort_ready_sessions = 1;
+        candidate.decode_cohort_blocked_sessions = 2;
+
+        let result = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(result, Ok("2026-01-01T00:00:01Z".into()));
+    }
+
+    #[test]
+    fn fresh_decode_ready_still_waits_for_blocked_prefill_siblings_when_group_owner_is_set() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_member".into();
+        candidate.group_lease_owner_device_id = Some("worker-1".into());
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_lease_target_session_count = Some(3);
+        candidate.decode_cohort_ready_sessions = 1;
+        candidate.decode_cohort_blocked_prefill_sessions = 2;
+        candidate.decode_cohort_blocked_sessions = 2;
+
+        let result = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(result, Err(SchedulerBlockedReason::WaitingForPrefillCohort));
+    }
+
+    #[test]
+    fn fresh_decode_ready_waits_for_live_cohort_even_when_row_target_is_stale() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_lease_target_session_count = Some(1);
+        candidate.decode_cohort_ready_sessions = 1;
+        candidate.decode_cohort_blocked_prefill_sessions = 2;
+        candidate.decode_cohort_blocked_sessions = 2;
+
+        let result = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(result, Err(SchedulerBlockedReason::WaitingForPrefillCohort));
     }
 
     #[test]
@@ -2190,6 +2351,21 @@ mod tests {
 
         let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
         assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+    }
+
+    #[test]
+    fn decode_ready_can_attach_to_peer_owned_leased_cohort_despite_transport_pressure() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("leased".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.group_lease_owner_device_id = Some("worker-peer".into());
+        candidate.group_lease_expires_at = Some("2026-01-01T00:10:00Z".into());
+        candidate.foreign_transport_island_inflight_jobs = 2;
+
+        let runnable = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
+        assert_eq!(runnable, Ok("2026-01-01T00:00:01Z".into()));
     }
 
     #[test]

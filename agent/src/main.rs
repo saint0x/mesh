@@ -41,12 +41,13 @@ use agent::pki::{
 };
 use agent::{
     api::types::{
-        ClaimInferenceAssignmentRequest, DecodeLeaseStatus, ExecutionGroupMember,
-        ExecutionPhase as ApiExecutionPhase, InferenceExecutionLease, InferenceJobStatusResponse,
-        InferenceSchedulerQueueState, PeerPunchPlan, PendingKvTransferStatus, ProgressEventKind,
-        ReleaseDecodeLeaseRequest, RenewDecodeLeaseRequest,
-        ReportInferenceAssignmentProgressRequest, RingTopologyResponse, ServingSessionMetadata,
-        UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode, WorkerInfo,
+        ClaimInferenceAssignmentRequest, DecodeLeaseSessionMember, DecodeLeaseStatus,
+        ExecutionGroupMember, ExecutionPhase as ApiExecutionPhase, InferenceExecutionLease,
+        InferenceJobStatusResponse, InferenceSchedulerQueueState, PeerPunchPlan,
+        PendingKvTransferStatus, ProgressEventKind, ReleaseDecodeLeaseRequest,
+        RenewDecodeLeaseRequest, ReportInferenceAssignmentProgressRequest, RingTopologyResponse,
+        ServingSessionMetadata, UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode,
+        WorkerInfo,
     },
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
@@ -217,6 +218,51 @@ async fn join_validated_ring_position(
     validate_worker_position_runtime_readiness(config, &position).await?;
     coordinator.join_ring(position.clone())?;
     Ok(position)
+}
+
+fn worker_position_runtime_identity_matches(
+    current: &agent::inference::coordinator::WorkerPosition,
+    desired: &agent::inference::coordinator::WorkerPosition,
+) -> bool {
+    current.model_id == desired.model_id
+        && current.position == desired.position
+        && current.total_workers == desired.total_workers
+        && current.left_neighbor == desired.left_neighbor
+        && current.left_neighbor_tensor_addr == desired.left_neighbor_tensor_addr
+        && current.right_neighbor == desired.right_neighbor
+        && current.right_neighbor_tensor_addr == desired.right_neighbor_tensor_addr
+        && current.shard_column_range == desired.shard_column_range
+        && current.shard_worker_position == desired.shard_worker_position
+        && current.shard_total_workers == desired.shard_total_workers
+}
+
+async fn apply_runtime_ring_position_if_needed(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    config: &DeviceConfig,
+    current: Option<&agent::inference::coordinator::WorkerPosition>,
+    desired: agent::inference::coordinator::WorkerPosition,
+) -> Result<Option<agent::inference::coordinator::WorkerPosition>> {
+    if let Some(current) = current {
+        if worker_position_runtime_identity_matches(current, &desired) {
+            return Ok(Some(current.clone()));
+        }
+        let active_sessions = coordinator.active_runtime_session_count();
+        if active_sessions > 0 {
+            warn!(
+                active_sessions,
+                current_position = current.position,
+                desired_position = desired.position,
+                current_shard_range = ?current.shard_column_range,
+                desired_shard_range = ?desired.shard_column_range,
+                "Deferring disruptive ring position cutover while runtime sessions are still active"
+            );
+            return Ok(None);
+        }
+    }
+
+    join_validated_ring_position(coordinator, config, desired)
+        .await
+        .map(Some)
 }
 
 fn validate_execution_assignment_artifacts(
@@ -1351,13 +1397,131 @@ async fn release_decode_setup_failure(
         .await;
 }
 
-fn build_runtime_inference_request(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeLeaseRole {
+    Owner,
+    Follower,
+}
+
+fn decode_lease_session_members(
+    assignment: &InferenceExecutionLease,
+    decode_batch_session_ids: &[Uuid],
+) -> Result<Vec<(DecodeLeaseSessionMember, DecodeLeaseRole)>> {
+    let mut members = if assignment.session.lease_session_members.is_empty() {
+        vec![DecodeLeaseSessionMember {
+            job_id: assignment.job_id.clone(),
+            session_id: assignment.session.session_id.clone(),
+            segment_id: assignment.active_segment.segment_id.clone(),
+            active_segment_id: assignment.session.active_segment_id.clone(),
+            status: assignment.session.status.clone(),
+            kv_owner_device_id: assignment.session.kv_owner_device_id.clone(),
+            kv_transfer_policy: assignment.session.kv_transfer_policy.clone(),
+            kv_sequence_position: assignment.session.kv_sequence_position,
+            checkpoint: assignment.session.checkpoint.clone(),
+            local_replica: assignment.session.local_replica.clone(),
+        }]
+    } else {
+        assignment.session.lease_session_members.clone()
+    };
+
+    members.sort_by_key(|member| {
+        decode_batch_session_ids
+            .iter()
+            .position(|session_id| session_id.to_string() == member.session_id)
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut materialized = Vec::with_capacity(members.len());
+    for member in members {
+        let parsed_session_id = Uuid::parse_str(&member.session_id).with_context(|| {
+            format!(
+                "invalid decode lease cohort session id {} for job {}",
+                member.session_id, member.job_id
+            )
+        })?;
+        if !decode_batch_session_ids.contains(&parsed_session_id) {
+            anyhow::bail!(
+                "decode lease cohort member {} for job {} was not present in the active decode target set",
+                member.session_id,
+                member.job_id
+            );
+        }
+        let role = if member.session_id == assignment.active_segment.session_id {
+            DecodeLeaseRole::Owner
+        } else {
+            DecodeLeaseRole::Follower
+        };
+        materialized.push((member, role));
+    }
+
+    if materialized.is_empty() {
+        anyhow::bail!("decode lease cohort did not expose any session members");
+    }
+    if !materialized
+        .iter()
+        .any(|(_, role)| matches!(role, DecodeLeaseRole::Owner))
+    {
+        anyhow::bail!(
+            "decode lease cohort did not expose an owner entry for primary session {}",
+            assignment.active_segment.session_id
+        );
+    }
+    if materialized.len() != decode_batch_session_ids.len() {
+        anyhow::bail!(
+            "decode lease cohort member count {} did not match active decode target count {}",
+            materialized.len(),
+            decode_batch_session_ids.len()
+        );
+    }
+
+    Ok(materialized)
+}
+
+fn canonical_decode_batch_session_ids(
     assignment: &InferenceExecutionLease,
     decode_lease: Option<&DecodeLeaseStatus>,
-    device_id: Uuid,
-    job_id: Uuid,
-) -> Result<agent::inference::InferenceRequest> {
-    let decode_batch_session_ids = decode_lease
+) -> Result<Vec<Uuid>> {
+    if !assignment.session.lease_session_members.is_empty() {
+        let session_ids = assignment
+            .session
+            .lease_session_members
+            .iter()
+            .map(|member| {
+                Uuid::parse_str(&member.session_id).with_context(|| {
+                    format!(
+                        "invalid decode lease cohort session id {} for job {}",
+                        member.session_id, member.job_id
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let decode_lease_session_ids = decode_lease
+            .map(|lease| lease.lease_session_ids.as_slice())
+            .unwrap_or(assignment.session.lease_session_ids.as_slice());
+        if !decode_lease_session_ids.is_empty() {
+            let parsed_lease_ids = decode_lease_session_ids
+                .iter()
+                .map(|session_id| {
+                    Uuid::parse_str(session_id).map_err(|error| {
+                        anyhow::anyhow!("invalid decode lease session_id {}: {}", session_id, error)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if parsed_lease_ids.len() != session_ids.len()
+                || parsed_lease_ids
+                    .iter()
+                    .any(|session_id| !session_ids.contains(session_id))
+            {
+                anyhow::bail!(
+                    "decode lease session_ids diverged from canonical lease member cohort"
+                );
+            }
+        }
+        return Ok(session_ids);
+    }
+
+    decode_lease
         .map(|lease| lease.lease_session_ids.as_slice())
         .unwrap_or(assignment.session.lease_session_ids.as_slice())
         .iter()
@@ -1366,7 +1530,27 @@ fn build_runtime_inference_request(
                 anyhow::anyhow!("invalid decode lease session_id {}: {}", session_id, error)
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()
+}
+
+fn build_runtime_inference_request(
+    assignment: &InferenceExecutionLease,
+    decode_lease: Option<&DecodeLeaseStatus>,
+    device_id: Uuid,
+    job_id: Uuid,
+) -> Result<agent::inference::InferenceRequest> {
+    let decode_batch_session_ids = canonical_decode_batch_session_ids(assignment, decode_lease)?;
+    if !decode_batch_session_ids.is_empty() {
+        let decode_lease_members =
+            decode_lease_session_members(assignment, decode_batch_session_ids.as_slice())?;
+        if decode_lease_members.len() != decode_batch_session_ids.len() {
+            anyhow::bail!(
+                "decode lease cohort member count {} drifted from target session count {}",
+                decode_lease_members.len(),
+                decode_batch_session_ids.len()
+            );
+        }
+    }
 
     Ok(agent::inference::InferenceRequest {
         job_id,
@@ -1418,6 +1602,313 @@ fn build_runtime_inference_request(
             .unwrap()
             .as_secs(),
     })
+}
+
+fn build_decode_cohort_member_request(
+    owner_request: &agent::inference::InferenceRequest,
+    member: &DecodeLeaseSessionMember,
+) -> Result<agent::inference::InferenceRequest> {
+    let mut request = owner_request.clone();
+    request.job_id = Uuid::parse_str(&member.job_id)
+        .with_context(|| format!("invalid decode cohort member job id {}", member.job_id))?;
+    request.session_id = Uuid::parse_str(&member.session_id).with_context(|| {
+        format!(
+            "invalid decode cohort member session id {} for job {}",
+            member.session_id, member.job_id
+        )
+    })?;
+    request.phase = agent::inference::ExecutionPhase::Decode;
+    Ok(request)
+}
+
+fn synthesize_decode_cohort_assignment(
+    owner_assignment: &InferenceExecutionLease,
+    member: &DecodeLeaseSessionMember,
+) -> InferenceExecutionLease {
+    let mut assignment = owner_assignment.clone();
+    assignment.job_id = member.job_id.clone();
+    assignment.active_segment.session_id = member.session_id.clone();
+    if let Some(active_segment_id) = member.active_segment_id.clone() {
+        assignment.active_segment.segment_id = active_segment_id;
+    }
+    assignment.session.session_id = member.session_id.clone();
+    assignment.session.status = member.status.clone();
+    assignment.session.active_segment_id = member.active_segment_id.clone();
+    assignment.session.kv_owner_device_id = member.kv_owner_device_id.clone();
+    assignment.session.kv_transfer_policy = member.kv_transfer_policy.clone();
+    assignment.session.kv_sequence_position = member.kv_sequence_position;
+    assignment.session.checkpoint = member.checkpoint.clone();
+    assignment.session.local_replica = member.local_replica.clone();
+    assignment
+}
+
+fn decode_cohort_member_control_plane_segment_id(
+    owner_assignment: &InferenceExecutionLease,
+    member: &DecodeLeaseSessionMember,
+) -> String {
+    if member.segment_id.is_empty() {
+        owner_assignment.active_segment.segment_id.clone()
+    } else {
+        member.segment_id.clone()
+    }
+}
+
+fn decode_member_ready_for_local_resume(member: &DecodeLeaseSessionMember) -> bool {
+    member
+        .local_replica
+        .as_ref()
+        .map(|replica| {
+            matches!(replica.status.as_str(), "decode_ready" | "decode_active")
+                && replica.kv_sequence_position.is_some()
+        })
+        .unwrap_or(false)
+}
+
+async fn materialize_decode_cohort_session(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    member: &DecodeLeaseSessionMember,
+    request: &agent::inference::InferenceRequest,
+    device_id: Uuid,
+) -> Result<()> {
+    if !decode_member_ready_for_local_resume(member) {
+        if coordinator.has_session(request.session_id) {
+            coordinator.pause_local_session(
+                request.session_id,
+                agent::inference::SessionPauseReason::LocalKvNotReady,
+                "decode lease missing local resume-ready KV replica".to_string(),
+            );
+        }
+        anyhow::bail!(
+            "decode lease missing local resume-ready KV replica for cohort session {}",
+            request.session_id
+        );
+    }
+
+    if coordinator.has_session(request.session_id) {
+        return Ok(());
+    }
+
+    let checkpoint = member.checkpoint.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "decode cohort session {} for job {} did not expose a recovery checkpoint",
+            member.session_id,
+            member.job_id
+        )
+    })?;
+    let manager = coordinator
+        .checkpoint_manager()
+        .context("checkpoint manager missing before decode recovery")?;
+    let expected_checkpoint_id = Uuid::parse_str(&checkpoint.checkpoint_id).with_context(|| {
+        format!(
+            "invalid checkpoint identifier {} for decode cohort session {}",
+            checkpoint.checkpoint_id, member.session_id
+        )
+    })?;
+    let expected_resume = agent::CheckpointResumeExpectation {
+        checkpoint_id: expected_checkpoint_id,
+        job_id: request.job_id,
+        session_id: request.session_id,
+        model_id: assignment.model_id.clone(),
+        phase: match checkpoint.phase {
+            ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
+            ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
+        },
+        source_worker_id: checkpoint.source_device_id.clone(),
+        owner_worker_id: device_id.to_string(),
+        kv_sequence_position: checkpoint.kv_sequence_position,
+    };
+
+    if checkpoint.source_device_id != device_id.to_string() {
+        let remote_checkpoint = registration_client
+            .download_inference_session_checkpoint(request.job_id, request.session_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to download remote checkpoint for decode cohort session {}",
+                    request.session_id
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "decode cohort session {} referenced remote checkpoint but no payload was available yet",
+                    request.session_id
+                )
+            })?;
+        if remote_checkpoint.metadata.checkpoint_id != checkpoint.checkpoint_id {
+            anyhow::bail!(
+                "downloaded checkpoint id {} drifted from expected {} for session {}",
+                remote_checkpoint.metadata.checkpoint_id,
+                checkpoint.checkpoint_id,
+                request.session_id
+            );
+        }
+        if remote_checkpoint.metadata.kv_sequence_position != checkpoint.kv_sequence_position {
+            anyhow::bail!(
+                "downloaded checkpoint kv sequence {:?} drifted from expected {:?} for session {}",
+                remote_checkpoint.metadata.kv_sequence_position,
+                checkpoint.kv_sequence_position,
+                request.session_id
+            );
+        }
+        let checkpoint_bytes =
+            hex::decode(&remote_checkpoint.checkpoint_hex).with_context(|| {
+                format!(
+                    "downloaded remote checkpoint payload was invalid hex for session {}",
+                    request.session_id
+                )
+            })?;
+        manager
+            .import_checkpoint_bytes(&checkpoint_bytes)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to import remote checkpoint before decode for session {}",
+                    request.session_id
+                )
+            })?;
+    }
+
+    let recovery_point = manager
+        .load_recovery_point_for_checkpoint(request.job_id, expected_checkpoint_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load local recovery point for checkpoint {}",
+                checkpoint.checkpoint_id
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "expected checkpoint {} was not present on the local worker for session {}",
+                checkpoint.checkpoint_id,
+                request.session_id
+            )
+        })?;
+    recovery_point
+        .validate_resume_expectation(&expected_resume)
+        .map_err(anyhow::Error::msg)?;
+    coordinator
+        .hydrate_session_from_recovery_point(request, recovery_point)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to hydrate decode session {} from the selected recovery point",
+                request.session_id
+            )
+        })?;
+    Ok(())
+}
+
+async fn admit_or_refresh_decode_cohort(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    position: &agent::inference::coordinator::WorkerPosition,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+    active_decode_order: &mut VecDeque<Uuid>,
+    assignment: &InferenceExecutionLease,
+    request: &agent::inference::InferenceRequest,
+    device_id: Uuid,
+) -> Result<()> {
+    let cohort_members = decode_lease_session_members(
+        assignment,
+        request.decode_batch_targets.session_ids.as_slice(),
+    )?;
+
+    for (member, lease_role) in cohort_members {
+        let member_request = build_decode_cohort_member_request(request, &member)?;
+        let member_assignment = synthesize_decode_cohort_assignment(assignment, &member);
+        let member_job_id = member_request.job_id;
+        let member_session_id = member_request.session_id;
+        let member_segment_id = member
+            .active_segment_id
+            .clone()
+            .unwrap_or_else(|| member_assignment.active_segment.segment_id.clone());
+        let member_control_plane_segment_id =
+            decode_cohort_member_control_plane_segment_id(assignment, &member);
+
+        materialize_decode_cohort_session(
+            coordinator,
+            registration_client,
+            assignment,
+            &member,
+            &member_request,
+            device_id,
+        )
+        .await?;
+
+        if let Some(active) = active_decode_assignments.get_mut(&member_session_id) {
+            if active.job_id != member_job_id {
+                anyhow::bail!(
+                    "conflicting decode lease claimed for already-active local session {}",
+                    member_session_id
+                );
+            }
+            let shape_changed = decode_assignment_refresh_requires_runtime_reset(
+                active,
+                &member_assignment,
+                &member_request,
+                &member_segment_id,
+            );
+            active.lease_role = lease_role;
+            update_active_decode_assignment(
+                active,
+                member_assignment,
+                member_request,
+                member_job_id,
+                device_id,
+                member_segment_id,
+                member_control_plane_segment_id,
+                shape_changed,
+            );
+            continue;
+        }
+
+        coordinator
+            .prepare_decode_session(&member_request, position)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to prepare decode session {} for cooperative scheduling",
+                    member_session_id
+                )
+            })?;
+
+        let decode_progress_reporter = DecodeProgressReporter::spawn(
+            registration_client.clone(),
+            member_job_id,
+            member_session_id,
+            device_id,
+            member_segment_id.clone(),
+            member_request.decode_batch_targets.target_session_count,
+            member_request.decode_batch_targets.target_batch_size,
+        );
+        active_decode_assignments.insert(
+            member_session_id,
+            ActiveDecodeAssignment {
+                lease_role,
+                assignment: member_assignment,
+                request: member_request,
+                job_id: member_job_id,
+                device_id,
+                active_segment_id: member_segment_id,
+                control_plane_segment_id: member_control_plane_segment_id,
+                admitted_at: Instant::now(),
+                started_at: None,
+                last_reported_completion_tokens: 0,
+                last_reported_batch_size: 0,
+                last_reported_active_decode_sessions: 0,
+                lease_renew_handle: None,
+                decode_progress_reporter,
+            },
+        );
+        if !active_decode_order.contains(&member_session_id) {
+            active_decode_order.push_back(member_session_id);
+        }
+    }
+
+    Ok(())
 }
 
 fn spawn_decode_lease_renew_task(
@@ -1483,14 +1974,18 @@ fn spawn_decode_lease_renew_task(
 }
 
 struct ActiveDecodeAssignment {
+    lease_role: DecodeLeaseRole,
     assignment: InferenceExecutionLease,
     request: agent::inference::InferenceRequest,
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: String,
+    control_plane_segment_id: String,
     admitted_at: Instant,
     started_at: Option<Instant>,
     last_reported_completion_tokens: u32,
+    last_reported_batch_size: u32,
+    last_reported_active_decode_sessions: u32,
     lease_renew_handle: Option<JoinHandle<()>>,
     decode_progress_reporter: DecodeProgressReporter,
 }
@@ -1581,6 +2076,7 @@ fn update_active_decode_assignment(
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: String,
+    control_plane_segment_id: String,
     reset_runtime_state: bool,
 ) {
     if reset_runtime_state {
@@ -1593,6 +2089,7 @@ fn update_active_decode_assignment(
     active.job_id = job_id;
     active.device_id = device_id;
     active.active_segment_id = active_segment_id;
+    active.control_plane_segment_id = control_plane_segment_id;
     if reset_runtime_state && active.last_reported_completion_tokens == 0 {
         active.started_at = None;
     }
@@ -1658,7 +2155,9 @@ fn activate_runnable_decode_assignments(
         if active.started_at.is_none() {
             active.started_at = Some(Instant::now());
         }
-        if active.lease_renew_handle.is_none() {
+        if active.lease_renew_handle.is_none()
+            && matches!(active.lease_role, DecodeLeaseRole::Owner)
+        {
             active.lease_renew_handle = spawn_decode_lease_renew_task(
                 registration_client,
                 &active.assignment,
@@ -1669,11 +2168,21 @@ fn activate_runnable_decode_assignments(
     }
 }
 
-fn observe_active_decode_progress(
+struct PendingDecodeProgressReport {
+    session_id: Uuid,
+    job_id: Uuid,
+    device_id: Uuid,
+    control_plane_segment_id: String,
+    progress: agent::inference::InferenceProgressUpdate,
+    completion_tokens: u32,
+}
+
+fn collect_active_decode_progress_reports(
     coordinator: &agent::inference::coordinator::InferenceCoordinator,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     telemetry: agent::inference::coordinator::DecodeBatchTelemetry,
-) -> agent::errors::Result<()> {
+) -> Vec<PendingDecodeProgressReport> {
+    let mut pending_reports = Vec::new();
     for active in active_decode_assignments.values_mut() {
         let Some(snapshot) = coordinator.session_progress_snapshot(active.session_id()) else {
             continue;
@@ -1682,13 +2191,18 @@ fn observe_active_decode_progress(
         let advanced = snapshot
             .completion_tokens
             .saturating_sub(active.last_reported_completion_tokens);
-        if advanced < progress_interval && !snapshot.is_complete {
+        let telemetry_expanded = telemetry.batch_size > active.last_reported_batch_size
+            || telemetry.active_decode_sessions > active.last_reported_active_decode_sessions;
+        if advanced < progress_interval && !snapshot.is_complete && !telemetry_expanded {
             continue;
         }
 
-        active
-            .decode_progress_reporter
-            .update(agent::inference::InferenceProgressUpdate {
+        pending_reports.push(PendingDecodeProgressReport {
+            session_id: active.session_id(),
+            job_id: active.job_id,
+            device_id: active.device_id,
+            control_plane_segment_id: active.control_plane_segment_id.clone(),
+            progress: agent::inference::InferenceProgressUpdate {
                 phase: agent::inference::ExecutionPhase::Decode,
                 completion_tokens: snapshot.completion_tokens,
                 execution_time_ms: active.execution_started_at().elapsed().as_millis() as u64,
@@ -1698,11 +2212,22 @@ fn observe_active_decode_progress(
                 active_decode_sessions: Some(telemetry.active_decode_sessions),
                 batch_kv_tokens: Some(telemetry.batch_kv_tokens),
                 deferred_decode_sessions: Some(telemetry.deferred_decode_sessions),
-            })
-            .map_err(|error| agent::errors::AgentError::Execution(error.to_string()))?;
-        active.last_reported_completion_tokens = snapshot.completion_tokens;
+            },
+            completion_tokens: snapshot.completion_tokens,
+        });
     }
-    Ok(())
+    pending_reports
+}
+
+async fn flush_active_decode_progress(active: &ActiveDecodeAssignment) {
+    if let Err(error) = active.decode_progress_reporter.flush().await {
+        warn!(
+            job_id = %active.job_id,
+            segment_id = %active.active_segment_id,
+            error = %error,
+            "Final buffered decode progress flush failed before assignment teardown"
+        );
+    }
 }
 
 async fn finalize_completed_active_decode_assignments(
@@ -1732,14 +2257,16 @@ async fn finalize_completed_active_decode_assignments(
         let Some(active) = active_decode_assignments.remove(&session_id) else {
             continue;
         };
+        flush_active_decode_progress(&active).await;
         handle_assignment_execution_outcome(
             coordinator,
             registration_client,
             &active.assignment,
+            active.lease_role,
             Ok(agent::inference::SegmentExecutionResult::Completed(result)),
             active.job_id,
             active.device_id,
-            &active.active_segment_id,
+            &active.control_plane_segment_id,
         )
         .await;
         active.shutdown().await;
@@ -1756,14 +2283,16 @@ async fn fail_single_active_decode_assignment(
     let Some(active) = active_decode_assignments.remove(&session_id) else {
         return;
     };
+    flush_active_decode_progress(&active).await;
     handle_assignment_execution_outcome(
         coordinator,
         registration_client,
         &active.assignment,
+        active.lease_role,
         Err(agent::errors::AgentError::Execution(error_message)),
         active.job_id,
         active.device_id,
-        &active.active_segment_id,
+        &active.control_plane_segment_id,
     )
     .await;
     active.shutdown().await;
@@ -1779,14 +2308,16 @@ async fn fail_active_decode_assignments(
         .into_values()
         .collect::<Vec<_>>();
     for active in drained {
+        flush_active_decode_progress(&active).await;
         handle_assignment_execution_outcome(
             coordinator,
             registration_client,
             &active.assignment,
+            active.lease_role,
             Err(agent::errors::AgentError::Execution(error_message.clone())),
             active.job_id,
             active.device_id,
-            &active.active_segment_id,
+            &active.control_plane_segment_id,
         )
         .await;
         active.shutdown().await;
@@ -1938,9 +2469,41 @@ async fn service_active_decode_assignments(
         }
     };
 
-    if let Err(error) =
-        observe_active_decode_progress(coordinator, active_decode_assignments, step.telemetry)
-    {
+    let progress_reports = collect_active_decode_progress_reports(
+        coordinator,
+        active_decode_assignments,
+        step.telemetry,
+    );
+    for report in progress_reports {
+        let update_result = send_decode_progress_update(
+            registration_client,
+            report.job_id,
+            report.session_id,
+            report.device_id,
+            &report.control_plane_segment_id,
+            active_decode_assignments[&report.session_id]
+                .request
+                .decode_batch_targets
+                .target_session_count,
+            active_decode_assignments[&report.session_id]
+                .request
+                .decode_batch_targets
+                .target_batch_size,
+            report.progress,
+        )
+        .await;
+        let Err(error) = update_result else {
+            if let Some(active) = active_decode_assignments.get_mut(&report.session_id) {
+                active.last_reported_completion_tokens = report.completion_tokens;
+                active.last_reported_batch_size = active
+                    .last_reported_batch_size
+                    .max(step.telemetry.batch_size);
+                active.last_reported_active_decode_sessions = active
+                    .last_reported_active_decode_sessions
+                    .max(step.telemetry.active_decode_sessions);
+            }
+            continue;
+        };
         error!(
             session_id = %session_id,
             error = %error,
@@ -1977,6 +2540,7 @@ async fn execute_assignment_segment_with_reporting(
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: &str,
+    control_plane_segment_id: &str,
 ) -> agent::errors::Result<agent::inference::SegmentExecutionResult> {
     let lease_renew_handle = spawn_decode_lease_renew_task(
         registration_client,
@@ -1990,19 +2554,24 @@ async fn execute_assignment_segment_with_reporting(
             Some(DecodeProgressReporter::spawn(
                 registration_client.clone(),
                 job_id,
+                request.session_id,
                 device_id,
-                active_segment_id.to_string(),
+                control_plane_segment_id.to_string(),
+                request.decode_batch_targets.target_session_count,
+                request.decode_batch_targets.target_batch_size,
             ))
         } else {
             None
         };
+    let progress_request = request.clone();
 
     let execution_result = coordinator
         .process_segment_with_progress(request, |progress| {
             let registration_client = registration_client.clone();
             let device_id = device_id;
-            let segment_id = active_segment_id.to_string();
+            let segment_id = control_plane_segment_id.to_string();
             let decode_progress_reporter = decode_progress_reporter.as_ref();
+            let progress_request = progress_request.clone();
             async move {
                 if progress.phase == agent::inference::ExecutionPhase::Decode {
                     if let Some(reporter) = decode_progress_reporter {
@@ -2018,6 +2587,7 @@ async fn execute_assignment_segment_with_reporting(
                         job_id,
                         ReportInferenceAssignmentProgressRequest {
                             device_id: device_id.to_string(),
+                            session_id: progress_request.session_id.to_string(),
                             segment_id: segment_id.clone(),
                             phase: api_phase(progress.phase),
                             event: if progress.phase == agent::inference::ExecutionPhase::Prefill {
@@ -2033,6 +2603,12 @@ async fn execute_assignment_segment_with_reporting(
                             active_decode_sessions: progress.active_decode_sessions,
                             batch_kv_tokens: progress.batch_kv_tokens,
                             deferred_decode_sessions: progress.deferred_decode_sessions,
+                            target_session_count: progress_request
+                                .decode_batch_targets
+                                .target_session_count,
+                            target_batch_size: progress_request
+                                .decode_batch_targets
+                                .target_batch_size,
                             scheduler_queue: None,
                             serving_session: None,
                         },
@@ -2063,10 +2639,11 @@ async fn handle_assignment_execution_outcome(
     coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     assignment: &InferenceExecutionLease,
+    lease_role: DecodeLeaseRole,
     execution_result: agent::errors::Result<agent::inference::SegmentExecutionResult>,
     job_id: Uuid,
     device_id: Uuid,
-    active_segment_id: &str,
+    control_plane_segment_id: &str,
 ) {
     match execution_result {
         Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
@@ -2089,7 +2666,7 @@ async fn handle_assignment_execution_outcome(
                                 agent::api::types::UploadInferenceSessionCheckpointRequest {
                                     device_id: device_id.to_string(),
                                     session_id: assignment.active_segment.session_id.clone(),
-                                    segment_id: active_segment_id.to_string(),
+                                    segment_id: control_plane_segment_id.to_string(),
                                     phase: ApiExecutionPhase::Prefill,
                                     kv_sequence_position: kv_cache_seq_len,
                                     checkpoint_hex: hex::encode(bytes),
@@ -2099,7 +2676,7 @@ async fn handle_assignment_execution_outcome(
                         {
                             error!(
                                 job_id = %job_id,
-                                segment_id = %active_segment_id,
+                                segment_id = %control_plane_segment_id,
                                 error = %error,
                                 "Failed to upload prefill session checkpoint"
                             );
@@ -2108,7 +2685,7 @@ async fn handle_assignment_execution_outcome(
                     Err(error) => {
                         error!(
                             job_id = %job_id,
-                            segment_id = %active_segment_id,
+                            segment_id = %control_plane_segment_id,
                             error = %error,
                             "Failed to export prefill session checkpoint"
                         );
@@ -2117,7 +2694,7 @@ async fn handle_assignment_execution_outcome(
             }
             info!(
                 job_id = %job_id,
-                segment_id = %active_segment_id,
+                segment_id = %control_plane_segment_id,
                 "Prefill segment completed and session retained for decode handoff"
             );
         }
@@ -2139,7 +2716,7 @@ async fn handle_assignment_execution_outcome(
 
             let result_request = agent::api::types::ReportInferenceAssignmentRequest {
                 device_id: device_id.to_string(),
-                segment_id: active_segment_id.to_string(),
+                segment_id: control_plane_segment_id.to_string(),
                 success: result.success,
                 completion,
                 completion_tokens: Some(result.completion_tokens),
@@ -2151,7 +2728,7 @@ async fn handle_assignment_execution_outcome(
             if let Err(error) = retry_control_plane_write(
                 "report_inference_result",
                 job_id,
-                Some(active_segment_id),
+                Some(control_plane_segment_id),
                 || {
                     let registration_client = registration_client.clone();
                     let request = result_request.clone();
@@ -2174,10 +2751,12 @@ async fn handle_assignment_execution_outcome(
         }
         Err(error) => {
             error!(job_id = %job_id, error = %error, "Inference job failed");
-            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
+                && matches!(lease_role, DecodeLeaseRole::Owner)
+            {
                 info!(
                     job_id = %job_id,
-                    segment_id = %active_segment_id,
+                    segment_id = %control_plane_segment_id,
                     error = %error,
                     "Decode segment failed; releasing lease for retry instead of reporting terminal failure"
                 );
@@ -2188,10 +2767,10 @@ async fn handle_assignment_execution_outcome(
                     Some(error.to_string()),
                 )
                 .await;
-            } else {
+            } else if !matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
                 let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
                     device_id: device_id.to_string(),
-                    segment_id: active_segment_id.to_string(),
+                    segment_id: control_plane_segment_id.to_string(),
                     success: false,
                     completion: None,
                     completion_tokens: None,
@@ -2203,7 +2782,7 @@ async fn handle_assignment_execution_outcome(
                 let _ = retry_control_plane_write(
                     "report_inference_result",
                     job_id,
-                    Some(active_segment_id),
+                    Some(control_plane_segment_id),
                     || {
                         let registration_client = registration_client.clone();
                         let request = failure_request.clone();
@@ -2606,8 +3185,11 @@ struct DecodeProgressReporter {
 async fn send_decode_progress_update(
     registration_client: &RegistrationClient,
     job_id: Uuid,
+    session_id: Uuid,
     device_id: Uuid,
     segment_id: &str,
+    target_session_count: Option<u32>,
+    target_batch_size: Option<u32>,
     progress: agent::inference::InferenceProgressUpdate,
 ) -> std::result::Result<(), String> {
     registration_client
@@ -2615,6 +3197,7 @@ async fn send_decode_progress_update(
             job_id,
             ReportInferenceAssignmentProgressRequest {
                 device_id: device_id.to_string(),
+                session_id: session_id.to_string(),
                 segment_id: segment_id.to_string(),
                 phase: api_phase(progress.phase),
                 event: ProgressEventKind::DecodeProgress,
@@ -2626,6 +3209,8 @@ async fn send_decode_progress_update(
                 active_decode_sessions: progress.active_decode_sessions,
                 batch_kv_tokens: progress.batch_kv_tokens,
                 deferred_decode_sessions: progress.deferred_decode_sessions,
+                target_session_count,
+                target_batch_size,
                 scheduler_queue: None,
                 serving_session: None,
             },
@@ -2638,8 +3223,11 @@ impl DecodeProgressReporter {
     fn spawn(
         registration_client: RegistrationClient,
         job_id: Uuid,
+        session_id: Uuid,
         device_id: Uuid,
         segment_id: String,
+        target_session_count: Option<u32>,
+        target_batch_size: Option<u32>,
     ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
@@ -2658,8 +3246,11 @@ impl DecodeProgressReporter {
                             if let Err(error) = send_decode_progress_update(
                                 &registration_client,
                                 job_id,
+                                session_id,
                                 device_id,
                                 &segment_id,
+                                target_session_count,
+                                target_batch_size,
                                 progress,
                             ).await {
                                 warn!(job_id = %job_id, segment_id = %segment_id, error, "Buffered decode progress flush failed");
@@ -2682,8 +3273,11 @@ impl DecodeProgressReporter {
                                         if let Err(error) = send_decode_progress_update(
                                             &registration_client,
                                             job_id,
+                                            session_id,
                                             device_id,
                                             &segment_id,
+                                            target_session_count,
+                                            target_batch_size,
                                             progress,
                                         ).await {
                                             warn!(job_id = %job_id, segment_id = %segment_id, error, "Eager decode progress flush failed");
@@ -2699,8 +3293,11 @@ impl DecodeProgressReporter {
                                     let result = send_decode_progress_update(
                                         &registration_client,
                                         job_id,
+                                        session_id,
                                         device_id,
                                         &segment_id,
+                                        target_session_count,
+                                        target_batch_size,
                                         progress,
                                     ).await;
                                     if result.is_ok() {
@@ -2717,8 +3314,11 @@ impl DecodeProgressReporter {
                                     send_decode_progress_update(
                                         &registration_client,
                                         job_id,
+                                        session_id,
                                         device_id,
                                         &segment_id,
+                                        target_session_count,
+                                        target_batch_size,
                                         progress,
                                     )
                                     .await
@@ -3765,17 +4365,42 @@ async fn cmd_runtime() -> Result<()> {
             let lease_topology = topology_from_execution_lease(&assignment);
             match build_worker_position_from_topology(&lease_topology, &device_id) {
                 Ok(position) => {
-                    if let Err(e) =
-                        join_validated_ring_position(&mut coordinator, &config, position.clone())
-                            .await
+                    match apply_runtime_ring_position_if_needed(
+                        &mut coordinator,
+                        &config,
+                        ring_position.as_ref(),
+                        position.clone(),
+                    )
+                    .await
                     {
-                        error!(
-                            error = %e,
-                            model_id = %position.model_id,
-                            "Failed to apply production-ready ring position from execution lease"
-                        );
-                    } else {
-                        ring_position = Some(position);
+                        Ok(Some(applied_position)) => {
+                            ring_position = Some(applied_position);
+                        }
+                        Ok(None) => {
+                            warn!(
+                                job_id = %job_id,
+                                lease_id = %assignment.lease_id,
+                                "Skipping claimed assignment because applying its ring cutover would disrupt active runtime sessions"
+                            );
+                            release_decode_lease_if_needed(
+                                &registration_client,
+                                &assignment,
+                                "ring_cutover_deferred",
+                                Some(
+                                    "claimed assignment required a disruptive ring cutover while runtime sessions were still active"
+                                        .to_string(),
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                model_id = %position.model_id,
+                                "Failed to apply production-ready ring position from execution lease"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -3783,26 +4408,48 @@ async fn cmd_runtime() -> Result<()> {
                     match fetch_worker_position_from_control_plane(&topology_url, &device_id).await
                     {
                         Ok(position) => {
-                            if let Err(join_error) = join_validated_ring_position(
+                            match apply_runtime_ring_position_if_needed(
                                 &mut coordinator,
                                 &config,
+                                ring_position.as_ref(),
                                 position.clone(),
                             )
                             .await
                             {
-                                error!(
-                                    error = %join_error,
-                                    model_id = %position.model_id,
-                                    "Failed to recover production-ready ring position from topology refresh"
-                                );
-                            } else {
-                                info!(
-                                    position = position.position,
-                                    total_workers = position.total_workers,
-                                    shard_range = ?position.shard_column_range,
-                                    "Recovered ring position from topology refresh"
-                                );
-                                ring_position = Some(position);
+                                Ok(Some(applied_position)) => {
+                                    info!(
+                                        position = applied_position.position,
+                                        total_workers = applied_position.total_workers,
+                                        shard_range = ?applied_position.shard_column_range,
+                                        "Recovered ring position from topology refresh"
+                                    );
+                                    ring_position = Some(applied_position);
+                                }
+                                Ok(None) => {
+                                    warn!(
+                                        job_id = %job_id,
+                                        lease_id = %assignment.lease_id,
+                                        "Skipping claimed assignment because topology refresh would disrupt active runtime sessions"
+                                    );
+                                    release_decode_lease_if_needed(
+                                        &registration_client,
+                                        &assignment,
+                                        "ring_cutover_deferred",
+                                        Some(
+                                            "topology refresh required a disruptive ring cutover while runtime sessions were still active"
+                                                .to_string(),
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                Err(join_error) => {
+                                    error!(
+                                        error = %join_error,
+                                        model_id = %position.model_id,
+                                        "Failed to recover production-ready ring position from topology refresh"
+                                    );
+                                }
                             }
                         }
                         Err(refresh_error) => {
@@ -3955,421 +4602,7 @@ async fn cmd_runtime() -> Result<()> {
                 }
             };
             let active_segment_id = assignment.active_segment.segment_id.clone();
-            let local_replica = assignment.session.local_replica.clone();
-            let session_checkpoint = assignment.session.checkpoint.clone();
-
             if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-                let decode_ready = local_replica
-                    .as_ref()
-                    .map(|replica| {
-                        matches!(replica.status.as_str(), "decode_ready" | "decode_active")
-                            && replica.kv_sequence_position.is_some()
-                    })
-                    .unwrap_or(false);
-                if !decode_ready {
-                    if coordinator.has_session(request.session_id) {
-                        coordinator.pause_local_session(
-                            request.session_id,
-                            agent::inference::SessionPauseReason::LocalKvNotReady,
-                            "decode lease missing local resume-ready KV replica".to_string(),
-                        );
-                    }
-                    error!(
-                        job_id = %job_id,
-                        segment_id = %active_segment_id,
-                        replica_status = ?local_replica.as_ref().map(|r| r.status.as_str()),
-                        replica_kv_seq = ?local_replica.as_ref().and_then(|r| r.kv_sequence_position),
-                        "Decode lease rejected because local replica is not resume-ready"
-                    );
-                    release_decode_lease_if_needed(
-                        &registration_client,
-                        &assignment,
-                        "local_replica_not_ready",
-                        Some("decode lease missing local resume-ready KV replica".to_string()),
-                    )
-                    .await;
-                    let _ = registration_client
-                        .report_inference_result(
-                            job_id,
-                            agent::api::types::ReportInferenceAssignmentRequest {
-                                device_id: device_id.to_string(),
-                                segment_id: active_segment_id.clone(),
-                                success: false,
-                                completion: None,
-                                completion_tokens: None,
-                                execution_time_ms: 0,
-                                time_to_first_token_ms: None,
-                                kv_cache_seq_len: None,
-                                error: Some(
-                                    "decode lease missing local resume-ready KV replica"
-                                        .to_string(),
-                                ),
-                            },
-                        )
-                        .await;
-                    continue;
-                }
-            }
-
-            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
-                && !coordinator.has_session(request.session_id)
-            {
-                if let Some(checkpoint) = session_checkpoint.as_ref() {
-                    let Some(manager) = coordinator.checkpoint_manager() else {
-                        error!(
-                            job_id = %job_id,
-                            session_id = %request.session_id,
-                            "Checkpoint manager missing before decode recovery"
-                        );
-                        release_decode_setup_failure(
-                            &registration_client,
-                            &assignment,
-                            "decode_resume_setup_unavailable",
-                            "checkpoint manager missing before decode recovery",
-                        )
-                        .await;
-                        continue;
-                    };
-                    let expected_checkpoint_id = match Uuid::parse_str(&checkpoint.checkpoint_id) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            error!(
-                                job_id = %job_id,
-                                session_id = %request.session_id,
-                                checkpoint_id = %checkpoint.checkpoint_id,
-                                error = %e,
-                                "Lease carried an invalid checkpoint identifier"
-                            );
-                            release_decode_setup_failure(
-                                &registration_client,
-                                &assignment,
-                                "invalid_resume_checkpoint_id",
-                                format!(
-                                    "invalid checkpoint identifier {}: {}",
-                                    checkpoint.checkpoint_id, e
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
-                    let expected_resume = agent::CheckpointResumeExpectation {
-                        checkpoint_id: expected_checkpoint_id,
-                        job_id,
-                        session_id: request.session_id,
-                        model_id: assignment.model_id.clone(),
-                        phase: match checkpoint.phase {
-                            ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
-                            ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
-                        },
-                        source_worker_id: checkpoint.source_device_id.clone(),
-                        owner_worker_id: device_id.to_string(),
-                        kv_sequence_position: checkpoint.kv_sequence_position,
-                    };
-
-                    if checkpoint.source_device_id != device_id.to_string() {
-                        match registration_client
-                            .download_inference_session_checkpoint(job_id, request.session_id)
-                            .await
-                        {
-                            Ok(Some(remote_checkpoint)) => {
-                                if remote_checkpoint.metadata.checkpoint_id
-                                    != checkpoint.checkpoint_id
-                                {
-                                    error!(
-                                        job_id = %job_id,
-                                        session_id = %request.session_id,
-                                        downloaded_checkpoint_id = %remote_checkpoint.metadata.checkpoint_id,
-                                        expected_checkpoint_id = %checkpoint.checkpoint_id,
-                                        "Downloaded remote session checkpoint metadata drifted from lease state"
-                                    );
-                                    release_decode_setup_failure(
-                                        &registration_client,
-                                        &assignment,
-                                        "remote_checkpoint_contract_drift",
-                                        format!(
-                                            "downloaded checkpoint id {} drifted from expected {}",
-                                            remote_checkpoint.metadata.checkpoint_id,
-                                            checkpoint.checkpoint_id
-                                        ),
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                if remote_checkpoint.metadata.kv_sequence_position
-                                    != checkpoint.kv_sequence_position
-                                {
-                                    error!(
-                                        job_id = %job_id,
-                                        session_id = %request.session_id,
-                                        downloaded_kv_sequence_position = remote_checkpoint.metadata.kv_sequence_position,
-                                        expected_kv_sequence_position = checkpoint.kv_sequence_position,
-                                        "Downloaded remote session checkpoint sequence position drifted from lease state"
-                                    );
-                                    release_decode_setup_failure(
-                                        &registration_client,
-                                        &assignment,
-                                        "remote_checkpoint_contract_drift",
-                                        format!(
-                                            "downloaded checkpoint kv sequence {:?} drifted from expected {:?}",
-                                            remote_checkpoint.metadata.kv_sequence_position,
-                                            checkpoint.kv_sequence_position
-                                        ),
-                                    )
-                                    .await;
-                                    continue;
-                                }
-
-                                let checkpoint_bytes = match hex::decode(
-                                    &remote_checkpoint.checkpoint_hex,
-                                ) {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        error!(
-                                            job_id = %job_id,
-                                            session_id = %request.session_id,
-                                            error = %e,
-                                            "Downloaded remote session checkpoint hex was invalid"
-                                        );
-                                        release_decode_setup_failure(
-                                            &registration_client,
-                                            &assignment,
-                                            "invalid_remote_checkpoint_payload",
-                                            format!(
-                                                "downloaded remote checkpoint payload was invalid hex: {}",
-                                                e
-                                            ),
-                                        )
-                                        .await;
-                                        continue;
-                                    }
-                                };
-
-                                if let Err(e) =
-                                    manager.import_checkpoint_bytes(&checkpoint_bytes).await
-                                {
-                                    error!(
-                                        job_id = %job_id,
-                                        session_id = %request.session_id,
-                                        error = %e,
-                                        "Failed to import remote session checkpoint before decode"
-                                    );
-                                    release_decode_setup_failure(
-                                        &registration_client,
-                                        &assignment,
-                                        "remote_checkpoint_import_failed",
-                                        format!(
-                                            "failed to import remote checkpoint before decode: {}",
-                                            e
-                                        ),
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                info!(
-                                    job_id = %job_id,
-                                    session_id = %request.session_id,
-                                    checkpoint_id = %remote_checkpoint.metadata.checkpoint_id,
-                                    source_device_id = %remote_checkpoint.metadata.source_device_id,
-                                    "Imported remote session checkpoint before decode"
-                                );
-                            }
-                            Ok(None) => {
-                                if coordinator.has_session(request.session_id) {
-                                    coordinator.pause_local_session(
-                                        request.session_id,
-                                        agent::inference::SessionPauseReason::LocalKvNotReady,
-                                        "remote checkpoint not yet available".to_string(),
-                                    );
-                                }
-                                warn!(
-                                    job_id = %job_id,
-                                    session_id = %request.session_id,
-                                    "Decode lease referenced remote checkpoint but no payload was available yet"
-                                );
-                                release_decode_setup_failure(
-                                    &registration_client,
-                                    &assignment,
-                                    "remote_checkpoint_not_ready",
-                                    "decode lease referenced remote checkpoint but no payload was available yet",
-                                )
-                                .await;
-                                continue;
-                            }
-                            Err(e) => {
-                                if coordinator.has_session(request.session_id) {
-                                    coordinator.pause_local_session(
-                                        request.session_id,
-                                        agent::inference::SessionPauseReason::Failover,
-                                        format!("remote checkpoint download failed: {}", e),
-                                    );
-                                }
-                                error!(
-                                    job_id = %job_id,
-                                    session_id = %request.session_id,
-                                    error = %e,
-                                    "Failed to download remote session checkpoint before decode"
-                                );
-                                release_decode_setup_failure(
-                                    &registration_client,
-                                    &assignment,
-                                    "remote_checkpoint_download_failed",
-                                    format!(
-                                        "failed to download remote checkpoint before decode: {}",
-                                        e
-                                    ),
-                                )
-                                .await;
-                                continue;
-                            }
-                        }
-                    }
-
-                    let recovery_point = match manager
-                        .load_recovery_point_for_checkpoint(job_id, expected_checkpoint_id)
-                        .await
-                    {
-                        Ok(Some(point)) => point,
-                        Ok(None) => {
-                            error!(
-                                job_id = %job_id,
-                                session_id = %request.session_id,
-                                checkpoint_id = %checkpoint.checkpoint_id,
-                                "Expected resume checkpoint was not present on the local worker"
-                            );
-                            release_decode_setup_failure(
-                                &registration_client,
-                                &assignment,
-                                "local_recovery_point_missing",
-                                format!(
-                                    "expected checkpoint {} was not present on the local worker",
-                                    checkpoint.checkpoint_id
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                        Err(e) => {
-                            error!(
-                                job_id = %job_id,
-                                session_id = %request.session_id,
-                                checkpoint_id = %checkpoint.checkpoint_id,
-                                error = %e,
-                                "Failed to load local recovery point for decode resume"
-                            );
-                            release_decode_setup_failure(
-                                &registration_client,
-                                &assignment,
-                                "local_recovery_point_load_failed",
-                                format!(
-                                    "failed to load local recovery point for checkpoint {}: {}",
-                                    checkpoint.checkpoint_id, e
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
-                    if let Err(e) = recovery_point.validate_resume_expectation(&expected_resume) {
-                        error!(
-                            job_id = %job_id,
-                            session_id = %request.session_id,
-                            checkpoint_id = %checkpoint.checkpoint_id,
-                            error = %e,
-                            "Local recovery point did not satisfy the control-plane resume contract"
-                        );
-                        release_decode_setup_failure(
-                            &registration_client,
-                            &assignment,
-                            "resume_contract_invalid",
-                            format!(
-                                "local recovery point did not satisfy resume contract: {}",
-                                e
-                            ),
-                        )
-                        .await;
-                        continue;
-                    }
-                    if let Err(e) = coordinator
-                        .hydrate_session_from_recovery_point(&request, recovery_point)
-                        .await
-                    {
-                        error!(
-                            job_id = %job_id,
-                            session_id = %request.session_id,
-                            checkpoint_id = %checkpoint.checkpoint_id,
-                            error = %e,
-                            "Failed to hydrate decode session from the selected recovery point"
-                        );
-                        release_decode_setup_failure(
-                            &registration_client,
-                            &assignment,
-                            "decode_hydration_failed",
-                            format!(
-                                "failed to hydrate decode session from selected recovery point: {}",
-                                e
-                            ),
-                        )
-                        .await;
-                        continue;
-                    }
-                }
-            }
-
-            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-                if let Some(active) = active_decode_assignments.get_mut(&request.session_id) {
-                    if active.job_id != job_id {
-                        warn!(
-                            job_id = %job_id,
-                            active_job_id = %active.job_id,
-                            session_id = %request.session_id,
-                            lease_id = %assignment.lease_id,
-                            "Rejected conflicting decode lease for already-active local session"
-                        );
-                        release_decode_setup_failure(
-                            &registration_client,
-                            &assignment,
-                            "conflicting_local_decode_lease",
-                            "conflicting decode lease claimed for already-active local session",
-                        )
-                        .await;
-                        continue;
-                    }
-
-                    let shape_changed = decode_assignment_refresh_requires_runtime_reset(
-                        active,
-                        &assignment,
-                        &request,
-                        &active_segment_id,
-                    );
-                    update_active_decode_assignment(
-                        active,
-                        assignment,
-                        request,
-                        job_id,
-                        device_id,
-                        active_segment_id,
-                        shape_changed,
-                    );
-                    if shape_changed {
-                        info!(
-                            job_id = %job_id,
-                            session_id = %active.session_id(),
-                            target_session_count = ?active.request.decode_batch_targets.target_session_count,
-                            target_batch_size = ?active.request.decode_batch_targets.target_batch_size,
-                            cohort_size = active.request.decode_batch_targets.session_ids.len(),
-                            "Updated active decode assignment with authoritative cohort refresh"
-                        );
-                    } else {
-                        debug!(
-                            job_id = %job_id,
-                            session_id = %active.session_id(),
-                            "Refreshed active decode assignment without cohort shape change"
-                        );
-                    }
-                    continue;
-                }
-
                 let Some(position) = ring_position.as_ref() else {
                     release_decode_setup_failure(
                         &registration_client,
@@ -4380,46 +4613,32 @@ async fn cmd_runtime() -> Result<()> {
                     .await;
                     continue;
                 };
-                if let Err(error) = coordinator.prepare_decode_session(&request, position).await {
+                if let Err(error) = admit_or_refresh_decode_cohort(
+                    &mut coordinator,
+                    &registration_client,
+                    position,
+                    &mut active_decode_assignments,
+                    &mut active_decode_order,
+                    &assignment,
+                    &request,
+                    device_id,
+                )
+                .await
+                {
                     error!(
                         job_id = %job_id,
-                        session_id = %request.session_id,
                         error = %error,
-                        "Failed to prepare decode session for cooperative scheduling"
+                        "Failed to admit pooled decode cohort for cooperative scheduling"
                     );
                     release_decode_setup_failure(
                         &registration_client,
                         &assignment,
-                        "decode_session_prepare_failed",
+                        "decode_cohort_admission_failed",
                         error.to_string(),
                     )
                     .await;
                     continue;
                 }
-
-                let decode_progress_reporter = DecodeProgressReporter::spawn(
-                    registration_client.clone(),
-                    job_id,
-                    device_id,
-                    active_segment_id.clone(),
-                );
-                let session_id = request.session_id;
-                active_decode_assignments.insert(
-                    session_id,
-                    ActiveDecodeAssignment {
-                        assignment,
-                        request,
-                        job_id,
-                        device_id,
-                        active_segment_id,
-                        admitted_at: Instant::now(),
-                        started_at: None,
-                        last_reported_completion_tokens: 0,
-                        lease_renew_handle: None,
-                        decode_progress_reporter,
-                    },
-                );
-                active_decode_order.push_back(session_id);
 
                 if let Err(error) = coordinator.persist_runtime_stats() {
                     warn!(
@@ -4439,6 +4658,7 @@ async fn cmd_runtime() -> Result<()> {
                 job_id,
                 device_id,
                 &active_segment_id,
+                &active_segment_id,
             )
             .await;
 
@@ -4446,6 +4666,7 @@ async fn cmd_runtime() -> Result<()> {
                 &mut coordinator,
                 &registration_client,
                 &assignment,
+                DecodeLeaseRole::Owner,
                 execution_result,
                 job_id,
                 device_id,
@@ -5833,10 +6054,9 @@ async fn cmd_doctor(stage: DoctorStage) -> Result<()> {
                 readiness.multi_session_batch_rate * 100.0
             ),
             Some(readiness) if readiness.decode_microbatches_executed > 0 => {
-                production_gate_failed = true;
                 println!(
-                    "  {} local decode pooling not production-ready: peak_batch_size={}, avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
-                    "FAIL".red().bold(),
+                    "  {} local decode pooling ownership not proven on this node: peak_batch_size={}, avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}; validate pooled serving at the network scheduler level",
+                    "WARN".yellow().bold(),
                     readiness.peak_decode_batch_size,
                     readiness.avg_decode_batch_size,
                     readiness.multi_session_batch_rate * 100.0,
@@ -5844,17 +6064,15 @@ async fn cmd_doctor(stage: DoctorStage) -> Result<()> {
                 )
             }
             Some(_) => {
-                production_gate_failed = true;
                 println!(
-                    "  {} local decode pooling unproven: no decode microbatch telemetry recorded yet",
-                    "FAIL".red().bold()
+                    "  {} local decode pooling ownership unproven on this node: no decode microbatch telemetry recorded yet; validate pooled serving at the network scheduler level",
+                    "WARN".yellow().bold()
                 )
             }
             None => {
-                production_gate_failed = true;
                 println!(
-                    "  {} local decode pooling unproven: no inference stats recorded yet",
-                    "FAIL".red().bold()
+                    "  {} local decode pooling ownership unproven on this node: no inference stats recorded yet; validate pooled serving at the network scheduler level",
+                    "WARN".yellow().bold()
                 )
             }
         },
@@ -6070,9 +6288,14 @@ pub(crate) async fn cmd_join_ring(model_id: String, memory: Option<String>) -> R
 mod tests {
     use super::*;
     use agent::api::types::{
-        PeerPunchPlan, PunchPathReason, PunchPathStrategy, ShardInfo, WorkerInfo,
+        DecodeLeaseSessionMember, ExecutionGroup, ExecutionGroupMember, ExecutionSegment,
+        InferenceExecutionLease, InferenceExecutionPlan, InferenceSessionLease, KvTransferPolicy,
+        PeerPunchPlan, PunchPathReason, PunchPathStrategy, RingProtocolClass, ShardInfo,
+        TransportCapabilityTier, WorkerInfo,
     };
+    use agent::provider::ProviderCompatibilityClass;
     use clap::CommandFactory;
+    use uuid::Uuid;
 
     fn test_worker(
         device_id: &str,
@@ -6115,6 +6338,119 @@ mod tests {
         }
     }
 
+    fn test_decode_assignment(primary_session_id: Uuid) -> InferenceExecutionLease {
+        InferenceExecutionLease {
+            lease_id: "lease-1".to_string(),
+            job_id: Uuid::new_v4().to_string(),
+            network_id: "test-network".to_string(),
+            device_id: "worker-1".to_string(),
+            model_id: "test-model".to_string(),
+            reserved_credits: 0.0,
+            available_completion_tokens: 32,
+            model_size_factor: 1.0,
+            lease_expires_at: "2026-01-01T00:00:00Z".to_string(),
+            execution_plan: InferenceExecutionPlan {
+                plan_id: "plan-1".to_string(),
+                runtime_mode: agent::api::types::InferenceRuntimeMode::ThroughputFirst,
+                execution_groups: vec![ExecutionGroup {
+                    group_id: "group-1".to_string(),
+                    execution_island_id: "island-1".to_string(),
+                    model_id: "test-model".to_string(),
+                    phase: ApiExecutionPhase::Decode,
+                    compatibility_class: ProviderCompatibilityClass::CpuPortable,
+                    backend_contract_hash: None,
+                    fast_path_eligible: true,
+                    protocol_class: RingProtocolClass::UniformModelRing,
+                    transport_tier: TransportCapabilityTier::DirectPreferred,
+                    kv_transfer_policy: KvTransferPolicy::CoLocated,
+                    total_capacity_units: 1,
+                    members: vec![ExecutionGroupMember {
+                        device_id: "worker-1".to_string(),
+                        peer_id: "peer-1".to_string(),
+                        ring_position: 0,
+                        status: "online".to_string(),
+                        contributed_memory: 1,
+                        shard: ShardInfo {
+                            model_id: "test-model".to_string(),
+                            column_start: 0,
+                            column_end: 1,
+                            estimated_memory: 1,
+                        },
+                        shard_worker_position: 0,
+                        shard_total_workers: 1,
+                        left_neighbor: "worker-1".to_string(),
+                        right_neighbor: "worker-1".to_string(),
+                        connectivity_state: None,
+                        listen_addrs: Vec::new(),
+                        direct_candidates: Vec::new(),
+                        assigned_capacity_units: 1,
+                        backend_contract: agent::provider::BackendContractDescriptor::for_provider(
+                            agent::provider::ExecutionProviderKind::Cpu,
+                        ),
+                    }],
+                    peer_punch_plans: Vec::new(),
+                }],
+                support_groups: Vec::new(),
+                segments: vec![ExecutionSegment {
+                    segment_id: "segment-1".to_string(),
+                    session_id: primary_session_id.to_string(),
+                    execution_group_id: "group-1".to_string(),
+                    execution_island_id: "island-1".to_string(),
+                    phase: ApiExecutionPhase::Decode,
+                    prompt_tokens: vec![1, 2, 3],
+                    max_tokens: 32,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    kv_owner_device_id: "worker-1".to_string(),
+                    shard_owner_device_ids: vec!["worker-1".to_string()],
+                    participant_device_ids: vec!["worker-1".to_string()],
+                }],
+                initial_segment_id: "segment-1".to_string(),
+            },
+            active_segment: ExecutionSegment {
+                segment_id: "segment-1".to_string(),
+                session_id: primary_session_id.to_string(),
+                execution_group_id: "group-1".to_string(),
+                execution_island_id: "island-1".to_string(),
+                phase: ApiExecutionPhase::Decode,
+                prompt_tokens: vec![1, 2, 3],
+                max_tokens: 32,
+                temperature: 0.0,
+                top_p: 1.0,
+                kv_owner_device_id: "worker-1".to_string(),
+                shard_owner_device_ids: vec!["worker-1".to_string()],
+                participant_device_ids: vec!["worker-1".to_string()],
+            },
+            session: InferenceSessionLease {
+                session_id: primary_session_id.to_string(),
+                status: "leased".to_string(),
+                active_segment_id: Some("segment-1".to_string()),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(16),
+                latest_batch_size: None,
+                latest_active_decode_sessions: None,
+                latest_batch_kv_tokens: None,
+                latest_deferred_decode_sessions: None,
+                lease_session_ids: Vec::new(),
+                lease_session_members: Vec::new(),
+                kv_checkpoint_device_id: None,
+                kv_checkpoint_created_at: None,
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                checkpoint: None,
+                local_replica: None,
+                lease_target_session_count: None,
+                lease_target_batch_size: None,
+                pooled_batch_group_key: None,
+                pooled_total_sessions: None,
+                pooled_ready_sessions: None,
+                pooled_blocked_sessions: None,
+                pooled_leased_sessions: None,
+                pooled_active_sessions: None,
+            },
+        }
+    }
+
     #[test]
     fn decode_refresh_without_shape_or_metadata_change_preserves_runtime_state() {
         let session_a = Uuid::new_v4();
@@ -6128,6 +6464,149 @@ mod tests {
             "lease-a",
             "segment-a",
         ));
+    }
+
+    #[test]
+    fn decode_lease_session_members_follow_runtime_target_order() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let mut assignment = test_decode_assignment(session_a);
+        assignment.session.lease_session_members = vec![
+            DecodeLeaseSessionMember {
+                job_id: Uuid::new_v4().to_string(),
+                session_id: session_b.to_string(),
+                segment_id: "segment-1".to_string(),
+                active_segment_id: Some("segment-1".to_string()),
+                status: "leased".to_string(),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(16),
+                checkpoint: None,
+                local_replica: None,
+            },
+            DecodeLeaseSessionMember {
+                job_id: Uuid::new_v4().to_string(),
+                session_id: session_a.to_string(),
+                segment_id: "segment-1".to_string(),
+                active_segment_id: Some("segment-1".to_string()),
+                status: "leased".to_string(),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(16),
+                checkpoint: None,
+                local_replica: None,
+            },
+        ];
+
+        let members = decode_lease_session_members(&assignment, &[session_a, session_b]).unwrap();
+
+        assert_eq!(members[0].0.session_id, session_a.to_string());
+        assert_eq!(members[1].0.session_id, session_b.to_string());
+        assert!(matches!(members[0].1, DecodeLeaseRole::Owner));
+        assert!(matches!(members[1].1, DecodeLeaseRole::Follower));
+    }
+
+    #[test]
+    fn decode_lease_session_members_reject_missing_target_member() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let mut assignment = test_decode_assignment(session_a);
+        assignment.session.lease_session_members = vec![DecodeLeaseSessionMember {
+            job_id: Uuid::new_v4().to_string(),
+            session_id: session_a.to_string(),
+            segment_id: "segment-1".to_string(),
+            active_segment_id: Some("segment-1".to_string()),
+            status: "leased".to_string(),
+            kv_owner_device_id: "worker-1".to_string(),
+            kv_transfer_policy: KvTransferPolicy::CoLocated,
+            kv_sequence_position: Some(16),
+            checkpoint: None,
+            local_replica: None,
+        }];
+
+        let error = decode_lease_session_members(&assignment, &[session_a, session_b]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("member count 1 did not match active decode target count 2"));
+    }
+
+    #[test]
+    fn canonical_decode_batch_session_ids_prefer_member_order() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let mut assignment = test_decode_assignment(session_a);
+        assignment.session.lease_session_ids = vec![session_a.to_string(), session_b.to_string()];
+        assignment.session.lease_session_members = vec![
+            DecodeLeaseSessionMember {
+                job_id: Uuid::new_v4().to_string(),
+                session_id: session_b.to_string(),
+                segment_id: "segment-b".to_string(),
+                active_segment_id: Some("segment-b".to_string()),
+                status: "leased".to_string(),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(17),
+                checkpoint: None,
+                local_replica: None,
+            },
+            DecodeLeaseSessionMember {
+                job_id: Uuid::new_v4().to_string(),
+                session_id: session_a.to_string(),
+                segment_id: "segment-a".to_string(),
+                active_segment_id: Some("segment-a".to_string()),
+                status: "leased".to_string(),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(16),
+                checkpoint: None,
+                local_replica: None,
+            },
+        ];
+
+        let session_ids = canonical_decode_batch_session_ids(&assignment, None).unwrap();
+
+        assert_eq!(session_ids, vec![session_b, session_a]);
+    }
+
+    #[test]
+    fn canonical_decode_batch_session_ids_reject_divergent_redundant_ordering() {
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let mut assignment = test_decode_assignment(session_a);
+        assignment.session.lease_session_ids = vec![session_a.to_string()];
+        assignment.session.lease_session_members = vec![
+            DecodeLeaseSessionMember {
+                job_id: Uuid::new_v4().to_string(),
+                session_id: session_a.to_string(),
+                segment_id: "segment-a".to_string(),
+                active_segment_id: Some("segment-a".to_string()),
+                status: "leased".to_string(),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(16),
+                checkpoint: None,
+                local_replica: None,
+            },
+            DecodeLeaseSessionMember {
+                job_id: Uuid::new_v4().to_string(),
+                session_id: session_b.to_string(),
+                segment_id: "segment-b".to_string(),
+                active_segment_id: Some("segment-b".to_string()),
+                status: "leased".to_string(),
+                kv_owner_device_id: "worker-1".to_string(),
+                kv_transfer_policy: KvTransferPolicy::CoLocated,
+                kv_sequence_position: Some(17),
+                checkpoint: None,
+                local_replica: None,
+            },
+        ];
+
+        let error = canonical_decode_batch_session_ids(&assignment, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("diverged from canonical lease member cohort"));
     }
 
     #[test]

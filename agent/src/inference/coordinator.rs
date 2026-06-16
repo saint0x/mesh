@@ -696,6 +696,13 @@ impl InferenceCoordinator {
         self.sessions.contains_key(&session_id)
     }
 
+    pub fn active_runtime_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| !session.job.is_complete())
+            .count()
+    }
+
     pub fn pause_local_session(
         &mut self,
         session_id: Uuid,
@@ -804,7 +811,13 @@ impl InferenceCoordinator {
             )
         })?;
         self.prune_unused_model_residency();
-        Ok(Some(session.job.into_result()))
+        let result = session.job.into_result();
+        self.stats.record_success(
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.execution_time_ms,
+        );
+        Ok(Some(result))
     }
 
     #[allow(dead_code)]

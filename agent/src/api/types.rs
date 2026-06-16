@@ -456,6 +456,7 @@ pub struct ReportInferenceAssignmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportInferenceAssignmentProgressRequest {
     pub device_id: String,
+    pub session_id: String,
     pub segment_id: String,
     pub phase: ExecutionPhase,
     pub event: ProgressEventKind,
@@ -471,6 +472,10 @@ pub struct ReportInferenceAssignmentProgressRequest {
     pub batch_kv_tokens: Option<u32>,
     #[serde(default)]
     pub deferred_decode_sessions: Option<u32>,
+    #[serde(default)]
+    pub target_session_count: Option<u32>,
+    #[serde(default)]
+    pub target_batch_size: Option<u32>,
     #[serde(default)]
     pub scheduler_queue: Option<InferenceSchedulerQueueState>,
     #[serde(default)]
@@ -532,6 +537,24 @@ pub struct ReleaseDecodeLeaseResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodeLeaseSessionMember {
+    pub job_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    #[serde(default)]
+    pub active_segment_id: Option<String>,
+    pub status: String,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    #[serde(default)]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(default)]
+    pub checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(default)]
+    pub local_replica: Option<InferenceSessionReplicaStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceSessionLease {
     pub session_id: String,
     pub status: String,
@@ -553,6 +576,8 @@ pub struct InferenceSessionLease {
     pub pooled_active_sessions: Option<u32>,
     #[serde(default)]
     pub lease_session_ids: Vec<String>,
+    #[serde(default)]
+    pub lease_session_members: Vec<DecodeLeaseSessionMember>,
     pub kv_checkpoint_device_id: Option<String>,
     pub kv_checkpoint_created_at: Option<String>,
     pub updated_at: String,

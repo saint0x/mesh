@@ -637,6 +637,7 @@ pub struct ReportInferenceAssignmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportInferenceAssignmentProgressRequest {
     pub device_id: String,
+    pub session_id: String,
     pub segment_id: String,
     pub phase: ExecutionPhase,
     pub event: ProgressEventKind,
@@ -654,6 +655,10 @@ pub struct ReportInferenceAssignmentProgressRequest {
     pub batch_kv_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred_decode_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_session_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduler_queue: Option<InferenceSchedulerQueueState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -898,6 +903,24 @@ pub struct InferenceSessionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodeLeaseSessionMember {
+    pub job_id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<String>,
+    pub status: String,
+    pub kv_owner_device_id: String,
+    pub kv_transfer_policy: KvTransferPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_sequence_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<InferenceSessionCheckpointStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_replica: Option<InferenceSessionReplicaStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceSessionLease {
     pub session_id: String,
     pub status: String,
@@ -917,6 +940,8 @@ pub struct InferenceSessionLease {
     pub latest_deferred_decode_sessions: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lease_session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_session_members: Vec<DecodeLeaseSessionMember>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_target_session_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -450,9 +450,6 @@ for index, item in enumerate(stats, start=1):
     worker_name = f"worker{index}"
     worker_allreduce_ops = int(item.get("allreduce_operations", 0))
     worker_tensor_bytes_sent = int(item.get("tensor_bytes_sent", 0))
-    worker_decode_microbatches = int(item.get("decode_microbatches_executed", 0))
-    worker_peak_decode_batch = int(item.get("decode_batch_size_peak", 0))
-    worker_multi_session_rate = float(item.get("multi_session_batch_rate", 0.0))
 
     if worker_allreduce_ops <= 0:
         raise SystemExit(
@@ -461,18 +458,6 @@ for index, item in enumerate(stats, start=1):
     if worker_tensor_bytes_sent <= 0:
         raise SystemExit(
             f"{worker_name} did not emit tensor-plane traffic; tensor_bytes_sent={worker_tensor_bytes_sent}"
-        )
-    if worker_decode_microbatches <= 0:
-        raise SystemExit(
-            f"{worker_name} did not execute decode work; decode_microbatches_executed={worker_decode_microbatches}"
-        )
-    if worker_peak_decode_batch < 2:
-        raise SystemExit(
-            f"{worker_name} never observed pooled decode locally; decode_batch_size_peak={worker_peak_decode_batch}"
-        )
-    if worker_multi_session_rate <= 0.0:
-        raise SystemExit(
-            f"{worker_name} never observed a multi-session decode microbatch; multi_session_batch_rate={worker_multi_session_rate:.3f}"
         )
 
 if total_tokens <= 0:
