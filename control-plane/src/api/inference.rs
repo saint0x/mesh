@@ -10273,6 +10273,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_decode_peer_can_attach_before_leader_acknowledges_leased_queue() {
+        let network_id = "test-network-decode-leased-attach";
+        let state = joined_state(&["worker-1", "worker-2"], network_id).await;
+
+        let submit = submit_inference(
+            State(state.clone()),
+            Json(SubmitInferenceRequest {
+                request_id: Uuid::new_v4().to_string(),
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                model_id: "llama-70b".into(),
+                prompt: "attach-before-ack".into(),
+                max_tokens: 8,
+                temperature: 0.7,
+                top_p: 0.9,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let plan = submit
+            .execution_plan
+            .clone()
+            .expect("expected execution plan");
+        let decode_segment_id = plan
+            .segments
+            .iter()
+            .find(|segment| matches!(segment.phase, ExecutionPhase::Decode))
+            .map(|segment| segment.segment_id.clone())
+            .expect("expected decode segment id");
+
+        let status = drive_job_to_decode_ready(&state, &submit.job_id, network_id, &plan).await;
+        assert_eq!(status.status, "running");
+        assert_eq!(
+            status
+                .session
+                .as_ref()
+                .map(|session| session.status.as_str()),
+            Some("decode_ready")
+        );
+
+        let leader_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-1".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected leader decode claim");
+        assert_eq!(leader_claim.active_segment.segment_id, decode_segment_id);
+
+        let conn = state.db.get_conn().unwrap();
+        let worker2_assignment_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, active_segment_id
+                FROM inference_job_assignments
+                WHERE job_id = ? AND device_id = 'worker-2'
+                "#,
+                params![submit.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let worker2_group_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, lease_owner_device_id
+                FROM inference_serving_groups
+                WHERE job_id = ? AND device_id = 'worker-2' AND phase = 'decode'
+                "#,
+                params![submit.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let decode_queue_state: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT status, lease_owner_device_id
+                FROM inference_decode_queue
+                WHERE job_id = ?
+                "#,
+                params![submit.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(worker2_assignment_state.0, "leased");
+        assert_eq!(
+            worker2_assignment_state.1.as_deref(),
+            Some(decode_segment_id.as_str())
+        );
+        assert_eq!(worker2_group_state.0, "decode_ready");
+        assert_eq!(worker2_group_state.1.as_deref(), Some("worker-1"));
+        assert_eq!(decode_queue_state.0, "leased");
+        assert_eq!(decode_queue_state.1.as_deref(), Some("worker-1"));
+
+        let follower_claim = claim_inference_assignment(
+            State(state.clone()),
+            Json(ClaimInferenceAssignmentRequest {
+                device_id: "worker-2".into(),
+                network_id: network_id.into(),
+                claim_mode: crate::api::types::WorkClaimMode::Any,
+                include_queue_state: false,
+                include_serving_session: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .expect("expected follower to attach to leased decode cohort");
+        assert_eq!(follower_claim.active_segment.segment_id, decode_segment_id);
+    }
+
+    #[tokio::test]
     async fn test_decode_peer_can_attach_after_leader_acknowledges_active_queue() {
         let network_id = "test-network-decode-active-attach";
         let state = joined_state(&["worker-1", "worker-2"], network_id).await;
