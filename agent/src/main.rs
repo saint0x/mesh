@@ -5191,7 +5191,7 @@ async fn cmd_inference(
 
         let status = response.status();
         let is_retryable = status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            || response.headers().contains_key("x-meshnet-db-locked");
+            && response.headers().contains_key("x-meshnet-db-locked");
         if !is_retryable {
             break response;
         }

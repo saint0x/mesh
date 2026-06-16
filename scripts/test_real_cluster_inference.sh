@@ -9,6 +9,7 @@ MODEL_ID="${MESHNET_REAL_CLUSTER_MODEL_ID:-smollm2-135m-instruct}"
 ORIGINAL_HOME="${HOME:-}"
 MODEL_STORE="${MESHNET_MODEL_STORE:-${ORIGINAL_HOME}/.meshnet/models}"
 TEST_RUST_LOG="${MESHNET_TEST_RUST_LOG:-info}"
+PREFERRED_PROVIDER="${MESHNET_REAL_CLUSTER_PREFERRED_PROVIDER:-}"
 NETWORK_ID="real-cluster-e2e"
 CONTROL_HOME="$TEST_ROOT/control-plane"
 WORKER1_HOME="$TEST_ROOT/worker1"
@@ -111,41 +112,41 @@ wait_for_local_tensor_endpoint() {
     return 1
 }
 
-patch_cpu_provider() {
-    local home_dir="$1"
-    local config_path="$home_dir/.meshnet/device.toml"
-    python3 - "$config_path" <<'PY'
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-if "[execution]" not in text:
-    text = text.rstrip() + '\n\n[execution]\npreferred_provider = "cpu"\n'
-elif "preferred_provider" not in text:
-    text = re.sub(r"(\[execution\]\n)", '\\1preferred_provider = "cpu"\n', text, count=1)
-else:
-    text = re.sub(
-        r'preferred_provider\s*=\s*"[^"]+"',
-        'preferred_provider = "cpu"',
-        text,
-        count=1,
-    )
-path.write_text(text)
-PY
-}
-
 run_agent_cli() {
     local home_dir="$1"
     shift
-    env \
-        HOME="$home_dir" \
-        MESHNET_HOME="$home_dir" \
-        MESHNET_MODEL_STORE="$MODEL_STORE" \
-        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-        "$AGENT_BIN" "$@"
+    (
+        cd "$home_dir"
+        env \
+            HOME="$home_dir" \
+            MESHNET_HOME="$home_dir" \
+            MESHNET_MODEL_STORE="$MODEL_STORE" \
+            CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+            "$AGENT_BIN" "$@"
+    )
+}
+
+require_production_provider() {
+    local home_dir="$1"
+    local output
+    output="$(run_agent_cli "$home_dir" doctor 2>&1 || true)"
+    if ! grep -q "provider contract production-ready" <<<"$output"; then
+        echo "device at $home_dir is not production-serving ready" >&2
+        echo "$output" >&2
+        return 1
+    fi
+}
+
+require_assigned_shard_readiness() {
+    local home_dir="$1"
+    local output
+    output="$(run_agent_cli "$home_dir" doctor 2>&1 || true)"
+    if ! grep -q "assigned shard production-ready" <<<"$output"; then
+        echo "device at $home_dir does not have a production-ready assigned shard" >&2
+        echo "$output" >&2
+        return 1
+    fi
 }
 
 device_id_from_home() {
@@ -155,6 +156,11 @@ device_id_from_home() {
 
 if [[ ! -d "$MODEL_STORE/$MODEL_ID" ]]; then
     echo "required real model artifacts not found at $MODEL_STORE/$MODEL_ID" >&2
+    exit 1
+fi
+
+if [[ "$PREFERRED_PROVIDER" == "cpu" ]]; then
+    echo "cpu is not a production-serving provider; refusing to run real cluster production validation" >&2
     exit 1
 fi
 
@@ -170,13 +176,16 @@ if [[ -z "$AGENT_BIN" || -z "$CONTROL_BIN" ]]; then
     exit 1
 fi
 
-env \
-    HOME="$CONTROL_HOME" \
-    MESHNET_MODEL_STORE="$MODEL_STORE" \
-    RUST_LOG="$TEST_RUST_LOG" \
-    CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-    "$CONTROL_BIN" --port "$CONTROL_PORT" >"$CONTROL_LOG" 2>&1 &
+(
+    cd "$CONTROL_HOME"
+    env \
+        HOME="$CONTROL_HOME" \
+        MESHNET_MODEL_STORE="$MODEL_STORE" \
+        RUST_LOG="$TEST_RUST_LOG" \
+        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+        "$CONTROL_BIN" --port "$CONTROL_PORT" >"$CONTROL_LOG" 2>&1
+) &
 CONTROL_PID=$!
 
 if ! wait_for_http "http://127.0.0.1:${CONTROL_PORT}/health" 120; then
@@ -199,8 +208,17 @@ curl -fsS -X POST "${CONTROL_URL}/api/networks" \
         }
     }" >/dev/null
 
-run_agent_cli "$WORKER1_HOME" device init --network-id "$NETWORK_ID" --name "Worker 1" --control-plane "$CONTROL_URL" --preferred-provider cpu >/dev/null
-run_agent_cli "$WORKER2_HOME" device init --network-id "$NETWORK_ID" --name "Worker 2" --control-plane "$CONTROL_URL" --preferred-provider cpu >/dev/null
+WORKER1_INIT_ARGS=(device init --network-id "$NETWORK_ID" --name "Worker 1" --control-plane "$CONTROL_URL")
+WORKER2_INIT_ARGS=(device init --network-id "$NETWORK_ID" --name "Worker 2" --control-plane "$CONTROL_URL")
+if [[ -n "$PREFERRED_PROVIDER" ]]; then
+    WORKER1_INIT_ARGS+=(--preferred-provider "$PREFERRED_PROVIDER")
+    WORKER2_INIT_ARGS+=(--preferred-provider "$PREFERRED_PROVIDER")
+fi
+run_agent_cli "$WORKER1_HOME" "${WORKER1_INIT_ARGS[@]}" >/dev/null
+run_agent_cli "$WORKER2_HOME" "${WORKER2_INIT_ARGS[@]}" >/dev/null
+
+require_production_provider "$WORKER1_HOME"
+require_production_provider "$WORKER2_HOME"
 
 WORKER1_DEVICE_ID="$(device_id_from_home "$WORKER1_HOME")"
 WORKER2_DEVICE_ID="$(device_id_from_home "$WORKER2_HOME")"
@@ -221,24 +239,30 @@ for device_id in "$WORKER1_DEVICE_ID" "$WORKER2_DEVICE_ID"; do
         }" >/dev/null
 done
 
-env \
-    HOME="$WORKER1_HOME" \
-    MESHNET_HOME="$WORKER1_HOME" \
-    MESHNET_MODEL_STORE="$MODEL_STORE" \
-    RUST_LOG="$TEST_RUST_LOG" \
-    CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-    "$AGENT_BIN" device start --log-level info >"$WORKER1_LOG" 2>&1 &
+(
+    cd "$WORKER1_HOME"
+    env \
+        HOME="$WORKER1_HOME" \
+        MESHNET_HOME="$WORKER1_HOME" \
+        MESHNET_MODEL_STORE="$MODEL_STORE" \
+        RUST_LOG="$TEST_RUST_LOG" \
+        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+        "$AGENT_BIN" device start --log-level info >"$WORKER1_LOG" 2>&1
+) &
 WORKER1_PID=$!
 
-env \
-    HOME="$WORKER2_HOME" \
-    MESHNET_HOME="$WORKER2_HOME" \
-    MESHNET_MODEL_STORE="$MODEL_STORE" \
-    RUST_LOG="$TEST_RUST_LOG" \
-    CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-    "$AGENT_BIN" device start --log-level info >"$WORKER2_LOG" 2>&1 &
+(
+    cd "$WORKER2_HOME"
+    env \
+        HOME="$WORKER2_HOME" \
+        MESHNET_HOME="$WORKER2_HOME" \
+        MESHNET_MODEL_STORE="$MODEL_STORE" \
+        RUST_LOG="$TEST_RUST_LOG" \
+        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+        "$AGENT_BIN" device start --log-level info >"$WORKER2_LOG" 2>&1
+) &
 WORKER2_PID=$!
 
 if ! wait_for_local_tensor_endpoint "$WORKER1_HOME" 120; then
@@ -265,24 +289,30 @@ unset WORKER2_PID
 run_agent_cli "$WORKER1_HOME" ring join --model-id "$MODEL_ID" --memory 1GB >/dev/null
 run_agent_cli "$WORKER2_HOME" ring join --model-id "$MODEL_ID" --memory 1GB >/dev/null
 
-env \
-    HOME="$WORKER1_HOME" \
-    MESHNET_HOME="$WORKER1_HOME" \
-    MESHNET_MODEL_STORE="$MODEL_STORE" \
-    RUST_LOG="$TEST_RUST_LOG" \
-    CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-    "$AGENT_BIN" device start --log-level info >"$WORKER1_LOG" 2>&1 &
+(
+    cd "$WORKER1_HOME"
+    env \
+        HOME="$WORKER1_HOME" \
+        MESHNET_HOME="$WORKER1_HOME" \
+        MESHNET_MODEL_STORE="$MODEL_STORE" \
+        RUST_LOG="$TEST_RUST_LOG" \
+        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+        "$AGENT_BIN" device start --log-level info >"$WORKER1_LOG" 2>&1
+) &
 WORKER1_PID=$!
 
-env \
-    HOME="$WORKER2_HOME" \
-    MESHNET_HOME="$WORKER2_HOME" \
-    MESHNET_MODEL_STORE="$MODEL_STORE" \
-    RUST_LOG="$TEST_RUST_LOG" \
-    CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
-    "$AGENT_BIN" device start --log-level info >"$WORKER2_LOG" 2>&1 &
+(
+    cd "$WORKER2_HOME"
+    env \
+        HOME="$WORKER2_HOME" \
+        MESHNET_HOME="$WORKER2_HOME" \
+        MESHNET_MODEL_STORE="$MODEL_STORE" \
+        RUST_LOG="$TEST_RUST_LOG" \
+        CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}" \
+        "$AGENT_BIN" device start --log-level info >"$WORKER2_LOG" 2>&1
+) &
 WORKER2_PID=$!
 
 if ! wait_for_topology 180; then
@@ -293,11 +323,14 @@ if ! wait_for_topology 180; then
     exit 1
 fi
 
+require_assigned_shard_readiness "$WORKER1_HOME"
+require_assigned_shard_readiness "$WORKER2_HOME"
+
 curl -fsS "http://127.0.0.1:${CONTROL_PORT}/api/ring/topology?network_id=${NETWORK_ID}" \
     >"$TOPOLOGY_LOG"
 
 run_with_timeout 240s bash -lc \
-    "HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'Say hello from mesh in five words.' --max-tokens 16 --temperature 0.0 --top-p 1.0" \
+    "cd '$WORKER1_HOME' && HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'Say hello from mesh in five words.' --max-tokens 16 --temperature 0.0 --top-p 1.0" \
     >"$JOB1_LOG" 2>&1
 
 if ! grep -q "Status:          completed" "$JOB1_LOG"; then
@@ -328,17 +361,17 @@ then
 fi
 
 run_with_timeout 300s bash -lc \
-    "HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'Count upward in short words.' --max-tokens 32 --temperature 0.0 --top-p 1.0" \
+    "cd '$WORKER1_HOME' && HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'Count upward in short words.' --max-tokens 32 --temperature 0.0 --top-p 1.0" \
     >"$JOB2_LOG" 2>&1 &
 JOB2_PID=$!
 
 run_with_timeout 300s bash -lc \
-    "HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'List three tiny animals.' --max-tokens 32 --temperature 0.0 --top-p 1.0" \
+    "cd '$WORKER1_HOME' && HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'List three tiny animals.' --max-tokens 32 --temperature 0.0 --top-p 1.0" \
     >"$JOB3_LOG" 2>&1 &
 JOB3_PID=$!
 
 run_with_timeout 300s bash -lc \
-    "HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'Name a few bright colors.' --max-tokens 32 --temperature 0.0 --top-p 1.0" \
+    "cd '$WORKER1_HOME' && HOME='$WORKER1_HOME' MESHNET_HOME='$WORKER1_HOME' MESHNET_MODEL_STORE='$MODEL_STORE' CARGO_HOME='${CARGO_HOME:-$ORIGINAL_HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$ORIGINAL_HOME/.rustup}' '$AGENT_BIN' job run --model-id '$MODEL_ID' --prompt 'Name a few bright colors.' --max-tokens 32 --temperature 0.0 --top-p 1.0" \
     >"$JOB4_LOG" 2>&1 &
 JOB4_PID=$!
 

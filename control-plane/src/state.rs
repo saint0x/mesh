@@ -30,12 +30,12 @@ impl AppState {
     pub fn new(db: Database, keypair: Arc<ControlPlaneKeypair>) -> Self {
         let topology_notifier = Arc::new(TopologyNotifier::new(Arc::new(db.clone())));
         Self {
+            inference_write_gate: db.write_gate(),
             db,
             keypair,
             ring_managers: Arc::new(RwLock::new(HashMap::new())),
             network_scheduling_policies: Arc::new(RwLock::new(HashMap::new())),
             topology_notifier,
-            inference_write_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -105,5 +105,21 @@ impl AppState {
         managers.insert(network_id.to_string(), manager.clone());
 
         Ok(manager)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::create_test_db;
+    use crate::services::certificate::ControlPlaneKeypair;
+
+    #[test]
+    fn app_state_uses_database_authoritative_write_gate() {
+        let db = create_test_db();
+        let keypair = Arc::new(ControlPlaneKeypair::load_or_generate().unwrap());
+        let state = AppState::new(db.clone(), keypair);
+
+        assert!(Arc::ptr_eq(&state.inference_write_gate, &db.write_gate()));
     }
 }

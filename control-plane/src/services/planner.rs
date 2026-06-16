@@ -108,9 +108,9 @@ impl ExecutionPlanner {
         let prefill_segment_id = format!("segment-{}-prefill", session_id);
         let decode_segment_id = format!("segment-{}-decode", session_id);
         let prefill_island =
-            classify_execution_island(&req.model_id, ExecutionPhase::Prefill, &prefill_members);
+            classify_execution_island(&req.model_id, ExecutionPhase::Prefill, &prefill_members)?;
         let decode_island =
-            classify_execution_island(&req.model_id, ExecutionPhase::Decode, &decode_members);
+            classify_execution_island(&req.model_id, ExecutionPhase::Decode, &decode_members)?;
         let peer_punch_plans = topology
             .peer_punch_plans
             .iter()
@@ -160,7 +160,7 @@ impl ExecutionPlanner {
             &prefill_members,
             &decode_members,
             &topology.peer_punch_plans,
-        );
+        )?;
         let prefill_segment = ExecutionSegment {
             segment_id: prefill_segment_id.clone(),
             session_id: session_id.clone(),
@@ -301,7 +301,7 @@ impl ExecutionPlanner {
             .map(|member| member.device_id.clone())
             .collect::<Vec<_>>();
         let decode_island =
-            classify_execution_island(&model_id, ExecutionPhase::Decode, &decode_members);
+            classify_execution_island(&model_id, ExecutionPhase::Decode, &decode_members)?;
 
         let mut refreshed = plan.clone();
         refreshed.runtime_mode = runtime_mode;
@@ -366,7 +366,7 @@ impl ExecutionPlanner {
             &prefill_members,
             &decode_members,
             &topology.peer_punch_plans,
-        );
+        )?;
 
         Ok(refreshed)
     }
@@ -379,7 +379,7 @@ fn build_support_groups(
     prefill_members: &[ExecutionGroupMember],
     decode_members: &[ExecutionGroupMember],
     peer_punch_plans: &[crate::services::ring_manager::PeerPunchPlan],
-) -> Vec<SupportGroup> {
+) -> ApiResult<Vec<SupportGroup>> {
     let mut support_groups = Vec::new();
     let contract_aligned_members = decode_members
         .first()
@@ -409,31 +409,34 @@ fn build_support_groups(
         .collect::<Vec<_>>();
 
     let kv_members = select_support_members(&contract_aligned_members, &non_decode_members, 2);
-    support_groups.push(build_support_group(
+    maybe_push_support_group(
+        &mut support_groups,
         plan_id,
         model_id,
         SupportGroupRole::Kv,
         &kv_members,
         peer_punch_plans,
-    ));
+    )?;
 
     let checkpoint_seed = union_members(&kv_members, &non_decode_members);
-    support_groups.push(build_support_group(
+    maybe_push_support_group(
+        &mut support_groups,
         plan_id,
         model_id,
         SupportGroupRole::Checkpoint,
         &checkpoint_seed,
         peer_punch_plans,
-    ));
+    )?;
 
     let recovery_seed = union_members(&kv_members, decode_members);
-    support_groups.push(build_support_group(
+    maybe_push_support_group(
+        &mut support_groups,
         plan_id,
         model_id,
         SupportGroupRole::Recovery,
         &recovery_seed,
         peer_punch_plans,
-    ));
+    )?;
 
     let overflow_seed = contract_aligned_members
         .iter()
@@ -443,7 +446,8 @@ fn build_support_groups(
         })
         .cloned()
         .collect::<Vec<_>>();
-    support_groups.push(build_support_group(
+    maybe_push_support_group(
+        &mut support_groups,
         plan_id,
         model_id,
         SupportGroupRole::Overflow,
@@ -453,12 +457,30 @@ fn build_support_groups(
             &overflow_seed
         },
         peer_punch_plans,
-    ));
+    )?;
 
-    support_groups
-        .into_iter()
-        .filter(|group| !group.members.is_empty())
-        .collect()
+    Ok(support_groups)
+}
+
+fn maybe_push_support_group(
+    support_groups: &mut Vec<SupportGroup>,
+    plan_id: &str,
+    model_id: &str,
+    role: SupportGroupRole,
+    members: &[ExecutionGroupMember],
+    peer_punch_plans: &[crate::services::ring_manager::PeerPunchPlan],
+) -> ApiResult<()> {
+    if members.is_empty() {
+        return Ok(());
+    }
+    support_groups.push(build_support_group(
+        plan_id,
+        model_id,
+        role,
+        members,
+        peer_punch_plans,
+    )?);
+    Ok(())
 }
 
 fn select_support_members(
@@ -508,7 +530,7 @@ fn build_support_group(
     role: SupportGroupRole,
     members: &[ExecutionGroupMember],
     peer_punch_plans: &[crate::services::ring_manager::PeerPunchPlan],
-) -> SupportGroup {
+) -> ApiResult<SupportGroup> {
     let group_id = format!(
         "support:{}:{}",
         match role {
@@ -519,12 +541,12 @@ fn build_support_group(
         },
         plan_id
     );
-    let island = classify_execution_island(model_id, ExecutionPhase::Decode, members);
+    let island = classify_execution_island(model_id, ExecutionPhase::Decode, members)?;
     let member_ids = members
         .iter()
         .map(|member| member.device_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    SupportGroup {
+    Ok(SupportGroup {
         group_id,
         role,
         execution_island_id: island.island_id,
@@ -547,7 +569,7 @@ fn build_support_group(
             })
             .map(map_peer_punch_plan)
             .collect(),
-    }
+    })
 }
 
 pub fn validate_serving_group_legality(
@@ -803,7 +825,7 @@ fn classify_execution_island(
     model_id: &str,
     phase: ExecutionPhase,
     members: &[ExecutionGroupMember],
-) -> ExecutionIsland {
+) -> ApiResult<ExecutionIsland> {
     let unique_hashes = members
         .iter()
         .map(|member| member.backend_contract.contract_hash.clone())
@@ -814,7 +836,7 @@ fn classify_execution_island(
             .all(|member| member.backend_contract.fast_path_eligible)
     {
         let first = &members[0].backend_contract;
-        return ExecutionIsland {
+        return Ok(ExecutionIsland {
             island_id: execution_island_id(
                 model_id,
                 phase,
@@ -826,22 +848,13 @@ fn classify_execution_island(
             fast_path_eligible: true,
             protocol_class: RingProtocolClass::ProviderHomogeneousFastRing,
             members: members.to_vec(),
-        };
+        });
     }
 
-    ExecutionIsland {
-        island_id: execution_island_id(
-            model_id,
-            phase,
-            ProviderCompatibilityClass::HeterogeneousPortable,
-            None,
-        ),
-        compatibility_class: ProviderCompatibilityClass::HeterogeneousPortable,
-        backend_contract_hash: None,
-        fast_path_eligible: false,
-        protocol_class: RingProtocolClass::ProviderHeterogeneousPortableRing,
-        members: members.to_vec(),
-    }
+    Err(ApiError::Conflict(format!(
+        "production execution island for model {} phase {:?} must be homogeneous fast-path",
+        model_id, phase
+    )))
 }
 
 fn candidates_for_rule(
