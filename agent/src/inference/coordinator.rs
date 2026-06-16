@@ -325,29 +325,29 @@ struct QueuedDecodeTask {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DecodeBatchTelemetry {
-    pub(crate) kv_cache_seq_len: u32,
-    pub(crate) batch_size: u32,
-    pub(crate) active_decode_sessions: u32,
-    pub(crate) batch_kv_tokens: u32,
-    pub(crate) deferred_decode_sessions: u32,
+pub struct DecodeBatchTelemetry {
+    pub kv_cache_seq_len: u32,
+    pub batch_size: u32,
+    pub active_decode_sessions: u32,
+    pub batch_kv_tokens: u32,
+    pub deferred_decode_sessions: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SchedulerOwnedDecodeStep {
-    pub(crate) primary_completion_tokens: u32,
-    pub(crate) primary_time_to_first_token_ms: Option<u64>,
-    pub(crate) telemetry: DecodeBatchTelemetry,
+pub struct SchedulerOwnedDecodeStep {
+    pub primary_completion_tokens: u32,
+    pub primary_time_to_first_token_ms: Option<u64>,
+    pub telemetry: DecodeBatchTelemetry,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub(crate) struct SessionProgressSnapshot {
-    pub(crate) completion_tokens: u32,
-    pub(crate) is_complete: bool,
-    pub(crate) kv_cache_seq_len: u32,
-    pub(crate) time_to_first_token_ms: Option<u64>,
-    pub(crate) paused_detail: Option<String>,
+pub struct SessionProgressSnapshot {
+    pub completion_tokens: u32,
+    pub is_complete: bool,
+    pub kv_cache_seq_len: u32,
+    pub time_to_first_token_ms: Option<u64>,
+    pub paused_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -766,10 +766,7 @@ impl InferenceCoordinator {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn session_progress_snapshot(
-        &self,
-        session_id: Uuid,
-    ) -> Option<SessionProgressSnapshot> {
+    pub fn session_progress_snapshot(&self, session_id: Uuid) -> Option<SessionProgressSnapshot> {
         self.sessions
             .get(&session_id)
             .map(|session| SessionProgressSnapshot {
@@ -789,7 +786,7 @@ impl InferenceCoordinator {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn take_completed_session_result(
+    pub fn take_completed_session_result(
         &mut self,
         session_id: Uuid,
     ) -> Result<Option<InferenceResult>> {
@@ -811,7 +808,7 @@ impl InferenceCoordinator {
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn prepare_decode_session(
+    pub async fn prepare_decode_session(
         &mut self,
         request: &InferenceRequest,
         position: &WorkerPosition,
@@ -2493,7 +2490,7 @@ impl InferenceCoordinator {
         Ok((result, last_batch_telemetry, execution_time_ms as u32))
     }
 
-    pub(crate) async fn execute_scheduler_owned_decode_step(
+    pub async fn execute_scheduler_owned_decode_step(
         &mut self,
         request: &InferenceRequest,
         position: &WorkerPosition,

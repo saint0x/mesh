@@ -61,9 +61,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -72,6 +73,7 @@ use ui::cmd_ui;
 use uuid::Uuid;
 
 const CLAIM_POLL_INTERVAL_SECS: u64 = 1;
+const ACTIVE_DECODE_SCHEDULER_TICK_MS: u64 = 10;
 const IDLE_QUEUE_OBSERVATION_POLL_INTERVAL: u32 = 5;
 const DECODE_PROGRESS_FLUSH_INTERVAL_MS: u64 = 1500;
 const DECODE_PROGRESS_EAGER_TOKEN_DELTA: u32 = 16;
@@ -1458,6 +1460,235 @@ fn spawn_decode_lease_renew_task(
             }
         }
     }))
+}
+
+struct ActiveDecodeAssignment {
+    assignment: InferenceExecutionLease,
+    request: agent::inference::InferenceRequest,
+    job_id: Uuid,
+    device_id: Uuid,
+    active_segment_id: String,
+    started_at: Instant,
+    last_reported_completion_tokens: u32,
+    lease_renew_handle: JoinHandle<()>,
+    decode_progress_reporter: DecodeProgressReporter,
+}
+
+impl ActiveDecodeAssignment {
+    fn session_id(&self) -> Uuid {
+        self.request.session_id
+    }
+
+    async fn shutdown(self) {
+        if let Err(error) = self.decode_progress_reporter.flush().await {
+            warn!(
+                job_id = %self.job_id,
+                error = %error,
+                "Final buffered decode progress flush failed"
+            );
+        }
+        self.lease_renew_handle.abort();
+        if let Err(error) = self.decode_progress_reporter.shutdown().await {
+            warn!(
+                job_id = %self.job_id,
+                error = %error,
+                "Decode progress reporter shutdown failed"
+            );
+        }
+    }
+}
+
+fn decode_progress_interval(request: &agent::inference::InferenceRequest) -> u32 {
+    request.config.progress_report_interval.max(1)
+}
+
+fn observe_active_decode_progress(
+    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+    telemetry: agent::inference::coordinator::DecodeBatchTelemetry,
+) -> agent::errors::Result<()> {
+    for active in active_decode_assignments.values_mut() {
+        let Some(snapshot) = coordinator.session_progress_snapshot(active.session_id()) else {
+            continue;
+        };
+        let progress_interval = decode_progress_interval(&active.request);
+        let advanced = snapshot
+            .completion_tokens
+            .saturating_sub(active.last_reported_completion_tokens);
+        if advanced < progress_interval && !snapshot.is_complete {
+            continue;
+        }
+
+        active
+            .decode_progress_reporter
+            .update(agent::inference::InferenceProgressUpdate {
+                phase: agent::inference::ExecutionPhase::Decode,
+                completion_tokens: snapshot.completion_tokens,
+                execution_time_ms: active.started_at.elapsed().as_millis() as u64,
+                time_to_first_token_ms: snapshot.time_to_first_token_ms,
+                kv_cache_seq_len: Some(snapshot.kv_cache_seq_len),
+                batch_size: Some(telemetry.batch_size),
+                active_decode_sessions: Some(telemetry.active_decode_sessions),
+                batch_kv_tokens: Some(telemetry.batch_kv_tokens),
+                deferred_decode_sessions: Some(telemetry.deferred_decode_sessions),
+            })
+            .map_err(|error| agent::errors::AgentError::Execution(error.to_string()))?;
+        active.last_reported_completion_tokens = snapshot.completion_tokens;
+    }
+    Ok(())
+}
+
+async fn finalize_completed_active_decode_assignments(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+) {
+    let session_ids = active_decode_assignments
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for session_id in session_ids {
+        let result = match coordinator.take_completed_session_result(session_id) {
+            Ok(result) => result,
+            Err(error) => {
+                error!(
+                    session_id = %session_id,
+                    error = %error,
+                    "Failed to extract completed decode session result"
+                );
+                None
+            }
+        };
+        let Some(result) = result else {
+            continue;
+        };
+        let Some(active) = active_decode_assignments.remove(&session_id) else {
+            continue;
+        };
+        handle_assignment_execution_outcome(
+            coordinator,
+            registration_client,
+            &active.assignment,
+            Ok(agent::inference::SegmentExecutionResult::Completed(result)),
+            active.job_id,
+            active.device_id,
+            &active.active_segment_id,
+        )
+        .await;
+        active.shutdown().await;
+    }
+}
+
+async fn fail_active_decode_assignments(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+    error_message: String,
+) {
+    let drained = std::mem::take(active_decode_assignments)
+        .into_values()
+        .collect::<Vec<_>>();
+    for active in drained {
+        handle_assignment_execution_outcome(
+            coordinator,
+            registration_client,
+            &active.assignment,
+            Err(agent::errors::AgentError::Execution(error_message.clone())),
+            active.job_id,
+            active.device_id,
+            &active.active_segment_id,
+        )
+        .await;
+        active.shutdown().await;
+    }
+}
+
+async fn service_active_decode_assignments(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    position: &agent::inference::coordinator::WorkerPosition,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+    active_decode_order: &mut VecDeque<Uuid>,
+) -> bool {
+    if active_decode_assignments.is_empty() {
+        return false;
+    }
+
+    let mut selected_session_id = None;
+    let iterations = active_decode_order.len().max(1);
+    for _ in 0..iterations {
+        let Some(session_id) = active_decode_order.pop_front() else {
+            break;
+        };
+        if !active_decode_assignments.contains_key(&session_id) {
+            continue;
+        }
+        let assignment = &active_decode_assignments[&session_id].assignment;
+        if validate_materialized_decode_cohort(coordinator, assignment, None).is_err() {
+            active_decode_order.push_back(session_id);
+            continue;
+        }
+        selected_session_id = Some(session_id);
+        break;
+    }
+
+    let Some(session_id) = selected_session_id else {
+        return false;
+    };
+    let request = active_decode_assignments[&session_id].request.clone();
+    let step = match coordinator
+        .execute_scheduler_owned_decode_step(&request, position)
+        .await
+    {
+        Ok(step) => step,
+        Err(error) => {
+            let error_message = format!("{error}");
+            error!(
+                session_id = %session_id,
+                error = %error,
+                "Cooperative decode scheduler step failed"
+            );
+            fail_active_decode_assignments(
+                coordinator,
+                registration_client,
+                active_decode_assignments,
+                error_message,
+            )
+            .await;
+            active_decode_order.clear();
+            return true;
+        }
+    };
+
+    if let Err(error) =
+        observe_active_decode_progress(coordinator, active_decode_assignments, step.telemetry)
+    {
+        error!(
+            session_id = %session_id,
+            error = %error,
+            "Active decode progress reporting failed"
+        );
+        fail_active_decode_assignments(
+            coordinator,
+            registration_client,
+            active_decode_assignments,
+            error.to_string(),
+        )
+        .await;
+        active_decode_order.clear();
+        return true;
+    }
+
+    finalize_completed_active_decode_assignments(
+        coordinator,
+        registration_client,
+        active_decode_assignments,
+    )
+    .await;
+    if active_decode_assignments.contains_key(&session_id) {
+        active_decode_order.push_back(session_id);
+    }
+    true
 }
 
 async fn execute_assignment_segment_with_reporting(
@@ -3064,11 +3295,18 @@ async fn cmd_runtime() -> Result<()> {
         }
 
         // Claim and execute inference assignments
+        let mut active_decode_assignments = BTreeMap::<Uuid, ActiveDecodeAssignment>::new();
+        let mut active_decode_order = VecDeque::<Uuid>::new();
         let mut idle_claim_polls = 0u32;
+        let mut last_claim_poll_at = Instant::now() - Duration::from_secs(CLAIM_POLL_INTERVAL_SECS);
         let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)) => {}
+                _ = tokio::time::sleep(if active_decode_assignments.is_empty() {
+                    tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)
+                } else {
+                    tokio::time::Duration::from_millis(ACTIVE_DECODE_SCHEDULER_TICK_MS)
+                }) => {}
                 signal = &mut shutdown_signal => {
                     let signal = match signal {
                         Ok(signal) => signal,
@@ -3124,6 +3362,28 @@ async fn cmd_runtime() -> Result<()> {
                 &network_id,
             )
             .await;
+            if let Some(position) = ring_position.as_ref() {
+                let serviced_active_decode = service_active_decode_assignments(
+                    &mut coordinator,
+                    &registration_client,
+                    position,
+                    &mut active_decode_assignments,
+                    &mut active_decode_order,
+                )
+                .await;
+                if serviced_active_decode {
+                    if let Err(error) = coordinator.persist_runtime_stats() {
+                        warn!(
+                            error = %error,
+                            "Failed to persist runtime stats after cooperative decode step"
+                        );
+                    }
+                }
+            }
+            if last_claim_poll_at.elapsed() < Duration::from_secs(CLAIM_POLL_INTERVAL_SECS) {
+                continue;
+            }
+            last_claim_poll_at = Instant::now();
             let observe_idle_queue = idle_claim_polls % IDLE_QUEUE_OBSERVATION_POLL_INTERVAL == 0;
             let claim_response = match registration_client
                 .claim_inference_work(ClaimInferenceAssignmentRequest {
@@ -3788,24 +4048,88 @@ async fn cmd_runtime() -> Result<()> {
                 }
             }
 
-            if let Err(error) = validate_materialized_decode_cohort(
-                &coordinator,
-                &assignment,
-                decode_lease.as_ref(),
-            ) {
-                error!(
-                    job_id = %job_id,
-                    segment_id = %active_segment_id,
-                    error = %error,
-                    "Decode lease rejected because the full cohort is not materialized locally"
-                );
-                release_decode_setup_failure(
+            if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+                if active_decode_assignments.contains_key(&request.session_id) {
+                    warn!(
+                        job_id = %job_id,
+                        session_id = %request.session_id,
+                        lease_id = %assignment.lease_id,
+                        "Duplicate decode lease claimed for already-active local session"
+                    );
+                    release_decode_setup_failure(
+                        &registration_client,
+                        &assignment,
+                        "duplicate_local_decode_lease",
+                        "duplicate decode lease claimed for already-active local session",
+                    )
+                    .await;
+                    continue;
+                }
+
+                let Some(position) = ring_position.as_ref() else {
+                    release_decode_setup_failure(
+                        &registration_client,
+                        &assignment,
+                        "worker_not_in_ring",
+                        "worker not in ring topology",
+                    )
+                    .await;
+                    continue;
+                };
+                if let Err(error) = coordinator.prepare_decode_session(&request, position).await {
+                    error!(
+                        job_id = %job_id,
+                        session_id = %request.session_id,
+                        error = %error,
+                        "Failed to prepare decode session for cooperative scheduling"
+                    );
+                    release_decode_setup_failure(
+                        &registration_client,
+                        &assignment,
+                        "decode_session_prepare_failed",
+                        error.to_string(),
+                    )
+                    .await;
+                    continue;
+                }
+
+                let lease_renew_handle = spawn_decode_lease_renew_task(
                     &registration_client,
                     &assignment,
-                    "decode_cohort_not_materialized",
-                    error.to_string(),
+                    device_id,
+                    &active_segment_id,
                 )
-                .await;
+                .expect("decode assignments require a renew task");
+                let decode_progress_reporter = DecodeProgressReporter::spawn(
+                    registration_client.clone(),
+                    job_id,
+                    device_id,
+                    active_segment_id.clone(),
+                );
+                let session_id = request.session_id;
+                active_decode_assignments.insert(
+                    session_id,
+                    ActiveDecodeAssignment {
+                        assignment,
+                        request,
+                        job_id,
+                        device_id,
+                        active_segment_id,
+                        started_at: Instant::now(),
+                        last_reported_completion_tokens: 0,
+                        lease_renew_handle,
+                        decode_progress_reporter,
+                    },
+                );
+                active_decode_order.push_back(session_id);
+
+                if let Err(error) = coordinator.persist_runtime_stats() {
+                    warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "Failed to persist runtime stats after decode admission"
+                    );
+                }
                 continue;
             }
 
@@ -3838,6 +4162,16 @@ async fn cmd_runtime() -> Result<()> {
                     "Failed to persist runtime stats after assignment processing"
                 );
             }
+        }
+
+        if !active_decode_assignments.is_empty() {
+            fail_active_decode_assignments(
+                &mut coordinator,
+                &registration_client,
+                &mut active_decode_assignments,
+                "runtime shutting down".to_string(),
+            )
+            .await;
         }
 
         if let Err(error) = coordinator.persist_runtime_stats() {
