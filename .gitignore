@@ -32,6 +32,10 @@ PLAN.md
 *.bak
 /control-plane.db
 /mesh_control_plane.db
+/.pool-info
+/.tl-init.lock
+/.tmp-meshnet-py/
+/.venv313/
 
 # Environment files
 .env
@@ -74,4 +78,19 @@ $RECYCLE.BIN/
 # Backup files
 *.orig
 
-READY_TO_USE.md
+# Internal working docs and local artifacts not shipped with production
+/BLOCKUPDATES.md
+/AGENTS.md
+/EXTRAPOLATION.md
+/FINAL_STATUS.md
+/FIXDOC.md
+/INSIGHT.md
+/LAN_DISCOVERY_TEST.md
+/PLAN.md
+/READY_TO_USE.md
+/REFACTOR.md
+/TUNEUP.md
+/WORKING.md
+/ZIPPERF.md
+/meshnet-viz.html
+/iron_sights_ads_walkthrough.html
