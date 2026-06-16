@@ -35,6 +35,7 @@
 
 mod ui;
 
+use agent::inference::ShardLoader;
 use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
@@ -88,7 +89,9 @@ fn local_backend_contract(
 }
 
 fn validate_local_production_provider(config: &DeviceConfig) -> Result<()> {
-    let contract = local_backend_contract(config)?;
+    let selected_provider = config.resolve_execution_provider()?;
+    set_selected_execution_provider(selected_provider)?;
+    let contract = agent::provider::BackendContractDescriptor::for_provider(selected_provider);
     if !contract.supports_production_serving() {
         anyhow::bail!("{}", contract.production_readiness_summary());
     }
@@ -137,7 +140,53 @@ fn validate_production_artifact_assignment(
     Ok(())
 }
 
-fn validate_worker_position_runtime_readiness(
+async fn probe_production_artifact_assignment_materialization(
+    model_id: &str,
+    shard_worker_position: u32,
+    shard_total_workers: u32,
+    shard_column_range: (u32, u32),
+) -> Result<usize> {
+    let assignment = agent::model::ShardAssignment::from_column_range(
+        model_id.to_string(),
+        shard_worker_position,
+        shard_total_workers,
+        shard_column_range.0,
+        shard_column_range.1,
+    );
+    let probe_root =
+        std::env::temp_dir().join(format!("meshnet-artifact-readiness-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&probe_root).context("create artifact readiness probe directory")?;
+    let registry = agent::model::ShardRegistry::new(probe_root.join("registry"))
+        .context("create artifact readiness probe registry")?;
+    registry
+        .assign_shard(assignment.clone())
+        .await
+        .context("register assigned shard for readiness probe")?;
+
+    let loader = agent::inference::ArtifactShardLoader::new(agent::model_assets::model_store_dir());
+    let weights = loader
+        .load_shard(model_id, &assignment, &registry)
+        .await
+        .with_context(|| {
+            format!(
+                "load exact production shard for worker {}/{} columns {}..{}",
+                shard_worker_position,
+                shard_total_workers,
+                shard_column_range.0,
+                shard_column_range.1
+            )
+        })?;
+    let residency = agent::inference::forward_pass::SharedModelResidency::from_host(weights)
+        .context("materialize assigned shard onto the selected execution device")?;
+    let resident_bytes = residency.resident_bytes();
+    if resident_bytes == 0 {
+        anyhow::bail!("assigned shard materialized with zero resident bytes");
+    }
+    let _ = std::fs::remove_dir_all(&probe_root);
+    Ok(resident_bytes)
+}
+
+async fn validate_worker_position_runtime_readiness(
     config: &DeviceConfig,
     position: &agent::inference::coordinator::WorkerPosition,
 ) -> Result<()> {
@@ -148,6 +197,13 @@ fn validate_worker_position_runtime_readiness(
         position.shard_total_workers,
         position.shard_column_range,
     )?;
+    probe_production_artifact_assignment_materialization(
+        &position.model_id,
+        position.shard_worker_position,
+        position.shard_total_workers,
+        position.shard_column_range,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2552,6 +2608,7 @@ async fn cmd_runtime() -> Result<()> {
             Ok(position) => {
                 if let Err(e) =
                     validate_worker_position_runtime_readiness(&inference_config_task, &position)
+                        .await
                 {
                     error!(
                         error = %e,
@@ -2609,7 +2666,9 @@ async fn cmd_runtime() -> Result<()> {
                         if let Err(e) = validate_worker_position_runtime_readiness(
                             &inference_config_task,
                             &position,
-                        ) {
+                        )
+                        .await
+                        {
                             error!(
                                 error = %e,
                                 model_id = %position.model_id,
@@ -4673,6 +4732,7 @@ async fn cmd_doctor() -> Result<()> {
     );
 
     let provider = config.resolve_execution_provider()?;
+    set_selected_execution_provider(provider)?;
     println!(
         "  {} execution provider {}",
         "OK".green().bold(),
@@ -4746,7 +4806,7 @@ async fn cmd_doctor() -> Result<()> {
 
     if let Ok(topology) = fetch_ring_topology(&config).await {
         if let Ok(position) = build_worker_position_from_topology(&topology, &config.device_id) {
-            match validate_worker_position_runtime_readiness(&config, &position) {
+            match validate_worker_position_runtime_readiness(&config, &position).await {
                 Ok(()) => println!(
                     "  {} assigned shard production-ready for {} {}..{}",
                     "OK".green().bold(),

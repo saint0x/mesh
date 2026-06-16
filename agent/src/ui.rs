@@ -2512,7 +2512,8 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
                                 position.shard_column_range,
                                 crate::validate_worker_position_runtime_readiness(
                                     config, &position,
-                                ),
+                                )
+                                .await,
                             )),
                             Err(error) => Some((
                                 String::new(),

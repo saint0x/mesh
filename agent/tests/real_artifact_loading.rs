@@ -3,6 +3,10 @@ use agent::inference::{ArtifactShardLoader, ShardLoader};
 use agent::model::ShardAssignment;
 use agent::model::ShardRegistry;
 use agent::model_assets::{load_model_manifest, model_store_dir};
+use agent::provider::{
+    default_execution_provider, detect_execution_providers, resolve_requested_provider,
+    set_selected_execution_provider, BackendContractDescriptor, ExecutionProviderKind,
+};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,12 +86,33 @@ fn discover_assignment(model_id: &str, model_dir: &Path) -> Option<ShardAssignme
     None
 }
 
+fn configure_real_artifact_provider() {
+    let requested = std::env::var("MESHNET_REAL_ARTIFACT_PROVIDER")
+        .ok()
+        .and_then(|value| ExecutionProviderKind::from_str(&value));
+    let providers = detect_execution_providers();
+    let provider = resolve_requested_provider(
+        requested.or_else(|| Some(default_execution_provider(&providers))),
+        &providers,
+    )
+    .expect("resolve real artifact execution provider");
+    let contract = BackendContractDescriptor::for_provider(provider);
+    assert!(
+        contract.supports_production_serving(),
+        "real artifact test requires a production-serving provider, got {}",
+        provider.as_str()
+    );
+    set_selected_execution_provider(provider).expect("initialize real artifact execution provider");
+}
+
 #[tokio::test]
 async fn loads_real_artifact_shard_into_residency() {
     if !enabled() {
         eprintln!("skipping real artifact loading test; set MESHNET_ENABLE_REAL_ARTIFACT_TEST=1");
         return;
     }
+
+    configure_real_artifact_provider();
 
     let store = model_store_dir();
     let model_dir =

@@ -164,6 +164,11 @@ if [[ "$PREFERRED_PROVIDER" == "cpu" ]]; then
     exit 1
 fi
 
+MESHNET_ENABLE_REAL_ARTIFACT_TEST=1 \
+MESHNET_REAL_ARTIFACT_MODEL_ID="$MODEL_ID" \
+MESHNET_REAL_ARTIFACT_PROVIDER="${PREFERRED_PROVIDER:-}" \
+bash "$ROOT_DIR/scripts/test_real_artifact_loading.sh"
+
 mkdir -p "$CONTROL_HOME" "$WORKER1_HOME" "$WORKER2_HOME"
 
 cd "$ROOT_DIR"
