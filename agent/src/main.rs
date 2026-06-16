@@ -1579,6 +1579,29 @@ async fn finalize_completed_active_decode_assignments(
     }
 }
 
+async fn fail_single_active_decode_assignment(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+    session_id: Uuid,
+    error_message: String,
+) {
+    let Some(active) = active_decode_assignments.remove(&session_id) else {
+        return;
+    };
+    handle_assignment_execution_outcome(
+        coordinator,
+        registration_client,
+        &active.assignment,
+        Err(agent::errors::AgentError::Execution(error_message)),
+        active.job_id,
+        active.device_id,
+        &active.active_segment_id,
+    )
+    .await;
+    active.shutdown().await;
+}
+
 async fn fail_active_decode_assignments(
     coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
@@ -1603,6 +1626,41 @@ async fn fail_active_decode_assignments(
     }
 }
 
+async fn reconcile_active_decode_assignments(
+    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    registration_client: &RegistrationClient,
+    active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
+    active_decode_order: &mut VecDeque<Uuid>,
+) {
+    let session_ids = active_decode_assignments
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for session_id in session_ids {
+        let failure = match coordinator.session_progress_snapshot(session_id) {
+            Some(snapshot) => snapshot.paused_detail,
+            None => Some("active decode session vanished after local admission".to_string()),
+        };
+        let Some(error_message) = failure else {
+            continue;
+        };
+        warn!(
+            session_id = %session_id,
+            error = %error_message,
+            "Active decode assignment became unrunnable after local admission"
+        );
+        fail_single_active_decode_assignment(
+            coordinator,
+            registration_client,
+            active_decode_assignments,
+            session_id,
+            error_message,
+        )
+        .await;
+    }
+    active_decode_order.retain(|session_id| active_decode_assignments.contains_key(session_id));
+}
+
 async fn service_active_decode_assignments(
     coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
@@ -1612,6 +1670,17 @@ async fn service_active_decode_assignments(
 ) -> bool {
     if active_decode_assignments.is_empty() {
         return false;
+    }
+
+    reconcile_active_decode_assignments(
+        coordinator,
+        registration_client,
+        active_decode_assignments,
+        active_decode_order,
+    )
+    .await;
+    if active_decode_assignments.is_empty() {
+        return true;
     }
 
     let mut selected_session_id = None;
