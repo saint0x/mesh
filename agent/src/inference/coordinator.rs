@@ -340,6 +340,16 @@ pub(crate) struct SchedulerOwnedDecodeStep {
     pub(crate) telemetry: DecodeBatchTelemetry,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct SessionProgressSnapshot {
+    pub(crate) completion_tokens: u32,
+    pub(crate) is_complete: bool,
+    pub(crate) kv_cache_seq_len: u32,
+    pub(crate) time_to_first_token_ms: Option<u64>,
+    pub(crate) paused_detail: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PrefillStepResult {
     pub(crate) completion: InferenceJob,
@@ -753,6 +763,86 @@ impl InferenceCoordinator {
             session.engine_state.paused = Some(SessionPauseState { reason, detail });
         }
         self.remove_decode_task(session_id);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn session_progress_snapshot(
+        &self,
+        session_id: Uuid,
+    ) -> Option<SessionProgressSnapshot> {
+        self.sessions
+            .get(&session_id)
+            .map(|session| SessionProgressSnapshot {
+                completion_tokens: session.job.current_token_idx,
+                is_complete: session.job.is_complete(),
+                kv_cache_seq_len: session.backend.cache_seq_len() as u32,
+                time_to_first_token_ms: session
+                    .job
+                    .time_to_first_token()
+                    .map(|value| value.as_millis() as u64),
+                paused_detail: session
+                    .engine_state
+                    .paused
+                    .as_ref()
+                    .map(|state| state.detail.clone()),
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn take_completed_session_result(
+        &mut self,
+        session_id: Uuid,
+    ) -> Result<Option<InferenceResult>> {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Ok(None);
+        };
+        if !session.job.is_complete() {
+            return Ok(None);
+        }
+
+        self.remove_decode_task(session_id);
+        let session = self.sessions.remove(&session_id).ok_or_else(|| {
+            AgentError::Execution(
+                "completed decode session vanished before finalization".to_string(),
+            )
+        })?;
+        self.prune_unused_model_residency();
+        Ok(Some(session.job.into_result()))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn prepare_decode_session(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> Result<()> {
+        self.invalidate_session_for_layout_change(request, position)
+            .await?;
+        if !self.sessions.contains_key(&request.session_id) {
+            let recovered = self
+                .recover_session_from_checkpoint(request, position)
+                .await?;
+            if recovered {
+                info!(
+                    job_id = %request.job_id,
+                    session_id = %request.session_id,
+                    "Recovered decode segment session state from checkpoint"
+                );
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(&request.session_id) {
+            session.job.request = request.clone();
+        }
+
+        let _ = self.sessions.get(&request.session_id).ok_or_else(|| {
+            AgentError::Execution(format!(
+                "decode session {} is not materialized after preparation",
+                request.session_id
+            ))
+        })?;
+        self.resume_session(request.session_id)?;
+        self.enqueue_decode_task(request.session_id)?;
+        Ok(())
     }
 
     fn resume_session(&mut self, session_id: Uuid) -> Result<()> {

@@ -1398,6 +1398,68 @@ fn build_runtime_inference_request(
     })
 }
 
+fn spawn_decode_lease_renew_task(
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    device_id: Uuid,
+    active_segment_id: &str,
+) -> Option<JoinHandle<()>> {
+    if !matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+        return None;
+    }
+
+    let registration_client = registration_client.clone();
+    let lease_id = assignment.lease_id.clone();
+    let device_id = device_id.to_string();
+    let network_id = assignment.network_id.clone();
+    let session_id = assignment.active_segment.session_id.clone();
+    let segment_id = active_segment_id.to_string();
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(20));
+        loop {
+            tick.tick().await;
+            match registration_client
+                .renew_decode_lease(
+                    &lease_id,
+                    RenewDecodeLeaseRequest {
+                        device_id: device_id.clone(),
+                        network_id: network_id.clone(),
+                        session_id: session_id.clone(),
+                        segment_id: segment_id.clone(),
+                        include_decode_lease: false,
+                        include_queue_state: false,
+                        include_serving_session: false,
+                        scheduler_queue: None,
+                    },
+                )
+                .await
+            {
+                Ok(Some(response)) => {
+                    debug!(
+                        lease_id = %lease_id,
+                        lease_expires_at = response
+                            .decode_lease
+                            .as_ref()
+                            .and_then(|lease| lease.lease_expires_at.as_deref()),
+                        queue_status = response
+                            .queue_state
+                            .as_ref()
+                            .and_then(|state| state.status.as_deref()),
+                        "Renewed decode lease"
+                    );
+                }
+                Ok(None) => {
+                    debug!(lease_id = %lease_id, "Decode lease renew endpoint unavailable");
+                    break;
+                }
+                Err(error) => {
+                    warn!(lease_id = %lease_id, error = %error, "Decode lease renew failed");
+                }
+            }
+        }
+    }))
+}
+
 async fn execute_assignment_segment_with_reporting(
     coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
@@ -1407,61 +1469,12 @@ async fn execute_assignment_segment_with_reporting(
     device_id: Uuid,
     active_segment_id: &str,
 ) -> agent::errors::Result<agent::inference::SegmentExecutionResult> {
-    let lease_renew_handle = if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
-    {
-        let registration_client = registration_client.clone();
-        let lease_id = assignment.lease_id.clone();
-        let device_id = device_id.to_string();
-        let network_id = assignment.network_id.clone();
-        let session_id = assignment.active_segment.session_id.clone();
-        let segment_id = active_segment_id.to_string();
-        Some(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(20));
-            loop {
-                tick.tick().await;
-                match registration_client
-                    .renew_decode_lease(
-                        &lease_id,
-                        RenewDecodeLeaseRequest {
-                            device_id: device_id.clone(),
-                            network_id: network_id.clone(),
-                            session_id: session_id.clone(),
-                            segment_id: segment_id.clone(),
-                            include_decode_lease: false,
-                            include_queue_state: false,
-                            include_serving_session: false,
-                            scheduler_queue: None,
-                        },
-                    )
-                    .await
-                {
-                    Ok(Some(response)) => {
-                        debug!(
-                            lease_id = %lease_id,
-                            lease_expires_at = response
-                                .decode_lease
-                                .as_ref()
-                                .and_then(|lease| lease.lease_expires_at.as_deref()),
-                            queue_status = response
-                                .queue_state
-                                .as_ref()
-                                .and_then(|state| state.status.as_deref()),
-                            "Renewed decode lease"
-                        );
-                    }
-                    Ok(None) => {
-                        debug!(lease_id = %lease_id, "Decode lease renew endpoint unavailable");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(lease_id = %lease_id, error = %e, "Decode lease renew failed");
-                    }
-                }
-            }
-        }))
-    } else {
-        None
-    };
+    let lease_renew_handle = spawn_decode_lease_renew_task(
+        registration_client,
+        assignment,
+        device_id,
+        active_segment_id,
+    );
 
     let decode_progress_reporter =
         if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
