@@ -1319,6 +1319,16 @@ async fn retry_control_plane_write(
     }
 }
 
+async fn release_decode_setup_failure(
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    reason: &str,
+    detail: impl Into<String>,
+) {
+    release_decode_lease_if_needed(registration_client, assignment, reason, Some(detail.into()))
+        .await;
+}
+
 fn build_runtime_inference_request(
     assignment: &InferenceExecutionLease,
     decode_lease: Option<&DecodeLeaseStatus>,
@@ -1525,6 +1535,39 @@ async fn execute_assignment_segment_with_reporting(
     }
 
     execution_result
+}
+
+fn validate_materialized_decode_cohort(
+    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    assignment: &InferenceExecutionLease,
+    decode_lease: Option<&DecodeLeaseStatus>,
+) -> Result<()> {
+    if !matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
+        return Ok(());
+    }
+
+    let cohort_session_ids = decode_lease
+        .map(|lease| lease.lease_session_ids.as_slice())
+        .unwrap_or(assignment.session.lease_session_ids.as_slice());
+    if cohort_session_ids.len() <= 1 {
+        return Ok(());
+    }
+
+    let missing_sessions = cohort_session_ids
+        .iter()
+        .filter_map(|session_id| match Uuid::parse_str(session_id) {
+            Ok(session_id) if coordinator.has_session(session_id) => None,
+            Ok(_) | Err(_) => Some(session_id.clone()),
+        })
+        .collect::<Vec<_>>();
+    if missing_sessions.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "decode lease cohort is not fully materialized locally; missing sessions: {}",
+        missing_sessions.join(", ")
+    );
 }
 
 async fn handle_assignment_execution_outcome(
@@ -3437,6 +3480,13 @@ async fn cmd_runtime() -> Result<()> {
                             session_id = %request.session_id,
                             "Checkpoint manager missing before decode recovery"
                         );
+                        release_decode_setup_failure(
+                            &registration_client,
+                            &assignment,
+                            "decode_resume_setup_unavailable",
+                            "checkpoint manager missing before decode recovery",
+                        )
+                        .await;
                         continue;
                     };
                     let expected_checkpoint_id = match Uuid::parse_str(&checkpoint.checkpoint_id) {
@@ -3449,6 +3499,16 @@ async fn cmd_runtime() -> Result<()> {
                                 error = %e,
                                 "Lease carried an invalid checkpoint identifier"
                             );
+                            release_decode_setup_failure(
+                                &registration_client,
+                                &assignment,
+                                "invalid_resume_checkpoint_id",
+                                format!(
+                                    "invalid checkpoint identifier {}: {}",
+                                    checkpoint.checkpoint_id, e
+                                ),
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -3482,6 +3542,17 @@ async fn cmd_runtime() -> Result<()> {
                                         expected_checkpoint_id = %checkpoint.checkpoint_id,
                                         "Downloaded remote session checkpoint metadata drifted from lease state"
                                     );
+                                    release_decode_setup_failure(
+                                        &registration_client,
+                                        &assignment,
+                                        "remote_checkpoint_contract_drift",
+                                        format!(
+                                            "downloaded checkpoint id {} drifted from expected {}",
+                                            remote_checkpoint.metadata.checkpoint_id,
+                                            checkpoint.checkpoint_id
+                                        ),
+                                    )
+                                    .await;
                                     continue;
                                 }
                                 if remote_checkpoint.metadata.kv_sequence_position
@@ -3494,6 +3565,17 @@ async fn cmd_runtime() -> Result<()> {
                                         expected_kv_sequence_position = checkpoint.kv_sequence_position,
                                         "Downloaded remote session checkpoint sequence position drifted from lease state"
                                     );
+                                    release_decode_setup_failure(
+                                        &registration_client,
+                                        &assignment,
+                                        "remote_checkpoint_contract_drift",
+                                        format!(
+                                            "downloaded checkpoint kv sequence {:?} drifted from expected {:?}",
+                                            remote_checkpoint.metadata.kv_sequence_position,
+                                            checkpoint.kv_sequence_position
+                                        ),
+                                    )
+                                    .await;
                                     continue;
                                 }
 
@@ -3508,6 +3590,16 @@ async fn cmd_runtime() -> Result<()> {
                                             error = %e,
                                             "Downloaded remote session checkpoint hex was invalid"
                                         );
+                                        release_decode_setup_failure(
+                                            &registration_client,
+                                            &assignment,
+                                            "invalid_remote_checkpoint_payload",
+                                            format!(
+                                                "downloaded remote checkpoint payload was invalid hex: {}",
+                                                e
+                                            ),
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 };
@@ -3521,6 +3613,16 @@ async fn cmd_runtime() -> Result<()> {
                                         error = %e,
                                         "Failed to import remote session checkpoint before decode"
                                     );
+                                    release_decode_setup_failure(
+                                        &registration_client,
+                                        &assignment,
+                                        "remote_checkpoint_import_failed",
+                                        format!(
+                                            "failed to import remote checkpoint before decode: {}",
+                                            e
+                                        ),
+                                    )
+                                    .await;
                                     continue;
                                 }
                                 info!(
@@ -3544,6 +3646,13 @@ async fn cmd_runtime() -> Result<()> {
                                     session_id = %request.session_id,
                                     "Decode lease referenced remote checkpoint but no payload was available yet"
                                 );
+                                release_decode_setup_failure(
+                                    &registration_client,
+                                    &assignment,
+                                    "remote_checkpoint_not_ready",
+                                    "decode lease referenced remote checkpoint but no payload was available yet",
+                                )
+                                .await;
                                 continue;
                             }
                             Err(e) => {
@@ -3560,6 +3669,16 @@ async fn cmd_runtime() -> Result<()> {
                                     error = %e,
                                     "Failed to download remote session checkpoint before decode"
                                 );
+                                release_decode_setup_failure(
+                                    &registration_client,
+                                    &assignment,
+                                    "remote_checkpoint_download_failed",
+                                    format!(
+                                        "failed to download remote checkpoint before decode: {}",
+                                        e
+                                    ),
+                                )
+                                .await;
                                 continue;
                             }
                         }
@@ -3577,6 +3696,16 @@ async fn cmd_runtime() -> Result<()> {
                                 checkpoint_id = %checkpoint.checkpoint_id,
                                 "Expected resume checkpoint was not present on the local worker"
                             );
+                            release_decode_setup_failure(
+                                &registration_client,
+                                &assignment,
+                                "local_recovery_point_missing",
+                                format!(
+                                    "expected checkpoint {} was not present on the local worker",
+                                    checkpoint.checkpoint_id
+                                ),
+                            )
+                            .await;
                             continue;
                         }
                         Err(e) => {
@@ -3587,6 +3716,16 @@ async fn cmd_runtime() -> Result<()> {
                                 error = %e,
                                 "Failed to load local recovery point for decode resume"
                             );
+                            release_decode_setup_failure(
+                                &registration_client,
+                                &assignment,
+                                "local_recovery_point_load_failed",
+                                format!(
+                                    "failed to load local recovery point for checkpoint {}: {}",
+                                    checkpoint.checkpoint_id, e
+                                ),
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -3598,6 +3737,16 @@ async fn cmd_runtime() -> Result<()> {
                             error = %e,
                             "Local recovery point did not satisfy the control-plane resume contract"
                         );
+                        release_decode_setup_failure(
+                            &registration_client,
+                            &assignment,
+                            "resume_contract_invalid",
+                            format!(
+                                "local recovery point did not satisfy resume contract: {}",
+                                e
+                            ),
+                        )
+                        .await;
                         continue;
                     }
                     if let Err(e) = coordinator
@@ -3611,9 +3760,40 @@ async fn cmd_runtime() -> Result<()> {
                             error = %e,
                             "Failed to hydrate decode session from the selected recovery point"
                         );
+                        release_decode_setup_failure(
+                            &registration_client,
+                            &assignment,
+                            "decode_hydration_failed",
+                            format!(
+                                "failed to hydrate decode session from selected recovery point: {}",
+                                e
+                            ),
+                        )
+                        .await;
                         continue;
                     }
                 }
+            }
+
+            if let Err(error) = validate_materialized_decode_cohort(
+                &coordinator,
+                &assignment,
+                decode_lease.as_ref(),
+            ) {
+                error!(
+                    job_id = %job_id,
+                    segment_id = %active_segment_id,
+                    error = %error,
+                    "Decode lease rejected because the full cohort is not materialized locally"
+                );
+                release_decode_setup_failure(
+                    &registration_client,
+                    &assignment,
+                    "decode_cohort_not_materialized",
+                    error.to_string(),
+                )
+                .await;
+                continue;
             }
 
             let execution_result = execute_assignment_segment_with_reporting(
