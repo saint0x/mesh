@@ -333,6 +333,13 @@ struct DecodeBatchTelemetry {
     deferred_decode_sessions: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SchedulerOwnedDecodeStep {
+    primary_completion_tokens: u32,
+    primary_time_to_first_token_ms: Option<u64>,
+    telemetry: DecodeBatchTelemetry,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SessionMemoryFootprint {
     runtime_bytes: usize,
@@ -2318,88 +2325,29 @@ impl InferenceCoordinator {
                 return Err(AgentError::Execution("Inference job timed out".to_string()));
             }
 
-            self.enforce_runtime_memory_budget(Some(request.session_id))
+            let step = self
+                .execute_scheduler_owned_decode_step(request, position)
                 .await?;
+            last_batch_telemetry = Some(step.telemetry);
 
-            let batch = self.build_next_decode_batch(
-                request.session_id,
-                request.decode_batch_targets.clone(),
-            )?;
-            if batch.is_empty() {
-                return Err(AgentError::Execution(
-                    "decode runtime had no admitted work despite active queued sessions"
-                        .to_string(),
-                ));
-            }
-            self.stats.record_decode_microbatch(
-                batch.slots.len(),
-                batch.total_kv_tokens,
-                batch.deferred.len(),
-                batch.deferred_for_capacity,
-                batch.deferred_for_kv_budget,
-                batch.deferred_for_guardrail,
-            );
-            let batch_size = u32::try_from(batch.slots.len()).unwrap_or(u32::MAX);
-            let batch_kv_tokens = u32::try_from(batch.total_kv_tokens).unwrap_or(u32::MAX);
-            let deferred_decode_sessions = u32::try_from(batch.deferred.len()).unwrap_or(u32::MAX);
-
-            let outcomes = self.execute_decode_microbatch(batch, position).await?;
-            self.drain_swarm_events().await?;
-            let active_decode_sessions =
-                u32::try_from(self.active_decode_session_count()).unwrap_or(u32::MAX);
-
-            for outcome in outcomes {
-                if outcome.should_checkpoint {
-                    let checkpoint_snapshot = self
-                        .sessions
-                        .get(&outcome.session_id)
-                        .map(|session| session.job.clone())
-                        .ok_or_else(|| {
-                            AgentError::Execution(
-                                "decode session vanished before checkpointing".to_string(),
-                            )
-                        })?;
-                    self.checkpoint(&checkpoint_snapshot).await?;
-                    if let Some(session) = self.sessions.get_mut(&outcome.session_id) {
-                        session.job.mark_checkpointed();
-                    }
-                }
-
-                if let Some(session) = self.sessions.get_mut(&outcome.session_id) {
-                    session.last_active_at = Instant::now();
-                }
-
-                if outcome.session_id != request.session_id {
-                    continue;
-                }
-
-                last_batch_telemetry = Some(DecodeBatchTelemetry {
-                    kv_cache_seq_len: outcome.kv_cache_seq_len,
-                    batch_size,
-                    active_decode_sessions,
-                    batch_kv_tokens,
-                    deferred_decode_sessions,
-                });
-
-                if outcome
-                    .completion_tokens
-                    .saturating_sub(last_reported_completion_tokens)
-                    >= progress_report_interval
-                {
-                    on_progress(InferenceProgressUpdate {
-                        phase: ExecutionPhase::Decode,
-                        completion_tokens: outcome.completion_tokens,
-                        execution_time_ms: segment_start.elapsed().as_millis() as u64,
-                        time_to_first_token_ms: outcome.time_to_first_token_ms,
-                        kv_cache_seq_len: Some(outcome.kv_cache_seq_len),
-                        batch_size: Some(batch_size),
-                        active_decode_sessions: Some(active_decode_sessions),
-                        batch_kv_tokens: Some(batch_kv_tokens),
-                        deferred_decode_sessions: Some(deferred_decode_sessions),
-                    })
-                    .await?;
-                    last_reported_completion_tokens = outcome.completion_tokens;
-                }
+            if step
+                .primary_completion_tokens
+                .saturating_sub(last_reported_completion_tokens)
+                >= progress_report_interval
+            {
+                on_progress(InferenceProgressUpdate {
+                    phase: ExecutionPhase::Decode,
+                    completion_tokens: step.primary_completion_tokens,
+                    execution_time_ms: segment_start.elapsed().as_millis() as u64,
+                    time_to_first_token_ms: step.primary_time_to_first_token_ms,
+                    kv_cache_seq_len: Some(step.telemetry.kv_cache_seq_len),
+                    batch_size: Some(step.telemetry.batch_size),
+                    active_decode_sessions: Some(step.telemetry.active_decode_sessions),
+                    batch_kv_tokens: Some(step.telemetry.batch_kv_tokens),
+                    deferred_decode_sessions: Some(step.telemetry.deferred_decode_sessions),
+                })
+                .await?;
+                last_reported_completion_tokens = step.primary_completion_tokens;
             }
         }
 
@@ -2430,6 +2378,85 @@ impl InferenceCoordinator {
         }
 
         Ok((result, last_batch_telemetry, execution_time_ms as u32))
+    }
+
+    async fn execute_scheduler_owned_decode_step(
+        &mut self,
+        request: &InferenceRequest,
+        position: &WorkerPosition,
+    ) -> Result<SchedulerOwnedDecodeStep> {
+        self.enforce_runtime_memory_budget(Some(request.session_id))
+            .await?;
+
+        let batch =
+            self.build_next_decode_batch(request.session_id, request.decode_batch_targets.clone())?;
+        if batch.is_empty() {
+            return Err(AgentError::Execution(
+                "decode runtime had no admitted work despite active queued sessions".to_string(),
+            ));
+        }
+        self.stats.record_decode_microbatch(
+            batch.slots.len(),
+            batch.total_kv_tokens,
+            batch.deferred.len(),
+            batch.deferred_for_capacity,
+            batch.deferred_for_kv_budget,
+            batch.deferred_for_guardrail,
+        );
+        let batch_size = u32::try_from(batch.slots.len()).unwrap_or(u32::MAX);
+        let batch_kv_tokens = u32::try_from(batch.total_kv_tokens).unwrap_or(u32::MAX);
+        let deferred_decode_sessions = u32::try_from(batch.deferred.len()).unwrap_or(u32::MAX);
+
+        let outcomes = self.execute_decode_microbatch(batch, position).await?;
+        self.drain_swarm_events().await?;
+        let active_decode_sessions =
+            u32::try_from(self.active_decode_session_count()).unwrap_or(u32::MAX);
+
+        let mut primary_outcome = None::<DecodeStepOutcome>;
+        for outcome in outcomes {
+            if outcome.should_checkpoint {
+                let checkpoint_snapshot = self
+                    .sessions
+                    .get(&outcome.session_id)
+                    .map(|session| session.job.clone())
+                    .ok_or_else(|| {
+                        AgentError::Execution(
+                            "decode session vanished before checkpointing".to_string(),
+                        )
+                    })?;
+                self.checkpoint(&checkpoint_snapshot).await?;
+                if let Some(session) = self.sessions.get_mut(&outcome.session_id) {
+                    session.job.mark_checkpointed();
+                }
+            }
+
+            if let Some(session) = self.sessions.get_mut(&outcome.session_id) {
+                session.last_active_at = Instant::now();
+            }
+
+            if outcome.session_id == request.session_id {
+                primary_outcome = Some(outcome);
+            }
+        }
+
+        let primary_outcome = primary_outcome.ok_or_else(|| {
+            AgentError::Execution(
+                "decode microbatch completed without an outcome for the primary session"
+                    .to_string(),
+            )
+        })?;
+
+        Ok(SchedulerOwnedDecodeStep {
+            primary_completion_tokens: primary_outcome.completion_tokens,
+            primary_time_to_first_token_ms: primary_outcome.time_to_first_token_ms,
+            telemetry: DecodeBatchTelemetry {
+                kv_cache_seq_len: primary_outcome.kv_cache_seq_len,
+                batch_size,
+                active_decode_sessions,
+                batch_kv_tokens,
+                deferred_decode_sessions,
+            },
+        })
     }
 
     async fn run_decode_segment<F, Fut>(
