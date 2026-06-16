@@ -35,6 +35,22 @@
       "times": 1
     },
     {
+      "name": "serialized decode profile remains blocked despite otherwise healthy failover signals",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_scheduler_status_readiness_blocks_serialized_decode_profile",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
       "name": "active decode can shrink from four workers to three and resume immediately",
       "type": "proc_when",
       "cmd": "cargo",

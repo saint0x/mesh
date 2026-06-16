@@ -49,6 +49,22 @@
       "exit_code": 0,
       "stdout": "test result: ok.\n",
       "times": 1
+    },
+    {
+      "name": "serialized decode telemetry stays blocked in scheduler readiness",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "control-plane",
+        "db::tests::test_scheduler_status_readiness_blocks_serialized_decode_profile",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
     }
   ]
 }
