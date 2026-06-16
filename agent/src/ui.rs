@@ -2645,6 +2645,52 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         duration_ms: artifact_start.elapsed().as_millis() as u64,
     });
 
+    let decode_pooling_start = std::time::Instant::now();
+    let decode_pooling = crate::load_local_decode_pooling_readiness();
+    checks.push(UiDoctorCheck {
+        id: "decode_pooling".into(),
+        label: "Decode pooling".into(),
+        status: match &decode_pooling {
+            Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => "ok".into(),
+            Ok(Some(readiness)) if readiness.decode_microbatches_executed > 0 => "fail".into(),
+            Ok(Some(_)) => "warn".into(),
+            Ok(None) => "warn".into(),
+            Err(_) => "warn".into(),
+        },
+        detail: match &decode_pooling {
+            Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => format!(
+                "Observed pooled decode serving locally with avg batch size {:.2} and multi-session rate {:.1}%.",
+                readiness.avg_decode_batch_size,
+                readiness.multi_session_batch_rate * 100.0
+            ),
+            Ok(Some(readiness)) if readiness.decode_microbatches_executed > 0 => format!(
+                "Observed only serialized decode locally: avg batch size {:.2}, multi-session rate {:.1}%, microbatches {}.",
+                readiness.avg_decode_batch_size,
+                readiness.multi_session_batch_rate * 100.0,
+                readiness.decode_microbatches_executed
+            ),
+            Ok(Some(_)) => "No local decode microbatch telemetry has been recorded yet.".into(),
+            Ok(None) => "No inference stats file exists yet for local decode batching proof.".into(),
+            Err(error) => format!("Could not read local decode batching telemetry: {error}"),
+        },
+        hint: match &decode_pooling {
+            Ok(Some(readiness)) if readiness.demonstrates_pooled_decode() => None,
+            Ok(Some(readiness)) if readiness.decode_microbatches_executed > 0 => Some(
+                "Do not treat this node as production decode-ready until concurrent real jobs produce pooled multi-session decode batches."
+                    .into(),
+            ),
+            Ok(Some(_)) | Ok(None) => Some(
+                "Run the real-cluster production gate to record decode batching proof on this node."
+                    .into(),
+            ),
+            Err(_) => Some(
+                "Fix local inference stats persistence so decode batching readiness can be proven."
+                    .into(),
+            ),
+        },
+        duration_ms: decode_pooling_start.elapsed().as_millis() as u64,
+    });
+
     let overall = if checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if checks.iter().any(|check| check.status == "warn") {

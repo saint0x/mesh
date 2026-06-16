@@ -4698,6 +4698,53 @@ async fn cmd_ledger_events(job_id: Option<&str>, limit: usize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LocalDecodePoolingReadiness {
+    pub decode_microbatches_executed: u64,
+    pub avg_decode_batch_size: f64,
+    pub multi_session_batch_rate: f64,
+}
+
+impl LocalDecodePoolingReadiness {
+    pub(crate) fn demonstrates_pooled_decode(&self) -> bool {
+        self.decode_microbatches_executed > 0
+            && self.avg_decode_batch_size >= 2.0
+            && self.multi_session_batch_rate > 0.0
+    }
+}
+
+pub(crate) fn load_local_decode_pooling_readiness() -> Result<Option<LocalDecodePoolingReadiness>> {
+    use std::path::PathBuf;
+
+    let stats_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".meshnet")
+        .join("inference_stats.json");
+    if !stats_path.exists() {
+        return Ok(None);
+    }
+
+    let stats_json =
+        std::fs::read_to_string(&stats_path).context("Failed to read inference stats file")?;
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_json).context("Failed to parse inference stats")?;
+
+    Ok(Some(LocalDecodePoolingReadiness {
+        decode_microbatches_executed: stats
+            .get("decode_microbatches_executed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        avg_decode_batch_size: stats
+            .get("avg_decode_batch_size")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+        multi_session_batch_rate: stats
+            .get("multi_session_batch_rate")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+    }))
+}
+
 async fn cmd_doctor() -> Result<()> {
     use colored::Colorize;
     use control_plane::{db::find_shadow_local_db_files, Database};
@@ -4843,6 +4890,29 @@ async fn cmd_doctor() -> Result<()> {
             "  {} local real artifact materialization failed: {}",
             "FAIL".red().bold(),
             error
+        ),
+    }
+    match load_local_decode_pooling_readiness()? {
+        Some(readiness) if readiness.demonstrates_pooled_decode() => println!(
+            "  {} local decode pooling proven: avg_batch_size={:.2}, multi_session_rate={:.1}%",
+            "OK".green().bold(),
+            readiness.avg_decode_batch_size,
+            readiness.multi_session_batch_rate * 100.0
+        ),
+        Some(readiness) if readiness.decode_microbatches_executed > 0 => println!(
+            "  {} local decode pooling not production-ready: avg_batch_size={:.2}, multi_session_rate={:.1}%, decode_microbatches={}",
+            "FAIL".red().bold(),
+            readiness.avg_decode_batch_size,
+            readiness.multi_session_batch_rate * 100.0,
+            readiness.decode_microbatches_executed
+        ),
+        Some(_) => println!(
+            "  {} local decode pooling unproven: no decode microbatch telemetry recorded yet",
+            "WARN".yellow().bold()
+        ),
+        None => println!(
+            "  {} local decode pooling unproven: no inference stats recorded yet",
+            "WARN".yellow().bold()
         ),
     }
     println!();
