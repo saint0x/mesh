@@ -61,7 +61,7 @@ pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{
     BackendInstanceSpec, BackendOptimizationProfile, DecodeBatchPlan, DecodeBatchPolicy,
     DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase, ExecutorPhasePlan,
-    FallbackKernel, FusedKernelStage, InferenceRuntimeMode, KvRuntimeContract, KvTransferPolicy,
+    FusedKernelStage, HostKernel, InferenceRuntimeMode, KvRuntimeContract, KvTransferPolicy,
     LocalExecutorClass, LocalExecutorContract, RuntimeMemoryBudget, SessionAssignment,
     SessionEvictionReason, SessionEvictionState, SessionPauseReason, SessionPauseState,
     SessionRuntimeStatus, TransportCapabilityTier,

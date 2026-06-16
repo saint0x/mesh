@@ -109,14 +109,14 @@ pub enum BackendOptimizationProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalExecutorClass {
-    Fallback,
+    Baseline,
     FastPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FallbackKernel {
-    LegacyForwardPass,
+pub enum HostKernel {
+    ForwardPass,
     SerialDecode,
     HostAssistedSampling,
 }
@@ -152,7 +152,7 @@ pub struct KvRuntimeContract {
 pub struct LocalExecutorContract {
     pub class: LocalExecutorClass,
     pub optimization_profile: BackendOptimizationProfile,
-    pub fallback_kernels: Vec<FallbackKernel>,
+    pub host_kernels: Vec<HostKernel>,
     pub fused_stages: Vec<FusedKernelStage>,
     pub prefill: ExecutorPhasePlan,
     pub decode: ExecutorPhasePlan,
@@ -164,24 +164,24 @@ impl LocalExecutorContract {
     pub fn for_provider(provider: ExecutionProviderKind) -> Self {
         match provider {
             ExecutionProviderKind::Cpu => Self {
-                class: LocalExecutorClass::Fallback,
+                class: LocalExecutorClass::Baseline,
                 optimization_profile: BackendOptimizationProfile::CpuSerial,
-                fallback_kernels: vec![
-                    FallbackKernel::LegacyForwardPass,
-                    FallbackKernel::SerialDecode,
-                    FallbackKernel::HostAssistedSampling,
+                host_kernels: vec![
+                    HostKernel::ForwardPass,
+                    HostKernel::SerialDecode,
+                    HostKernel::HostAssistedSampling,
                 ],
                 fused_stages: Vec::new(),
                 prefill: ExecutorPhasePlan {
                     phase: ExecutionPhase::Prefill,
-                    class: LocalExecutorClass::Fallback,
+                    class: LocalExecutorClass::Baseline,
                     supports_microbatch: false,
                     requires_static_workspace: false,
                     uses_device_sampling: false,
                 },
                 decode: ExecutorPhasePlan {
                     phase: ExecutionPhase::Decode,
-                    class: LocalExecutorClass::Fallback,
+                    class: LocalExecutorClass::Baseline,
                     supports_microbatch: false,
                     requires_static_workspace: false,
                     uses_device_sampling: false,
@@ -197,7 +197,7 @@ impl LocalExecutorContract {
             ExecutionProviderKind::Metal => Self {
                 class: LocalExecutorClass::FastPath,
                 optimization_profile: BackendOptimizationProfile::MetalVectorized,
-                fallback_kernels: vec![FallbackKernel::HostAssistedSampling],
+                host_kernels: vec![HostKernel::HostAssistedSampling],
                 fused_stages: vec![
                     FusedKernelStage::NormQkv,
                     FusedKernelStage::RopeKvWrite,
@@ -230,7 +230,7 @@ impl LocalExecutorContract {
             ExecutionProviderKind::Cuda => Self {
                 class: LocalExecutorClass::FastPath,
                 optimization_profile: BackendOptimizationProfile::CudaFused,
-                fallback_kernels: vec![FallbackKernel::HostAssistedSampling],
+                host_kernels: vec![HostKernel::HostAssistedSampling],
                 fused_stages: vec![
                     FusedKernelStage::NormQkv,
                     FusedKernelStage::RopeKvWrite,

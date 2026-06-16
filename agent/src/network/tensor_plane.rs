@@ -142,7 +142,7 @@ pub struct TensorPlaneCapabilitiesSnapshot {
     pub prioritized_traffic_classes: bool,
     pub persistent_serving_peer_channels: bool,
     pub per_peer_bulk_fairness: bool,
-    pub runtime_mode_aware_fallbacks: bool,
+    pub runtime_mode_aware_traffic_policies: bool,
     pub provider_specialized_collectives: bool,
 }
 
@@ -1047,7 +1047,7 @@ impl TensorPlane {
             prioritized_traffic_classes: true,
             persistent_serving_peer_channels: true,
             per_peer_bulk_fairness: true,
-            runtime_mode_aware_fallbacks: true,
+            runtime_mode_aware_traffic_policies: true,
             provider_specialized_collectives: true,
         }
     }

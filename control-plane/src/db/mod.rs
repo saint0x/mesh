@@ -220,16 +220,38 @@ impl Database {
     }
 }
 
-pub fn find_ambiguous_local_db_files() -> Vec<PathBuf> {
+fn find_shadow_db_files_in(dir: &Path) -> Vec<PathBuf> {
+    ["control-plane.db", "mesh_control_plane.db"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+pub fn find_shadow_local_db_files() -> Vec<PathBuf> {
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
     };
 
-    ["control-plane.db", "mesh_control_plane.db"]
-        .into_iter()
-        .map(|name| cwd.join(name))
-        .filter(|path| path.exists())
-        .collect()
+    find_shadow_db_files_in(&cwd)
+}
+
+pub fn ensure_no_shadow_local_db_files(authoritative_db_path: &Path) -> Result<()> {
+    let shadow_files = find_shadow_local_db_files();
+    if shadow_files.is_empty() {
+        return Ok(());
+    }
+
+    let rendered_files = shadow_files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(DbError::Config(format!(
+        "Found repo-local SQLite shadow artifacts ({}) while authoritative control-plane DB is {}. Remove shadow DB files before starting Meshnet.",
+        rendered_files,
+        authoritative_db_path.display()
+    )))
 }
 
 fn locate_migrations_dir() -> Result<PathBuf> {

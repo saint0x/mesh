@@ -41,15 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize database
     let db_path = Database::default_path()?;
+    control_plane::db::ensure_no_shadow_local_db_files(&db_path)?;
     info!(path = %db_path.display(), "Using database");
-    let ambiguous_db_files = control_plane::db::find_ambiguous_local_db_files();
-    if !ambiguous_db_files.is_empty() {
-        tracing::warn!(
-            files = ?ambiguous_db_files,
-            authoritative = %db_path.display(),
-            "Ignoring ambiguous local SQLite artifacts outside the authoritative Mesh home path"
-        );
-    }
 
     let db_path_str = db_path.to_str().ok_or_else(|| {
         format!(

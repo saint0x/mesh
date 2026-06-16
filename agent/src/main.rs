@@ -4395,7 +4395,7 @@ async fn cmd_ledger_events(job_id: Option<&str>, limit: usize) -> Result<()> {
 
 async fn cmd_doctor() -> Result<()> {
     use colored::Colorize;
-    use control_plane::{db::find_ambiguous_local_db_files, Database};
+    use control_plane::{db::find_shadow_local_db_files, Database};
 
     println!("\n{}", "Mesh Doctor".bold().cyan());
     println!("{}", "===========".cyan());
@@ -4465,8 +4465,8 @@ async fn cmd_doctor() -> Result<()> {
         load_local_listen_addrs().len()
     );
     let authoritative_db = Database::default_path()?;
-    let ambiguous_db_files = find_ambiguous_local_db_files();
-    if ambiguous_db_files.is_empty() {
+    let shadow_db_files = find_shadow_local_db_files();
+    if shadow_db_files.is_empty() {
         println!(
             "  {} control-plane db {}",
             "OK".green().bold(),
@@ -4474,9 +4474,9 @@ async fn cmd_doctor() -> Result<()> {
         );
     } else {
         println!(
-            "  {} ambiguous local db artifacts found: {}",
+            "  {} repo-local shadow db artifacts found: {}",
             "FAIL".red().bold(),
-            ambiguous_db_files
+            shadow_db_files
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()

@@ -17,7 +17,7 @@ use control_plane::{
     connectivity::InferenceSchedulingPolicy,
     consumption_policy::{quote_consumption, ConsumptionQuoteInput},
     credit_policy::{compute_credit_policy, AssignmentCreditInput, CreditPolicyInput},
-    db::find_ambiguous_local_db_files,
+    db::find_shadow_local_db_files,
     model_assets, Database,
 };
 use serde::{Deserialize, Serialize};
@@ -2418,24 +2418,24 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
 
     let db_start = std::time::Instant::now();
     let authoritative_db = Database::default_path()?;
-    let ambiguous_db_files = find_ambiguous_local_db_files();
+    let shadow_db_files = find_shadow_local_db_files();
     checks.push(UiDoctorCheck {
         id: "control_plane_db_path".into(),
         label: "Control-plane DB".into(),
-        status: if ambiguous_db_files.is_empty() {
+        status: if shadow_db_files.is_empty() {
             "ok".into()
         } else {
             "fail".into()
         },
-        detail: if ambiguous_db_files.is_empty() {
+        detail: if shadow_db_files.is_empty() {
             format!(
                 "Authoritative control-plane DB is {}",
                 authoritative_db.display()
             )
         } else {
             format!(
-                "Found ambiguous repo-local DB artifacts: {}. Authoritative DB is {}",
-                ambiguous_db_files
+                "Found repo-local SQLite shadow artifacts: {}. Authoritative DB is {}",
+                shadow_db_files
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
@@ -2443,10 +2443,12 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
                 authoritative_db.display()
             )
         },
-        hint: if ambiguous_db_files.is_empty() {
+        hint: if shadow_db_files.is_empty() {
             None
         } else {
-            Some("Remove repo-local SQLite artifacts and use the Mesh home database only.".into())
+            Some(
+                "Remove repo-local SQLite shadow files and use the Mesh home database only.".into(),
+            )
         },
         duration_ms: db_start.elapsed().as_millis() as u64,
     });
