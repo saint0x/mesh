@@ -1808,6 +1808,21 @@ async fn wait_for_shutdown_signal() -> Result<&'static str> {
     }
 }
 
+#[cfg(unix)]
+fn terminate_child_process(child: &tokio::process::Child) -> Result<()> {
+    use anyhow::Context;
+
+    let pid = child
+        .id()
+        .context("Runtime child PID was unavailable during shutdown")?;
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to forward SIGTERM to runtime child");
+    }
+    Ok(())
+}
+
 /// Run agent daemon
 pub(crate) async fn cmd_start(log_level: String) -> Result<()> {
     println!("🛡️  Starting Mesh inference supervisor...\n");
@@ -1866,8 +1881,28 @@ pub(crate) async fn cmd_start(log_level: String) -> Result<()> {
             signal = wait_for_shutdown_signal() => {
                 let signal = signal?;
                 info!(signal, "Supervisor received shutdown signal");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                #[cfg(unix)]
+                {
+                    if let Err(error) = terminate_child_process(&child) {
+                        warn!(error = %error, "Failed to forward SIGTERM to runtime child");
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.start_kill();
+                }
+
+                match tokio::time::timeout(tokio::time::Duration::from_secs(5), child.wait()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "Failed while waiting for runtime child shutdown");
+                    }
+                    Err(_) => {
+                        warn!("Runtime child did not exit after graceful shutdown window; forcing kill");
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -2197,7 +2232,7 @@ async fn cmd_runtime() -> Result<()> {
     // Start inference coordinator (in background)
     let inference_config_task = config.clone();
     let runtime_endpoint_clone = runtime_endpoint.clone();
-    tokio::spawn(async move {
+    let inference_task = tokio::spawn(async move {
         use agent::checkpoint::{CheckpointConfig, CheckpointManager};
         use agent::inference::coordinator::{InferenceConfig, InferenceCoordinator};
         use agent::inference::job::{GenerationConfig, InferenceRequest};
@@ -2397,8 +2432,22 @@ async fn cmd_runtime() -> Result<()> {
 
         // Claim and execute inference assignments
         let mut idle_claim_polls = 0u32;
+        let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(CLAIM_POLL_INTERVAL_SECS)) => {}
+                signal = &mut shutdown_signal => {
+                    let signal = match signal {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            warn!(error = %error, "Runtime shutdown signal listener failed");
+                            "signal_listener_error"
+                        }
+                    };
+                    info!(signal, "Runtime received shutdown signal");
+                    break;
+                }
+            }
             if ring_position.is_none() {
                 match fetch_worker_position_from_control_plane(&topology_url, &device_id).await {
                     Ok(position) => {
@@ -3243,6 +3292,10 @@ async fn cmd_runtime() -> Result<()> {
                 }
             }
         }
+
+        if let Err(error) = coordinator.persist_runtime_stats() {
+            warn!(error = %error, "Failed to persist runtime stats during shutdown");
+        }
     });
 
     println!("\n✅ Agent ready - participating in mesh inference...");
@@ -3315,6 +3368,16 @@ async fn cmd_runtime() -> Result<()> {
                     | agent::MeshEvent::ReservationAccepted { .. } => {}
                 }
             }
+        }
+    }
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(5), inference_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(error = %error, "Inference runtime task exited with join error during shutdown");
+        }
+        Err(_) => {
+            warn!("Inference runtime task did not exit within shutdown grace window");
         }
     }
 

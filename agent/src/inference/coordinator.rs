@@ -556,6 +556,13 @@ impl InferenceCoordinator {
         &self.stats
     }
 
+    pub fn persist_runtime_stats(&self) -> Result<()> {
+        self.sync_tensor_plane_metrics();
+        self.stats
+            .save_to_file()
+            .map_err(|e| AgentError::Execution(format!("Failed to save inference stats: {}", e)))
+    }
+
     pub fn has_session(&self, session_id: Uuid) -> bool {
         self.sessions.contains_key(&session_id)
     }
