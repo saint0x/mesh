@@ -6177,6 +6177,42 @@ mod tests {
     }
 
     #[test]
+    fn local_decode_pooling_readiness_requires_peak_batch_and_multi_session_rate() {
+        let readiness = LocalDecodePoolingReadiness {
+            decode_microbatches_executed: 3,
+            peak_decode_batch_size: 2,
+            avg_decode_batch_size: 1.34,
+            multi_session_batch_rate: 0.25,
+        };
+
+        assert!(readiness.demonstrates_pooled_decode());
+    }
+
+    #[test]
+    fn local_decode_pooling_readiness_rejects_serialized_peak_even_with_high_average() {
+        let readiness = LocalDecodePoolingReadiness {
+            decode_microbatches_executed: 3,
+            peak_decode_batch_size: 1,
+            avg_decode_batch_size: 2.75,
+            multi_session_batch_rate: 0.25,
+        };
+
+        assert!(!readiness.demonstrates_pooled_decode());
+    }
+
+    #[test]
+    fn local_decode_pooling_readiness_rejects_zero_multi_session_rate() {
+        let readiness = LocalDecodePoolingReadiness {
+            decode_microbatches_executed: 4,
+            peak_decode_batch_size: 3,
+            avg_decode_batch_size: 2.2,
+            multi_session_batch_rate: 0.0,
+        };
+
+        assert!(!readiness.demonstrates_pooled_decode());
+    }
+
+    #[test]
     fn cli_definitions_pass_clap_debug_asserts() {
         Cli::command().debug_assert();
     }
