@@ -388,12 +388,17 @@ if tensor_bytes_sent <= 0:
     raise SystemExit("tensor_bytes_sent was not positive")
 if max_decode_batch < 1.0:
     raise SystemExit("avg_decode_batch_size was invalid")
+if max_multi_session_rate <= 0.0 or max_decode_batch < 2.0:
+    raise SystemExit(
+        "concurrent real serving never produced a pooled decode microbatch; "
+        f"multi_session_batch_rate={max_multi_session_rate:.3f} avg_decode_batch_size={max_decode_batch:.2f}"
+    )
 
 print(
     f"tokens={total_tokens} avg_tps={avg_tps:.2f} allreduce_ops={allreduce_ops} "
     f"tensor_bytes_sent={tensor_bytes_sent} multi_session_batch_rate={max_multi_session_rate:.3f} "
     f"avg_decode_batch_size={max_decode_batch:.2f} "
-    f"transport_island_serialized={'yes' if max_multi_session_rate <= 0.0 else 'no'}"
+    f"production_decode_pooling_ready=yes"
 )
 PY
 )"

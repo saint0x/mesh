@@ -41,6 +41,7 @@ Results:
 - explicit real safetensors artifact loading completed cleanly on this machine on 2026-06-15, taking about 128 seconds against the local TinyLlama shard set
 - the real artifact validation path is explicit and host-backed; a plain `cargo test --workspace` run does not enable it automatically
 - `fozzy map suites` still reports uncovered required hotspots in several high-risk files
+- the host-backed real-cluster path now proves real artifact loading and real distributed execution, but it must not be treated as production decode-parity proof unless concurrent runs actually achieve pooled multi-session decode batches
 
 ## Current Caveats
 
@@ -48,6 +49,7 @@ Results:
 - real artifact validation is materially heavier than the rest of the suite and should be budgeted as a separate production gate
 - whole-suite Rust test stability should continue to be stressed in CI even though the earlier flake did not reproduce on 2026-06-15
 - high-risk hotspots still need broader Fozzy suite coverage beyond the scenarios already present
+- the current runtime can still appear green while concurrent real jobs serialize through single-session decode, so production readiness should be blocked until the real-cluster gate observes true pooled decode batching
 
 ## Current Recommendation
 
@@ -56,3 +58,4 @@ Treat the repo as:
 - real distributed runtime code
 - no longer blocked by the old "missing inference endpoint" narrative
 - not yet ready for casual “everything is fully production-ready” language
+- specifically not decode-parity ready until the real-cluster production gate passes with real concurrent pooled decode batches
