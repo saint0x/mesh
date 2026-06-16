@@ -1508,6 +1508,7 @@ pub struct SchedulerReadinessThresholds {
     pub max_recent_regroup_failures: u32,
     pub max_peak_recovery_latency_ms: u64,
     pub max_avg_post_failover_throughput_loss_pct: f64,
+    pub min_peak_decode_batch_size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

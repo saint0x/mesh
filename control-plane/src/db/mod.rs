@@ -1580,6 +1580,7 @@ fn compute_scheduler_readiness(metrics: &SchedulerBatchMetrics) -> SchedulerRead
         max_recent_regroup_failures: 0,
         max_peak_recovery_latency_ms: 10_000,
         max_avg_post_failover_throughput_loss_pct: 25.0,
+        min_peak_decode_batch_size: 2,
     };
     let mut blockers = Vec::new();
 
@@ -1615,6 +1616,15 @@ fn compute_scheduler_readiness(metrics: &SchedulerBatchMetrics) -> SchedulerRead
                 .recent_avg_post_failover_throughput_loss_pct
                 .unwrap_or(0.0),
             thresholds.max_avg_post_failover_throughput_loss_pct
+        ));
+    }
+    if metrics.sessions_with_batch_telemetry > 0
+        && metrics.peak_batch_size.unwrap_or(0) < thresholds.min_peak_decode_batch_size
+    {
+        blockers.push(format!(
+            "observed peak decode batch size {} is below required pooled target {}",
+            metrics.peak_batch_size.unwrap_or(0),
+            thresholds.min_peak_decode_batch_size
         ));
     }
 
@@ -3478,6 +3488,77 @@ mod tests {
             status.metrics.recent_avg_post_failover_throughput_loss_pct,
             Some(16.666666666666664)
         );
+        assert_eq!(status.readiness.thresholds.min_peak_decode_batch_size, 2);
+    }
+
+    #[test]
+    fn test_scheduler_status_readiness_blocks_serialized_decode_profile() {
+        let db = create_test_db();
+        seed_scheduler_visibility_fixture(&db);
+
+        let conn = db.get_conn().expect("Failed to get connection");
+        conn.execute(
+            r#"
+            UPDATE inference_sessions
+            SET latest_batch_size = 1,
+                latest_active_decode_sessions = 1,
+                latest_batch_kv_tokens = 11,
+                latest_deferred_decode_sessions = 0
+            WHERE session_id = 'session-1'
+            "#,
+            [],
+        )
+        .expect("Failed to force serialized decode telemetry");
+        conn.execute(
+            r#"
+            UPDATE inference_decode_batch_events
+            SET batch_size = 1,
+                active_decode_sessions = 1,
+                deferred_decode_sessions = 0,
+                target_session_count = 1,
+                target_batch_size = 1
+            WHERE session_id = 'session-1'
+            "#,
+            [],
+        )
+        .expect("Failed to force serialized decode batch events");
+        conn.execute(
+            "DELETE FROM inference_scheduler_events WHERE event_kind = 'decode_regroup_failed'",
+            [],
+        )
+        .expect("Failed to drop failing regroup event");
+        conn.execute(
+            r#"
+            UPDATE inference_session_kv_transfers
+            SET transfer_kind = 'live_kv_handoff'
+            WHERE transfer_id = 'transfer-2'
+            "#,
+            [],
+        )
+        .expect("Failed to rebalance transfer mix");
+        conn.execute(
+            r#"
+            UPDATE inference_decode_batch_events
+            SET completion_tokens = 10
+            WHERE session_id = 'session-1' AND observed_at = '2026-04-25T12:00:12Z'
+            "#,
+            [],
+        )
+        .expect("Failed to improve post-failover throughput sample");
+        drop(conn);
+
+        let status = db
+            .load_network_scheduler_status("net-1")
+            .expect("Failed to load network scheduler status");
+
+        assert!(!status.readiness.ready);
+        assert_eq!(status.metrics.sessions_with_batch_telemetry, 1);
+        assert_eq!(status.metrics.peak_batch_size, Some(1));
+        assert!(status
+            .readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("observed peak decode batch size 1")));
     }
 
     #[test]
