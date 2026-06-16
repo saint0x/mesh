@@ -35,10 +35,10 @@
 
 mod ui;
 
-use agent::inference::ShardLoader;
 use agent::pki::{
     DeviceKeyPair, MembershipRole, PeerCache, PoolConfig, PoolId, PoolMembershipCert,
 };
+use agent::zip::ShardLoader;
 use agent::{
     api::types::{
         ClaimInferenceAssignmentRequest, DecodeLeaseSessionMember, DecodeLeaseStatus,
@@ -126,7 +126,7 @@ fn validate_production_artifact_assignment(
         shard_column_range.0,
         shard_column_range.1,
     );
-    if !agent::inference::artifact_loader::artifact_exists(
+    if !agent::zip::artifact_loader::artifact_exists(
         &agent::model_assets::model_store_dir(),
         &assignment,
     ) {
@@ -166,7 +166,7 @@ async fn probe_production_artifact_assignment_materialization(
         .await
         .context("register assigned shard for readiness probe")?;
 
-    let loader = agent::inference::ArtifactShardLoader::new(agent::model_assets::model_store_dir());
+    let loader = agent::zip::ArtifactShardLoader::new(agent::model_assets::model_store_dir());
     let weights = loader
         .load_shard(model_id, &assignment, &registry)
         .await
@@ -179,7 +179,7 @@ async fn probe_production_artifact_assignment_materialization(
                 shard_column_range.1
             )
         })?;
-    let residency = agent::inference::forward_pass::SharedModelResidency::from_host(weights)
+    let residency = agent::zip::forward_pass::SharedModelResidency::from_host(weights)
         .context("materialize assigned shard onto the selected execution device")?;
     let resident_bytes = residency.resident_bytes();
     if resident_bytes == 0 {
@@ -191,7 +191,7 @@ async fn probe_production_artifact_assignment_materialization(
 
 async fn validate_worker_position_runtime_readiness(
     config: &DeviceConfig,
-    position: &agent::inference::coordinator::WorkerPosition,
+    position: &agent::zip::coordinator::WorkerPosition,
 ) -> Result<()> {
     validate_local_production_provider(config)?;
     validate_production_artifact_assignment(
@@ -211,18 +211,18 @@ async fn validate_worker_position_runtime_readiness(
 }
 
 async fn join_validated_ring_position(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     config: &DeviceConfig,
-    position: agent::inference::coordinator::WorkerPosition,
-) -> Result<agent::inference::coordinator::WorkerPosition> {
+    position: agent::zip::coordinator::WorkerPosition,
+) -> Result<agent::zip::coordinator::WorkerPosition> {
     validate_worker_position_runtime_readiness(config, &position).await?;
     coordinator.join_ring(position.clone())?;
     Ok(position)
 }
 
 fn worker_position_runtime_identity_matches(
-    current: &agent::inference::coordinator::WorkerPosition,
-    desired: &agent::inference::coordinator::WorkerPosition,
+    current: &agent::zip::coordinator::WorkerPosition,
+    desired: &agent::zip::coordinator::WorkerPosition,
 ) -> bool {
     current.model_id == desired.model_id
         && current.position == desired.position
@@ -237,11 +237,11 @@ fn worker_position_runtime_identity_matches(
 }
 
 async fn apply_runtime_ring_position_if_needed(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     config: &DeviceConfig,
-    current: Option<&agent::inference::coordinator::WorkerPosition>,
-    desired: agent::inference::coordinator::WorkerPosition,
-) -> Result<Option<agent::inference::coordinator::WorkerPosition>> {
+    current: Option<&agent::zip::coordinator::WorkerPosition>,
+    desired: agent::zip::coordinator::WorkerPosition,
+) -> Result<Option<agent::zip::coordinator::WorkerPosition>> {
     if let Some(current) = current {
         if worker_position_runtime_identity_matches(current, &desired) {
             return Ok(Some(current.clone()));
@@ -1064,7 +1064,7 @@ fn direct_candidate_age_seconds(last_updated_ms: u64) -> u64 {
 fn build_worker_position_from_topology(
     topology: &RingTopologyResponse,
     device_id: &Uuid,
-) -> Result<agent::inference::coordinator::WorkerPosition> {
+) -> Result<agent::zip::coordinator::WorkerPosition> {
     let self_worker = topology
         .workers
         .iter()
@@ -1092,7 +1092,7 @@ fn build_worker_position_from_topology(
     let left_punch_plan = find_peer_punch_plan(topology, device_id, &left_worker.device_id);
     let right_punch_plan = find_peer_punch_plan(topology, device_id, &right_worker.device_id);
 
-    Ok(agent::inference::coordinator::WorkerPosition {
+    Ok(agent::zip::coordinator::WorkerPosition {
         model_id: self_worker.shard.model_id.clone(),
         position: self_worker.position,
         total_workers: topology.workers.len() as u32,
@@ -1132,7 +1132,7 @@ fn build_worker_position_from_topology(
 async fn fetch_worker_position_from_control_plane(
     topology_url: &str,
     device_id: &Uuid,
-) -> Result<agent::inference::coordinator::WorkerPosition> {
+) -> Result<agent::zip::coordinator::WorkerPosition> {
     let response = reqwest::Client::new()
         .get(topology_url)
         .send()
@@ -1248,10 +1248,10 @@ fn topology_from_execution_lease(lease: &InferenceExecutionLease) -> RingTopolog
     }
 }
 
-fn api_phase(phase: agent::inference::ExecutionPhase) -> ApiExecutionPhase {
+fn api_phase(phase: agent::zip::ExecutionPhase) -> ApiExecutionPhase {
     match phase {
-        agent::inference::ExecutionPhase::Prefill => ApiExecutionPhase::Prefill,
-        agent::inference::ExecutionPhase::Decode => ApiExecutionPhase::Decode,
+        agent::zip::ExecutionPhase::Prefill => ApiExecutionPhase::Prefill,
+        agent::zip::ExecutionPhase::Decode => ApiExecutionPhase::Decode,
     }
 }
 
@@ -1538,7 +1538,7 @@ fn build_runtime_inference_request(
     decode_lease: Option<&DecodeLeaseStatus>,
     device_id: Uuid,
     job_id: Uuid,
-) -> Result<agent::inference::InferenceRequest> {
+) -> Result<agent::zip::InferenceRequest> {
     let decode_batch_session_ids = canonical_decode_batch_session_ids(assignment, decode_lease)?;
     if !decode_batch_session_ids.is_empty() {
         let decode_lease_members =
@@ -1552,12 +1552,12 @@ fn build_runtime_inference_request(
         }
     }
 
-    Ok(agent::inference::InferenceRequest {
+    Ok(agent::zip::InferenceRequest {
         job_id,
         network_id: assignment.network_id.clone(),
         model_id: assignment.model_id.clone(),
         prompt_tokens: assignment.active_segment.prompt_tokens.clone(),
-        config: agent::inference::GenerationConfig {
+        config: agent::zip::GenerationConfig {
             max_tokens: assignment
                 .available_completion_tokens
                 .min(assignment.active_segment.max_tokens),
@@ -1567,10 +1567,10 @@ fn build_runtime_inference_request(
         },
         session_id: Uuid::parse_str(&assignment.active_segment.session_id).unwrap_or(job_id),
         phase: match assignment.active_segment.phase {
-            ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
-            ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
+            ApiExecutionPhase::Prefill => agent::zip::ExecutionPhase::Prefill,
+            ApiExecutionPhase::Decode => agent::zip::ExecutionPhase::Decode,
         },
-        decode_batch_targets: agent::inference::DecodeBatchTargets {
+        decode_batch_targets: agent::zip::DecodeBatchTargets {
             target_session_count: decode_lease
                 .and_then(|lease| lease.lease_target_session_count)
                 .or(assignment.session.lease_target_session_count),
@@ -1581,16 +1581,16 @@ fn build_runtime_inference_request(
         },
         runtime_mode: match assignment.execution_plan.runtime_mode {
             agent::api::types::InferenceRuntimeMode::FitFirst => {
-                agent::inference::InferenceRuntimeMode::FitFirst
+                agent::zip::InferenceRuntimeMode::FitFirst
             }
             agent::api::types::InferenceRuntimeMode::ThroughputFirst => {
-                agent::inference::InferenceRuntimeMode::ThroughputFirst
+                agent::zip::InferenceRuntimeMode::ThroughputFirst
             }
             agent::api::types::InferenceRuntimeMode::LatencyFirst => {
-                agent::inference::InferenceRuntimeMode::LatencyFirst
+                agent::zip::InferenceRuntimeMode::LatencyFirst
             }
             agent::api::types::InferenceRuntimeMode::ResilientEdge => {
-                agent::inference::InferenceRuntimeMode::ResilientEdge
+                agent::zip::InferenceRuntimeMode::ResilientEdge
             }
         },
         fast_path_permitted: active_group(assignment)
@@ -1605,9 +1605,9 @@ fn build_runtime_inference_request(
 }
 
 fn build_decode_cohort_member_request(
-    owner_request: &agent::inference::InferenceRequest,
+    owner_request: &agent::zip::InferenceRequest,
     member: &DecodeLeaseSessionMember,
-) -> Result<agent::inference::InferenceRequest> {
+) -> Result<agent::zip::InferenceRequest> {
     let mut request = owner_request.clone();
     request.job_id = Uuid::parse_str(&member.job_id)
         .with_context(|| format!("invalid decode cohort member job id {}", member.job_id))?;
@@ -1617,7 +1617,7 @@ fn build_decode_cohort_member_request(
             member.session_id, member.job_id
         )
     })?;
-    request.phase = agent::inference::ExecutionPhase::Decode;
+    request.phase = agent::zip::ExecutionPhase::Decode;
     Ok(request)
 }
 
@@ -1665,18 +1665,18 @@ fn decode_member_ready_for_local_resume(member: &DecodeLeaseSessionMember) -> bo
 }
 
 async fn materialize_decode_cohort_session(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     assignment: &InferenceExecutionLease,
     member: &DecodeLeaseSessionMember,
-    request: &agent::inference::InferenceRequest,
+    request: &agent::zip::InferenceRequest,
     device_id: Uuid,
 ) -> Result<()> {
     if !decode_member_ready_for_local_resume(member) {
         if coordinator.has_session(request.session_id) {
             coordinator.pause_local_session(
                 request.session_id,
-                agent::inference::SessionPauseReason::LocalKvNotReady,
+                agent::zip::SessionPauseReason::LocalKvNotReady,
                 "decode lease missing local resume-ready KV replica".to_string(),
             );
         }
@@ -1712,8 +1712,8 @@ async fn materialize_decode_cohort_session(
         session_id: request.session_id,
         model_id: assignment.model_id.clone(),
         phase: match checkpoint.phase {
-            ApiExecutionPhase::Prefill => agent::inference::ExecutionPhase::Prefill,
-            ApiExecutionPhase::Decode => agent::inference::ExecutionPhase::Decode,
+            ApiExecutionPhase::Prefill => agent::zip::ExecutionPhase::Prefill,
+            ApiExecutionPhase::Decode => agent::zip::ExecutionPhase::Decode,
         },
         source_worker_id: checkpoint.source_device_id.clone(),
         owner_worker_id: device_id.to_string(),
@@ -1802,13 +1802,13 @@ async fn materialize_decode_cohort_session(
 }
 
 async fn admit_or_refresh_decode_cohort(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
-    position: &agent::inference::coordinator::WorkerPosition,
+    position: &agent::zip::coordinator::WorkerPosition,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     active_decode_order: &mut VecDeque<Uuid>,
     assignment: &InferenceExecutionLease,
-    request: &agent::inference::InferenceRequest,
+    request: &agent::zip::InferenceRequest,
     device_id: Uuid,
 ) -> Result<()> {
     let cohort_members = decode_lease_session_members(
@@ -1976,7 +1976,7 @@ fn spawn_decode_lease_renew_task(
 struct ActiveDecodeAssignment {
     lease_role: DecodeLeaseRole,
     assignment: InferenceExecutionLease,
-    request: agent::inference::InferenceRequest,
+    request: agent::zip::InferenceRequest,
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: String,
@@ -2031,7 +2031,7 @@ fn active_decode_assignment_shape(
 }
 
 fn runtime_decode_assignment_shape(
-    request: &agent::inference::InferenceRequest,
+    request: &agent::zip::InferenceRequest,
 ) -> (Vec<Uuid>, Option<u32>, Option<u32>) {
     (
         request.decode_batch_targets.session_ids.clone(),
@@ -2056,7 +2056,7 @@ fn decode_assignment_refresh_needs_runtime_reset(
 fn decode_assignment_refresh_requires_runtime_reset(
     active: &ActiveDecodeAssignment,
     assignment: &InferenceExecutionLease,
-    request: &agent::inference::InferenceRequest,
+    request: &agent::zip::InferenceRequest,
     active_segment_id: &str,
 ) -> bool {
     decode_assignment_refresh_needs_runtime_reset(
@@ -2072,7 +2072,7 @@ fn decode_assignment_refresh_requires_runtime_reset(
 fn update_active_decode_assignment(
     active: &mut ActiveDecodeAssignment,
     assignment: InferenceExecutionLease,
-    request: agent::inference::InferenceRequest,
+    request: agent::zip::InferenceRequest,
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: String,
@@ -2109,7 +2109,7 @@ fn active_decode_depends_on_session(active: &ActiveDecodeAssignment, session_id:
         .any(|candidate| *candidate == session_id)
 }
 
-fn decode_progress_interval(request: &agent::inference::InferenceRequest) -> u32 {
+fn decode_progress_interval(request: &agent::zip::InferenceRequest) -> u32 {
     request.config.progress_report_interval.max(1)
 }
 
@@ -2120,7 +2120,7 @@ fn decode_assignment_lease_expired(active: &ActiveDecodeAssignment) -> bool {
 }
 
 fn validate_active_decode_cohort_materialization(
-    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &agent::zip::coordinator::InferenceCoordinator,
     active: &ActiveDecodeAssignment,
 ) -> Result<()> {
     let cohort_session_ids = active_decode_cohort_session_ids(active);
@@ -2144,7 +2144,7 @@ fn validate_active_decode_cohort_materialization(
 }
 
 fn activate_runnable_decode_assignments(
-    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
 ) {
@@ -2173,14 +2173,14 @@ struct PendingDecodeProgressReport {
     job_id: Uuid,
     device_id: Uuid,
     control_plane_segment_id: String,
-    progress: agent::inference::InferenceProgressUpdate,
+    progress: agent::zip::InferenceProgressUpdate,
     completion_tokens: u32,
 }
 
 fn collect_active_decode_progress_reports(
-    coordinator: &agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &agent::zip::coordinator::InferenceCoordinator,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
-    telemetry: agent::inference::coordinator::DecodeBatchTelemetry,
+    telemetry: agent::zip::coordinator::DecodeBatchTelemetry,
 ) -> Vec<PendingDecodeProgressReport> {
     let mut pending_reports = Vec::new();
     for active in active_decode_assignments.values_mut() {
@@ -2202,8 +2202,8 @@ fn collect_active_decode_progress_reports(
             job_id: active.job_id,
             device_id: active.device_id,
             control_plane_segment_id: active.control_plane_segment_id.clone(),
-            progress: agent::inference::InferenceProgressUpdate {
-                phase: agent::inference::ExecutionPhase::Decode,
+            progress: agent::zip::InferenceProgressUpdate {
+                phase: agent::zip::ExecutionPhase::Decode,
                 completion_tokens: snapshot.completion_tokens,
                 execution_time_ms: active.execution_started_at().elapsed().as_millis() as u64,
                 time_to_first_token_ms: snapshot.time_to_first_token_ms,
@@ -2231,7 +2231,7 @@ async fn flush_active_decode_progress(active: &ActiveDecodeAssignment) {
 }
 
 async fn finalize_completed_active_decode_assignments(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
 ) {
@@ -2263,7 +2263,7 @@ async fn finalize_completed_active_decode_assignments(
             registration_client,
             &active.assignment,
             active.lease_role,
-            Ok(agent::inference::SegmentExecutionResult::Completed(result)),
+            Ok(agent::zip::SegmentExecutionResult::Completed(result)),
             active.job_id,
             active.device_id,
             &active.control_plane_segment_id,
@@ -2274,7 +2274,7 @@ async fn finalize_completed_active_decode_assignments(
 }
 
 async fn fail_single_active_decode_assignment(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     session_id: Uuid,
@@ -2299,7 +2299,7 @@ async fn fail_single_active_decode_assignment(
 }
 
 async fn fail_active_decode_assignments(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     error_message: String,
@@ -2325,7 +2325,7 @@ async fn fail_active_decode_assignments(
 }
 
 async fn reconcile_active_decode_assignments(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     active_decode_order: &mut VecDeque<Uuid>,
@@ -2397,9 +2397,9 @@ async fn reconcile_active_decode_assignments(
 }
 
 async fn service_active_decode_assignments(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
-    position: &agent::inference::coordinator::WorkerPosition,
+    position: &agent::zip::coordinator::WorkerPosition,
     active_decode_assignments: &mut BTreeMap<Uuid, ActiveDecodeAssignment>,
     active_decode_order: &mut VecDeque<Uuid>,
 ) -> bool {
@@ -2533,15 +2533,15 @@ async fn service_active_decode_assignments(
 }
 
 async fn execute_assignment_segment_with_reporting(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     assignment: &InferenceExecutionLease,
-    request: agent::inference::InferenceRequest,
+    request: agent::zip::InferenceRequest,
     job_id: Uuid,
     device_id: Uuid,
     active_segment_id: &str,
     control_plane_segment_id: &str,
-) -> agent::errors::Result<agent::inference::SegmentExecutionResult> {
+) -> agent::errors::Result<agent::zip::SegmentExecutionResult> {
     let lease_renew_handle = spawn_decode_lease_renew_task(
         registration_client,
         assignment,
@@ -2573,7 +2573,7 @@ async fn execute_assignment_segment_with_reporting(
             let decode_progress_reporter = decode_progress_reporter.as_ref();
             let progress_request = progress_request.clone();
             async move {
-                if progress.phase == agent::inference::ExecutionPhase::Decode {
+                if progress.phase == agent::zip::ExecutionPhase::Decode {
                     if let Some(reporter) = decode_progress_reporter {
                         reporter
                             .update(progress)
@@ -2590,7 +2590,7 @@ async fn execute_assignment_segment_with_reporting(
                             session_id: progress_request.session_id.to_string(),
                             segment_id: segment_id.clone(),
                             phase: api_phase(progress.phase),
-                            event: if progress.phase == agent::inference::ExecutionPhase::Prefill {
+                            event: if progress.phase == agent::zip::ExecutionPhase::Prefill {
                                 ProgressEventKind::PrefillComplete
                             } else {
                                 ProgressEventKind::DecodeProgress
@@ -2636,17 +2636,17 @@ async fn execute_assignment_segment_with_reporting(
 }
 
 async fn handle_assignment_execution_outcome(
-    coordinator: &mut agent::inference::coordinator::InferenceCoordinator,
+    coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     registration_client: &RegistrationClient,
     assignment: &InferenceExecutionLease,
     lease_role: DecodeLeaseRole,
-    execution_result: agent::errors::Result<agent::inference::SegmentExecutionResult>,
+    execution_result: agent::errors::Result<agent::zip::SegmentExecutionResult>,
     job_id: Uuid,
     device_id: Uuid,
     control_plane_segment_id: &str,
 ) {
     match execution_result {
-        Ok(agent::inference::SegmentExecutionResult::PrefillComplete {
+        Ok(agent::zip::SegmentExecutionResult::PrefillComplete {
             kv_cache_seq_len, ..
         }) => {
             if !matches!(
@@ -2698,7 +2698,7 @@ async fn handle_assignment_execution_outcome(
                 "Prefill segment completed and session retained for decode handoff"
             );
         }
-        Ok(agent::inference::SegmentExecutionResult::Completed(result)) => {
+        Ok(agent::zip::SegmentExecutionResult::Completed(result)) => {
             let completion = result.generated_tokens.as_ref().and_then(|tokens| {
                 match agent::model_assets::decode_tokens(&assignment.model_id, tokens) {
                     Ok(text) => Some(text),
@@ -2802,7 +2802,7 @@ async fn handle_assignment_execution_outcome(
 
 async fn publish_pending_kv_transfer_payload(
     registration_client: &RegistrationClient,
-    coordinator: &mut agent::inference::InferenceCoordinator,
+    coordinator: &mut agent::zip::InferenceCoordinator,
     transfer: &PendingKvTransferStatus,
     local_device_id: Uuid,
 ) -> Result<()> {
@@ -2842,7 +2842,7 @@ async fn publish_pending_kv_transfer_payload(
 
 async fn consume_pending_kv_transfer_payload(
     registration_client: &RegistrationClient,
-    coordinator: &mut agent::inference::InferenceCoordinator,
+    coordinator: &mut agent::zip::InferenceCoordinator,
     transfer: &PendingKvTransferStatus,
     local_device_id: Uuid,
 ) -> Result<()> {
@@ -2898,7 +2898,7 @@ async fn consume_pending_kv_transfer_payload(
 }
 
 async fn maybe_serve_live_kv_transfer_request(
-    coordinator: &mut agent::inference::InferenceCoordinator,
+    coordinator: &mut agent::zip::InferenceCoordinator,
     transfer: &PendingKvTransferStatus,
 ) -> Result<()> {
     let collective_id = live_kv_collective_id(&transfer.transfer_id)?;
@@ -2948,7 +2948,7 @@ async fn maybe_serve_live_kv_transfer_request(
         .serving_transport_for_neighbors(
             target_addr,
             target_addr,
-            agent::inference::InferenceRuntimeMode::ResilientEdge,
+            agent::zip::InferenceRuntimeMode::ResilientEdge,
             agent::ExecutionProviderKind::Cpu,
         )
         .await?;
@@ -2960,7 +2960,7 @@ async fn maybe_serve_live_kv_transfer_request(
 
 async fn consume_live_kv_transfer_from_source(
     registration_client: &RegistrationClient,
-    coordinator: &mut agent::inference::InferenceCoordinator,
+    coordinator: &mut agent::zip::InferenceCoordinator,
     transfer: &PendingKvTransferStatus,
     local_device_id: Uuid,
 ) -> Result<()> {
@@ -2986,7 +2986,7 @@ async fn consume_live_kv_transfer_from_source(
         .serving_transport_for_neighbors(
             source_addr,
             source_addr,
-            agent::inference::InferenceRuntimeMode::ResilientEdge,
+            agent::zip::InferenceRuntimeMode::ResilientEdge,
             agent::ExecutionProviderKind::Cpu,
         )
         .await?;
@@ -3040,7 +3040,7 @@ async fn consume_live_kv_transfer_from_source(
 
 async fn drain_pending_kv_transfers(
     registration_client: &RegistrationClient,
-    coordinator: &mut agent::inference::InferenceCoordinator,
+    coordinator: &mut agent::zip::InferenceCoordinator,
     local_device_id: Uuid,
     network_id: &str,
 ) {
@@ -3172,7 +3172,7 @@ async fn drain_pending_kv_transfers(
 }
 
 enum DecodeProgressReporterCommand {
-    Update(agent::inference::InferenceProgressUpdate),
+    Update(agent::zip::InferenceProgressUpdate),
     Flush(oneshot::Sender<std::result::Result<(), String>>),
     Shutdown(oneshot::Sender<std::result::Result<(), String>>),
 }
@@ -3190,7 +3190,7 @@ async fn send_decode_progress_update(
     segment_id: &str,
     target_session_count: Option<u32>,
     target_batch_size: Option<u32>,
-    progress: agent::inference::InferenceProgressUpdate,
+    progress: agent::zip::InferenceProgressUpdate,
 ) -> std::result::Result<(), String> {
     registration_client
         .report_inference_progress(
@@ -3231,7 +3231,7 @@ impl DecodeProgressReporter {
     ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
-            let mut latest_pending = None::<agent::inference::InferenceProgressUpdate>;
+            let mut latest_pending = None::<agent::zip::InferenceProgressUpdate>;
             let mut last_flushed_completion_tokens = 0u32;
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
                 DECODE_PROGRESS_FLUSH_INTERVAL_MS,
@@ -3338,7 +3338,7 @@ impl DecodeProgressReporter {
         Self { tx, handle }
     }
 
-    fn update(&self, progress: agent::inference::InferenceProgressUpdate) -> Result<()> {
+    fn update(&self, progress: agent::zip::InferenceProgressUpdate) -> Result<()> {
         self.tx
             .send(DecodeProgressReporterCommand::Update(progress))
             .map_err(|_| anyhow::anyhow!("decode progress reporter task stopped"))?;
@@ -3924,7 +3924,7 @@ async fn cmd_runtime() -> Result<()> {
     let runtime_endpoint_clone = runtime_endpoint.clone();
     let inference_task = tokio::spawn(async move {
         use agent::checkpoint::{CheckpointConfig, CheckpointManager};
-        use agent::inference::coordinator::{InferenceConfig, InferenceCoordinator};
+        use agent::zip::coordinator::{InferenceConfig, InferenceCoordinator};
         use uuid::Uuid;
 
         let network_id = inference_config_task.network_id.clone();

@@ -1,5 +1,10 @@
 # Zip Roadmap
 
+`zip` is now exposed inside Mesh through the native engine boundary in
+[agent/src/zip.rs](/Users/deepsaint/Desktop/meshnet/agent/src/zip.rs). The
+files under [agent/src/inference](/Users/deepsaint/Desktop/meshnet/agent/src/inference)
+remain the internal implementation of that engine surface.
+
 This file tracks the remaining work to turn the current explicit-session,
 explicit-segment serving stack into the full production `zip` engine.
 

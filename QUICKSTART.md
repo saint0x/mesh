@@ -81,7 +81,8 @@ Before starting workers, place real shard artifacts for the selected `model_id` 
 - `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.manifest.json`
 - `~/.meshnet/models/<model_id>/shard-<worker>-of-<total>.safetensors`
 
-The safetensors file must satisfy the loader contract in [agent/src/inference/artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
+The safetensors file must satisfy the loader contract exposed through the `zip`
+engine boundary in [agent/src/zip.rs](/Users/deepsaint/Desktop/meshnet/agent/src/zip.rs) and implemented by [agent/src/inference/artifact_loader.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/artifact_loader.rs).
 
 Ring membership is explicit. `mesh device init` registers the device, and `mesh ring join --model-id ...` is the only supported way to place a worker into a model ring.
 

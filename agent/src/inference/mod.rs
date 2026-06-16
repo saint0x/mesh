@@ -1,4 +1,4 @@
-//! zip inference engine module for tensor-parallel distributed inference
+//! Internal `zip` engine implementation for tensor-parallel distributed inference
 //!
 //! This module provides the core `zip` orchestration layer for running distributed inference
 //! across a ring of workers using tensor parallelism. Each worker:
@@ -40,6 +40,9 @@
 //! - [`kv_cache`]: KV cache management for transformer attention
 //! - [`forward_pass`]: Tensor-parallel forward pass implementation
 //! - [`artifact_loader`]: Verified safetensors shard loading
+//!
+//! Mesh code outside the agent runtime should prefer the public
+//! [`crate::zip`] boundary instead of importing this module directly.
 
 pub mod artifact_loader;
 pub mod backend;

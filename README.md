@@ -220,7 +220,7 @@ The default `bash scripts/test_real_artifact_loading.sh` smoke path also prefers
 
 ## Core Components
 
-- `agent`: worker runtime and CLI for device bring-up, pool participation, ring membership, shard loading, inference execution, and dataplane transport. It embeds `zip` inside the larger worker process. See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [coordinator.rs](/Users/deepsaint/Desktop/meshnet/agent/src/inference/coordinator.rs).
+- `agent`: worker runtime and CLI for device bring-up, pool participation, ring membership, shard loading, inference execution, and dataplane transport. It embeds `zip` inside the larger worker process. The native Mesh boundary for the engine is [zip.rs](/Users/deepsaint/Desktop/meshnet/agent/src/zip.rs), with the current internal engine implementation living under [agent/src/inference](/Users/deepsaint/Desktop/meshnet/agent/src/inference). See [main.rs](/Users/deepsaint/Desktop/meshnet/agent/src/main.rs) and [zip.rs](/Users/deepsaint/Desktop/meshnet/agent/src/zip.rs).
 - `control-plane`: durable coordinator for registration, topology, distributed job dispatch, status polling, and ledger events. See [inference.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/api/inference.rs) and [ring_manager.rs](/Users/deepsaint/Desktop/meshnet/control-plane/src/services/ring_manager.rs).
 - `relay-server`: optional connectivity layer for environments that cannot keep workers directly connected. See [relay-server/README.md](/Users/deepsaint/Desktop/meshnet/relay-server/README.md).
 

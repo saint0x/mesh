@@ -5,7 +5,6 @@ pub mod device;
 pub mod discovery;
 pub mod errors;
 pub mod executor;
-pub mod inference;
 pub mod model;
 pub mod model_assets;
 pub mod network;
@@ -14,6 +13,9 @@ pub mod pki;
 pub mod provider;
 pub mod resource_manager;
 pub mod telemetry;
+pub mod zip;
+
+mod inference;
 
 pub use api::RegistrationClient;
 pub use checkpoint::{
@@ -33,10 +35,6 @@ pub use connectivity::{
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
 pub use errors::{AgentError, Result};
 pub use executor::{Tensor, WorkerRing};
-pub use inference::{
-    GenerationConfig, InferenceConfig, InferenceCoordinator, InferenceJob, InferenceRequest,
-    InferenceResult, InferenceStats,
-};
 pub use model::{ModelInfo, ShardAssignment, ShardInfo, ShardRegistry, ShardStatus};
 pub use network::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
@@ -54,3 +52,7 @@ pub use provider::{
 };
 pub use resource_manager::{format_bytes, parse_memory_string, ResourceManager};
 pub use telemetry::{LedgerClient, LedgerEvent};
+pub use zip::{
+    GenerationConfig, InferenceConfig, InferenceCoordinator, InferenceJob, InferenceRequest,
+    InferenceResult, InferenceStats,
+};
