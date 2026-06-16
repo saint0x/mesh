@@ -77,6 +77,7 @@ struct SchedulerCandidate {
     prefill_group_leased_members: u32,
     prefill_group_active_members: u32,
     model_prefill_inflight_groups: u32,
+    foreign_transport_island_inflight_jobs: u32,
     decode_lease_target_session_count: Option<u32>,
     decode_cohort_ready_sessions: u32,
     decode_cohort_blocked_sessions: u32,
@@ -313,6 +314,9 @@ fn classify_candidate(
     requesting_device_id: &str,
     now: &str,
 ) -> Result<String, SchedulerBlockedReason> {
+    if candidate.foreign_transport_island_inflight_jobs > 0 {
+        return Err(SchedulerBlockedReason::LeaseHeldByPeer);
+    }
     match candidate.phase {
         SchedulerPhase::Prefill => match candidate.group_status.as_str() {
             "prefill_member" | "prefill_leased" => {
@@ -868,6 +872,49 @@ fn load_scheduler_candidates(
                 WHERE phase = 'prefill'
                 GROUP BY network_id, job_id, group_id
             ),
+            group_device_sets AS (
+                SELECT
+                    network_id,
+                    job_id,
+                    group_id,
+                    GROUP_CONCAT(device_id, ',') AS member_device_set
+                FROM (
+                    SELECT DISTINCT network_id, job_id, group_id, device_id
+                    FROM inference_serving_groups
+                    ORDER BY network_id, job_id, group_id, device_id
+                )
+                GROUP BY network_id, job_id, group_id
+            ),
+            transport_island_inflight AS (
+                SELECT
+                    current_group.network_id,
+                    current_group.job_id,
+                    current_group.group_id,
+                    COUNT(DISTINCT foreign_group.job_id) AS foreign_inflight_jobs
+                FROM group_device_sets current_group
+                INNER JOIN inference_jobs current_job
+                    ON current_job.job_id = current_group.job_id
+                LEFT JOIN group_device_sets foreign_group
+                    ON foreign_group.network_id = current_group.network_id
+                   AND foreign_group.member_device_set = current_group.member_device_set
+                   AND foreign_group.job_id <> current_group.job_id
+                LEFT JOIN inference_jobs foreign_job
+                    ON foreign_job.job_id = foreign_group.job_id
+                   AND foreign_job.model_id = current_job.model_id
+                LEFT JOIN inference_serving_groups foreign_sg
+                    ON foreign_sg.network_id = foreign_group.network_id
+                   AND foreign_sg.job_id = foreign_group.job_id
+                   AND foreign_sg.group_id = foreign_group.group_id
+                   AND foreign_sg.status IN (
+                        'prefill_leased',
+                        'prefill_active',
+                        'decode_leased',
+                        'decode_active'
+                   )
+                WHERE foreign_job.job_id IS NOT NULL
+                  AND foreign_sg.job_id IS NOT NULL
+                GROUP BY current_group.network_id, current_group.job_id, current_group.group_id
+            ),
             prefill_model_inflight AS (
                 SELECT
                     network_id,
@@ -902,6 +949,7 @@ fn load_scheduler_candidates(
                 COALESCE(prefill_stats.leased_members, 0),
                 COALESCE(prefill_stats.active_members, 0),
                 COALESCE(prefill_model_inflight.inflight_groups, 0),
+                COALESCE(transport_inflight.foreign_inflight_jobs, 0),
                 dq.lease_target_session_count,
                 COALESCE(stats.ready_sessions, 0),
                 COALESCE(stats.blocked_sessions, 0),
@@ -922,6 +970,10 @@ fn load_scheduler_candidates(
                 ON prefill_stats.network_id = a.network_id
                AND prefill_stats.job_id = a.job_id
                AND prefill_stats.group_id = sg.group_id
+            LEFT JOIN transport_island_inflight transport_inflight
+                ON transport_inflight.network_id = a.network_id
+               AND transport_inflight.job_id = a.job_id
+               AND transport_inflight.group_id = sg.group_id
             LEFT JOIN prefill_model_inflight
                 ON prefill_model_inflight.network_id = a.network_id
                AND prefill_model_inflight.model_id = j.model_id
@@ -974,12 +1026,13 @@ fn load_scheduler_candidates(
                 prefill_group_leased_members: row.get::<_, i64>(20)? as u32,
                 prefill_group_active_members: row.get::<_, i64>(21)? as u32,
                 model_prefill_inflight_groups: row.get::<_, i64>(22)? as u32,
-                decode_lease_target_session_count: row.get::<_, Option<i64>>(23)?.map(|v| v as u32),
-                decode_cohort_ready_sessions: row.get::<_, i64>(24)? as u32,
-                decode_cohort_blocked_sessions: row.get::<_, i64>(25)? as u32,
-                decode_cohort_oldest_ready_at: row.get(26)?,
-                decode_cohort_leased_sessions: row.get::<_, i64>(27)? as u32,
-                decode_cohort_active_sessions: row.get::<_, i64>(28)? as u32,
+                foreign_transport_island_inflight_jobs: row.get::<_, i64>(23)? as u32,
+                decode_lease_target_session_count: row.get::<_, Option<i64>>(24)?.map(|v| v as u32),
+                decode_cohort_ready_sessions: row.get::<_, i64>(25)? as u32,
+                decode_cohort_blocked_sessions: row.get::<_, i64>(26)? as u32,
+                decode_cohort_oldest_ready_at: row.get(27)?,
+                decode_cohort_leased_sessions: row.get::<_, i64>(28)? as u32,
+                decode_cohort_active_sessions: row.get::<_, i64>(29)? as u32,
                 decode_topology_rank: u32::MAX,
             },
         ))
@@ -1802,6 +1855,7 @@ mod tests {
             prefill_group_leased_members: 0,
             prefill_group_active_members: 0,
             model_prefill_inflight_groups: 0,
+            foreign_transport_island_inflight_jobs: 0,
             decode_lease_target_session_count: None,
             decode_cohort_ready_sessions: 0,
             decode_cohort_blocked_sessions: 0,
@@ -2097,6 +2151,28 @@ mod tests {
         candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
         candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
         candidate.decode_cohort_active_sessions = 1;
+
+        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
+        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+    }
+
+    #[test]
+    fn fresh_prefill_is_blocked_while_foreign_transport_island_job_is_inflight() {
+        let mut candidate = base_candidate(SchedulerPhase::Prefill);
+        candidate.foreign_transport_island_inflight_jobs = 1;
+
+        let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:00:00Z");
+        assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));
+    }
+
+    #[test]
+    fn fresh_decode_ready_is_blocked_while_foreign_transport_island_job_is_inflight() {
+        let mut candidate = base_candidate(SchedulerPhase::Decode);
+        candidate.group_status = "decode_ready".into();
+        candidate.decode_queue_status = Some("ready".into());
+        candidate.decode_ready_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.decode_updated_at = Some("2026-01-01T00:00:01Z".into());
+        candidate.foreign_transport_island_inflight_jobs = 1;
 
         let blocked = classify_candidate(&candidate, "worker-1", "2026-01-01T00:05:00Z");
         assert_eq!(blocked, Err(SchedulerBlockedReason::LeaseHeldByPeer));

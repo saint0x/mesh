@@ -3529,6 +3529,14 @@ async fn cmd_runtime() -> Result<()> {
                     }
                 }
             }
+
+            if let Err(error) = coordinator.persist_runtime_stats() {
+                warn!(
+                    job_id = %job_id,
+                    error = %error,
+                    "Failed to persist runtime stats after assignment processing"
+                );
+            }
         }
 
         if let Err(error) = coordinator.persist_runtime_stats() {
