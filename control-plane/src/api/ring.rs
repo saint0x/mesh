@@ -132,12 +132,8 @@ pub async fn get_topology(
     // Check if network exists
     let db = state.db.clone();
     let network_id = query.network_id.clone();
-    let db_gate = state.inference_write_gate.clone();
 
     let network_exists_result = tokio::task::spawn_blocking(move || {
-        let _db_guard = db_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| {
             let conn = db.get_conn()?;
             let exists: Option<String> = conn
@@ -168,13 +164,9 @@ pub async fn get_topology(
     // Get ring manager for this network
     let ring_manager = state.get_ring_manager(&query.network_id)?;
     let network_id = query.network_id.clone();
-    let db_gate = state.inference_write_gate.clone();
 
     // Execute blocking database operation in thread pool
     let topology_result = tokio::task::spawn_blocking(move || {
-        let _db_guard = db_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| ring_manager.get_topology(&network_id))
     })
     .await

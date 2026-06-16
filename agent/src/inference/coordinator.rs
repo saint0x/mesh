@@ -2137,13 +2137,12 @@ impl InferenceCoordinator {
     /// This listens for network events and processes them.
     #[instrument(skip(self), fields(peer_id = %self.swarm.local_peer_id()))]
     pub async fn run(mut self) -> Result<()> {
-        use tokio::signal;
-
         info!("Starting inference coordinator");
 
         // Periodic stats saver
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_signal = Box::pin(Self::shutdown_signal());
 
         loop {
             tokio::select! {
@@ -2169,7 +2168,7 @@ impl InferenceCoordinator {
                 }
 
                 // Handle shutdown signal
-                _ = signal::ctrl_c() => {
+                _ = &mut shutdown_signal => {
                     info!("Received shutdown signal");
                     break;
                 }
@@ -2183,6 +2182,27 @@ impl InferenceCoordinator {
         let _ = self.stats.save_to_file();
 
         Ok(())
+    }
+
+    fn shutdown_signal() -> impl std::future::Future<Output = ()> + Send {
+        async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+
+                let mut terminate = signal(SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
     }
 
     /// Handle a mesh network event

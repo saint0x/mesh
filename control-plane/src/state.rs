@@ -29,14 +29,13 @@ impl AppState {
     /// Create new application state
     pub fn new(db: Database, keypair: Arc<ControlPlaneKeypair>) -> Self {
         let topology_notifier = Arc::new(TopologyNotifier::new(Arc::new(db.clone())));
-        let inference_write_gate = db.write_gate();
         Self {
             db,
             keypair,
             ring_managers: Arc::new(RwLock::new(HashMap::new())),
             network_scheduling_policies: Arc::new(RwLock::new(HashMap::new())),
             topology_notifier,
-            inference_write_gate,
+            inference_write_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -44,15 +43,6 @@ impl AppState {
         &self,
         network_id: &str,
     ) -> ApiResult<InferenceSchedulingPolicy> {
-        if let Some(policy) = self.load_cached_network_scheduling_policy(network_id)? {
-            return Ok(policy);
-        }
-
-        let _write_guard = self
-            .inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
-
         if let Some(policy) = self.load_cached_network_scheduling_policy(network_id)? {
             return Ok(policy);
         }

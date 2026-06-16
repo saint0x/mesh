@@ -411,11 +411,7 @@ async fn submit_inference_once(
 
     let ring_manager = state.get_ring_manager(&req.network_id)?;
     let topology_network_id = req.network_id.clone();
-    let inference_write_gate = state.inference_write_gate.clone();
     let topology = tokio::task::spawn_blocking(move || {
-        let _write_guard = inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         execute_with_db_lock_retry(|| ring_manager.get_topology(&topology_network_id))
     })
     .await
@@ -440,11 +436,7 @@ async fn submit_inference_once(
     let topology_for_prepare = topology.clone();
     let prompt_tokens_for_prepare = prompt_tokens.clone();
     let scheduling_policy_for_prepare = scheduling_policy.clone();
-    let inference_write_gate = state.inference_write_gate.clone();
     let prepared_submission = tokio::task::spawn_blocking(move || {
-        let _write_guard = inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         execute_with_db_lock_retry(|| {
             prepare_inference_submission(
                 &db,
@@ -934,11 +926,7 @@ pub async fn claim_inference_assignment(
         let db = state.db.clone();
         let network_id = req.network_id.clone();
         let device_id = req.device_id.clone();
-        let inference_write_gate = state.inference_write_gate.clone();
         match tokio::task::spawn_blocking(move || {
-            let _write_guard = inference_write_gate.lock().map_err(|_| {
-                ApiError::Internal("Inference write gate lock poisoned".to_string())
-            })?;
             execute_with_db_lock_retry(|| {
                 load_queue_observation(&db, &network_id, &device_id, active_session_id.clone())
             })
@@ -993,11 +981,7 @@ pub async fn observe_decode_queue_state(
 
     let db = state.db.clone();
     let query_clone = query.clone();
-    let inference_write_gate = state.inference_write_gate.clone();
     let observation = tokio::task::spawn_blocking(move || {
-        let _write_guard = inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             load_queue_observation(&db, &query_clone.network_id, &query_clone.device_id, None)
         });
@@ -1034,11 +1018,7 @@ pub async fn observe_pending_kv_transfers(
 
     let db = state.db.clone();
     let query_clone = query.clone();
-    let inference_write_gate = state.inference_write_gate.clone();
     let transfers = tokio::task::spawn_blocking(move || {
-        let _write_guard = inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             let conn = db.get_conn()?;
             load_pending_kv_transfers(&conn, &query_clone.network_id, &query_clone.device_id)
@@ -3751,11 +3731,7 @@ pub async fn download_inference_session_checkpoint(
 
     let db = state.db.clone();
     let session_id_for_log = session_id.clone();
-    let inference_write_gate = state.inference_write_gate.clone();
     let checkpoint = tokio::task::spawn_blocking(move || {
-        let _write_guard = inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| {
             load_latest_session_checkpoint_payload(&db, &job_id, &session_id)
         });
@@ -3790,11 +3766,7 @@ pub async fn get_inference_job_status(
 
     let db = state.db.clone();
     let job_id_for_log = job_id.clone();
-    let inference_write_gate = state.inference_write_gate.clone();
     let status = tokio::task::spawn_blocking(move || {
-        let _write_guard = inference_write_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Inference write gate lock poisoned".to_string()))?;
         let result = execute_with_db_lock_retry(|| load_job_status(&db, &job_id));
         if let Err(err) = &result {
             log_locked_route_error(

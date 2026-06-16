@@ -21,11 +21,7 @@ pub async fn get_network_scheduler_status(
     }
 
     let db = state.db.clone();
-    let db_gate = state.inference_write_gate.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _db_guard = db_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| Ok(db.load_network_scheduler_status(&network_id)?))
     })
     .await
@@ -49,11 +45,7 @@ pub async fn get_job_scheduler_status(
     }
 
     let db = state.db.clone();
-    let db_gate = state.inference_write_gate.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _db_guard = db_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| Ok(db.load_job_scheduler_status(&job_id)?))
     })
     .await

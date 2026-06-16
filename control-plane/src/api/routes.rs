@@ -94,11 +94,7 @@ pub async fn create_network(
 #[instrument(skip(state))]
 pub async fn list_networks(State(state): State<AppState>) -> ApiResult<Json<ListNetworksResponse>> {
     let db = state.db.clone();
-    let db_gate = state.inference_write_gate.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _db_guard = db_gate
-            .lock()
-            .map_err(|_| ApiError::Internal("Database write gate lock poisoned".into()))?;
         execute_with_db_lock_retry(|| network_service::list_networks(&db))
     })
     .await
