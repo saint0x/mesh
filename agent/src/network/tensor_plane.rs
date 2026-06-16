@@ -2609,9 +2609,10 @@ mod tests {
         })
         .await
         .unwrap();
+        let left_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
         let session = plane
             .serving_transport_for_neighbors(
-                plane.local_addr(),
+                left_peer,
                 plane.local_addr(),
                 InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cuda,
@@ -2729,9 +2730,10 @@ mod tests {
         })
         .await
         .unwrap();
+        let left_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
         let session = plane
             .serving_transport_for_neighbors(
-                plane.local_addr(),
+                left_peer,
                 plane.local_addr(),
                 InferenceRuntimeMode::LatencyFirst,
                 ExecutionProviderKind::Cuda,
