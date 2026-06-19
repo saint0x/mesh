@@ -86,9 +86,7 @@ const CONTROL_PLANE_WRITE_RETRY_STEP_MS: u64 = 250;
 fn local_backend_contract(
     config: &DeviceConfig,
 ) -> Result<agent::provider::BackendContractDescriptor> {
-    Ok(agent::provider::BackendContractDescriptor::for_provider(
-        config.resolve_execution_provider()?,
-    ))
+    Ok(config.effective_capabilities()?.default_backend_contract())
 }
 
 fn validate_local_production_provider(config: &DeviceConfig) -> Result<()> {
@@ -697,15 +695,15 @@ pub(crate) async fn cmd_init(
         config.execution.preferred_provider = Some(parsed);
     }
     let selected_provider = config.resolve_execution_provider()?;
+    let effective_capabilities = config.effective_capabilities()?;
 
     println!("   Device ID: {}", config.device_id);
     println!("   Network ID: {}", network_id);
     println!("   Name: {}", name);
-    println!("   Tier: {:?}", config.capabilities.tier);
-    println!("   CPU Cores: {}", config.capabilities.cpu_cores);
-    println!("   RAM: {} MB", config.capabilities.ram_mb);
-    let available_providers = config
-        .capabilities
+    println!("   Tier: {:?}", effective_capabilities.tier);
+    println!("   CPU Cores: {}", effective_capabilities.cpu_cores);
+    println!("   RAM: {} MB", effective_capabilities.ram_mb);
+    let available_providers = effective_capabilities
         .execution_providers
         .iter()
         .filter(|provider| provider.available)
@@ -721,7 +719,7 @@ pub(crate) async fn cmd_init(
     );
     println!(
         "   Default Provider: {}",
-        config.capabilities.default_execution_provider.as_str()
+        effective_capabilities.default_execution_provider.as_str()
     );
     println!("   Selected Provider: {}", selected_provider.as_str());
     let selected_contract = local_backend_contract(&config)?;
@@ -3426,11 +3424,13 @@ fn resolve_ring_contributed_memory(config: &DeviceConfig, memory: Option<&str>) 
         }
     }
 
-    if let Some(gpu_vram_mb) = config.capabilities.gpu_vram_mb {
+    let effective_capabilities = config.effective_capabilities()?;
+
+    if let Some(gpu_vram_mb) = effective_capabilities.gpu_vram_mb {
         return Ok(gpu_vram_mb as u64 * 1024 * 1024);
     }
 
-    Ok(config.capabilities.ram_mb as u64 * 1024 * 1024)
+    Ok(effective_capabilities.ram_mb as u64 * 1024 * 1024)
 }
 
 fn load_supervised_memory_limit_bytes() -> Result<u64> {
@@ -3643,7 +3643,7 @@ async fn cmd_runtime() -> Result<()> {
 
     println!("📋 Device: {} ({})", config.name, config.device_id);
     println!("   Network: {}", config.network_id);
-    println!("   Tier: {:?}", config.capabilities.tier);
+    println!("   Tier: {:?}", config.effective_capabilities()?.tier);
     let selected_provider = config.resolve_execution_provider()?;
     set_selected_execution_provider(selected_provider)?;
     println!("   Execution Provider: {}", selected_provider.as_str());
@@ -4791,16 +4791,17 @@ async fn cmd_status() -> Result<()> {
     // Try to load configuration
     match DeviceConfig::load(&DeviceConfig::default_path()?) {
         Ok(config) => {
+            let effective_capabilities = config.effective_capabilities()?;
             println!("✅ Device Configured");
             println!("   Device ID: {}", config.device_id);
             println!("   Name: {}", config.name);
             println!("   Network ID: {}", config.network_id);
-            println!("   Tier: {:?}", config.capabilities.tier);
+            println!("   Tier: {:?}", effective_capabilities.tier);
             println!("\n   Capabilities:");
-            println!("     CPU Cores: {}", config.capabilities.cpu_cores);
-            println!("     RAM: {} MB", config.capabilities.ram_mb);
-            println!("     OS: {}", config.capabilities.os);
-            println!("     Architecture: {}", config.capabilities.arch);
+            println!("     CPU Cores: {}", effective_capabilities.cpu_cores);
+            println!("     RAM: {} MB", effective_capabilities.ram_mb);
+            println!("     OS: {}", effective_capabilities.os);
+            println!("     Architecture: {}", effective_capabilities.arch);
 
             // Check if certificate exists
             if config.has_certificate() {

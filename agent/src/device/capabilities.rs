@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 use sysinfo::System;
 
 use crate::provider::{
@@ -113,13 +114,13 @@ impl DeviceCapabilities {
 
         let tier = Tier::from_specs(cpu_cores, ram_gb);
 
-        // Basic GPU detection (enhanced detection deferred to Phase 1)
-        let gpu_present = Self::detect_gpu();
-        let gpu_vram_mb = None; // Will implement in Phase 1
-
         let os = Self::detect_os();
         let arch = Self::detect_arch();
         let execution_providers = detect_execution_providers();
+        let gpu_present = execution_providers
+            .iter()
+            .any(|provider| provider.available && provider.kind != ExecutionProviderKind::Cpu);
+        let gpu_vram_mb = Self::detect_gpu_vram_mb(&execution_providers);
         let default_execution_provider = default_execution_provider(&execution_providers);
         let default_contract = default_execution_contract(&execution_providers);
         let provider_contracts = execution_providers
@@ -127,7 +128,7 @@ impl DeviceCapabilities {
             .map(|provider| provider.contract.clone())
             .collect::<Vec<_>>();
 
-        Self {
+        let capabilities = Self {
             tier,
             cpu_cores,
             ram_mb,
@@ -140,7 +141,11 @@ impl DeviceCapabilities {
             provider_contracts,
             default_provider_contract_hash: default_contract.contract_hash.clone(),
             memory_model: default_contract.memory_model,
+        };
+        if let Err(error) = capabilities.validate_provider_contracts() {
+            tracing::warn!(error = %error, "Detected provider contracts failed validation");
         }
+        capabilities
     }
 
     pub fn default_backend_contract(&self) -> BackendContractDescriptor {
@@ -153,24 +158,50 @@ impl DeviceCapabilities {
             })
     }
 
-    /// Detect if GPU is present (basic detection).
-    ///
-    /// For MVP, this is a simple heuristic. Will be enhanced in Phase 1.
-    fn detect_gpu() -> bool {
-        // Basic heuristic: assume GPU present on macOS (Metal)
-        // and most modern desktop systems with >8GB RAM
-        #[cfg(target_os = "macos")]
-        {
-            true
+    pub fn validate_provider_contracts(&self) -> Result<(), crate::errors::AgentError> {
+        if self.provider_contracts.is_empty() {
+            return Err(crate::errors::AgentError::Config(
+                "device did not report any provider contracts".to_string(),
+            ));
         }
+        if !self
+            .provider_contracts
+            .iter()
+            .any(|contract| contract.contract_hash == self.default_provider_contract_hash)
+        {
+            return Err(crate::errors::AgentError::Config(format!(
+                "default provider contract hash {} is not present in the reported inventory",
+                self.default_provider_contract_hash
+            )));
+        }
+        for contract in &self.provider_contracts {
+            contract.validate_runtime_consistency()?;
+        }
+        Ok(())
+    }
 
-        #[cfg(not(target_os = "macos"))]
+    fn detect_gpu_vram_mb(providers: &[ExecutionProviderInfo]) -> Option<usize> {
+        if providers
+            .iter()
+            .any(|provider| provider.kind == ExecutionProviderKind::Cuda && provider.available)
         {
-            let mut sys = System::new_all();
-            sys.refresh_all();
-            let ram_gb = (sys.total_memory() / 1_073_741_824) as usize;
-            ram_gb > 8 // Heuristic: systems with >8GB likely have discrete GPU
+            return Self::detect_cuda_vram_mb();
         }
+        None
+    }
+
+    fn detect_cuda_vram_mb() -> Option<usize> {
+        let output = Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        stdout
+            .lines()
+            .find_map(|line| line.trim().parse::<usize>().ok())
     }
 
     /// Detect operating system.

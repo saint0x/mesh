@@ -158,10 +158,239 @@ impl From<FastPathInvariantError> for AgentError {
     }
 }
 
+#[derive(Debug)]
+struct DecodeWorkspaceBuffers {
+    scratch_bytes: Vec<u8>,
+    token_ids: Vec<u32>,
+    positions: Vec<u32>,
+    slot_sequence_lengths: Vec<u32>,
+    slot_positions: Vec<u32>,
+    slot_block_tables: Vec<u32>,
+    slot_mapping: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct PrefillWorkspaceBuffers {
+    scratch_bytes: Vec<u8>,
+    positions: Vec<u32>,
+}
+
+impl PrefillWorkspaceBuffers {
+    fn for_bucket(bucket: &FastPathBucketKey) -> Self {
+        let metadata_bytes = FastPathPlanner::metadata_fields(bucket)
+            .iter()
+            .map(|field| field.stride_bytes)
+            .sum();
+        let reserved_bytes = FastPathPlanner::workspace_requirements(bucket, metadata_bytes).bytes;
+        Self {
+            scratch_bytes: vec![0; reserved_bytes],
+            positions: vec![0; bucket.token_ceiling],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.scratch_bytes.fill(0);
+        self.positions.fill(0);
+    }
+}
+
+impl DecodeWorkspaceBuffers {
+    fn for_bucket(bucket: &FastPathBucketKey) -> Self {
+        let page_slots = bucket.token_ceiling.div_ceil(KV_PAGE_TOKENS);
+        let metadata_bytes = FastPathPlanner::metadata_fields(bucket)
+            .iter()
+            .map(|field| field.stride_bytes)
+            .sum();
+        let reserved_bytes = FastPathPlanner::workspace_requirements(bucket, metadata_bytes).bytes;
+        Self {
+            scratch_bytes: vec![0; reserved_bytes],
+            token_ids: vec![0; bucket.batch_size_ceiling],
+            positions: vec![0; bucket.batch_size_ceiling],
+            slot_sequence_lengths: vec![0; bucket.batch_size_ceiling],
+            slot_positions: vec![0; bucket.batch_size_ceiling],
+            slot_block_tables: vec![u32::MAX; bucket.batch_size_ceiling * page_slots],
+            slot_mapping: vec![u32::MAX; bucket.batch_size_ceiling],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.scratch_bytes.fill(0);
+        self.token_ids.fill(0);
+        self.positions.fill(0);
+        self.slot_sequence_lengths.fill(0);
+        self.slot_positions.fill(0);
+        self.slot_block_tables.fill(u32::MAX);
+        self.slot_mapping.fill(u32::MAX);
+    }
+}
+
+pub struct DecodeWorkspaceLease {
+    bucket: FastPathBucketKey,
+    buffers: Option<DecodeWorkspaceBuffers>,
+}
+
+pub struct PrefillWorkspaceLease {
+    bucket: FastPathBucketKey,
+    buffers: Option<PrefillWorkspaceBuffers>,
+}
+
+impl DecodeWorkspaceLease {
+    pub fn stage(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        sequence_lengths: &[u32],
+    ) -> Result<()> {
+        if tokens.len() != positions.len() || tokens.len() != sequence_lengths.len() {
+            return Err(AgentError::Execution(format!(
+                "decode workspace staging mismatch: tokens={} positions={} sequence_lengths={}",
+                tokens.len(),
+                positions.len(),
+                sequence_lengths.len()
+            )));
+        }
+        if tokens.len() > self.bucket.batch_size_ceiling {
+            return Err(FastPathInvariantError::CaptureUnsafe {
+                bucket_label: Self::bucket_label(&self.bucket),
+                detail: format!(
+                    "runtime batch size {} exceeds bucket ceiling {}",
+                    tokens.len(),
+                    self.bucket.batch_size_ceiling
+                ),
+            }
+            .into());
+        }
+
+        let page_slots = self.bucket.token_ceiling.div_ceil(KV_PAGE_TOKENS);
+        let buffers = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| AgentError::Execution("decode workspace lease is empty".to_string()))?;
+        buffers.reset();
+
+        buffers.token_ids[..tokens.len()].copy_from_slice(tokens);
+        buffers.positions[..positions.len()].copy_from_slice(positions);
+        buffers.slot_sequence_lengths[..sequence_lengths.len()].copy_from_slice(sequence_lengths);
+        buffers.slot_positions[..positions.len()].copy_from_slice(positions);
+
+        for (slot_idx, &sequence_len) in sequence_lengths.iter().enumerate() {
+            buffers.slot_mapping[slot_idx] = slot_idx as u32;
+            let pages = (sequence_len as usize)
+                .div_ceil(KV_PAGE_TOKENS)
+                .min(page_slots);
+            let table_start = slot_idx * page_slots;
+            for page_idx in 0..pages {
+                buffers.slot_block_tables[table_start + page_idx] = page_idx as u32;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn token_ids(&self, len: usize) -> &[u32] {
+        &self
+            .buffers
+            .as_ref()
+            .expect("decode workspace lease missing buffers")
+            .token_ids[..len]
+    }
+
+    pub fn positions(&self, len: usize) -> &[u32] {
+        &self
+            .buffers
+            .as_ref()
+            .expect("decode workspace lease missing buffers")
+            .positions[..len]
+    }
+
+    fn bucket_label(bucket: &FastPathBucketKey) -> String {
+        format!(
+            "decode-b{}-kv{}-{}",
+            bucket.batch_size_ceiling,
+            bucket.token_ceiling,
+            bucket.provider.as_str()
+        )
+    }
+}
+
+impl PrefillWorkspaceLease {
+    pub fn stage_positions(
+        &mut self,
+        absolute_position_start: usize,
+        token_count: usize,
+    ) -> Result<&[u32]> {
+        if token_count > self.bucket.token_ceiling {
+            return Err(FastPathInvariantError::CaptureUnsafe {
+                bucket_label: format!(
+                    "prefill-t{}-{}",
+                    self.bucket.token_ceiling,
+                    self.bucket.provider.as_str()
+                ),
+                detail: format!(
+                    "prefill token count {} exceeds bucket ceiling {}",
+                    token_count, self.bucket.token_ceiling
+                ),
+            }
+            .into());
+        }
+
+        let buffers = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| AgentError::Execution("prefill workspace lease is empty".to_string()))?;
+        buffers.reset();
+        for (offset, position) in buffers.positions[..token_count].iter_mut().enumerate() {
+            *position = absolute_position_start
+                .saturating_add(offset)
+                .try_into()
+                .map_err(|_| {
+                    AgentError::Execution(
+                        "prefill absolute position exceeded u32 addressable range".to_string(),
+                    )
+                })?;
+        }
+        Ok(&buffers.positions[..token_count])
+    }
+}
+
+impl Drop for DecodeWorkspaceLease {
+    fn drop(&mut self) {
+        let Some(mut buffers) = self.buffers.take() else {
+            return;
+        };
+        buffers.reset();
+        if let Ok(mut guard) = FastPathRuntime::state().lock() {
+            guard
+                .decode_workspaces
+                .entry(self.bucket.clone())
+                .or_default()
+                .push(buffers);
+        }
+    }
+}
+
+impl Drop for PrefillWorkspaceLease {
+    fn drop(&mut self) {
+        let Some(mut buffers) = self.buffers.take() else {
+            return;
+        };
+        buffers.reset();
+        if let Ok(mut guard) = FastPathRuntime::state().lock() {
+            guard
+                .prefill_workspaces
+                .entry(self.bucket.clone())
+                .or_default()
+                .push(buffers);
+        }
+    }
+}
+
 #[derive(Default)]
 struct FastPathRuntimeState {
     layout_hashes: HashMap<FastPathBucketKey, u64>,
     reserved_workspaces: HashMap<FastPathBucketKey, usize>,
+    decode_workspaces: HashMap<FastPathBucketKey, Vec<DecodeWorkspaceBuffers>>,
+    prefill_workspaces: HashMap<FastPathBucketKey, Vec<PrefillWorkspaceBuffers>>,
 }
 
 pub struct FastPathRuntime;
@@ -216,6 +445,68 @@ impl FastPathRuntime {
                 })
             }
         }
+    }
+
+    pub fn checkout_decode_workspace(
+        plan: &FastPathExecutionPlan,
+    ) -> Result<(WorkspaceReservation, DecodeWorkspaceLease)> {
+        if plan.bucket.phase != ExecutionPhase::Decode {
+            return Err(AgentError::Execution(format!(
+                "decode workspace checkout requires decode plan, got {:?}",
+                plan.bucket.phase
+            )));
+        }
+
+        let reservation = Self::prepare(plan)?;
+        let state = Self::state();
+        let mut guard = state.lock().map_err(|_| {
+            AgentError::Execution("fast-path runtime state mutex is poisoned".to_string())
+        })?;
+        let buffers = guard
+            .decode_workspaces
+            .entry(plan.bucket.clone())
+            .or_default()
+            .pop()
+            .unwrap_or_else(|| DecodeWorkspaceBuffers::for_bucket(&plan.bucket));
+
+        Ok((
+            reservation,
+            DecodeWorkspaceLease {
+                bucket: plan.bucket.clone(),
+                buffers: Some(buffers),
+            },
+        ))
+    }
+
+    pub fn checkout_prefill_workspace(
+        plan: &FastPathExecutionPlan,
+    ) -> Result<(WorkspaceReservation, PrefillWorkspaceLease)> {
+        if plan.bucket.phase != ExecutionPhase::Prefill {
+            return Err(AgentError::Execution(format!(
+                "prefill workspace checkout requires prefill plan, got {:?}",
+                plan.bucket.phase
+            )));
+        }
+
+        let reservation = Self::prepare(plan)?;
+        let state = Self::state();
+        let mut guard = state.lock().map_err(|_| {
+            AgentError::Execution("fast-path runtime state mutex is poisoned".to_string())
+        })?;
+        let buffers = guard
+            .prefill_workspaces
+            .entry(plan.bucket.clone())
+            .or_default()
+            .pop()
+            .unwrap_or_else(|| PrefillWorkspaceBuffers::for_bucket(&plan.bucket));
+
+        Ok((
+            reservation,
+            PrefillWorkspaceLease {
+                bucket: plan.bucket.clone(),
+                buffers: Some(buffers),
+            },
+        ))
     }
 }
 
@@ -447,7 +738,7 @@ impl FastPathPlanner {
 
     fn capture_strategy(profile: BackendOptimizationProfile) -> GraphCaptureStrategy {
         match profile {
-            BackendOptimizationProfile::CpuSerial => GraphCaptureStrategy::Unsupported,
+            BackendOptimizationProfile::CpuSerial => GraphCaptureStrategy::LayoutValidated,
             BackendOptimizationProfile::MetalVectorized => GraphCaptureStrategy::LayoutValidated,
             BackendOptimizationProfile::CudaFused => GraphCaptureStrategy::ReplayPreferred,
         }
@@ -577,5 +868,53 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not match planned provider/profile"));
+    }
+
+    #[test]
+    fn decode_workspace_lease_stages_batch_metadata_and_reuses_bucket_pool() {
+        let plan = FastPathPlanner::plan_decode(&cuda_context(), 3, 5_000, 2_048)
+            .expect("decode plan should resolve");
+        let (first_reservation, mut first_lease) =
+            FastPathRuntime::checkout_decode_workspace(&plan).expect("first checkout");
+        assert!(!first_reservation.reused_existing_arena);
+        first_lease
+            .stage(&[11, 12, 13], &[31, 32, 33], &[31, 32, 33])
+            .expect("workspace stage should succeed");
+        assert_eq!(first_lease.token_ids(3), &[11, 12, 13]);
+        assert_eq!(first_lease.positions(3), &[31, 32, 33]);
+        drop(first_lease);
+
+        let (second_reservation, mut second_lease) =
+            FastPathRuntime::checkout_decode_workspace(&plan).expect("second checkout");
+        assert!(second_reservation.reused_existing_arena);
+        second_lease
+            .stage(&[21, 22], &[41, 42], &[41, 42])
+            .expect("workspace restage should succeed");
+        assert_eq!(second_lease.token_ids(2), &[21, 22]);
+        assert_eq!(second_lease.positions(2), &[41, 42]);
+    }
+
+    #[test]
+    fn prefill_workspace_lease_stages_positions_and_reuses_bucket_pool() {
+        let plan =
+            FastPathPlanner::plan_prefill(&cuda_context(), 400).expect("prefill plan should work");
+        let (first_reservation, mut first_lease) =
+            FastPathRuntime::checkout_prefill_workspace(&plan).expect("first checkout");
+        assert!(!first_reservation.reused_existing_arena);
+        let first_positions = first_lease
+            .stage_positions(64, 4)
+            .expect("prefill stage should succeed")
+            .to_vec();
+        assert_eq!(first_positions, vec![64, 65, 66, 67]);
+        drop(first_lease);
+
+        let (second_reservation, mut second_lease) =
+            FastPathRuntime::checkout_prefill_workspace(&plan).expect("second checkout");
+        assert!(second_reservation.reused_existing_arena);
+        let second_positions = second_lease
+            .stage_positions(128, 3)
+            .expect("prefill restage should succeed")
+            .to_vec();
+        assert_eq!(second_positions, vec![128, 129, 130]);
     }
 }

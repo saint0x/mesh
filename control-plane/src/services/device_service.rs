@@ -34,6 +34,9 @@ pub fn register_device(
     if peer_id.trim().is_empty() {
         return Err(ApiError::BadRequest("peer_id cannot be empty".into()));
     }
+    capabilities
+        .validate_provider_contracts()
+        .map_err(ApiError::BadRequest)?;
 
     network_service::require_network_exists(db, &network_id)?;
     let connectivity = network_service::load_network_connectivity(db, &network_id)?;

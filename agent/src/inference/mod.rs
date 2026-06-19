@@ -57,8 +57,9 @@ pub mod tensor_ops;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
 pub use backend::{
-    BackendMicrobatchExecutor, CandleExecutionBackend, DecodeMicrobatchOutput,
-    DecodeMicrobatchRequest, ExecutionBackend,
+    BackendMicrobatchExecutor, CandleExecutionBackend, CpuExecutionBackend, CudaExecutionBackend,
+    DecodeMicrobatchOutput, DecodeMicrobatchRequest, ExecutionBackend, MetalExecutionBackend,
+    ProviderExecutionBackend,
 };
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{
@@ -69,10 +70,11 @@ pub use engine::{
     SessionEvictionReason, SessionEvictionState, SessionPauseReason, SessionPauseState,
     SessionRuntimeStatus, TransportCapabilityTier,
 };
+#[allow(unused_imports)]
 pub use fast_path::{
     FastPathBackendContext, FastPathBucketKey, FastPathExecutionPlan, FastPathInvariantError,
     FastPathPlanner, FastPathRuntime, GraphCaptureStrategy, PrefillBucketStrategy,
-    WorkspaceRequirements,
+    PrefillWorkspaceLease, WorkspaceRequirements,
 };
 pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
 pub use job::{

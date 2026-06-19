@@ -722,11 +722,6 @@ impl SlidingWindowCache {
     pub fn cache(&self) -> &KVCache {
         &self.inner
     }
-
-    /// Get mutable inner cache
-    pub fn cache_mut(&mut self) -> &mut KVCache {
-        &mut self.inner
-    }
 }
 
 #[cfg(test)]

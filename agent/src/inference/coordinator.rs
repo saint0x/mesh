@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use super::artifact_loader::{ArtifactShardLoader, ShardLoader};
 use super::backend::{
-    BackendMicrobatchExecutor, CandleExecutionBackend, DecodeMicrobatchRequest, ExecutionBackend,
+    BackendMicrobatchExecutor, DecodeMicrobatchRequest, ExecutionBackend, ProviderExecutionBackend,
 };
 use super::engine::{
     DecodeBatchPlan, DecodeBatchPolicy, DecodeBatchSlot, DecodeTask, EngineSessionState,
@@ -605,7 +605,7 @@ impl InferenceCoordinator {
             let model = self
                 .get_or_load_model_residency(&request.model_id, position)
                 .await?;
-            let backend = CandleExecutionBackend::new(
+            let backend = ProviderExecutionBackend::new(
                 Arc::clone(&model),
                 position.shard_worker_position,
                 position.shard_column_range.0 as usize,
@@ -2159,17 +2159,23 @@ impl InferenceCoordinator {
                     "session backend missing at prefill execution time".to_string(),
                 )
             })?;
-            if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend() {
+            let mut prefill_workspace = if session.job.request.fast_path_permitted
+                && session.backend.is_fast_path_backend()
+            {
                 let prefill_plan = FastPathPlanner::plan_prefill(
                     &session.backend.fast_path_context(),
                     request.prompt_tokens.len(),
                 )?;
-                let reservation = FastPathRuntime::prepare(&prefill_plan)?;
+                let (reservation, workspace) =
+                    FastPathRuntime::checkout_prefill_workspace(&prefill_plan)?;
                 self.stats.record_prefill_fast_path_plan(
                     &prefill_plan,
                     reservation.reused_existing_arena,
                 );
-            }
+                Some(workspace)
+            } else {
+                None
+            };
             let mut worker_ring = WorkerRing::new(
                 position.position,
                 position.total_workers,
@@ -2211,7 +2217,12 @@ impl InferenceCoordinator {
             );
             let logits = session
                 .backend
-                .prefill(&request.prompt_tokens, &mut worker_ring, request.job_id)
+                .prefill(
+                    &request.prompt_tokens,
+                    &mut worker_ring,
+                    request.job_id,
+                    prefill_workspace.as_mut(),
+                )
                 .await?;
             info!(
                 job_id = %request.job_id,
@@ -2265,11 +2276,14 @@ impl InferenceCoordinator {
         }
 
         let fast_path = batch.fast_path.clone();
-        if let Some(plan) = fast_path.as_ref() {
-            let reservation = FastPathRuntime::prepare(plan)?;
+        let mut decode_workspace = if let Some(plan) = fast_path.as_ref() {
+            let (reservation, workspace) = FastPathRuntime::checkout_decode_workspace(plan)?;
             self.stats
                 .record_decode_fast_path_plan(plan, reservation.reused_existing_arena);
-        }
+            Some(workspace)
+        } else {
+            None
+        };
 
         let mut batch_sessions = Vec::with_capacity(batch.slots.len());
         for slot in batch.slots {
@@ -2337,6 +2351,7 @@ impl InferenceCoordinator {
             &mut requests,
             fast_path.as_ref(),
             &mut worker_ring,
+            decode_workspace.as_mut(),
         )
         .await?;
 
@@ -2808,6 +2823,7 @@ mod tests {
             _tokens: &[u32],
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
+            _workspace: Option<&mut crate::inference::PrefillWorkspaceLease>,
         ) -> Result<BackendLogits> {
             Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }

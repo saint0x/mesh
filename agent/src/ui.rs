@@ -2398,7 +2398,7 @@ async fn build_doctor_report() -> Result<UiDoctorReport> {
         hint: match &provider_contract {
             Some(Ok(contract)) if contract.supports_production_serving() => None,
             Some(Ok(_)) => Some(
-                "Select a fast-path accelerator provider before treating this device as production-ready."
+                "Use a runtime-verified fast-path provider before treating this device as production-ready."
                     .into(),
             ),
             Some(Err(_)) => Some(

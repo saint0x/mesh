@@ -9,13 +9,16 @@
 
 use crate::errors::{AgentError, Result};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+#[cfg(target_os = "linux")]
+use candle_core::Storage;
 use candle_core::{CustomOp1, DType, Device, Layout, Shape, Tensor as CandleTensor, D};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use candle_core::{MetalStorage, Result as CandleResult};
 use candle_nn::ops as candle_ops;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::f32::consts::PI;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 2D Tensor for transformer computations
 ///
@@ -278,39 +281,6 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
     from_candle_2d(&lhs.matmul(&rhs).map_err(candle_error)?)
 }
 
-/// Matrix-vector multiplication: A[m, n] @ v[n] -> result[m]
-pub fn matvec(a: &Tensor2D, v: &Tensor1D) -> Result<Tensor1D> {
-    if a.cols != v.len() {
-        return Err(AgentError::Execution(format!(
-            "Matvec shape mismatch: {}x{} @ {}",
-            a.rows,
-            a.cols,
-            v.len()
-        )));
-    }
-
-    if is_cpu_provider() {
-        let mut out = vec![0.0; a.rows];
-        for (row_idx, out_cell) in out.iter_mut().enumerate() {
-            let row = &a.data[row_idx * a.cols..(row_idx + 1) * a.cols];
-            *out_cell = row.iter().zip(&v.data).map(|(lhs, rhs)| lhs * rhs).sum();
-        }
-        return Ok(Tensor1D { data: out });
-    }
-
-    let lhs = to_candle_2d(a)?;
-    let rhs = CandleTensor::from_vec(v.data.clone(), (v.len(), 1), execution_device()?)
-        .map_err(candle_error)?;
-    let result = lhs.matmul(&rhs).map_err(candle_error)?;
-    Ok(Tensor1D {
-        data: result
-            .flatten_all()
-            .map_err(candle_error)?
-            .to_vec1::<f32>()
-            .map_err(candle_error)?,
-    })
-}
-
 // ============== Activation Functions ==============
 
 /// GELU activation function (Gaussian Error Linear Unit)
@@ -342,21 +312,6 @@ pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
         from_candle_2d(&scaled.broadcast_mul(&one_plus).map_err(candle_error)?)
     })();
     result.expect("GPU GELU failed")
-}
-
-/// ReLU activation function
-pub fn relu(tensor: &Tensor2D) -> Tensor2D {
-    if is_cpu_provider() {
-        return Tensor2D {
-            data: tensor.data.iter().map(|value| value.max(0.0)).collect(),
-            rows: tensor.rows,
-            cols: tensor.cols,
-        };
-    }
-    let result = to_candle_2d(tensor)
-        .and_then(|x| from_candle_2d(&x.relu().map_err(candle_error)?))
-        .expect("GPU ReLU failed");
-    result
 }
 
 /// SiLU (Sigmoid Linear Unit) / Swish activation
@@ -467,24 +422,6 @@ pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
         .and_then(|x| from_candle_2d(&candle_ops::softmax(&x, 1).map_err(candle_error)?))
         .expect("GPU softmax failed");
     result
-}
-
-/// Softmax for 1D tensor (single row of logits)
-pub fn softmax_1d(tensor: &Tensor1D) -> Tensor1D {
-    let max_val = tensor
-        .data
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f32 = tensor.data.iter().map(|x| (x - max_val).exp()).sum();
-
-    let data: Vec<f32> = tensor
-        .data
-        .iter()
-        .map(|x| (x - max_val).exp() / exp_sum)
-        .collect();
-
-    Tensor1D { data }
 }
 
 // ============== Token Sampling ==============
@@ -741,9 +678,60 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
     }
 
     let table = to_candle_2d(embedding_table)?;
-    let ids = CandleTensor::from_vec(tokens.to_vec(), tokens.len(), execution_device()?)
+    let ids = CandleTensor::from_slice(tokens, tokens.len(), execution_device()?)
         .map_err(candle_error)?;
     from_candle_2d(&table.embedding(&ids).map_err(candle_error)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RopeFrequencyKey {
+    head_dim: usize,
+    base_bits: u32,
+}
+
+fn rope_inverse_frequency(head_dim: usize, half_dim: usize, base: f32) -> Arc<[f32]> {
+    static CACHE: OnceLock<Mutex<HashMap<RopeFrequencyKey, Arc<[f32]>>>> = OnceLock::new();
+    let key = RopeFrequencyKey {
+        head_dim,
+        base_bits: base.to_bits(),
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .expect("rope inverse frequency cache mutex poisoned");
+    guard
+        .entry(key)
+        .or_insert_with(|| {
+            (0..half_dim)
+                .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .clone()
+}
+
+fn rope_positions_tensor(positions: &[u32], rows: usize, device: &Device) -> Result<CandleTensor> {
+    let contiguous = positions
+        .first()
+        .copied()
+        .map(|start| {
+            positions
+                .iter()
+                .enumerate()
+                .all(|(offset, position)| *position == start.saturating_add(offset as u32))
+        })
+        .unwrap_or(true);
+
+    if contiguous {
+        let start = positions.first().copied().unwrap_or_default() as f32;
+        let end = start + rows as f32;
+        return CandleTensor::arange(start, end, device)
+            .and_then(|tensor| tensor.reshape((rows, 1)))
+            .map_err(candle_error);
+    }
+
+    let pos = positions.iter().map(|p| *p as f32).collect::<Vec<_>>();
+    CandleTensor::from_slice(&pos, (rows, 1), device).map_err(candle_error)
 }
 
 // ============== Rotary Position Embedding (RoPE) ==============
@@ -788,17 +776,10 @@ pub fn apply_rope(
     let x1 = x.narrow(2, 0, half_dim).map_err(candle_error)?;
     let x2 = x.narrow(2, half_dim, half_dim).map_err(candle_error)?;
 
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
-        .collect();
-    let pos = CandleTensor::from_vec(
-        positions.iter().map(|p| *p as f32).collect::<Vec<_>>(),
-        (seq_len, 1),
-        execution_device()?,
-    )
-    .map_err(candle_error)?;
-    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?)
-        .map_err(candle_error)?;
+    let device = execution_device()?;
+    let inv_freq = rope_inverse_frequency(head_dim, half_dim, base);
+    let pos = rope_positions_tensor(positions, seq_len, &device)?;
+    let inv = CandleTensor::from_slice(&inv_freq, (1, half_dim), &device).map_err(candle_error)?;
     let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
     let cos = freqs
         .cos()
@@ -938,10 +919,52 @@ pub(crate) fn collective_buffer_from_candle_2d(
         .contiguous()
         .map_err(candle_error)?;
 
+    if let Some(matrix) = collective_buffer_from_dense_cuda_tensor(&flattened, dims[0], dims[1])? {
+        return Ok(matrix);
+    }
+
     let data = flattened.to_vec1::<f32>().map_err(candle_error)?;
     Ok(crate::executor::ring_allreduce::CollectiveMatrix::new(
         data, dims[0], dims[1],
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn collective_buffer_from_dense_cuda_tensor(
+    tensor: &CandleTensor,
+    rows: usize,
+    cols: usize,
+) -> Result<Option<crate::executor::ring_allreduce::CollectiveMatrix>> {
+    let elem_count = tensor.elem_count();
+    let (storage, layout) = tensor.storage_and_layout();
+    if let Storage::Cuda(cuda_storage) = &*storage {
+        if let Some((start, end)) = layout.contiguous_offsets() {
+            let total_len = end.saturating_sub(start);
+            if start == 0 && total_len == elem_count {
+                let src = cuda_storage.as_cuda_slice::<f32>().map_err(candle_error)?;
+                let device = cuda_storage.device();
+                let mut matrix =
+                    crate::executor::ring_allreduce::CollectiveMatrix::from_pooled_host_buffer(
+                        rows, cols,
+                    );
+                device
+                    .memcpy_dtoh(src, matrix.host_slice_mut())
+                    .map_err(candle_error)?;
+                return Ok(Some(matrix));
+            }
+        }
+    }
+    drop(storage);
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collective_buffer_from_dense_cuda_tensor(
+    _tensor: &CandleTensor,
+    _rows: usize,
+    _cols: usize,
+) -> Result<Option<crate::executor::ring_allreduce::CollectiveMatrix>> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1065,17 +1088,10 @@ pub(crate) fn apply_rope_candle(
     let x1 = x.narrow(2, 0, half_dim).map_err(candle_error)?;
     let x2 = x.narrow(2, half_dim, half_dim).map_err(candle_error)?;
 
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
-        .collect();
-    let pos = CandleTensor::from_vec(
-        positions.iter().map(|p| *p as f32).collect::<Vec<_>>(),
-        (rows, 1),
-        execution_device()?,
-    )
-    .map_err(candle_error)?;
-    let inv = CandleTensor::from_vec(inv_freq, (1, half_dim), execution_device()?)
-        .map_err(candle_error)?;
+    let device = execution_device()?;
+    let inv_freq = rope_inverse_frequency(head_dim, half_dim, base);
+    let pos = rope_positions_tensor(positions, rows, &device)?;
+    let inv = CandleTensor::from_slice(&inv_freq, (1, half_dim), &device).map_err(candle_error)?;
     let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
     let cos = freqs
         .cos()
@@ -1106,67 +1122,6 @@ pub(crate) fn apply_rope_candle(
         .map_err(candle_error)?
         .reshape((rows, cols))
         .map_err(candle_error)
-}
-
-pub(crate) fn causal_self_attention_candle(
-    q_t: &CandleTensor,
-    k_t: &CandleTensor,
-    v_t: &CandleTensor,
-    rows: usize,
-    cols: usize,
-    scale: f32,
-) -> Result<CandleTensor> {
-    let q_t = q_t.contiguous().map_err(candle_error)?;
-    let k_t = k_t
-        .transpose(0, 1)
-        .map_err(candle_error)?
-        .contiguous()
-        .map_err(candle_error)?;
-    let v_t = v_t.contiguous().map_err(candle_error)?;
-    let scores = q_t.matmul(&k_t).map_err(candle_error)?;
-    let scores = scores.affine(scale as f64, 0.0).map_err(candle_error)?;
-
-    let mut mask = vec![0.0f32; rows * rows];
-    for i in 0..rows {
-        for j in (i + 1)..rows {
-            mask[i * rows + j] = f32::NEG_INFINITY;
-        }
-    }
-    let mask =
-        CandleTensor::from_vec(mask, (rows, rows), execution_device()?).map_err(candle_error)?;
-    let masked = scores.broadcast_add(&mask).map_err(candle_error)?;
-    let probs = candle_ops::softmax(&masked, 1).map_err(candle_error)?;
-    let probs = probs.contiguous().map_err(candle_error)?;
-    let output = probs.matmul(&v_t).map_err(candle_error)?;
-    let dims = output.dims();
-    if dims != [rows, cols] {
-        return Err(AgentError::Execution(format!(
-            "GPU attention output shape mismatch: expected [{}, {}], got {:?}",
-            rows, cols, dims
-        )));
-    }
-    Ok(output)
-}
-
-pub fn causal_self_attention_gpu(
-    q: &Tensor2D,
-    k: &Tensor2D,
-    v: &Tensor2D,
-    scale: f32,
-) -> Result<Tensor2D> {
-    if q.rows != k.rows || q.rows != v.rows || q.cols != k.cols || q.cols != v.cols {
-        return Err(AgentError::Execution(format!(
-            "Attention shape mismatch: q {}x{}, k {}x{}, v {}x{}",
-            q.rows, q.cols, k.rows, k.cols, v.rows, v.cols
-        )));
-    }
-
-    let q_t = to_candle_2d(q)?;
-    let k_t = to_candle_2d(k)?;
-    let v_t = to_candle_2d(v)?;
-    from_candle_2d(&causal_self_attention_candle(
-        &q_t, &k_t, &v_t, q.rows, q.cols, scale,
-    )?)
 }
 
 #[cfg(test)]

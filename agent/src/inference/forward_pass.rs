@@ -48,6 +48,9 @@ use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use candle_core::{DType, Tensor as CandleTensor};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -62,6 +65,7 @@ use super::tensor_ops::{
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
 use crate::inference::backend::BackendLogits;
+use crate::inference::fast_path::{DecodeWorkspaceLease, PrefillWorkspaceLease};
 
 fn run_in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
     match Handle::try_current() {
@@ -259,12 +263,22 @@ impl DeviceKVPage {
 }
 
 #[derive(Clone)]
+struct SelectedDeviceKvHeads {
+    keys_for_scores: CandleTensor,
+    values: CandleTensor,
+    seq_len: usize,
+}
+
+#[derive(Clone)]
 struct DeviceLayerKVCache {
     pages: Vec<DeviceKVPage>,
     block_table: Vec<usize>,
     seq_len: usize,
     cols: usize,
     page_rows: usize,
+    cached_active: Option<(CandleTensor, CandleTensor, usize)>,
+    cached_heads: Option<(CandleTensor, CandleTensor, usize, usize)>,
+    cached_selected_heads: Option<(u64, CandleTensor, CandleTensor, usize)>,
 }
 
 impl DeviceLayerKVCache {
@@ -275,7 +289,16 @@ impl DeviceLayerKVCache {
             seq_len: 0,
             cols: 0,
             page_rows,
+            cached_active: None,
+            cached_heads: None,
+            cached_selected_heads: None,
         }
+    }
+
+    fn invalidate_active_cache(&mut self) {
+        self.cached_active = None;
+        self.cached_heads = None;
+        self.cached_selected_heads = None;
     }
 
     fn ensure_page_shape(&mut self, cols: usize) -> Result<()> {
@@ -337,6 +360,7 @@ impl DeviceLayerKVCache {
 
         let new_rows = key_dims[0];
         let cols = key_dims[1];
+        self.invalidate_active_cache();
         let mut appended_rows = 0;
         while appended_rows < new_rows {
             let page_index = self.ensure_writable_tail(cols, new_keys.device())?;
@@ -368,7 +392,7 @@ impl DeviceLayerKVCache {
         Ok(())
     }
 
-    fn active_tensors(&self) -> Result<(CandleTensor, CandleTensor, usize)> {
+    fn build_active_tensors(&self) -> Result<(CandleTensor, CandleTensor, usize)> {
         if self.seq_len == 0 || self.block_table.is_empty() {
             return Err(AgentError::Execution(
                 "Requested device KV state before cache initialization".to_string(),
@@ -417,12 +441,113 @@ impl DeviceLayerKVCache {
         Ok((active_keys, active_values, self.seq_len))
     }
 
+    fn active_tensors(&mut self) -> Result<(CandleTensor, CandleTensor, usize)> {
+        if let Some((keys, values, seq_len)) = &self.cached_active {
+            return Ok((keys.clone(), values.clone(), *seq_len));
+        }
+        let active = self.build_active_tensors()?;
+        self.cached_active = Some((active.0.clone(), active.1.clone(), active.2));
+        Ok(active)
+    }
+
+    fn active_heads(
+        &mut self,
+        head_dim: usize,
+    ) -> Result<(CandleTensor, CandleTensor, usize, usize)> {
+        if let Some((keys, values, seq_len, local_kv_heads)) = &self.cached_heads {
+            return Ok((keys.clone(), values.clone(), *seq_len, *local_kv_heads));
+        }
+
+        let (cached_k, cached_v, cached_seq_len) = self.active_tensors()?;
+        let k_dims = cached_k.dims();
+        if k_dims.len() != 2 {
+            return Err(AgentError::Execution(format!(
+                "Device KV active tensor expected rank-2 keys, got {:?}",
+                k_dims
+            )));
+        }
+        let kv_cols = k_dims[1];
+        if kv_cols % head_dim != 0 {
+            return Err(AgentError::Execution(format!(
+                "Device KV active width {} is not a multiple of head_dim {}",
+                kv_cols, head_dim
+            )));
+        }
+        let local_kv_heads = kv_cols / head_dim;
+        let k_heads = cached_k
+            .reshape((cached_seq_len, local_kv_heads, head_dim))
+            .map_err(device_error)?
+            .transpose(0, 1)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
+        let v_heads = cached_v
+            .reshape((cached_seq_len, local_kv_heads, head_dim))
+            .map_err(device_error)?
+            .transpose(0, 1)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
+        self.cached_heads = Some((
+            k_heads.clone(),
+            v_heads.clone(),
+            cached_seq_len,
+            local_kv_heads,
+        ));
+        Ok((k_heads, v_heads, cached_seq_len, local_kv_heads))
+    }
+
+    fn selected_heads(
+        &mut self,
+        head_dim: usize,
+        selection_signature: u64,
+        local_kv_head_indices: &CandleTensor,
+    ) -> Result<SelectedDeviceKvHeads> {
+        if let Some((cached_signature, selected_k_t, selected_v, cached_seq_len)) =
+            &self.cached_selected_heads
+        {
+            if *cached_signature == selection_signature {
+                return Ok(SelectedDeviceKvHeads {
+                    keys_for_scores: selected_k_t.clone(),
+                    values: selected_v.clone(),
+                    seq_len: *cached_seq_len,
+                });
+            }
+        }
+
+        let (k_heads, v_heads, cached_seq_len, _local_kv_heads) = self.active_heads(head_dim)?;
+        let selected_k_t = k_heads
+            .index_select(local_kv_head_indices, 0)
+            .map_err(device_error)?
+            .transpose(1, 2)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
+        let selected_v = v_heads
+            .index_select(local_kv_head_indices, 0)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
+        self.cached_selected_heads = Some((
+            selection_signature,
+            selected_k_t.clone(),
+            selected_v.clone(),
+            cached_seq_len,
+        ));
+        Ok(SelectedDeviceKvHeads {
+            keys_for_scores: selected_k_t,
+            values: selected_v,
+            seq_len: cached_seq_len,
+        })
+    }
+
     #[cfg(test)]
     fn block_table_len(&self) -> usize {
         self.block_table.len()
     }
 
     fn clear(&mut self) {
+        self.invalidate_active_cache();
         for page in &mut self.pages {
             page.used_rows = 0;
         }
@@ -438,7 +563,7 @@ impl DeviceLayerKVCache {
             self.clear();
             return Ok(());
         }
-        let (active_keys, active_values, active_rows) = self.active_tensors()?;
+        let (active_keys, active_values, active_rows) = self.build_active_tensors()?;
         let start_row = active_rows - keep_rows;
         let kept_keys = active_keys
             .narrow(0, start_row, keep_rows)
@@ -466,6 +591,7 @@ struct DeviceKVCache {
     layers: Vec<DeviceLayerKVCache>,
     base_position: usize,
     config: KVCacheConfig,
+    causal_mask_cache: HashMap<(usize, usize, usize), CandleTensor>,
 }
 
 impl DeviceKVCache {
@@ -477,6 +603,7 @@ impl DeviceKVCache {
                 .collect(),
             base_position: 0,
             config,
+            causal_mask_cache: HashMap::new(),
         }
     }
 
@@ -526,12 +653,42 @@ impl DeviceKVCache {
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))
     }
 
-    fn get_layer_active_kv(&self, layer_idx: usize) -> Result<(CandleTensor, CandleTensor, usize)> {
+    #[cfg(test)]
+    fn get_layer_active_kv(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(CandleTensor, CandleTensor, usize)> {
         let layer = self
             .layers
-            .get(layer_idx)
+            .get_mut(layer_idx)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
         layer.active_tensors()
+    }
+
+    fn get_layer_active_heads(
+        &mut self,
+        layer_idx: usize,
+        head_dim: usize,
+    ) -> Result<(CandleTensor, CandleTensor, usize, usize)> {
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
+        layer.active_heads(head_dim)
+    }
+
+    fn get_layer_selected_heads(
+        &mut self,
+        layer_idx: usize,
+        head_dim: usize,
+        selection_signature: u64,
+        local_kv_head_indices: &CandleTensor,
+    ) -> Result<SelectedDeviceKvHeads> {
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?;
+        layer.selected_heads(head_dim, selection_signature, local_kv_head_indices)
     }
 
     fn seq_len(&self) -> usize {
@@ -551,6 +708,7 @@ impl DeviceKVCache {
             layer.clear();
         }
         self.base_position = 0;
+        self.causal_mask_cache.clear();
     }
 
     fn retain_suffix(&mut self, keep_rows: usize) -> Result<()> {
@@ -565,6 +723,37 @@ impl DeviceKVCache {
         Ok(())
     }
 
+    fn causal_attention_mask(
+        &mut self,
+        q_rows: usize,
+        cached_seq_len: usize,
+        cache_prefix_len: usize,
+        device: &candle_core::Device,
+    ) -> Result<CandleTensor> {
+        let key = (q_rows, cached_seq_len, cache_prefix_len);
+        if let Some(mask) = self.causal_mask_cache.get(&key) {
+            return Ok(mask.clone());
+        }
+
+        let mut mask = vec![f32::NEG_INFINITY; q_rows * cached_seq_len];
+        for q_row in 0..q_rows {
+            let max_k = cache_prefix_len + q_row + 1;
+            if max_k > cached_seq_len {
+                return Err(AgentError::Execution(format!(
+                    "Attention prefix exceeds cache: prefix {} + query_row {} > cached_seq_len {}",
+                    cache_prefix_len, q_row, cached_seq_len
+                )));
+            }
+            for k_row in 0..max_k {
+                mask[q_row * cached_seq_len + k_row] = 0.0;
+            }
+        }
+        let tensor = CandleTensor::from_vec(mask, (1, q_rows, cached_seq_len), device)
+            .map_err(device_error)?;
+        self.causal_mask_cache.insert(key, tensor.clone());
+        Ok(tensor)
+    }
+
     #[cfg(test)]
     fn live_page_tokens(&self) -> usize {
         self.config.live_page_tokens()
@@ -576,6 +765,11 @@ impl DeviceKVCache {
             .get(layer_idx)
             .map(DeviceLayerKVCache::block_table_len)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))
+    }
+
+    #[cfg(test)]
+    fn causal_mask_cache_len(&self) -> usize {
+        self.causal_mask_cache.len()
     }
 
     fn memory_usage(&self) -> usize {
@@ -607,7 +801,13 @@ impl DeviceKVCache {
             if layer_seq_len == 0 {
                 continue;
             }
-            let (keys, values, _) = self.get_layer_active_kv(layer_idx)?;
+            let (keys, values, _) = self
+                .layers
+                .get(layer_idx)
+                .ok_or_else(|| {
+                    AgentError::Execution(format!("Invalid layer index: {}", layer_idx))
+                })?
+                .build_active_tensors()?;
             host_cache.append_layer(layer_idx, from_candle_2d(&keys)?, from_candle_2d(&values)?)?;
         }
         if let Some(limit) = max_cached_tokens {
@@ -804,6 +1004,16 @@ fn validate_positions(absolute_positions: &[u32], expected_start: usize) -> Resu
     Ok(())
 }
 
+fn validate_single_position(position: u32, expected_start: usize) -> Result<()> {
+    if position as usize != expected_start {
+        return Err(crate::errors::AgentError::Execution(format!(
+            "Non-contiguous attention positions: expected {}, got {}",
+            expected_start, position
+        )));
+    }
+    Ok(())
+}
+
 fn build_positions(start: usize, count: usize) -> Vec<u32> {
     (start..start + count)
         .map(|position| position as u32)
@@ -848,13 +1058,6 @@ fn attention_output(
         )));
     }
 
-    let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
-    let incoming_rows = absolute_positions.len();
-    let max_seq_len = kv_cache.config.max_seq_len.max(1);
-    if current_layer_seq_len.saturating_add(incoming_rows) > max_seq_len {
-        let drop_rows = current_layer_seq_len.saturating_add(incoming_rows) - max_seq_len;
-        kv_cache.retain_suffix(current_layer_seq_len.saturating_sub(drop_rows));
-    }
     let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
     let incoming_rows = absolute_positions.len();
     let max_seq_len = kv_cache.config.max_seq_len.max(1);
@@ -1029,7 +1232,18 @@ fn concat_projection_tensors(tensors: &[&CandleTensor]) -> Result<CandleTensor> 
     })
 }
 
-fn split_projection_tensor(tensor: &CandleTensor, widths: &[usize]) -> Result<Vec<CandleTensor>> {
+fn narrow_projection(tensor: &CandleTensor, start: usize, width: usize) -> Result<CandleTensor> {
+    tensor
+        .narrow(1, start, width)
+        .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))
+}
+
+fn split_qkv_projection(
+    tensor: &CandleTensor,
+    q_width: usize,
+    k_width: usize,
+    v_width: usize,
+) -> Result<(CandleTensor, CandleTensor, CandleTensor)> {
     let dims = tensor.dims();
     if dims.len() != 2 {
         return Err(AgentError::Execution(format!(
@@ -1037,7 +1251,7 @@ fn split_projection_tensor(tensor: &CandleTensor, widths: &[usize]) -> Result<Ve
             dims
         )));
     }
-    let total_width: usize = widths.iter().sum();
+    let total_width = q_width.saturating_add(k_width).saturating_add(v_width);
     if dims[1] != total_width {
         return Err(AgentError::Execution(format!(
             "projection split width mismatch: tensor cols {} vs expected {}",
@@ -1045,17 +1259,37 @@ fn split_projection_tensor(tensor: &CandleTensor, widths: &[usize]) -> Result<Ve
         )));
     }
 
-    let mut outputs = Vec::with_capacity(widths.len());
-    let mut start = 0usize;
-    for width in widths {
-        outputs.push(
-            tensor
-                .narrow(1, start, *width)
-                .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?,
-        );
-        start = start.saturating_add(*width);
+    Ok((
+        narrow_projection(tensor, 0, q_width)?,
+        narrow_projection(tensor, q_width, k_width)?,
+        narrow_projection(tensor, q_width.saturating_add(k_width), v_width)?,
+    ))
+}
+
+fn split_gate_up_projection(
+    tensor: &CandleTensor,
+    gate_width: usize,
+    up_width: usize,
+) -> Result<(CandleTensor, CandleTensor)> {
+    let dims = tensor.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "projection split expects rank-2 tensor, got {:?}",
+            dims
+        )));
     }
-    Ok(outputs)
+    let total_width = gate_width.saturating_add(up_width);
+    if dims[1] != total_width {
+        return Err(AgentError::Execution(format!(
+            "projection split width mismatch: tensor cols {} vs expected {}",
+            dims[1], total_width
+        )));
+    }
+
+    Ok((
+        narrow_projection(tensor, 0, gate_width)?,
+        narrow_projection(tensor, gate_width, up_width)?,
+    ))
 }
 
 fn qkv_partials_from_combined(
@@ -1065,14 +1299,7 @@ fn qkv_partials_from_combined(
     let combined = normed
         .matmul(&layer.w_qkv)
         .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
-    let widths = [layer.q_width, layer.k_width, layer.v_width];
-    let parts = split_projection_tensor(&combined, &widths)?;
-    let mut iter = parts.into_iter();
-    Ok((
-        iter.next().expect("q projection"),
-        iter.next().expect("k projection"),
-        iter.next().expect("v projection"),
-    ))
+    split_qkv_projection(&combined, layer.q_width, layer.k_width, layer.v_width)
 }
 
 fn gate_up_partials_from_combined(
@@ -1082,13 +1309,7 @@ fn gate_up_partials_from_combined(
     let combined = mlp_normed
         .matmul(&layer.w_gate_up)
         .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
-    let widths = [layer.gate_width, layer.up_width];
-    let parts = split_projection_tensor(&combined, &widths)?;
-    let mut iter = parts.into_iter();
-    Ok((
-        iter.next().expect("gate projection"),
-        iter.next().expect("up projection"),
-    ))
+    split_gate_up_projection(&combined, layer.gate_width, layer.up_width)
 }
 
 #[derive(Clone)]
@@ -1132,6 +1353,7 @@ pub struct ForwardPass {
     allreduce_timeout: std::time::Duration,
     attention_layout: AttentionShardLayout,
     local_kv_head_indices: CandleTensor,
+    local_kv_head_indices_signature: u64,
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
@@ -1170,8 +1392,11 @@ impl ForwardPass {
             max_seq_len: 4096,
         };
         let attention_layout = resolve_attention_shard_layout(&config, shard_start, shard_end)?;
+        let local_kv_head_indices_host = build_local_kv_head_indices(attention_layout)?;
+        let local_kv_head_indices_signature =
+            kv_head_selection_signature(&local_kv_head_indices_host);
         let local_kv_head_indices = CandleTensor::from_vec(
-            build_local_kv_head_indices(attention_layout)?,
+            local_kv_head_indices_host,
             attention_layout.local_q_heads,
             residency.device_weights.embedding.device(),
         )
@@ -1183,6 +1408,7 @@ impl ForwardPass {
             allreduce_timeout,
             attention_layout,
             local_kv_head_indices,
+            local_kv_head_indices_signature,
             device_kv_cache: DeviceKVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -1215,14 +1441,11 @@ impl ForwardPass {
 
     /// Embed input tokens
     fn embed(&self, tokens: &[u32]) -> Result<CandleTensor> {
-        let ids = CandleTensor::from_vec(
-            tokens.to_vec(),
-            tokens.len(),
-            self.device_weights.embedding.device(),
-        )
-        .map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
+        let ids =
+            CandleTensor::from_slice(tokens, tokens.len(), self.device_weights.embedding.device())
+                .map_err(|e| {
+                    crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+                })?;
         self.device_weights.embedding.embedding(&ids).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })
@@ -1237,8 +1460,7 @@ impl ForwardPass {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<CandleTensor> {
-        let layer = self.device_weights.layers[layer_idx].clone();
-        let config = self.config.clone();
+        let rms_norm_eps = self.config.rms_norm_eps;
         let start = Instant::now();
         let hidden_dims = hidden.dims();
         let hidden_rows = hidden_dims[0];
@@ -1254,9 +1476,10 @@ impl ForwardPass {
         );
 
         let o_partial = run_in_blocking_region(|| -> Result<_> {
+            let layer = &self.device_weights.layers[layer_idx];
             // These CPU-side tensor ops can run long enough under concurrent inference
             // to starve async control loops if they stay on Tokio worker threads.
-            let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
+            let normed = rms_norm_candle(hidden, &layer.attn_norm, rms_norm_eps)?;
 
             let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
@@ -1276,10 +1499,11 @@ impl ForwardPass {
 
             let attn_output = attention_output_device(
                 &mut self.device_kv_cache,
-                &config,
+                &self.config,
                 self.attention_layout,
                 layer_idx,
                 absolute_positions,
+                self.local_kv_head_indices_signature,
                 &self.local_kv_head_indices,
                 q_partial,
                 k_partial,
@@ -1310,11 +1534,12 @@ impl ForwardPass {
         );
 
         let (post_attn, down_partial) = run_in_blocking_region(|| -> Result<_> {
+            let layer = &self.device_weights.layers[layer_idx];
             let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
 
-            let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
+            let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, rms_norm_eps)?;
             let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
             let gate_activated = silu_candle(&gate_partial)?;
             let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
@@ -1424,6 +1649,7 @@ impl ForwardPass {
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
+        workspace: Option<&mut PrefillWorkspaceLease>,
     ) -> Result<BackendLogits> {
         if tokens.is_empty() {
             return Err(crate::errors::AgentError::Execution(
@@ -1436,7 +1662,7 @@ impl ForwardPass {
         let start = tokens.len().saturating_sub(window);
         self.device_kv_cache.base_position = start;
         let hidden = self
-            .forward_tokens(&tokens[start..], start, worker_ring, job_id)
+            .forward_tokens(&tokens[start..], start, worker_ring, job_id, workspace)
             .await?;
         self.position = tokens.len();
         debug_assert_eq!(self.device_kv_cache.next_position(), self.position);
@@ -1464,7 +1690,7 @@ impl ForwardPass {
         }
 
         let hidden = self
-            .forward_tokens(&[token], self.position, worker_ring, job_id)
+            .forward_tokens(&[token], self.position, worker_ring, job_id, None)
             .await?;
         self.position += 1;
         self.compute_logits(&hidden)
@@ -1477,6 +1703,7 @@ impl ForwardPass {
         tokens: &[u32],
         job_ids: &[Uuid],
         worker_ring: &mut WorkerRing<'_>,
+        mut workspace: Option<&mut DecodeWorkspaceLease>,
     ) -> Result<CandleTensor> {
         if backends.is_empty() || tokens.is_empty() {
             return Err(crate::errors::AgentError::Execution(
@@ -1504,6 +1731,7 @@ impl ForwardPass {
         let batch_job_id = collective_batch_job_id(job_ids);
 
         let mut positions = Vec::with_capacity(backends.len());
+        let mut sequence_lengths = Vec::with_capacity(backends.len());
         for backend in backends.iter() {
             let forward_pass = &backend.forward_pass;
             if forward_pass.position == 0 {
@@ -1519,16 +1747,24 @@ impl ForwardPass {
                 )));
             }
             positions.push(forward_pass.position as u32);
+            sequence_lengths.push(forward_pass.device_kv_cache.next_position() as u32);
         }
 
-        let ids = CandleTensor::from_vec(
-            tokens.to_vec(),
-            tokens.len(),
-            device_weights.embedding.device(),
-        )
-        .map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
+        let (positions, token_ids) = if let Some(workspace) = workspace.as_deref_mut() {
+            workspace.stage(tokens, &positions, &sequence_lengths)?;
+            (
+                workspace.positions(tokens.len()),
+                workspace.token_ids(tokens.len()),
+            )
+        } else {
+            (positions.as_slice(), tokens)
+        };
+
+        let ids =
+            CandleTensor::from_slice(token_ids, tokens.len(), device_weights.embedding.device())
+                .map_err(|e| {
+                    crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+                })?;
         let mut hidden = device_weights.embedding.embedding(&ids).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
@@ -1552,7 +1788,7 @@ impl ForwardPass {
                 &config,
                 attention_layout,
                 layer_idx,
-                &positions,
+                positions,
                 &local_kv_head_indices,
                 q_partial,
                 k_partial,
@@ -1733,6 +1969,7 @@ impl ForwardPass {
         absolute_position_start: usize,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
+        mut workspace: Option<&mut PrefillWorkspaceLease>,
     ) -> Result<CandleTensor> {
         if tokens.is_empty() {
             return Err(crate::errors::AgentError::Execution(
@@ -1740,7 +1977,13 @@ impl ForwardPass {
             ));
         }
         let start = Instant::now();
-        let absolute_positions = build_positions(absolute_position_start, tokens.len());
+        let owned_positions;
+        let absolute_positions = if let Some(workspace) = workspace.as_deref_mut() {
+            workspace.stage_positions(absolute_position_start, tokens.len())?
+        } else {
+            owned_positions = build_positions(absolute_position_start, tokens.len());
+            owned_positions.as_slice()
+        };
         self.last_allreduce_metrics = RingAllReduceMetrics::default();
 
         info!(
@@ -1803,6 +2046,7 @@ fn attention_output_device(
     attention_layout: AttentionShardLayout,
     layer_idx: usize,
     absolute_positions: &[u32],
+    local_kv_head_indices_signature: u64,
     local_kv_head_indices: &CandleTensor,
     q_local: CandleTensor,
     k_local: CandleTensor,
@@ -1871,6 +2115,7 @@ fn attention_output_device(
         attention_layout,
         layer_idx,
         cache_prefix_len,
+        local_kv_head_indices_signature,
         local_kv_head_indices,
         &q_rope,
     )
@@ -1949,8 +2194,24 @@ fn attention_output_device_batch_from_backends(
         head_dim,
         config.rope_base,
     )?;
+    let local_q_heads = q_cols / head_dim;
+    if local_kv_head_indices.dims() != [local_q_heads] {
+        return Err(AgentError::Execution(format!(
+            "Local KV head index tensor mismatch: expected [{}], got {:?}",
+            local_q_heads,
+            local_kv_head_indices.dims()
+        )));
+    }
+    let q_heads_batch = q_rope
+        .reshape((batch_size, local_q_heads, head_dim))
+        .map_err(device_error)?
+        .transpose(0, 1)
+        .map_err(device_error)?
+        .contiguous()
+        .map_err(device_error)?;
 
-    let mut outputs = Vec::with_capacity(batch_size);
+    let mut outputs = CandleTensor::zeros((batch_size, q_cols), DType::F32, q_local.device())
+        .map_err(device_error)?;
     for (row_idx, backend) in backends.iter_mut().enumerate() {
         let kv_cache = &mut backend.forward_pass.device_kv_cache;
         let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
@@ -1960,37 +2221,67 @@ fn attention_output_device_batch_from_backends(
             kv_cache.retain_suffix(current_layer_seq_len.saturating_sub(drop_rows))?;
         }
         let prefix_len = kv_cache.layer_seq_len(layer_idx)?;
-        validate_positions(
-            &[absolute_positions[row_idx]],
+        validate_single_position(
+            absolute_positions[row_idx],
             kv_cache.base_position().saturating_add(prefix_len),
         )?;
-        let q_row = q_rope.narrow(0, row_idx, 1).map_err(device_error)?;
+        let q_heads_row = q_heads_batch
+            .narrow(1, row_idx, 1)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
         let k_row = k_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let v_row = v_local.narrow(0, row_idx, 1).map_err(device_error)?;
         kv_cache.append_layer(layer_idx, &k_row, &v_row)?;
-        outputs.push(attention_output_device_cached(
+        let output_row = attention_output_device_cached_single_query_from_heads(
             kv_cache,
             config,
-            attention_layout,
             layer_idx,
             prefix_len,
+            backend.forward_pass.local_kv_head_indices_signature,
             local_kv_head_indices,
-            &q_row,
-        )?);
+            &q_heads_row,
+            q_cols,
+        )?;
+        outputs = outputs
+            .slice_assign(&[row_idx..row_idx + 1, 0..q_cols], &output_row)
+            .map_err(device_error)?;
     }
 
-    let output_refs = outputs.iter().collect::<Vec<_>>();
-    CandleTensor::cat(&output_refs, 0).map_err(device_error)
+    Ok(outputs)
 }
 
 fn attention_output_device_cached(
-    kv_cache: &DeviceKVCache,
+    kv_cache: &mut DeviceKVCache,
     config: &ModelConfig,
     _attention_layout: AttentionShardLayout,
     layer_idx: usize,
     cache_prefix_len: usize,
+    local_kv_head_indices_signature: u64,
     local_kv_head_indices: &CandleTensor,
     q_rope: &CandleTensor,
+) -> Result<CandleTensor> {
+    attention_output_device_cached_with_precomputed_query(
+        kv_cache,
+        config,
+        layer_idx,
+        cache_prefix_len,
+        local_kv_head_indices_signature,
+        local_kv_head_indices,
+        q_rope,
+        None,
+    )
+}
+
+fn attention_output_device_cached_with_precomputed_query(
+    kv_cache: &mut DeviceKVCache,
+    config: &ModelConfig,
+    layer_idx: usize,
+    cache_prefix_len: usize,
+    local_kv_head_indices_signature: u64,
+    local_kv_head_indices: &CandleTensor,
+    q_rope: &CandleTensor,
+    precomputed_q_heads: Option<&CandleTensor>,
 ) -> Result<CandleTensor> {
     let q_dims = q_rope.dims();
     if q_dims.len() != 2 {
@@ -2011,68 +2302,108 @@ fn attention_output_device_cached(
         )));
     }
 
-    let (cached_k, cached_v, cached_seq_len) = kv_cache.get_layer_active_kv(layer_idx)?;
-    let k_dims = cached_k.dims();
-    let local_kv_heads = k_dims[1] / head_dim;
-    if local_kv_heads == 0 {
-        return Err(AgentError::Execution(format!(
-            "Device attention found zero local KV heads on layer {}",
-            layer_idx
-        )));
-    }
+    let selected_heads = kv_cache.get_layer_selected_heads(
+        layer_idx,
+        head_dim,
+        local_kv_head_indices_signature,
+        local_kv_head_indices,
+    )?;
 
-    let q_heads = q_rope
-        .reshape((q_rows, local_q_heads, head_dim))
-        .map_err(device_error)?
-        .transpose(0, 1)
-        .map_err(device_error)?
-        .contiguous()
-        .map_err(device_error)?;
-    let k_heads = cached_k
-        .reshape((cached_seq_len, local_kv_heads, head_dim))
-        .map_err(device_error)?
-        .transpose(0, 1)
-        .map_err(device_error)?
-        .contiguous()
-        .map_err(device_error)?;
-    let v_heads = cached_v
-        .reshape((cached_seq_len, local_kv_heads, head_dim))
-        .map_err(device_error)?
-        .transpose(0, 1)
-        .map_err(device_error)?
-        .contiguous()
-        .map_err(device_error)?;
-
-    let selected_k = k_heads
-        .index_select(local_kv_head_indices, 0)
-        .map_err(device_error)?
-        .contiguous()
-        .map_err(device_error)?;
-    let selected_v = v_heads
-        .index_select(local_kv_head_indices, 0)
-        .map_err(device_error)?
-        .contiguous()
-        .map_err(device_error)?;
+    let q_heads = if let Some(q_heads) = precomputed_q_heads {
+        q_heads.clone()
+    } else {
+        q_rope
+            .reshape((q_rows, local_q_heads, head_dim))
+            .map_err(device_error)?
+            .transpose(0, 1)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?
+    };
     let scores = q_heads
-        .matmul(&selected_k.transpose(1, 2).map_err(device_error)?)
+        .matmul(&selected_heads.keys_for_scores)
         .map_err(device_error)?
         .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
         .map_err(device_error)?;
-    let full_prefix_visible = q_rows == 1 && cache_prefix_len + 1 == cached_seq_len;
+    let full_prefix_visible = q_rows == 1 && cache_prefix_len + 1 == selected_heads.seq_len;
     let probs = if full_prefix_visible {
         candle_nn::ops::softmax(&scores, 2).map_err(device_error)?
     } else {
-        let mask =
-            causal_attention_mask(q_rows, cached_seq_len, cache_prefix_len, q_rope.device())?;
+        let mask = kv_cache.causal_attention_mask(
+            q_rows,
+            selected_heads.seq_len,
+            cache_prefix_len,
+            q_rope.device(),
+        )?;
         let masked = scores.broadcast_add(&mask).map_err(device_error)?;
         candle_nn::ops::softmax(&masked, 2).map_err(device_error)?
     };
     probs
-        .matmul(&selected_v)
+        .matmul(&selected_heads.values)
         .map_err(device_error)?
         .transpose(0, 1)
         .map_err(device_error)?
         .reshape((q_rows, local_q_heads * head_dim))
+        .map_err(device_error)
+}
+
+fn attention_output_device_cached_single_query_from_heads(
+    kv_cache: &mut DeviceKVCache,
+    config: &ModelConfig,
+    layer_idx: usize,
+    cache_prefix_len: usize,
+    local_kv_head_indices_signature: u64,
+    local_kv_head_indices: &CandleTensor,
+    q_heads: &CandleTensor,
+    q_cols: usize,
+) -> Result<CandleTensor> {
+    let head_dim = config.hidden_dim / config.num_heads;
+    let q_head_dims = q_heads.dims();
+    if q_head_dims.len() != 3 || q_head_dims[1] != 1 || q_head_dims[2] != head_dim {
+        return Err(AgentError::Execution(format!(
+            "Single-query attention expects [local_q_heads, 1, head_dim], got {:?}",
+            q_head_dims
+        )));
+    }
+    let local_q_heads = q_head_dims[0];
+    if local_q_heads * head_dim != q_cols {
+        return Err(AgentError::Execution(format!(
+            "Single-query attention width mismatch: local_q_heads {} * head_dim {} != q_cols {}",
+            local_q_heads, head_dim, q_cols
+        )));
+    }
+    if local_kv_head_indices.dims() != [local_q_heads] {
+        return Err(AgentError::Execution(format!(
+            "Local KV head index tensor mismatch: expected [{}], got {:?}",
+            local_q_heads,
+            local_kv_head_indices.dims()
+        )));
+    }
+
+    let selected_heads = kv_cache.get_layer_selected_heads(
+        layer_idx,
+        head_dim,
+        local_kv_head_indices_signature,
+        local_kv_head_indices,
+    )?;
+    if cache_prefix_len + 1 != selected_heads.seq_len {
+        return Err(AgentError::Execution(format!(
+            "Single-query attention expected full prefix visibility: prefix {} cached_seq_len {}",
+            cache_prefix_len, selected_heads.seq_len
+        )));
+    }
+    let scores = q_heads
+        .matmul(&selected_heads.keys_for_scores)
+        .map_err(device_error)?
+        .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
+        .map_err(device_error)?;
+    candle_nn::ops::softmax(&scores, 2)
+        .map_err(device_error)?
+        .matmul(&selected_heads.values)
+        .map_err(device_error)?
+        .transpose(0, 1)
+        .map_err(device_error)?
+        .reshape((1, q_cols))
         .map_err(device_error)
 }
 
@@ -2097,6 +2428,12 @@ fn build_local_kv_head_indices(attention_layout: AttentionShardLayout) -> Result
     Ok(indices)
 }
 
+fn kv_head_selection_signature(indices: &[u32]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    indices.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn collective_batch_job_id(job_ids: &[Uuid]) -> Uuid {
     let mut batch_seed = [0u8; 16];
     for job_id in job_ids {
@@ -2105,28 +2442,6 @@ fn collective_batch_job_id(job_ids: &[Uuid]) -> Uuid {
         }
     }
     Uuid::from_bytes(batch_seed)
-}
-
-fn causal_attention_mask(
-    q_rows: usize,
-    cached_seq_len: usize,
-    cache_prefix_len: usize,
-    device: &candle_core::Device,
-) -> Result<CandleTensor> {
-    let mut mask = vec![f32::NEG_INFINITY; q_rows * cached_seq_len];
-    for q_row in 0..q_rows {
-        let max_k = cache_prefix_len + q_row + 1;
-        if max_k > cached_seq_len {
-            return Err(AgentError::Execution(format!(
-                "Attention prefix exceeds cache: prefix {} + query_row {} > cached_seq_len {}",
-                cache_prefix_len, q_row, cached_seq_len
-            )));
-        }
-        for k_row in 0..max_k {
-            mask[q_row * cached_seq_len + k_row] = 0.0;
-        }
-    }
-    CandleTensor::from_vec(mask, (1, q_rows, cached_seq_len), device).map_err(device_error)
 }
 
 fn device_error(err: candle_core::Error) -> AgentError {
@@ -2650,6 +2965,136 @@ mod tests {
         assert_eq!(metadata.tail_tokens, 1);
     }
 
+    #[test]
+    fn test_device_kv_active_view_cache_invalidates_on_append() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 4,
+            max_seq_len: 8,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let first_keys = to_candle_2d(&Tensor2D::filled(2, 4, 1.0)).unwrap();
+        let first_values = to_candle_2d(&Tensor2D::filled(2, 4, 2.0)).unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+
+        let (cached_keys, cached_values, cached_rows) = kv_cache.get_layer_active_kv(0).unwrap();
+        assert_eq!(cached_rows, 2);
+        assert_eq!(cached_keys.dims(), &[2, 4]);
+        assert_eq!(cached_values.dims(), &[2, 4]);
+
+        let second_keys = to_candle_2d(&Tensor2D::filled(1, 4, 3.0)).unwrap();
+        let second_values = to_candle_2d(&Tensor2D::filled(1, 4, 4.0)).unwrap();
+        kv_cache
+            .append_layer(0, &second_keys, &second_values)
+            .unwrap();
+
+        let (updated_keys, updated_values, updated_rows) = kv_cache.get_layer_active_kv(0).unwrap();
+        assert_eq!(updated_rows, 3);
+        assert_eq!(updated_keys.dims(), &[3, 4]);
+        assert_eq!(updated_values.dims(), &[3, 4]);
+        let host_keys = from_candle_2d(&updated_keys).unwrap();
+        let host_values = from_candle_2d(&updated_values).unwrap();
+        assert_eq!(&host_keys.data[8..12], &[3.0; 4]);
+        assert_eq!(&host_values.data[8..12], &[4.0; 4]);
+    }
+
+    #[test]
+    fn test_device_kv_causal_mask_cache_reuses_by_shape() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 4,
+            max_seq_len: 8,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let device = candle_core::Device::Cpu;
+
+        let first = kv_cache.causal_attention_mask(3, 5, 2, &device).unwrap();
+        let second = kv_cache.causal_attention_mask(3, 5, 2, &device).unwrap();
+        let third = kv_cache.causal_attention_mask(2, 5, 1, &device).unwrap();
+
+        assert_eq!(first.dims(), &[1, 3, 5]);
+        assert_eq!(second.dims(), &[1, 3, 5]);
+        assert_eq!(third.dims(), &[1, 2, 5]);
+        assert_eq!(kv_cache.causal_mask_cache_len(), 2);
+    }
+
+    #[test]
+    fn test_device_kv_active_head_cache_invalidates_on_append() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 2,
+            max_seq_len: 8,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let first_keys = to_candle_2d(&Tensor2D::filled(2, 4, 1.0)).unwrap();
+        let first_values = to_candle_2d(&Tensor2D::filled(2, 4, 2.0)).unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+
+        let (cached_k_heads, cached_v_heads, cached_rows, cached_heads) =
+            kv_cache.get_layer_active_heads(0, 2).unwrap();
+        assert_eq!(cached_rows, 2);
+        assert_eq!(cached_heads, 2);
+        assert_eq!(cached_k_heads.dims(), &[2, 2, 2]);
+        assert_eq!(cached_v_heads.dims(), &[2, 2, 2]);
+
+        let second_keys = to_candle_2d(&Tensor2D::filled(1, 4, 3.0)).unwrap();
+        let second_values = to_candle_2d(&Tensor2D::filled(1, 4, 4.0)).unwrap();
+        kv_cache
+            .append_layer(0, &second_keys, &second_values)
+            .unwrap();
+
+        let (updated_k_heads, updated_v_heads, updated_rows, updated_heads) =
+            kv_cache.get_layer_active_heads(0, 2).unwrap();
+        assert_eq!(updated_rows, 3);
+        assert_eq!(updated_heads, 2);
+        assert_eq!(updated_k_heads.dims(), &[2, 3, 2]);
+        assert_eq!(updated_v_heads.dims(), &[2, 3, 2]);
+    }
+
+    #[test]
+    fn test_device_kv_selected_head_cache_invalidates_on_append() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 2,
+            max_seq_len: 8,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let selection = CandleTensor::new(&[1u32, 0u32], &candle_core::Device::Cpu).unwrap();
+        let first_keys = to_candle_2d(&Tensor2D::filled(2, 4, 1.0)).unwrap();
+        let first_values = to_candle_2d(&Tensor2D::filled(2, 4, 2.0)).unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+
+        let selected_heads = kv_cache
+            .get_layer_selected_heads(0, 2, 7, &selection)
+            .unwrap();
+        assert_eq!(selected_heads.seq_len, 2);
+        assert_eq!(selected_heads.keys_for_scores.dims(), &[2, 2, 2]);
+        assert_eq!(selected_heads.values.dims(), &[2, 2, 2]);
+
+        let second_keys = to_candle_2d(&Tensor2D::filled(1, 4, 3.0)).unwrap();
+        let second_values = to_candle_2d(&Tensor2D::filled(1, 4, 4.0)).unwrap();
+        kv_cache
+            .append_layer(0, &second_keys, &second_values)
+            .unwrap();
+
+        let updated_heads = kv_cache
+            .get_layer_selected_heads(0, 2, 7, &selection)
+            .unwrap();
+        assert_eq!(updated_heads.seq_len, 3);
+        assert_eq!(updated_heads.keys_for_scores.dims(), &[2, 2, 3]);
+        assert_eq!(updated_heads.values.dims(), &[2, 3, 2]);
+    }
+
     #[tokio::test]
     async fn test_decode_microbatch_respects_sliding_device_kv_window() {
         let config = create_test_config();
@@ -2700,12 +3145,12 @@ mod tests {
         let prompt = vec![1, 2, 3];
         backend_a
             .forward_pass
-            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .prefill(&prompt, &mut worker_ring, Uuid::new_v4(), None)
             .await
             .unwrap();
         backend_b
             .forward_pass
-            .prefill(&prompt, &mut worker_ring, Uuid::new_v4())
+            .prefill(&prompt, &mut worker_ring, Uuid::new_v4(), None)
             .await
             .unwrap();
 
@@ -2719,6 +3164,7 @@ mod tests {
             &[7, 8],
             &[Uuid::new_v4(), Uuid::new_v4()],
             &mut worker_ring,
+            None,
         )
         .await
         .unwrap();

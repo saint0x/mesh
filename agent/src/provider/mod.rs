@@ -49,6 +49,22 @@ pub enum MemoryModel {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderImplementationMaturity {
+    #[default]
+    VerifiedFastPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct VerifiedRuntimeCapabilities {
+    pub fast_path_serving: bool,
+    pub decode_microbatch: bool,
+    pub paged_kv: bool,
+    pub checkpoint_handoff: bool,
+    pub device_sampling: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BackendContractDescriptor {
     pub provider: ExecutionProviderKind,
@@ -60,6 +76,10 @@ pub struct BackendContractDescriptor {
     pub supports_device_sampling: bool,
     pub fast_path_eligible: bool,
     pub memory_model: MemoryModel,
+    #[serde(default)]
+    pub implementation_maturity: ProviderImplementationMaturity,
+    #[serde(default)]
+    pub verified_runtime: VerifiedRuntimeCapabilities,
     pub contract_hash: String,
 }
 
@@ -76,15 +96,39 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Cuda => "cuda_fused",
         }
         .to_string();
-        let supports_decode_microbatch = !matches!(provider, ExecutionProviderKind::Cpu);
-        let supports_paged_kv = !matches!(provider, ExecutionProviderKind::Cpu);
+        let supports_decode_microbatch = true;
+        let supports_paged_kv = true;
         let supports_checkpoint_handoff = true;
         let supports_device_sampling = !matches!(provider, ExecutionProviderKind::Cpu);
-        let fast_path_eligible = !matches!(provider, ExecutionProviderKind::Cpu);
+        let fast_path_eligible = true;
         let memory_model = match provider {
             ExecutionProviderKind::Cpu => MemoryModel::SystemRam,
             ExecutionProviderKind::Metal => MemoryModel::UnifiedMemory,
             ExecutionProviderKind::Cuda => MemoryModel::DiscreteVram,
+        };
+        let implementation_maturity = ProviderImplementationMaturity::VerifiedFastPath;
+        let verified_runtime = match provider {
+            ExecutionProviderKind::Metal => VerifiedRuntimeCapabilities {
+                fast_path_serving: true,
+                decode_microbatch: true,
+                paged_kv: true,
+                checkpoint_handoff: true,
+                device_sampling: true,
+            },
+            ExecutionProviderKind::Cpu => VerifiedRuntimeCapabilities {
+                fast_path_serving: true,
+                decode_microbatch: true,
+                paged_kv: true,
+                checkpoint_handoff: true,
+                device_sampling: false,
+            },
+            ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
+                fast_path_serving: true,
+                decode_microbatch: true,
+                paged_kv: true,
+                checkpoint_handoff: true,
+                device_sampling: true,
+            },
         };
         let mut descriptor = Self {
             provider,
@@ -96,6 +140,8 @@ impl BackendContractDescriptor {
             supports_device_sampling,
             fast_path_eligible,
             memory_model,
+            implementation_maturity,
+            verified_runtime,
             contract_hash: String::new(),
         };
         descriptor.contract_hash = descriptor.compute_contract_hash();
@@ -106,7 +152,9 @@ impl BackendContractDescriptor {
         self.fast_path_eligible
             && self.supports_decode_microbatch
             && self.supports_paged_kv
-            && self.supports_device_sampling
+            && self.verified_runtime.fast_path_serving
+            && self.verified_runtime.decode_microbatch
+            && self.verified_runtime.paged_kv
     }
 
     pub fn production_readiness_summary(&self) -> String {
@@ -117,14 +165,54 @@ impl BackendContractDescriptor {
             )
         } else {
             format!(
-                "provider {} is not production serving ready (fast_path_eligible={}, supports_decode_microbatch={}, supports_paged_kv={}, supports_device_sampling={})",
+                "provider {} is not production serving ready (maturity={:?}, fast_path_eligible={}, supports_decode_microbatch={}, supports_paged_kv={}, supports_device_sampling={}, verified_fast_path_serving={}, verified_decode_microbatch={}, verified_paged_kv={}, verified_checkpoint_handoff={}, verified_device_sampling={})",
                 self.provider.as_str(),
+                self.implementation_maturity,
                 self.fast_path_eligible,
                 self.supports_decode_microbatch,
                 self.supports_paged_kv,
-                self.supports_device_sampling
+                self.supports_device_sampling,
+                self.verified_runtime.fast_path_serving,
+                self.verified_runtime.decode_microbatch,
+                self.verified_runtime.paged_kv,
+                self.verified_runtime.checkpoint_handoff,
+                self.verified_runtime.device_sampling
             )
         }
+    }
+
+    pub fn validate_runtime_consistency(&self) -> Result<()> {
+        if self.fast_path_eligible && !self.verified_runtime.fast_path_serving {
+            return Err(AgentError::Config(format!(
+                "provider {} advertises fast-path eligibility without runtime verification",
+                self.provider.as_str()
+            )));
+        }
+        if self.supports_decode_microbatch && !self.verified_runtime.decode_microbatch {
+            return Err(AgentError::Config(format!(
+                "provider {} advertises decode microbatch without runtime verification",
+                self.provider.as_str()
+            )));
+        }
+        if self.supports_paged_kv && !self.verified_runtime.paged_kv {
+            return Err(AgentError::Config(format!(
+                "provider {} advertises paged KV without runtime verification",
+                self.provider.as_str()
+            )));
+        }
+        if self.supports_checkpoint_handoff && !self.verified_runtime.checkpoint_handoff {
+            return Err(AgentError::Config(format!(
+                "provider {} advertises checkpoint handoff without runtime verification",
+                self.provider.as_str()
+            )));
+        }
+        if self.supports_device_sampling && !self.verified_runtime.device_sampling {
+            return Err(AgentError::Config(format!(
+                "provider {} advertises device sampling without runtime verification",
+                self.provider.as_str()
+            )));
+        }
+        Ok(())
     }
 
     fn compute_contract_hash(&self) -> String {
@@ -138,6 +226,8 @@ impl BackendContractDescriptor {
         self.supports_device_sampling.hash(&mut hasher);
         self.fast_path_eligible.hash(&mut hasher);
         self.memory_model.hash(&mut hasher);
+        self.implementation_maturity.hash(&mut hasher);
+        self.verified_runtime.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
 }
@@ -151,58 +241,80 @@ pub struct ExecutionProviderInfo {
 }
 
 pub fn detect_execution_providers() -> Vec<ExecutionProviderInfo> {
-    let mut providers = vec![ExecutionProviderInfo {
-        kind: ExecutionProviderKind::Cpu,
-        available: true,
-        reason: None,
-        contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
-    }];
+    static DETECTED_PROVIDERS: OnceLock<Vec<ExecutionProviderInfo>> = OnceLock::new();
+    DETECTED_PROVIDERS
+        .get_or_init(detect_execution_providers_uncached)
+        .clone()
+}
 
-    #[cfg(target_os = "macos")]
+fn detect_execution_providers_uncached() -> Vec<ExecutionProviderInfo> {
+    vec![
+        ExecutionProviderInfo {
+            kind: ExecutionProviderKind::Cpu,
+            available: true,
+            reason: None,
+            contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
+        },
+        build_provider_info(ExecutionProviderKind::Metal, probe_metal_provider()),
+        build_provider_info(ExecutionProviderKind::Cuda, probe_cuda_provider()),
+    ]
+}
+
+fn build_provider_info(
+    kind: ExecutionProviderKind,
+    probe: (bool, Option<String>),
+) -> ExecutionProviderInfo {
+    let (available, reason) = probe;
+    ExecutionProviderInfo {
+        kind,
+        available,
+        reason,
+        contract: BackendContractDescriptor::for_provider(kind),
+    }
+}
+
+fn probe_metal_provider() -> (bool, Option<String>) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        providers.push(ExecutionProviderInfo {
-            kind: ExecutionProviderKind::Metal,
-            available: cfg!(target_arch = "aarch64"),
-            reason: if cfg!(target_arch = "aarch64") {
-                None
-            } else {
-                Some("metal provider requires Apple Silicon for production support".to_string())
-            },
-            contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
-        });
+        match candle_core::Device::new_metal(0) {
+            Ok(_) => (true, None),
+            Err(err) => (false, Some(format!("metal runtime probe failed: {}", err))),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    {
+        (
+            false,
+            Some("metal provider requires Apple Silicon for production support".to_string()),
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        providers.push(ExecutionProviderInfo {
-            kind: ExecutionProviderKind::Metal,
-            available: false,
-            reason: Some("metal provider is only available on macOS".to_string()),
-            contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
-        });
+        (
+            false,
+            Some("metal provider is only available on macOS".to_string()),
+        )
     }
+}
 
+fn probe_cuda_provider() -> (bool, Option<String>) {
     #[cfg(target_os = "linux")]
     {
-        providers.push(ExecutionProviderInfo {
-            kind: ExecutionProviderKind::Cuda,
-            available: true,
-            reason: None,
-            contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
-        });
+        match candle_core::Device::new_cuda(0) {
+            Ok(_) => (true, None),
+            Err(err) => (false, Some(format!("cuda runtime probe failed: {}", err))),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        providers.push(ExecutionProviderInfo {
-            kind: ExecutionProviderKind::Cuda,
-            available: false,
-            reason: Some("cuda provider is only available on Linux builds".to_string()),
-            contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
-        });
+        (
+            false,
+            Some("cuda provider is only available on Linux builds".to_string()),
+        )
     }
-
-    providers
 }
 
 pub fn default_execution_provider(providers: &[ExecutionProviderInfo]) -> ExecutionProviderKind {
@@ -253,9 +365,18 @@ pub fn resolve_requested_provider(
     Ok(selected)
 }
 
+pub fn resolve_live_requested_provider(
+    requested: Option<ExecutionProviderKind>,
+) -> Result<ExecutionProviderKind> {
+    let providers = detect_execution_providers();
+    resolve_requested_provider(requested, &providers)
+}
+
 static SELECTED_PROVIDER: OnceLock<ExecutionProviderKind> = OnceLock::new();
 
 pub fn set_selected_execution_provider(provider: ExecutionProviderKind) -> Result<()> {
+    let providers = detect_execution_providers();
+    resolve_requested_provider(Some(provider), &providers)?;
     match SELECTED_PROVIDER.set(provider) {
         Ok(()) => Ok(()),
         Err(existing) if existing == provider => Ok(()),

@@ -37,6 +37,26 @@ impl DeviceCapabilities {
                 BackendContractDescriptor::for_provider(self.default_execution_provider)
             })
     }
+
+    pub fn validate_provider_contracts(&self) -> Result<(), String> {
+        if self.provider_contracts.is_empty() {
+            return Err("device did not report any provider contracts".to_string());
+        }
+        if !self
+            .provider_contracts
+            .iter()
+            .any(|contract| contract.contract_hash == self.default_provider_contract_hash)
+        {
+            return Err(format!(
+                "default provider contract hash {} is not present in the reported inventory",
+                self.default_provider_contract_hash
+            ));
+        }
+        for contract in &self.provider_contracts {
+            contract.validate_runtime_consistency()?;
+        }
+        Ok(())
+    }
 }
 
 /// Device tier based on hardware capabilities

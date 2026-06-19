@@ -164,7 +164,7 @@ impl LocalExecutorContract {
     pub fn for_provider(provider: ExecutionProviderKind) -> Self {
         match provider {
             ExecutionProviderKind::Cpu => Self {
-                class: LocalExecutorClass::Baseline,
+                class: LocalExecutorClass::FastPath,
                 optimization_profile: BackendOptimizationProfile::CpuSerial,
                 host_kernels: vec![
                     HostKernel::ForwardPass,
@@ -174,20 +174,20 @@ impl LocalExecutorContract {
                 fused_stages: Vec::new(),
                 prefill: ExecutorPhasePlan {
                     phase: ExecutionPhase::Prefill,
-                    class: LocalExecutorClass::Baseline,
+                    class: LocalExecutorClass::FastPath,
                     supports_microbatch: false,
                     requires_static_workspace: false,
                     uses_device_sampling: false,
                 },
                 decode: ExecutorPhasePlan {
                     phase: ExecutionPhase::Decode,
-                    class: LocalExecutorClass::Baseline,
-                    supports_microbatch: false,
+                    class: LocalExecutorClass::FastPath,
+                    supports_microbatch: true,
                     requires_static_workspace: false,
                     uses_device_sampling: false,
                 },
                 kv_runtime: KvRuntimeContract {
-                    requires_paged_cache: false,
+                    requires_paged_cache: true,
                     append_only_decode: true,
                     supports_prefill: true,
                     supports_decode: true,

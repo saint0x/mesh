@@ -6,7 +6,10 @@ pub use capabilities::{DeviceCapabilities, Tier};
 use crate::connectivity::NetworkConnectivity;
 use crate::errors::{AgentError, Result};
 use crate::network::TensorPlaneProfile;
-use crate::provider::{resolve_requested_provider, ExecutionProviderKind};
+use crate::provider::{
+    default_execution_contract, detect_execution_providers, resolve_requested_provider,
+    ExecutionProviderKind,
+};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -175,28 +178,38 @@ impl DeviceConfig {
     }
 
     pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderKind> {
-        resolve_requested_provider(
-            self.execution.preferred_provider,
-            &self.capabilities.execution_providers,
-        )
+        let providers = detect_execution_providers();
+        resolve_requested_provider(self.execution.preferred_provider, &providers)
     }
 
     pub fn effective_capabilities(&self) -> Result<DeviceCapabilities> {
+        let execution_providers = detect_execution_providers();
         let selected_provider = self.resolve_execution_provider()?;
-        let selected_contract = self
-            .capabilities
-            .execution_providers
+        let selected_contract = execution_providers
             .iter()
             .find(|provider| provider.kind == selected_provider)
             .map(|provider| provider.contract.clone())
             .unwrap_or_else(|| {
                 crate::provider::BackendContractDescriptor::for_provider(selected_provider)
             });
+        let default_contract = default_execution_contract(&execution_providers);
+        let provider_contracts = execution_providers
+            .iter()
+            .map(|provider| provider.contract.clone())
+            .collect::<Vec<_>>();
 
         let mut capabilities = self.capabilities.clone();
+        capabilities.execution_providers = execution_providers;
+        capabilities.provider_contracts = provider_contracts;
         capabilities.default_execution_provider = selected_provider;
         capabilities.default_provider_contract_hash = selected_contract.contract_hash.clone();
         capabilities.memory_model = selected_contract.memory_model;
+        if self.execution.preferred_provider.is_none() {
+            capabilities.default_execution_provider = default_contract.provider;
+            capabilities.default_provider_contract_hash = default_contract.contract_hash.clone();
+            capabilities.memory_model = default_contract.memory_model;
+        }
+        capabilities.validate_provider_contracts()?;
         Ok(capabilities)
     }
 
@@ -511,15 +524,15 @@ gpu_vram_mb = 0
 os = "linux"
 arch = "x86_64"
 execution_providers = [
-  {{ kind = "cpu", available = true, contract = {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = false, supports_paged_kv = false, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = false, memory_model = "system_ram", contract_hash = "{cpu_hash}" }} }},
-  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS", contract = {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", contract_hash = "{metal_hash}" }} }},
-  {{ kind = "cuda", available = true, contract = {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", contract_hash = "{cuda_hash}" }} }},
+  {{ kind = "cpu", available = true, contract = {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = true, memory_model = "system_ram", implementation_maturity = "verified_fast_path", verified_runtime = {{ fast_path_serving = true, decode_microbatch = true, paged_kv = true, checkpoint_handoff = true, device_sampling = false }}, contract_hash = "{cpu_hash}" }} }},
+  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS", contract = {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", implementation_maturity = "verified_fast_path", verified_runtime = {{ fast_path_serving = true, decode_microbatch = true, paged_kv = true, checkpoint_handoff = true, device_sampling = true }}, contract_hash = "{metal_hash}" }} }},
+  {{ kind = "cuda", available = true, contract = {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", implementation_maturity = "verified_fast_path", verified_runtime = {{ fast_path_serving = true, decode_microbatch = true, paged_kv = true, checkpoint_handoff = true, device_sampling = true }}, contract_hash = "{cuda_hash}" }} }},
 ]
 default_execution_provider = "cuda"
 provider_contracts = [
-  {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = false, supports_paged_kv = false, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = false, memory_model = "system_ram", contract_hash = "{cpu_hash}" }},
-  {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", contract_hash = "{metal_hash}" }},
-  {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", contract_hash = "{cuda_hash}" }},
+  {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = true, memory_model = "system_ram", implementation_maturity = "verified_fast_path", verified_runtime = {{ fast_path_serving = true, decode_microbatch = true, paged_kv = true, checkpoint_handoff = true, device_sampling = false }}, contract_hash = "{cpu_hash}" }},
+  {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", implementation_maturity = "verified_fast_path", verified_runtime = {{ fast_path_serving = true, decode_microbatch = true, paged_kv = true, checkpoint_handoff = true, device_sampling = true }}, contract_hash = "{metal_hash}" }},
+  {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", implementation_maturity = "verified_fast_path", verified_runtime = {{ fast_path_serving = true, decode_microbatch = true, paged_kv = true, checkpoint_handoff = true, device_sampling = true }}, contract_hash = "{cuda_hash}" }},
 ]
 default_provider_contract_hash = "{cuda_hash}"
 memory_model = "discrete_vram"

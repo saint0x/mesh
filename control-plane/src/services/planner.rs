@@ -788,7 +788,7 @@ fn build_execution_islands(
                 model_id,
                 phase,
                 compatibility_class,
-                Some(contract_hash.as_str()),
+                contract_hash.as_str(),
             ),
             compatibility_class,
             backend_contract_hash: Some(contract_hash),
@@ -805,20 +805,17 @@ fn execution_island_id(
     model_id: &str,
     phase: ExecutionPhase,
     compatibility_class: ProviderCompatibilityClass,
-    contract_hash: Option<&str>,
+    contract_hash: &str,
 ) -> String {
     let phase = match phase {
         ExecutionPhase::Prefill => "prefill",
         ExecutionPhase::Decode => "decode",
     };
-    match contract_hash {
-        Some(contract_hash) => format!(
-            "island:{}:{}:{:?}:{}",
-            model_id, phase, compatibility_class, contract_hash
-        )
-        .to_ascii_lowercase(),
-        None => format!("island:{}:{}:heterogeneous_portable", model_id, phase),
-    }
+    format!(
+        "island:{}:{}:{:?}:{}",
+        model_id, phase, compatibility_class, contract_hash
+    )
+    .to_ascii_lowercase()
 }
 
 fn classify_execution_island(
@@ -841,7 +838,7 @@ fn classify_execution_island(
                 model_id,
                 phase,
                 first.compatibility_class,
-                Some(first.contract_hash.as_str()),
+                first.contract_hash.as_str(),
             ),
             compatibility_class: first.compatibility_class,
             backend_contract_hash: Some(first.contract_hash.clone()),
@@ -1811,7 +1808,14 @@ mod tests {
             vec!["c"]
         );
         assert_eq!(decode_group.members.len(), 1);
-        assert_eq!(decode_group.members[0].device_id, "c");
+        assert_eq!(
+            decode_group
+                .members
+                .iter()
+                .map(|member| member.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
         assert!(matches!(
             decode_group.kv_transfer_policy,
             KvTransferPolicy::CoLocated
@@ -1912,11 +1916,11 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_cpu_only_topology_for_production_serving() {
+    fn planner_accepts_cpu_only_topology_for_production_serving() {
         model_assets::testsupport::ensure_test_model("planner-cpu-rejected", 20);
         model_assets::clear_model_asset_cache();
 
-        let err = ExecutionPlanner::plan(
+        let plan = ExecutionPlanner::plan(
             &SubmitInferenceRequest {
                 request_id: "planner-request".into(),
                 device_id: "submitter".to_string(),
@@ -1939,14 +1943,13 @@ mod tests {
             &InferenceSchedulingPolicy::default(),
             &[planner_metadata(4, "cpu"), planner_metadata(4, "cpu")],
         )
-        .unwrap_err();
+        .unwrap();
 
-        match err {
-            ApiError::Conflict(message) => {
-                assert!(message.contains("no production-serving workers are available"));
-            }
-            other => panic!("expected conflict, got {other:?}"),
-        }
+        assert_eq!(plan.execution_groups.len(), 2);
+        assert!(plan
+            .execution_groups
+            .iter()
+            .all(|group| group.fast_path_eligible));
     }
 
     #[test]

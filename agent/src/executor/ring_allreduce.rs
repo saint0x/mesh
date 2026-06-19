@@ -22,6 +22,7 @@ use crate::provider::ExecutionProviderKind;
 use candle_core::{backend::BackendStorage, DType, MetalStorage};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::slice;
@@ -81,8 +82,72 @@ pub struct CollectiveMatrix {
 #[derive(Debug, Clone)]
 enum CollectiveMatrixBacking {
     Host(Vec<f32>),
+    PooledHost(PooledHostBuffer),
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MetalShared(MetalStorage),
+}
+
+#[derive(Debug)]
+struct PooledHostBuffer {
+    data: Vec<f32>,
+}
+
+thread_local! {
+    static COLLECTIVE_HOST_BUFFER_POOL: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
+}
+
+impl PooledHostBuffer {
+    fn new(len: usize) -> Self {
+        let data = COLLECTIVE_HOST_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(index) = pool.iter().position(|buffer| buffer.capacity() >= len) {
+                let mut buffer = pool.swap_remove(index);
+                buffer.resize(len, 0.0);
+                buffer
+            } else {
+                vec![0.0; len]
+            }
+        });
+        Self { data }
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        &self.data
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    fn into_vec(mut self) -> Vec<f32> {
+        std::mem::take(&mut self.data)
+    }
+}
+
+impl Clone for PooledHostBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl Drop for PooledHostBuffer {
+    fn drop(&mut self) {
+        if self.data.is_empty() {
+            return;
+        }
+        let mut recycled = Vec::new();
+        std::mem::swap(&mut recycled, &mut self.data);
+        COLLECTIVE_HOST_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < 8 {
+                recycled.clear();
+                recycled.shrink_to_fit();
+                pool.push(recycled);
+            }
+        });
+    }
 }
 
 impl CollectiveMatrix {
@@ -100,6 +165,15 @@ impl CollectiveMatrix {
             rows,
             cols,
             backing: CollectiveMatrixBacking::Host(data),
+        }
+    }
+
+    pub fn from_pooled_host_buffer(rows: usize, cols: usize) -> Self {
+        let len = rows.saturating_mul(cols);
+        Self {
+            rows,
+            cols,
+            backing: CollectiveMatrixBacking::PooledHost(PooledHostBuffer::new(len)),
         }
     }
 
@@ -148,6 +222,7 @@ impl CollectiveMatrix {
     pub fn to_host_vec(&self) -> Vec<f32> {
         match &self.backing {
             CollectiveMatrixBacking::Host(data) => data.clone(),
+            CollectiveMatrixBacking::PooledHost(data) => data.as_slice().to_vec(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
                 slice::from_raw_parts(storage.buffer().contents() as *const f32, self.len())
@@ -160,6 +235,7 @@ impl CollectiveMatrix {
         let len = self.rows.saturating_mul(self.cols);
         match self.backing {
             CollectiveMatrixBacking::Host(data) => data,
+            CollectiveMatrixBacking::PooledHost(data) => data.into_vec(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => {
                 unsafe { slice::from_raw_parts(storage.buffer().contents() as *const f32, len) }
@@ -171,9 +247,22 @@ impl CollectiveMatrix {
     pub fn host_range(&self, range: Range<usize>) -> &[f32] {
         match &self.backing {
             CollectiveMatrixBacking::Host(data) => &data[range],
+            CollectiveMatrixBacking::PooledHost(data) => &data.as_slice()[range],
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
                 &slice::from_raw_parts(storage.buffer().contents() as *const f32, self.len())[range]
+            },
+        }
+    }
+
+    pub fn host_slice_mut(&mut self) -> &mut [f32] {
+        let len = self.rows.saturating_mul(self.cols);
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => data.as_mut_slice(),
+            CollectiveMatrixBacking::PooledHost(data) => data.as_mut_slice(),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)
             },
         }
     }
@@ -182,6 +271,11 @@ impl CollectiveMatrix {
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => {
                 for (dst, src) in data[range].iter_mut().zip(values.iter()) {
+                    *dst += *src;
+                }
+            }
+            CollectiveMatrixBacking::PooledHost(data) => {
+                for (dst, src) in data.as_mut_slice()[range].iter_mut().zip(values.iter()) {
                     *dst += *src;
                 }
             }
@@ -218,6 +312,16 @@ impl CollectiveMatrix {
                     ]));
                 }
             }
+            CollectiveMatrixBacking::PooledHost(data) => {
+                for (dst, chunk) in data.as_mut_slice()[range]
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *dst += f32::from_bits(u32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
+            }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
                 let dst = &mut slice::from_raw_parts_mut(
@@ -239,6 +343,9 @@ impl CollectiveMatrix {
     pub fn copy_range_from_slice(&mut self, range: Range<usize>, values: &[f32]) {
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => data[range].copy_from_slice(values),
+            CollectiveMatrixBacking::PooledHost(data) => {
+                data.as_mut_slice()[range].copy_from_slice(values)
+            }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
                 let dst = &mut slice::from_raw_parts_mut(
@@ -262,6 +369,9 @@ impl CollectiveMatrix {
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => {
                 copy_wire_f32_bytes_into_slice(&mut data[range], payload_bytes);
+            }
+            CollectiveMatrixBacking::PooledHost(data) => {
+                copy_wire_f32_bytes_into_slice(&mut data.as_mut_slice()[range], payload_bytes);
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
