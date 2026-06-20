@@ -1,4 +1,5 @@
 use crate::errors::{AgentError, Result};
+use crate::inference::runtime;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -255,8 +256,14 @@ fn detect_execution_providers_uncached() -> Vec<ExecutionProviderInfo> {
             reason: None,
             contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
         },
-        build_provider_info(ExecutionProviderKind::Metal, probe_metal_provider()),
-        build_provider_info(ExecutionProviderKind::Cuda, probe_cuda_provider()),
+        build_provider_info(
+            ExecutionProviderKind::Metal,
+            runtime::probe_provider(ExecutionProviderKind::Metal),
+        ),
+        build_provider_info(
+            ExecutionProviderKind::Cuda,
+            runtime::probe_provider(ExecutionProviderKind::Cuda),
+        ),
     ]
 }
 
@@ -270,50 +277,6 @@ fn build_provider_info(
         available,
         reason,
         contract: BackendContractDescriptor::for_provider(kind),
-    }
-}
-
-fn probe_metal_provider() -> (bool, Option<String>) {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        match candle_core::Device::new_metal(0) {
-            Ok(_) => (true, None),
-            Err(err) => (false, Some(format!("metal runtime probe failed: {}", err))),
-        }
-    }
-
-    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
-    {
-        (
-            false,
-            Some("metal provider requires Apple Silicon for production support".to_string()),
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        (
-            false,
-            Some("metal provider is only available on macOS".to_string()),
-        )
-    }
-}
-
-fn probe_cuda_provider() -> (bool, Option<String>) {
-    #[cfg(target_os = "linux")]
-    {
-        match candle_core::Device::new_cuda(0) {
-            Ok(_) => (true, None),
-            Err(err) => (false, Some(format!("cuda runtime probe failed: {}", err))),
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        (
-            false,
-            Some("cuda provider is only available on Linux builds".to_string()),
-        )
     }
 }
 

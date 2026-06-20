@@ -7,7 +7,6 @@ use uuid::Uuid;
 use crate::errors::Result;
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use candle_core::Tensor as CandleTensor;
 
 use super::engine::{BackendOptimizationProfile, LocalExecutorContract};
 use super::fast_path::{
@@ -18,12 +17,13 @@ use std::sync::Arc;
 
 use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
+use super::runtime::{runtime_error, sample_tokens_device_with_seeds, DeviceTensor};
 use super::tensor_ops::Tensor1D;
 
 #[derive(Clone)]
 pub enum BackendLogits {
     Host(Tensor1D),
-    Device(CandleTensor),
+    Device(DeviceTensor),
 }
 
 #[async_trait]
@@ -206,15 +206,15 @@ impl BackendMicrobatchExecutor {
     }
 }
 
-/// Shared provider core used by the concrete CPU / Metal / CUDA backends.
-pub struct CandleExecutionBackend {
+/// Shared provider runtime core used by the concrete CPU / Metal / CUDA backends.
+pub(crate) struct ProviderRuntimeCore {
     pub(crate) model_id: String,
     pub(crate) provider: ExecutionProviderKind,
     pub(crate) executor_contract: LocalExecutorContract,
     pub(crate) forward_pass: ForwardPass,
 }
 
-impl CandleExecutionBackend {
+impl ProviderRuntimeCore {
     pub fn new(
         model: Arc<SharedModelResidency>,
         worker_position: u32,
@@ -259,20 +259,18 @@ impl CandleExecutionBackend {
         })
     }
 
-    fn split_logits_rows(logits_2d: &CandleTensor) -> Result<Vec<BackendLogits>> {
+    fn split_logits_rows(logits_2d: &DeviceTensor) -> Result<Vec<BackendLogits>> {
         let dims = logits_2d.dims();
         let mut logits = Vec::with_capacity(dims.first().copied().unwrap_or(0));
         for row_idx in 0..dims.first().copied().unwrap_or(0) {
-            let row = logits_2d.narrow(0, row_idx, 1).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
+            let row = logits_2d.narrow(0, row_idx, 1).map_err(runtime_error)?;
             logits.push(BackendLogits::Device(row));
         }
         Ok(logits)
     }
 
     fn sample_fast_path_logits_batch(
-        logits_2d: &CandleTensor,
+        logits_2d: &DeviceTensor,
         requests: &[DecodeMicrobatchRequest<'_>],
     ) -> Result<Vec<u32>> {
         let dims = logits_2d.dims();
@@ -298,19 +296,15 @@ impl CandleExecutionBackend {
             }
 
             let row_count = end - start;
-            let row_logits = logits_2d.narrow(0, start, row_count).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
+            let row_logits = logits_2d
+                .narrow(0, start, row_count)
+                .map_err(runtime_error)?;
             let seeds = requests[start..end]
                 .iter()
                 .map(|request| request.sampling_seed)
                 .collect::<Vec<_>>();
-            let group_tokens = super::tensor_ops::sample_tokens_device_with_seeds(
-                &row_logits,
-                temperature,
-                top_p,
-                &seeds,
-            )?;
+            let group_tokens =
+                sample_tokens_device_with_seeds(&row_logits, temperature, top_p, &seeds)?;
             sampled_tokens[start..end].copy_from_slice(&group_tokens);
             start = end;
         }
@@ -320,7 +314,7 @@ impl CandleExecutionBackend {
 }
 
 pub struct CpuExecutionBackend {
-    core: CandleExecutionBackend,
+    core: ProviderRuntimeCore,
 }
 
 impl CpuExecutionBackend {
@@ -333,7 +327,7 @@ impl CpuExecutionBackend {
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         Ok(Self {
-            core: CandleExecutionBackend::new_for_provider(
+            core: ProviderRuntimeCore::new_for_provider(
                 ExecutionProviderKind::Cpu,
                 model,
                 worker_position,
@@ -347,7 +341,7 @@ impl CpuExecutionBackend {
 }
 
 pub struct MetalExecutionBackend {
-    core: CandleExecutionBackend,
+    core: ProviderRuntimeCore,
 }
 
 impl MetalExecutionBackend {
@@ -360,7 +354,7 @@ impl MetalExecutionBackend {
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         Ok(Self {
-            core: CandleExecutionBackend::new_for_provider(
+            core: ProviderRuntimeCore::new_for_provider(
                 ExecutionProviderKind::Metal,
                 model,
                 worker_position,
@@ -374,7 +368,7 @@ impl MetalExecutionBackend {
 }
 
 pub struct CudaExecutionBackend {
-    core: CandleExecutionBackend,
+    core: ProviderRuntimeCore,
 }
 
 impl CudaExecutionBackend {
@@ -387,7 +381,7 @@ impl CudaExecutionBackend {
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         Ok(Self {
-            core: CandleExecutionBackend::new_for_provider(
+            core: ProviderRuntimeCore::new_for_provider(
                 ExecutionProviderKind::Cuda,
                 model,
                 worker_position,
@@ -443,7 +437,7 @@ impl ProviderExecutionBackend {
         }
     }
 
-    fn core(&self) -> &CandleExecutionBackend {
+    fn core(&self) -> &ProviderRuntimeCore {
         match self {
             Self::Cpu(backend) => &backend.core,
             Self::Metal(backend) => &backend.core,
@@ -451,7 +445,7 @@ impl ProviderExecutionBackend {
         }
     }
 
-    fn core_mut(&mut self) -> &mut CandleExecutionBackend {
+    fn core_mut(&mut self) -> &mut ProviderRuntimeCore {
         match self {
             Self::Cpu(backend) => &mut backend.core,
             Self::Metal(backend) => &mut backend.core,
@@ -538,7 +532,7 @@ impl ProviderExecutionBackend {
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
         if let Ok(sampled_tokens) =
-            CandleExecutionBackend::sample_fast_path_logits_batch(&logits_2d, requests)
+            ProviderRuntimeCore::sample_fast_path_logits_batch(&logits_2d, requests)
         {
             return Ok(Some(
                 requests
@@ -561,7 +555,7 @@ impl ProviderExecutionBackend {
         );
 
         Ok(Some(
-            CandleExecutionBackend::split_logits_rows(&logits_2d)?
+            ProviderRuntimeCore::split_logits_rows(&logits_2d)?
                 .into_iter()
                 .zip(requests.iter().map(|request| request.session_id))
                 .map(|(logits, session_id)| DecodeMicrobatchOutput {
@@ -664,7 +658,7 @@ impl ExecutionBackend for ProviderExecutionBackend {
 }
 
 #[async_trait]
-impl ExecutionBackend for CandleExecutionBackend {
+impl ExecutionBackend for ProviderRuntimeCore {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }

@@ -52,14 +52,14 @@ pub mod fast_path;
 pub mod forward_pass;
 pub mod job;
 pub mod kv_cache;
+pub mod runtime;
 pub mod stats;
 pub mod tensor_ops;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
 pub use backend::{
-    BackendMicrobatchExecutor, CandleExecutionBackend, CpuExecutionBackend, CudaExecutionBackend,
-    DecodeMicrobatchOutput, DecodeMicrobatchRequest, ExecutionBackend, MetalExecutionBackend,
-    ProviderExecutionBackend,
+    BackendMicrobatchExecutor, CpuExecutionBackend, CudaExecutionBackend, DecodeMicrobatchOutput,
+    DecodeMicrobatchRequest, ExecutionBackend, MetalExecutionBackend, ProviderExecutionBackend,
 };
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{

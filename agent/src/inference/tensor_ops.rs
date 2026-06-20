@@ -9,16 +9,17 @@
 
 use crate::errors::{AgentError, Result};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-#[cfg(target_os = "linux")]
-use candle_core::Storage;
-use candle_core::{CustomOp1, DType, Device, Layout, Shape, Tensor as CandleTensor, D};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use candle_core::{MetalStorage, Result as CandleResult};
-use candle_nn::ops as candle_ops;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::f32::consts::PI;
-use std::sync::{Arc, Mutex, OnceLock};
+
+use super::runtime::{
+    add_tensor2d, apply_rope_tensor2d,
+    collective_matrix_from_device_tensor as collective_buffer_from_candle_2d,
+    device_tensor_from_2d as to_candle_2d,
+    device_tensor_from_collective_matrix as candle_2d_from_collective_buffer, embed_tokens_device,
+    gelu_tensor2d, host_tensor_2d_from_device as from_candle_2d, layer_norm_tensor2d,
+    matmul_tensor2d, mul_tensor2d, narrow_tensor2d_columns, rms_norm_tensor2d, sample_token_device,
+    scale_tensor2d, silu_tensor2d, softmax_tensor2d, transpose_tensor2d,
+};
 
 /// 2D Tensor for transformer computations
 ///
@@ -113,9 +114,7 @@ impl Tensor2D {
             return Tensor2D::new(data, self.rows, self.cols);
         }
 
-        let lhs = to_candle_2d(self)?;
-        let rhs = to_candle_2d(other)?;
-        from_candle_2d(&lhs.broadcast_add(&rhs).map_err(candle_error)?)
+        add_tensor2d(self, other)
     }
 
     /// Element-wise multiplication (Hadamard product)
@@ -137,9 +136,7 @@ impl Tensor2D {
             return Tensor2D::new(data, self.rows, self.cols);
         }
 
-        let lhs = to_candle_2d(self)?;
-        let rhs = to_candle_2d(other)?;
-        from_candle_2d(&lhs.broadcast_mul(&rhs).map_err(candle_error)?)
+        mul_tensor2d(self, other)
     }
 
     /// Scale by a scalar
@@ -151,10 +148,7 @@ impl Tensor2D {
                 cols: self.cols,
             };
         }
-        let tensor = to_candle_2d(self)
-            .and_then(|x| from_candle_2d(&x.affine(scalar as f64, 0.0).map_err(candle_error)?))
-            .expect("GPU tensor scaling failed");
-        tensor
+        scale_tensor2d(self, scalar).expect("GPU tensor scaling failed")
     }
 
     /// Transpose the tensor
@@ -172,10 +166,7 @@ impl Tensor2D {
                 cols: self.rows,
             };
         }
-        let tensor = to_candle_2d(self)
-            .and_then(|x| from_candle_2d(&x.transpose(0, 1).map_err(candle_error)?))
-            .expect("GPU tensor transpose failed");
-        tensor
+        transpose_tensor2d(self).expect("GPU tensor transpose failed")
     }
 
     /// Convert to 1D tensor (flatten)
@@ -206,12 +197,7 @@ impl Tensor2D {
             }
             return Tensor2D::new(data, self.rows, slice_cols);
         }
-        let tensor = to_candle_2d(self)?;
-        from_candle_2d(
-            &tensor
-                .narrow(1, col_start, slice_cols)
-                .map_err(candle_error)?,
-        )
+        narrow_tensor2d_columns(self, col_start, slice_cols)
     }
 }
 
@@ -276,9 +262,7 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
         return Tensor2D::new(out, a.rows, b.cols);
     }
 
-    let lhs = to_candle_2d(a)?;
-    let rhs = to_candle_2d(b)?;
-    from_candle_2d(&lhs.matmul(&rhs).map_err(candle_error)?)
+    matmul_tensor2d(a, b)
 }
 
 // ============== Activation Functions ==============
@@ -288,30 +272,7 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
 /// Used in GPT-2, BERT, and many modern transformers.
 /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
-    let sqrt_2_over_pi = (2.0 / PI).sqrt() as f64;
-    let result = (|| -> Result<Tensor2D> {
-        let x = to_candle_2d(tensor)?;
-        let x3 = x
-            .sqr()
-            .map_err(candle_error)?
-            .broadcast_mul(&x)
-            .map_err(candle_error)?;
-        let inner = x
-            .affine(0.044715, 0.0)
-            .map_err(candle_error)?
-            .broadcast_mul(&x3)
-            .map_err(candle_error)?;
-        let inner = x.broadcast_add(&inner).map_err(candle_error)?;
-        let inner = inner
-            .affine(sqrt_2_over_pi, 0.0)
-            .map_err(candle_error)?
-            .tanh()
-            .map_err(candle_error)?;
-        let one_plus = inner.affine(1.0, 1.0).map_err(candle_error)?;
-        let scaled = x.affine(0.5, 0.0).map_err(candle_error)?;
-        from_candle_2d(&scaled.broadcast_mul(&one_plus).map_err(candle_error)?)
-    })();
-    result.expect("GPU GELU failed")
+    gelu_tensor2d(tensor).expect("GPU GELU failed")
 }
 
 /// SiLU (Sigmoid Linear Unit) / Swish activation
@@ -330,10 +291,7 @@ pub fn silu(tensor: &Tensor2D) -> Tensor2D {
             cols: tensor.cols,
         };
     }
-    let result = to_candle_2d(tensor)
-        .and_then(|x| from_candle_2d(&candle_ops::silu(&x).map_err(candle_error)?))
-        .expect("GPU SiLU failed");
-    result
+    silu_tensor2d(tensor).expect("GPU SiLU failed")
 }
 
 // ============== Normalization ==============
@@ -364,9 +322,7 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
         return Tensor2D::new(out, tensor.rows, tensor.cols);
     }
 
-    let x = to_candle_2d(tensor)?;
-    let weight = to_candle_1d(gamma)?;
-    from_candle_2d(&candle_ops::rms_norm(&x, &weight, eps).map_err(candle_error)?)
+    rms_norm_tensor2d(tensor, gamma, eps)
 }
 
 /// Standard Layer Normalization
@@ -387,10 +343,7 @@ pub fn layer_norm(
         )));
     }
 
-    let x = to_candle_2d(tensor)?;
-    let gamma = to_candle_1d(gamma)?;
-    let beta = to_candle_1d(beta)?;
-    from_candle_2d(&candle_ops::layer_norm(&x, &gamma, &beta, eps).map_err(candle_error)?)
+    layer_norm_tensor2d(tensor, gamma, beta, eps)
 }
 
 // ============== Softmax ==============
@@ -418,10 +371,7 @@ pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
             cols: tensor.cols,
         };
     }
-    let result = to_candle_2d(tensor)
-        .and_then(|x| from_candle_2d(&candle_ops::softmax(&x, 1).map_err(candle_error)?))
-        .expect("GPU softmax failed");
-    result
+    softmax_tensor2d(tensor).expect("GPU softmax failed")
 }
 
 // ============== Token Sampling ==============
@@ -493,146 +443,6 @@ pub fn sample_token(logits: &Tensor1D, temperature: f32, top_p: f32, rng_seed: u
     indexed_probs[0].0 as u32
 }
 
-fn deterministic_sample_threshold(rng_seed: u64) -> f32 {
-    let mut rng_state = rng_seed;
-    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-    ((rng_state >> 33) as f32) / (u32::MAX as f32)
-}
-
-fn deterministic_sample_thresholds_for_seeds(rng_seeds: &[u64]) -> Vec<f32> {
-    rng_seeds
-        .iter()
-        .map(|seed| deterministic_sample_threshold(*seed))
-        .collect()
-}
-
-fn apply_top_p_device(sorted_probs: &CandleTensor, top_p: f32) -> Result<CandleTensor> {
-    let dims = sorted_probs.dims();
-    if dims.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Device top-p sampling expects rank-2 probabilities, got {:?}",
-            dims
-        )));
-    }
-
-    let cumulative = sorted_probs.cumsum(D::Minus1).map_err(candle_error)?;
-    let shifted = cumulative
-        .broadcast_sub(&sorted_probs)
-        .map_err(candle_error)?;
-    let threshold = CandleTensor::full(top_p, dims, sorted_probs.device()).map_err(candle_error)?;
-    let keep_sorted = shifted.lt(&threshold).map_err(candle_error)?;
-    keep_sorted
-        .where_cond(
-            &sorted_probs,
-            &sorted_probs.zeros_like().map_err(candle_error)?,
-        )
-        .map_err(candle_error)
-}
-
-pub(crate) fn sample_tokens_device_with_seeds(
-    logits: &CandleTensor,
-    temperature: f32,
-    top_p: f32,
-    rng_seeds: &[u64],
-) -> Result<Vec<u32>> {
-    let dims = logits.dims();
-    if dims.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Device sampling expects rank-2 logits, got {:?}",
-            dims
-        )));
-    }
-    if dims[0] == 0 || dims[1] == 0 {
-        return Err(AgentError::Execution(
-            "Device sampling received an empty logits tensor".to_string(),
-        ));
-    }
-    if dims[0] != rng_seeds.len() {
-        return Err(AgentError::Execution(format!(
-            "Device sampling received {} rows but {} seeds",
-            dims[0],
-            rng_seeds.len()
-        )));
-    }
-
-    if temperature <= 0.0 || top_p <= 0.0 {
-        return logits
-            .argmax(1)
-            .and_then(|idx| idx.to_vec1::<u32>())
-            .map_err(candle_error);
-    }
-
-    let logits = logits.to_dtype(DType::F32).map_err(candle_error)?;
-    let device = logits.device().clone();
-    let scaled_logits = if temperature == 1.0 {
-        logits
-    } else {
-        logits
-            .affine((1.0 / temperature) as f64, 0.0)
-            .map_err(candle_error)?
-    };
-    let probs = candle_ops::softmax(&scaled_logits, 1).map_err(candle_error)?;
-    let (sorted_probs, sorted_indices) = probs.sort_last_dim(false).map_err(candle_error)?;
-    let filtered_sorted_probs = if top_p >= 1.0 {
-        sorted_probs
-    } else {
-        apply_top_p_device(&sorted_probs, top_p)?
-    };
-    let denom = filtered_sorted_probs.sum_keepdim(1).map_err(candle_error)?;
-    let renormalized = filtered_sorted_probs
-        .broadcast_mul(&denom.recip().map_err(candle_error)?)
-        .map_err(candle_error)?;
-    let cdf = renormalized.cumsum(D::Minus1).map_err(candle_error)?;
-    let thresholds = deterministic_sample_thresholds_for_seeds(rng_seeds);
-    let threshold = CandleTensor::from_vec(thresholds, (dims[0], 1), &device)
-        .map_err(candle_error)?
-        .broadcast_as((dims[0], dims[1]))
-        .map_err(candle_error)?;
-    let crossing = cdf
-        .ge(&threshold)
-        .map_err(candle_error)?
-        .to_dtype(DType::U32)
-        .map_err(candle_error)?;
-    let sampled_sorted = crossing.argmax(1).map_err(candle_error)?;
-    let sampled_token_ids = sorted_indices
-        .gather(&sampled_sorted.unsqueeze(1).map_err(candle_error)?, 1)
-        .and_then(|ids| ids.squeeze(1))
-        .and_then(|ids| ids.to_vec1::<u32>())
-        .map_err(candle_error)?;
-    Ok(sampled_token_ids)
-}
-
-pub(crate) fn sample_tokens_device(
-    logits: &CandleTensor,
-    temperature: f32,
-    top_p: f32,
-    rng_seed: u64,
-) -> Result<Vec<u32>> {
-    let dims = logits.dims();
-    if dims.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Device sampling expects rank-2 logits, got {:?}",
-            dims
-        )));
-    }
-    let seeds = (0..dims[0])
-        .map(|idx| rng_seed.wrapping_add(idx as u64))
-        .collect::<Vec<_>>();
-    sample_tokens_device_with_seeds(logits, temperature, top_p, &seeds)
-}
-
-pub(crate) fn sample_token_device(
-    logits: &CandleTensor,
-    temperature: f32,
-    top_p: f32,
-    rng_seed: u64,
-) -> Result<u32> {
-    sample_tokens_device(logits, temperature, top_p, rng_seed)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AgentError::Execution("Device sampling returned no token ids".to_string()))
-}
-
 /// Greedy sampling (argmax)
 pub fn sample_greedy(logits: &Tensor1D) -> u32 {
     let mut max_idx = 0;
@@ -677,61 +487,7 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
         return Tensor2D::new(data, tokens.len(), embedding_table.cols);
     }
 
-    let table = to_candle_2d(embedding_table)?;
-    let ids = CandleTensor::from_slice(tokens, tokens.len(), execution_device()?)
-        .map_err(candle_error)?;
-    from_candle_2d(&table.embedding(&ids).map_err(candle_error)?)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RopeFrequencyKey {
-    head_dim: usize,
-    base_bits: u32,
-}
-
-fn rope_inverse_frequency(head_dim: usize, half_dim: usize, base: f32) -> Arc<[f32]> {
-    static CACHE: OnceLock<Mutex<HashMap<RopeFrequencyKey, Arc<[f32]>>>> = OnceLock::new();
-    let key = RopeFrequencyKey {
-        head_dim,
-        base_bits: base.to_bits(),
-    };
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .expect("rope inverse frequency cache mutex poisoned");
-    guard
-        .entry(key)
-        .or_insert_with(|| {
-            (0..half_dim)
-                .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
-                .collect::<Vec<_>>()
-                .into()
-        })
-        .clone()
-}
-
-fn rope_positions_tensor(positions: &[u32], rows: usize, device: &Device) -> Result<CandleTensor> {
-    let contiguous = positions
-        .first()
-        .copied()
-        .map(|start| {
-            positions
-                .iter()
-                .enumerate()
-                .all(|(offset, position)| *position == start.saturating_add(offset as u32))
-        })
-        .unwrap_or(true);
-
-    if contiguous {
-        let start = positions.first().copied().unwrap_or_default() as f32;
-        let end = start + rows as f32;
-        return CandleTensor::arange(start, end, device)
-            .and_then(|tensor| tensor.reshape((rows, 1)))
-            .map_err(candle_error);
-    }
-
-    let pos = positions.iter().map(|p| *p as f32).collect::<Vec<_>>();
-    CandleTensor::from_slice(&pos, (rows, 1), device).map_err(candle_error)
+    embed_tokens_device(embedding_table, tokens)
 }
 
 // ============== Rotary Position Embedding (RoPE) ==============
@@ -767,55 +523,7 @@ pub fn apply_rope(
         )));
     }
 
-    let seq_len = tensor.rows;
-    let num_heads = tensor.cols / head_dim;
-    let half_dim = head_dim / 2;
-    let x = to_candle_2d(tensor)?
-        .reshape((seq_len, num_heads, head_dim))
-        .map_err(candle_error)?;
-    let x1 = x.narrow(2, 0, half_dim).map_err(candle_error)?;
-    let x2 = x.narrow(2, half_dim, half_dim).map_err(candle_error)?;
-
-    let device = execution_device()?;
-    let inv_freq = rope_inverse_frequency(head_dim, half_dim, base);
-    let pos = rope_positions_tensor(positions, seq_len, &device)?;
-    let inv = CandleTensor::from_slice(&inv_freq, (1, half_dim), &device).map_err(candle_error)?;
-    let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
-    let cos = freqs
-        .cos()
-        .map_err(candle_error)?
-        .unsqueeze(1)
-        .map_err(candle_error)?
-        .expand((seq_len, num_heads, half_dim))
-        .map_err(candle_error)?;
-    let sin = freqs
-        .sin()
-        .map_err(candle_error)?
-        .unsqueeze(1)
-        .map_err(candle_error)?
-        .expand((seq_len, num_heads, half_dim))
-        .map_err(candle_error)?;
-
-    let rot1 = x1
-        .broadcast_mul(&cos)
-        .map_err(candle_error)?
-        .broadcast_sub(&x2.broadcast_mul(&sin).map_err(candle_error)?)
-        .map_err(candle_error)?;
-    let rot2 = x1
-        .broadcast_mul(&sin)
-        .map_err(candle_error)?
-        .broadcast_add(&x2.broadcast_mul(&cos).map_err(candle_error)?)
-        .map_err(candle_error)?;
-    let rotated = CandleTensor::cat(&[&rot1, &rot2], 2).map_err(candle_error)?;
-    from_candle_2d(
-        &rotated
-            .reshape((seq_len, tensor.cols))
-            .map_err(candle_error)?,
-    )
-}
-
-fn candle_error(err: candle_core::Error) -> AgentError {
-    AgentError::Execution(format!("Tensor backend error: {}", err))
+    apply_rope_tensor2d(tensor, positions, head_dim, base)
 }
 
 #[inline]
@@ -824,304 +532,6 @@ fn is_cpu_provider() -> bool {
         selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
         ExecutionProviderKind::Cpu
     )
-}
-
-pub(crate) fn execution_device() -> Result<&'static Device> {
-    static DEVICE: OnceLock<std::result::Result<Device, String>> = OnceLock::new();
-    match DEVICE.get_or_init(|| init_execution_device().map_err(|e| e.to_string())) {
-        Ok(device) => Ok(device),
-        Err(err) => Err(AgentError::Execution(format!(
-            "Execution backend unavailable: {}",
-            err
-        ))),
-    }
-}
-
-fn init_execution_device() -> std::result::Result<Device, candle_core::Error> {
-    let provider = selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu);
-    match provider {
-        ExecutionProviderKind::Cpu => Ok(Device::Cpu),
-        ExecutionProviderKind::Cuda => {
-            #[cfg(target_os = "linux")]
-            {
-                Device::new_cuda(0)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Err(candle_core::Error::Msg(
-                    "cuda provider is unavailable on this platform".to_string(),
-                ))
-            }
-        }
-        ExecutionProviderKind::Metal => {
-            #[cfg(target_os = "macos")]
-            {
-                Device::new_metal(0)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(candle_core::Error::Msg(
-                    "metal provider is unavailable on this platform".to_string(),
-                ))
-            }
-        }
-    }
-}
-
-pub(crate) fn to_candle_2d(tensor: &Tensor2D) -> Result<CandleTensor> {
-    CandleTensor::from_vec(
-        tensor.data.clone(),
-        (tensor.rows, tensor.cols),
-        execution_device()?,
-    )
-    .map_err(candle_error)
-}
-
-pub(crate) fn to_candle_1d(tensor: &Tensor1D) -> Result<CandleTensor> {
-    CandleTensor::from_vec(tensor.data.clone(), tensor.len(), execution_device()?)
-        .map_err(candle_error)
-}
-
-pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
-    let dims = tensor.dims();
-    if dims.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Expected 2D GPU tensor, got shape {:?}",
-            dims
-        )));
-    }
-    let data = tensor
-        .flatten_all()
-        .map_err(candle_error)?
-        .to_dtype(DType::F32)
-        .map_err(candle_error)?
-        .to_vec1::<f32>()
-        .map_err(candle_error)?;
-    Tensor2D::new(data, dims[0], dims[1])
-}
-
-pub(crate) fn collective_buffer_from_candle_2d(
-    tensor: &CandleTensor,
-) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
-    let dims = tensor.dims();
-    if dims.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Expected 2D GPU tensor for collective buffer conversion, got shape {:?}",
-            dims
-        )));
-    }
-
-    let flattened = tensor
-        .flatten_all()
-        .map_err(candle_error)?
-        .to_dtype(DType::F32)
-        .map_err(candle_error)?
-        .contiguous()
-        .map_err(candle_error)?;
-
-    if let Some(matrix) = collective_buffer_from_dense_cuda_tensor(&flattened, dims[0], dims[1])? {
-        return Ok(matrix);
-    }
-
-    let data = flattened.to_vec1::<f32>().map_err(candle_error)?;
-    Ok(crate::executor::ring_allreduce::CollectiveMatrix::new(
-        data, dims[0], dims[1],
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn collective_buffer_from_dense_cuda_tensor(
-    tensor: &CandleTensor,
-    rows: usize,
-    cols: usize,
-) -> Result<Option<crate::executor::ring_allreduce::CollectiveMatrix>> {
-    let elem_count = tensor.elem_count();
-    let (storage, layout) = tensor.storage_and_layout();
-    if let Storage::Cuda(cuda_storage) = &*storage {
-        if let Some((start, end)) = layout.contiguous_offsets() {
-            let total_len = end.saturating_sub(start);
-            if start == 0 && total_len == elem_count {
-                let src = cuda_storage.as_cuda_slice::<f32>().map_err(candle_error)?;
-                let device = cuda_storage.device();
-                let mut matrix =
-                    crate::executor::ring_allreduce::CollectiveMatrix::from_pooled_host_buffer(
-                        rows, cols,
-                    );
-                device
-                    .memcpy_dtoh(src, matrix.host_slice_mut())
-                    .map_err(candle_error)?;
-                return Ok(Some(matrix));
-            }
-        }
-    }
-    drop(storage);
-    Ok(None)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn collective_buffer_from_dense_cuda_tensor(
-    _tensor: &CandleTensor,
-    _rows: usize,
-    _cols: usize,
-) -> Result<Option<crate::executor::ring_allreduce::CollectiveMatrix>> {
-    Ok(None)
-}
-
-#[cfg(test)]
-pub(crate) fn candle_2d_from_collective_buffer(
-    tensor: &crate::executor::ring_allreduce::CollectiveMatrix,
-) -> Result<CandleTensor> {
-    CandleTensor::from_vec(
-        tensor.to_host_vec(),
-        (tensor.rows, tensor.cols),
-        execution_device()?,
-    )
-    .map_err(candle_error)
-}
-
-pub(crate) fn candle_2d_from_collective_buffer_owned_like(
-    tensor: crate::executor::ring_allreduce::CollectiveMatrix,
-    template: &CandleTensor,
-) -> Result<CandleTensor> {
-    let rows = tensor.rows;
-    let cols = tensor.cols;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(storage) = tensor.metal_shared_storage() {
-        return restore_shared_metal_collective(storage, rows, cols, template)
-            .map_err(candle_error);
-    }
-
-    CandleTensor::from_vec(tensor.into_host_vec(), (rows, cols), template.device())
-        .map_err(candle_error)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
-struct RestoreSharedMetalCollective {
-    storage: MetalStorage,
-    shape: Shape,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl CustomOp1 for RestoreSharedMetalCollective {
-    fn name(&self) -> &'static str {
-        "restore-shared-metal-collective"
-    }
-
-    fn cpu_fwd(
-        &self,
-        _storage: &candle_core::CpuStorage,
-        _layout: &Layout,
-    ) -> CandleResult<(candle_core::CpuStorage, Shape)> {
-        Err(candle_core::Error::Msg(
-            "restore-shared-metal-collective requires a metal tensor".into(),
-        ))
-    }
-
-    fn metal_fwd(
-        &self,
-        _storage: &MetalStorage,
-        _layout: &Layout,
-    ) -> CandleResult<(MetalStorage, Shape)> {
-        Ok((self.storage.clone(), self.shape.clone()))
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn restore_shared_metal_collective(
-    storage: MetalStorage,
-    rows: usize,
-    cols: usize,
-    template: &CandleTensor,
-) -> CandleResult<CandleTensor> {
-    template.apply_op1_no_bwd(&RestoreSharedMetalCollective {
-        storage,
-        shape: Shape::from((rows, cols)),
-    })
-}
-
-pub(crate) fn rms_norm_candle(
-    tensor: &CandleTensor,
-    gamma: &CandleTensor,
-    eps: f32,
-) -> Result<CandleTensor> {
-    candle_ops::rms_norm(tensor, gamma, eps).map_err(candle_error)
-}
-
-pub(crate) fn silu_candle(tensor: &CandleTensor) -> Result<CandleTensor> {
-    candle_ops::silu(tensor).map_err(candle_error)
-}
-
-pub(crate) fn apply_rope_candle(
-    tensor: &CandleTensor,
-    rows: usize,
-    cols: usize,
-    positions: &[u32],
-    head_dim: usize,
-    base: f32,
-) -> Result<CandleTensor> {
-    if rows != positions.len() {
-        return Err(AgentError::Execution(format!(
-            "RoPE position count {} doesn't match sequence length {}",
-            positions.len(),
-            rows
-        )));
-    }
-    if head_dim % 2 != 0 {
-        return Err(AgentError::Execution(format!(
-            "RoPE requires even head_dim, got {}",
-            head_dim
-        )));
-    }
-    if cols % head_dim != 0 {
-        return Err(AgentError::Execution(format!(
-            "RoPE head_dim {} does not divide tensor width {}",
-            head_dim, cols
-        )));
-    }
-
-    let num_heads = cols / head_dim;
-    let half_dim = head_dim / 2;
-    let x = tensor
-        .reshape((rows, num_heads, head_dim))
-        .map_err(candle_error)?;
-    let x1 = x.narrow(2, 0, half_dim).map_err(candle_error)?;
-    let x2 = x.narrow(2, half_dim, half_dim).map_err(candle_error)?;
-
-    let device = execution_device()?;
-    let inv_freq = rope_inverse_frequency(head_dim, half_dim, base);
-    let pos = rope_positions_tensor(positions, rows, &device)?;
-    let inv = CandleTensor::from_slice(&inv_freq, (1, half_dim), &device).map_err(candle_error)?;
-    let freqs = pos.broadcast_matmul(&inv).map_err(candle_error)?;
-    let cos = freqs
-        .cos()
-        .map_err(candle_error)?
-        .unsqueeze(1)
-        .map_err(candle_error)?
-        .expand((rows, num_heads, half_dim))
-        .map_err(candle_error)?;
-    let sin = freqs
-        .sin()
-        .map_err(candle_error)?
-        .unsqueeze(1)
-        .map_err(candle_error)?
-        .expand((rows, num_heads, half_dim))
-        .map_err(candle_error)?;
-
-    let rot1 = x1
-        .broadcast_mul(&cos)
-        .map_err(candle_error)?
-        .broadcast_sub(&x2.broadcast_mul(&sin).map_err(candle_error)?)
-        .map_err(candle_error)?;
-    let rot2 = x1
-        .broadcast_mul(&sin)
-        .map_err(candle_error)?
-        .broadcast_add(&x2.broadcast_mul(&cos).map_err(candle_error)?)
-        .map_err(candle_error)?;
-    CandleTensor::cat(&[&rot1, &rot2], 2)
-        .map_err(candle_error)?
-        .reshape((rows, cols))
-        .map_err(candle_error)
 }
 
 #[cfg(test)]

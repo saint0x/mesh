@@ -46,7 +46,6 @@
 
 use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
-use candle_core::{DType, Tensor as CandleTensor};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -58,11 +57,18 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
+use super::runtime::{
+    apply_rope_device as apply_rope_candle,
+    collective_matrix_from_device_tensor as collective_buffer_from_candle_2d,
+    device_tensor_from_1d as to_candle_1d, device_tensor_from_2d as to_candle_2d,
+    device_tensor_from_collective_owned_like as candle_2d_from_collective_buffer_owned_like,
+    host_tensor_2d_from_device as from_candle_2d, rms_norm_device as rms_norm_candle,
+    runtime_error as device_error, sample_token_device, silu_device as silu_candle, softmax_device,
+    DeviceDType as DType, DeviceTensor as CandleTensor, RuntimeDevice,
+};
 use super::tensor_ops::{
-    apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
-    collective_buffer_from_candle_2d, embed_tokens, from_candle_2d, matmul, rms_norm,
-    rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
-    to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
+    apply_rope, embed_tokens, matmul, rms_norm, sample_greedy, sample_token, silu, Tensor1D,
+    Tensor2D,
 };
 use crate::inference::backend::BackendLogits;
 use crate::inference::fast_path::{DecodeWorkspaceLease, PrefillWorkspaceLease};
@@ -247,7 +253,7 @@ struct DeviceKVPage {
 }
 
 impl DeviceKVPage {
-    fn new(page_rows: usize, cols: usize, device: &candle_core::Device) -> Result<Self> {
+    fn new(page_rows: usize, cols: usize, device: &RuntimeDevice) -> Result<Self> {
         Ok(Self {
             keys: CandleTensor::zeros((page_rows, cols), DType::F32, device)
                 .map_err(device_error)?,
@@ -315,7 +321,7 @@ impl DeviceLayerKVCache {
         Ok(())
     }
 
-    fn ensure_writable_tail(&mut self, cols: usize, device: &candle_core::Device) -> Result<usize> {
+    fn ensure_writable_tail(&mut self, cols: usize, device: &RuntimeDevice) -> Result<usize> {
         self.ensure_page_shape(cols)?;
 
         if self.block_table.is_empty() {
@@ -728,7 +734,7 @@ impl DeviceKVCache {
         q_rows: usize,
         cached_seq_len: usize,
         cache_prefix_len: usize,
-        device: &candle_core::Device,
+        device: &RuntimeDevice,
     ) -> Result<CandleTensor> {
         let key = (q_rows, cached_seq_len, cache_prefix_len);
         if let Some(mask) = self.causal_mask_cache.get(&key) {
@@ -1135,7 +1141,7 @@ struct DeviceModelWeights {
     lm_head: CandleTensor,
 }
 
-fn candle_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
+fn device_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
     tensor
         .dims()
         .iter()
@@ -1146,12 +1152,12 @@ fn candle_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
 
 impl DeviceLayerWeights {
     fn memory_usage_bytes(&self) -> usize {
-        candle_tensor_memory_usage_bytes(&self.w_qkv)
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_o))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate_up))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_down))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.attn_norm))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.mlp_norm))
+        device_tensor_memory_usage_bytes(&self.w_qkv)
+            .saturating_add(device_tensor_memory_usage_bytes(&self.w_o))
+            .saturating_add(device_tensor_memory_usage_bytes(&self.w_gate_up))
+            .saturating_add(device_tensor_memory_usage_bytes(&self.w_down))
+            .saturating_add(device_tensor_memory_usage_bytes(&self.attn_norm))
+            .saturating_add(device_tensor_memory_usage_bytes(&self.mlp_norm))
     }
 }
 
@@ -1190,15 +1196,15 @@ impl DeviceModelWeights {
     }
 
     fn memory_usage_bytes(&self) -> usize {
-        candle_tensor_memory_usage_bytes(&self.embedding)
+        device_tensor_memory_usage_bytes(&self.embedding)
             .saturating_add(
                 self.layers
                     .iter()
                     .map(DeviceLayerWeights::memory_usage_bytes)
                     .sum(),
             )
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.final_norm))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.lm_head))
+            .saturating_add(device_tensor_memory_usage_bytes(&self.final_norm))
+            .saturating_add(device_tensor_memory_usage_bytes(&self.lm_head))
     }
 }
 
@@ -1526,7 +1532,7 @@ impl ForwardPass {
             "Layer O partial ready; entering first ring all-reduce"
         );
         let o_full = self
-            .ring_allreduce_candle(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
+            .ring_allreduce_device(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
             .await?;
         info!(
             layer_idx,
@@ -1555,7 +1561,7 @@ impl ForwardPass {
             "Layer MLP down partial ready; entering second ring all-reduce"
         );
         let down_full = self
-            .ring_allreduce_candle(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
+            .ring_allreduce_device(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
             .await?;
         info!(
             layer_idx,
@@ -1698,8 +1704,8 @@ impl ForwardPass {
 
     /// Provider-accelerated decode microbatch path used by the serving fast
     /// path once bucket and metadata invariants have been validated.
-    pub async fn fast_path_decode_microbatch(
-        backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
+    pub(crate) async fn fast_path_decode_microbatch(
+        backends: &mut [&mut crate::inference::backend::ProviderRuntimeCore],
         tokens: &[u32],
         job_ids: &[Uuid],
         worker_ring: &mut WorkerRing<'_>,
@@ -1798,7 +1804,7 @@ impl ForwardPass {
             let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
-            let o_full = Self::ring_allreduce_candle_batch(
+            let o_full = Self::ring_allreduce_device_batch(
                 &o_partial,
                 worker_ring,
                 batch_job_id,
@@ -1822,7 +1828,7 @@ impl ForwardPass {
             let down_partial = mlp_hidden.matmul(&layer.w_down).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
-            let down_full = Self::ring_allreduce_candle_batch(
+            let down_full = Self::ring_allreduce_device_batch(
                 &down_partial,
                 worker_ring,
                 batch_job_id,
@@ -1851,7 +1857,7 @@ impl ForwardPass {
 
     /// Materialize a single collective buffer from a device tensor and restore
     /// the reduced result directly back onto the execution device.
-    async fn ring_allreduce_candle(
+    async fn ring_allreduce_device(
         &mut self,
         tensor: &CandleTensor,
         worker_ring: &mut WorkerRing<'_>,
@@ -1890,7 +1896,7 @@ impl ForwardPass {
         candle_2d_from_collective_buffer_owned_like(reduced, tensor)
     }
 
-    async fn ring_allreduce_candle_batch(
+    async fn ring_allreduce_device_batch(
         tensor: &CandleTensor,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
@@ -2122,7 +2128,7 @@ fn attention_output_device(
 }
 
 fn attention_output_device_batch_from_backends(
-    backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
+    backends: &mut [&mut crate::inference::backend::ProviderRuntimeCore],
     config: &ModelConfig,
     attention_layout: AttentionShardLayout,
     layer_idx: usize,
@@ -2327,7 +2333,7 @@ fn attention_output_device_cached_with_precomputed_query(
         .map_err(device_error)?;
     let full_prefix_visible = q_rows == 1 && cache_prefix_len + 1 == selected_heads.seq_len;
     let probs = if full_prefix_visible {
-        candle_nn::ops::softmax(&scores, 2).map_err(device_error)?
+        softmax_device(&scores, 2)?
     } else {
         let mask = kv_cache.causal_attention_mask(
             q_rows,
@@ -2336,7 +2342,7 @@ fn attention_output_device_cached_with_precomputed_query(
             q_rope.device(),
         )?;
         let masked = scores.broadcast_add(&mask).map_err(device_error)?;
-        candle_nn::ops::softmax(&masked, 2).map_err(device_error)?
+        softmax_device(&masked, 2)?
     };
     probs
         .matmul(&selected_heads.values)
@@ -2397,8 +2403,7 @@ fn attention_output_device_cached_single_query_from_heads(
         .map_err(device_error)?
         .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
         .map_err(device_error)?;
-    candle_nn::ops::softmax(&scores, 2)
-        .map_err(device_error)?
+    softmax_device(&scores, 2)?
         .matmul(&selected_heads.values)
         .map_err(device_error)?
         .transpose(0, 1)
@@ -2442,10 +2447,6 @@ fn collective_batch_job_id(job_ids: &[Uuid]) -> Uuid {
         }
     }
     Uuid::from_bytes(batch_seed)
-}
-
-fn device_error(err: candle_core::Error) -> AgentError {
-    AgentError::Execution(format!("GPU tensor backend error: {}", err))
 }
 
 /// Simplified forward pass for testing without ring all-reduce
@@ -2612,7 +2613,7 @@ impl LocalForwardPass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::backend::CandleExecutionBackend;
+    use crate::inference::backend::ProviderRuntimeCore;
     use crate::inference::engine::InferenceRuntimeMode;
     use crate::network::{TensorPlane, TensorPlaneConfig};
     use crate::provider::ExecutionProviderKind;
@@ -3010,7 +3011,7 @@ mod tests {
             max_seq_len: 8,
         };
         let mut kv_cache = DeviceKVCache::new(config);
-        let device = candle_core::Device::Cpu;
+        let device = RuntimeDevice::Cpu;
 
         let first = kv_cache.causal_attention_mask(3, 5, 2, &device).unwrap();
         let second = kv_cache.causal_attention_mask(3, 5, 2, &device).unwrap();
@@ -3067,7 +3068,7 @@ mod tests {
             max_seq_len: 8,
         };
         let mut kv_cache = DeviceKVCache::new(config);
-        let selection = CandleTensor::new(&[1u32, 0u32], &candle_core::Device::Cpu).unwrap();
+        let selection = CandleTensor::new(&[1u32, 0u32], &RuntimeDevice::Cpu).unwrap();
         let first_keys = to_candle_2d(&Tensor2D::filled(2, 4, 1.0)).unwrap();
         let first_values = to_candle_2d(&Tensor2D::filled(2, 4, 2.0)).unwrap();
         kv_cache
@@ -3102,7 +3103,7 @@ mod tests {
             SharedModelResidency::from_host(create_test_weights(&config, config.hidden_dim))
                 .unwrap(),
         );
-        let mut backend_a = CandleExecutionBackend::new(
+        let mut backend_a = ProviderRuntimeCore::new(
             Arc::clone(&residency),
             0,
             0,
@@ -3111,7 +3112,7 @@ mod tests {
             std::time::Duration::from_secs(30),
         )
         .unwrap();
-        let mut backend_b = CandleExecutionBackend::new(
+        let mut backend_b = ProviderRuntimeCore::new(
             Arc::clone(&residency),
             0,
             0,
