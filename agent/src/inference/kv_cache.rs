@@ -4,6 +4,7 @@
 //! The KV cache stores computed key and value tensors from previous positions,
 //! allowing efficient autoregressive generation without recomputing past states.
 
+use super::stats::{record_runtime_kv_snapshot_export, record_runtime_kv_snapshot_materialization};
 use super::tensor_ops::Tensor2D;
 use crate::errors::{AgentError, Result};
 use serde::{Deserialize, Serialize};
@@ -75,16 +76,20 @@ pub struct KVCacheBlob {
 
 impl KVCacheBlob {
     pub fn from_cache(cache: &KVCache) -> Result<Self> {
+        let bytes = cache.to_bytes()?;
+        record_runtime_kv_snapshot_export(bytes.len() as u64);
         Ok(Self {
             encoding: KVCacheEncoding::FullSnapshotCbor,
-            bytes: cache.to_bytes()?,
+            bytes,
         })
     }
 
     pub fn decode(&self) -> Result<KVCache> {
-        match self.encoding {
+        let cache = match self.encoding {
             KVCacheEncoding::FullSnapshotCbor => KVCache::from_bytes(&self.bytes),
-        }
+        }?;
+        record_runtime_kv_snapshot_materialization(self.bytes.len() as u64);
+        Ok(cache)
     }
 
     pub fn size_bytes(&self) -> u64 {
@@ -422,9 +427,12 @@ impl LayerKVCache {
         if let (Some(keys), Some(values)) = (&mut self.keys, &mut self.values) {
             let kv_dim = keys.cols;
             let new_data_len = max_len * kv_dim;
+            let drop_values = (self.seq_len - max_len) * kv_dim;
 
+            keys.data.copy_within(drop_values.., 0);
             keys.data.truncate(new_data_len);
             keys.rows = max_len;
+            values.data.copy_within(drop_values.., 0);
             values.data.truncate(new_data_len);
             values.rows = max_len;
             self.seq_len = max_len;
@@ -626,8 +634,10 @@ impl KVCache {
             if let (Some(keys), Some(values)) = (&mut layer.keys, &mut layer.values) {
                 let kv_dim = keys.cols;
                 let drop_values = drop_rows * kv_dim;
-                keys.data.drain(0..drop_values);
-                values.data.drain(0..drop_values);
+                keys.data.copy_within(drop_values.., 0);
+                keys.data.truncate(max_len * kv_dim);
+                values.data.copy_within(drop_values.., 0);
+                values.data.truncate(max_len * kv_dim);
                 keys.rows = max_len;
                 values.rows = max_len;
                 layer.seq_len = max_len;
@@ -789,6 +799,36 @@ mod tests {
         cache.retain_suffix(10);
         assert_eq!(cache.seq_len(), 10);
         assert_eq!(cache.base_position(), 10);
+    }
+
+    #[test]
+    fn test_kv_cache_retain_suffix_preserves_tail_data() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 2,
+            max_seq_len: 16,
+        };
+        let mut cache = KVCache::new(config);
+
+        let keys = Tensor2D::new((0..12).map(|value| value as f32).collect(), 6, 2).unwrap();
+        let values = Tensor2D::new((100..112).map(|value| value as f32).collect(), 6, 2).unwrap();
+        cache.update_layer(0, keys, values).unwrap();
+
+        cache.retain_suffix(3);
+
+        let (keys, values) = cache.get_layer_kv(0).unwrap();
+        assert_eq!(keys.rows, 3);
+        assert_eq!(values.rows, 3);
+        assert_eq!(
+            keys.data,
+            (6..12).map(|value| value as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            values.data,
+            (106..112).map(|value| value as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(cache.base_position(), 3);
     }
 
     #[test]

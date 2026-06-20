@@ -5436,11 +5436,29 @@ async fn cmd_inference_stats() -> Result<()> {
             rate.as_f64().unwrap_or(0.0) * 100.0
         );
     }
+    if let Some(rate) = stats.get("device_resident_collective_rate") {
+        println!(
+            "  Device Resident:  {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("collective_host_materialization_rate") {
+        println!(
+            "  Host Materialized:{:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
     if let Some(share) = stats.get("collective_wait_share_of_collective_runtime") {
         println!(
             "  Coll Wait Share:  {:.1}%",
             share.as_f64().unwrap_or(0.0) * 100.0
         );
+    }
+    if let Some(events) = stats.get("collective_host_staging_events") {
+        println!("  Host Staging Evts: {}", events);
+    }
+    if let Some(bytes) = stats.get("collective_host_staging_bytes") {
+        println!("  Host Staging Bytes: {}", bytes);
     }
 
     println!("\n{}", "Decode Batching:".bold());
@@ -5464,6 +5482,78 @@ async fn cmd_inference_stats() -> Result<()> {
     }
     if let Some(avg) = stats.get("avg_deferred_sessions_per_microbatch") {
         println!("  Avg Deferred/Btch: {:.2}", avg.as_f64().unwrap_or(0.0));
+    }
+
+    println!("\n{}", "KV Residency:".bold());
+    if let Some(exports) = stats.get("kv_snapshot_exports") {
+        println!("  Snapshot Exports:  {}", exports);
+    }
+    if let Some(bytes) = stats.get("kv_snapshot_export_bytes") {
+        println!("  Export Bytes:      {}", bytes);
+    }
+    if let Some(materializations) = stats.get("kv_snapshot_materializations") {
+        println!("  Materializations:  {}", materializations);
+    }
+    if let Some(bytes) = stats.get("kv_snapshot_materialized_bytes") {
+        println!("  Materialized Bytes: {}", bytes);
+    }
+    if let Some(bytes) = stats.get("kv_snapshot_avg_export_bytes") {
+        println!("  Avg Export Bytes:  {:.2}", bytes.as_f64().unwrap_or(0.0));
+    }
+    if let Some(bytes) = stats.get("kv_snapshot_avg_materialized_bytes") {
+        println!("  Avg Materialized:  {:.2}", bytes.as_f64().unwrap_or(0.0));
+    }
+
+    println!("\n{}", "Sampling:".bold());
+    if let Some(requests) = stats.get("device_sampling_requests") {
+        println!("  Device Requests:   {}", requests);
+    }
+    if let Some(fallbacks) = stats.get("device_sampling_fallback_requests") {
+        println!("  Device Fallbacks:  {}", fallbacks);
+    }
+    if let Some(requests) = stats.get("host_sampling_requests") {
+        println!("  Host Requests:     {}", requests);
+    }
+    if let Some(ms) = stats.get("total_sampling_time_ms") {
+        println!("  Sampling Time:     {}ms", ms);
+    }
+    if let Some(share) = stats.get("sampling_share_of_runtime") {
+        println!(
+            "  Sampling Share:    {:.1}%",
+            share.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("device_sampling_fallback_rate") {
+        println!(
+            "  Fallback Rate:     {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(latency) = stats.get("avg_generated_token_latency_ms") {
+        println!(
+            "  Token Latency:     {:.3}ms",
+            latency.as_f64().unwrap_or(0.0)
+        );
+    }
+
+    println!("\n{}", "KV View Reuse:".bold());
+    if let Some(rate) = stats.get("device_kv_active_view_cache_hit_rate") {
+        println!(
+            "  Active View Hit:   {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("device_kv_head_view_cache_hit_rate") {
+        println!(
+            "  Head View Hit:     {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
+    }
+    if let Some(rate) = stats.get("device_kv_selected_head_view_cache_hit_rate") {
+        println!(
+            "  Selected View Hit: {:.1}%",
+            rate.as_f64().unwrap_or(0.0) * 100.0
+        );
     }
 
     println!("\n{}", "Fault Tolerance:".bold());

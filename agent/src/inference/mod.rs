@@ -63,12 +63,12 @@ pub use backend::{
 };
 pub use coordinator::{InferenceConfig, InferenceCoordinator};
 pub use engine::{
-    BackendInstanceSpec, BackendOptimizationProfile, DecodeBatchPlan, DecodeBatchPolicy,
-    DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase, ExecutorPhasePlan,
-    FusedKernelStage, HostKernel, InferenceRuntimeMode, KvRuntimeContract, KvTransferPolicy,
-    LocalExecutorClass, LocalExecutorContract, RuntimeMemoryBudget, SessionAssignment,
-    SessionEvictionReason, SessionEvictionState, SessionPauseReason, SessionPauseState,
-    SessionRuntimeStatus, TransportCapabilityTier,
+    BackendInstanceSpec, BackendOptimizationProfile, CollectiveResidency, DecodeBatchPlan,
+    DecodeBatchPolicy, DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase,
+    ExecutorPhasePlan, FusedKernelStage, HostKernel, InferenceRuntimeMode, KvRuntimeContract,
+    KvTransferPolicy, LocalExecutorClass, LocalExecutorContract, RuntimeMemoryBudget,
+    SessionAssignment, SessionEvictionReason, SessionEvictionState, SessionPauseReason,
+    SessionPauseState, SessionRuntimeStatus, TransportCapabilityTier,
 };
 #[allow(unused_imports)]
 pub use fast_path::{

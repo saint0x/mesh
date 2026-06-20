@@ -1,8 +1,9 @@
 //! Tensor-Parallel Forward Pass Implementation
 //!
-//! This module implements the actual tensor-parallel forward pass for transformer inference.
-//! Each worker holds a column shard of the model weights and participates in ring all-reduce
-//! to produce identical activations across all workers.
+//! This module implements the tensor-parallel forward pass used by the production inference
+//! runtime. Each worker holds a column shard of the model weights, executes backend-native local
+//! projection and KV work, and only synchronizes at the explicit residual boundaries that require
+//! globally identical activations.
 //!
 //! ## Forward Pass Flow (per layer)
 //!
@@ -11,33 +12,33 @@
 //!        │
 //!        ▼
 //! ┌─────────────────────────────────────────────────────┐
-//! │ 1. Partial Attention (my columns only)              │
-//! │    Q_partial = hidden @ W_q[my_cols]                │
-//! │    K_partial = hidden @ W_k[my_cols]                │
-//! │    V_partial = hidden @ W_v[my_cols]                │
+//! │ 1. Local Attention Preparation                      │
+//! │    normed = rms_norm(hidden)                        │
+//! │    Q_local, K_local, V_local = normed @ W_qkv       │
+//! │    apply RoPE + append paged KV cache               │
 //! └─────────────────────────────────────────────────────┘
 //!        │
 //!        ▼
 //! ┌─────────────────────────────────────────────────────┐
-//! │ 2. Ring All-Reduce (combine partials)               │
-//! │    Q_full = ring_allreduce(Q_partial)               │
-//! │    K_full = ring_allreduce(K_partial)               │
-//! │    V_full = ring_allreduce(V_partial)               │
+//! │ 2. Local Attention Compute                          │
+//! │    attn_output = attention(Q_local, cached KV)      │
+//! │    O_partial = attn_output @ W_o[my_cols]           │
 //! └─────────────────────────────────────────────────────┘
 //!        │
 //!        ▼
 //! ┌─────────────────────────────────────────────────────┐
-//! │ 3. Attention Computation (identical on all workers) │
-//! │    scores = softmax(Q @ K^T / sqrt(d))              │
-//! │    attn_output = scores @ V                         │
+//! │ 3. Residual Synchronization                         │
+//! │    O_full = ring_allreduce(O_partial)               │
+//! │    post_attn = hidden + O_full                      │
 //! └─────────────────────────────────────────────────────┘
 //!        │
 //!        ▼
 //! ┌─────────────────────────────────────────────────────┐
-//! │ 4. MLP (my columns only + all-reduce)               │
-//! │    mlp_partial = attn_output @ W_mlp[my_cols]       │
-//! │    mlp_full = ring_allreduce(mlp_partial)           │
-//! │    output = activation(mlp_full) @ W_down          │
+//! │ 4. Local MLP + Residual Synchronization             │
+//! │    down_partial = swiglu(rms_norm(post_attn))       │
+//! │                   @ W_down[my_cols]                 │
+//! │    down_full = ring_allreduce(down_partial)         │
+//! │    output = post_attn + down_full                   │
 //! └─────────────────────────────────────────────────────┘
 //!        │
 //!        ▼
@@ -52,19 +53,25 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::runtime::{Handle, RuntimeFlavor};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use super::engine::CollectiveResidency;
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
 use super::runtime::{
-    apply_rope_device as apply_rope_candle,
-    collective_matrix_from_device_tensor as collective_buffer_from_candle_2d,
-    device_tensor_from_1d as to_candle_1d, device_tensor_from_2d as to_candle_2d,
-    device_tensor_from_collective_owned_like as candle_2d_from_collective_buffer_owned_like,
-    host_tensor_2d_from_device as from_candle_2d, rms_norm_device as rms_norm_candle,
-    runtime_error as device_error, sample_token_device, silu_device as silu_candle, softmax_device,
-    DeviceDType as DType, DeviceTensor as CandleTensor, RuntimeDevice,
+    apply_rope_device as apply_rope_candle, device_tensor_from_1d as to_candle_1d,
+    device_tensor_from_2d as to_candle_2d, host_tensor_2d_from_device as from_candle_2d,
+    rms_norm_device as rms_norm_candle, runtime_error as device_error, sample_token_device,
+    silu_device as silu_candle, softmax_device, DeviceCollectiveBuffer, DeviceDType as DType,
+    DeviceTensor as CandleTensor, RuntimeDevice,
+};
+use super::stats::{
+    record_runtime_device_kv_active_view_cache_hit,
+    record_runtime_device_kv_active_view_cache_miss, record_runtime_device_kv_head_view_cache_hit,
+    record_runtime_device_kv_head_view_cache_miss,
+    record_runtime_device_kv_selected_head_view_cache_hit,
+    record_runtime_device_kv_selected_head_view_cache_miss, record_runtime_device_sampling,
+    record_runtime_host_sampling,
 };
 use super::tensor_ops::{
     apply_rope, embed_tokens, matmul, rms_norm, sample_greedy, sample_token, silu, Tensor1D,
@@ -72,15 +79,6 @@ use super::tensor_ops::{
 };
 use crate::inference::backend::BackendLogits;
 use crate::inference::fast_path::{DecodeWorkspaceLease, PrefillWorkspaceLease};
-
-fn run_in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
-    match Handle::try_current() {
-        Ok(handle) if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
-}
 
 /// Weights for a single transformer layer (sharded)
 ///
@@ -276,21 +274,41 @@ struct SelectedDeviceKvHeads {
 }
 
 #[derive(Clone)]
+struct CachedSelectedDeviceKvHeads {
+    selection_signature: u64,
+    local_kv_head_indices: CandleTensor,
+    local_kv_heads: usize,
+    head_dim: usize,
+    keys_for_scores: CandleTensor,
+    values: CandleTensor,
+    seq_len: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DevicePageSpan {
+    page_index: usize,
+    start_row: usize,
+    row_count: usize,
+}
+
+#[derive(Clone)]
 struct DeviceLayerKVCache {
     pages: Vec<DeviceKVPage>,
-    block_table: Vec<usize>,
+    free_pages: Vec<usize>,
+    block_table: Vec<DevicePageSpan>,
     seq_len: usize,
     cols: usize,
     page_rows: usize,
     cached_active: Option<(CandleTensor, CandleTensor, usize)>,
     cached_heads: Option<(CandleTensor, CandleTensor, usize, usize)>,
-    cached_selected_heads: Option<(u64, CandleTensor, CandleTensor, usize)>,
+    cached_selected_heads: Option<CachedSelectedDeviceKvHeads>,
 }
 
 impl DeviceLayerKVCache {
     fn new(page_rows: usize) -> Self {
         Self {
             pages: Vec::new(),
+            free_pages: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
             cols: 0,
@@ -325,27 +343,84 @@ impl DeviceLayerKVCache {
         self.ensure_page_shape(cols)?;
 
         if self.block_table.is_empty() {
-            if self.pages.is_empty() {
-                self.pages
-                    .push(DeviceKVPage::new(self.page_rows, cols, device)?);
-            }
-            self.block_table.push(0);
-            return Ok(0);
+            let page_index = self.allocate_page(cols, device)?;
+            self.block_table.push(DevicePageSpan {
+                page_index,
+                start_row: 0,
+                row_count: 0,
+            });
+            return Ok(page_index);
         }
 
-        let tail_index = *self
-            .block_table
-            .last()
-            .ok_or_else(|| AgentError::Execution("Device KV block table is empty".to_string()))?;
-        if self.pages[tail_index].free_rows(self.page_rows) > 0 {
-            return Ok(tail_index);
+        let tail_span =
+            self.block_table.last().copied().ok_or_else(|| {
+                AgentError::Execution("Device KV block table is empty".to_string())
+            })?;
+        let tail_page = self.pages.get(tail_span.page_index).ok_or_else(|| {
+            AgentError::Execution(format!(
+                "Invalid device KV page index {}",
+                tail_span.page_index
+            ))
+        })?;
+        let tail_end = tail_span.start_row.saturating_add(tail_span.row_count);
+        if tail_end != tail_page.used_rows {
+            return Err(AgentError::Execution(format!(
+                "Device KV tail span for page {} is inconsistent: span end {} vs used_rows {}",
+                tail_span.page_index, tail_end, tail_page.used_rows
+            )));
+        }
+        if tail_page.free_rows(self.page_rows) > 0 {
+            return Ok(tail_span.page_index);
         }
 
-        let new_index = self.pages.len();
+        let page_index = self.allocate_page(cols, device)?;
+        self.block_table.push(DevicePageSpan {
+            page_index,
+            start_row: 0,
+            row_count: 0,
+        });
+        Ok(page_index)
+    }
+
+    fn allocate_page(&mut self, cols: usize, device: &RuntimeDevice) -> Result<usize> {
+        self.ensure_page_shape(cols)?;
+        if let Some(page_index) = self.free_pages.pop() {
+            let page = self.pages.get_mut(page_index).ok_or_else(|| {
+                AgentError::Execution(format!("Invalid free device KV page index {}", page_index))
+            })?;
+            page.used_rows = 0;
+            return Ok(page_index);
+        }
+
+        let page_index = self.pages.len();
         self.pages
             .push(DeviceKVPage::new(self.page_rows, cols, device)?);
-        self.block_table.push(new_index);
-        Ok(new_index)
+        Ok(page_index)
+    }
+
+    fn release_page(&mut self, page_index: usize) -> Result<()> {
+        let page = self.pages.get_mut(page_index).ok_or_else(|| {
+            AgentError::Execution(format!("Invalid device KV page index {}", page_index))
+        })?;
+        page.used_rows = 0;
+        if !self.free_pages.contains(&page_index) {
+            self.free_pages.push(page_index);
+        }
+        Ok(())
+    }
+
+    fn reclaim_unused_pages(&mut self) -> Result<()> {
+        let referenced = self
+            .block_table
+            .iter()
+            .map(|span| span.page_index)
+            .collect::<std::collections::HashSet<_>>();
+        for page_index in 0..self.pages.len() {
+            if !referenced.contains(&page_index) && self.pages[page_index].used_rows != 0 {
+                self.release_page(page_index)?;
+            }
+        }
+        Ok(())
     }
 
     fn append(&mut self, new_keys: &CandleTensor, new_values: &CandleTensor) -> Result<()> {
@@ -366,7 +441,7 @@ impl DeviceLayerKVCache {
 
         let new_rows = key_dims[0];
         let cols = key_dims[1];
-        self.invalidate_active_cache();
+        let cache_updates = self.prepare_append_cache_updates(new_keys, new_values)?;
         let mut appended_rows = 0;
         while appended_rows < new_rows {
             let page_index = self.ensure_writable_tail(cols, new_keys.device())?;
@@ -392,10 +467,131 @@ impl DeviceLayerKVCache {
                 .slice_assign(row_ranges, &value_chunk)
                 .map_err(device_error)?;
             page.used_rows += copy_rows;
+            let tail_span = self.block_table.last_mut().ok_or_else(|| {
+                AgentError::Execution("Device KV block table unexpectedly empty".to_string())
+            })?;
+            if tail_span.page_index != page_index {
+                return Err(AgentError::Execution(format!(
+                    "Device KV tail span/page mismatch: span page {} vs active page {}",
+                    tail_span.page_index, page_index
+                )));
+            }
+            tail_span.row_count += copy_rows;
             appended_rows += copy_rows;
             self.seq_len += copy_rows;
         }
+        self.apply_append_cache_updates(cache_updates);
         Ok(())
+    }
+
+    fn prepare_append_cache_updates(
+        &self,
+        new_keys: &CandleTensor,
+        new_values: &CandleTensor,
+    ) -> Result<AppendCacheUpdates> {
+        let active = self.extend_cached_active(new_keys, new_values)?;
+        let heads = self.extend_cached_heads(new_keys, new_values)?;
+        let selected = self.extend_cached_selected_heads(new_keys, new_values)?;
+        Ok(AppendCacheUpdates {
+            active,
+            heads,
+            selected,
+        })
+    }
+
+    fn apply_append_cache_updates(&mut self, updates: AppendCacheUpdates) {
+        self.cached_active = updates.active;
+        self.cached_heads = updates.heads;
+        self.cached_selected_heads = updates.selected;
+    }
+
+    fn extend_cached_active(
+        &self,
+        new_keys: &CandleTensor,
+        new_values: &CandleTensor,
+    ) -> Result<Option<(CandleTensor, CandleTensor, usize)>> {
+        let Some((cached_keys, cached_values, cached_seq_len)) = &self.cached_active else {
+            return Ok(None);
+        };
+        let keys = concat_rows(cached_keys, new_keys)?;
+        let values = concat_rows(cached_values, new_values)?;
+        Ok(Some((keys, values, cached_seq_len + new_keys.dims()[0])))
+    }
+
+    fn extend_cached_heads(
+        &self,
+        new_keys: &CandleTensor,
+        new_values: &CandleTensor,
+    ) -> Result<Option<(CandleTensor, CandleTensor, usize, usize)>> {
+        let Some((cached_k_heads, cached_v_heads, cached_seq_len, local_kv_heads)) =
+            &self.cached_heads
+        else {
+            return Ok(None);
+        };
+        let head_dim = self.resolve_head_dim(*local_kv_heads)?;
+        let new_k_heads = reshape_device_kv_heads(new_keys, *local_kv_heads, head_dim)?;
+        let new_v_heads = reshape_device_kv_heads(new_values, *local_kv_heads, head_dim)?;
+        let k_heads = concat_head_sequence(cached_k_heads, &new_k_heads)?;
+        let v_heads = concat_head_sequence(cached_v_heads, &new_v_heads)?;
+        Ok(Some((
+            k_heads,
+            v_heads,
+            cached_seq_len + new_keys.dims()[0],
+            *local_kv_heads,
+        )))
+    }
+
+    fn extend_cached_selected_heads(
+        &self,
+        new_keys: &CandleTensor,
+        new_values: &CandleTensor,
+    ) -> Result<Option<CachedSelectedDeviceKvHeads>> {
+        let Some(cached) = &self.cached_selected_heads else {
+            return Ok(None);
+        };
+        let new_k_heads =
+            reshape_device_kv_heads(new_keys, cached.local_kv_heads, cached.head_dim)?;
+        let new_v_heads =
+            reshape_device_kv_heads(new_values, cached.local_kv_heads, cached.head_dim)?;
+        let selected_k_t = new_k_heads
+            .index_select(&cached.local_kv_head_indices, 0)
+            .map_err(device_error)?
+            .transpose(1, 2)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
+        let selected_v = new_v_heads
+            .index_select(&cached.local_kv_head_indices, 0)
+            .map_err(device_error)?
+            .contiguous()
+            .map_err(device_error)?;
+        Ok(Some(CachedSelectedDeviceKvHeads {
+            selection_signature: cached.selection_signature,
+            local_kv_head_indices: cached.local_kv_head_indices.clone(),
+            local_kv_heads: cached.local_kv_heads,
+            head_dim: cached.head_dim,
+            keys_for_scores: concat_selected_keys_for_scores(
+                &cached.keys_for_scores,
+                &selected_k_t,
+            )?,
+            values: concat_selected_values(&cached.values, &selected_v)?,
+            seq_len: cached.seq_len + new_keys.dims()[0],
+        }))
+    }
+
+    fn resolve_head_dim(&self, local_kv_heads: usize) -> Result<usize> {
+        if local_kv_heads == 0 {
+            return Err(AgentError::Execution(
+                "Device KV head cache cannot derive a head_dim from zero heads".to_string(),
+            ));
+        }
+        if self.cols == 0 || self.cols % local_kv_heads != 0 {
+            return Err(AgentError::Execution(format!(
+                "Device KV width {} is not divisible by local_kv_heads {}",
+                self.cols, local_kv_heads
+            )));
+        }
+        Ok(self.cols / local_kv_heads)
     }
 
     fn build_active_tensors(&self) -> Result<(CandleTensor, CandleTensor, usize)> {
@@ -407,21 +603,21 @@ impl DeviceLayerKVCache {
 
         let mut key_chunks = Vec::with_capacity(self.block_table.len());
         let mut value_chunks = Vec::with_capacity(self.block_table.len());
-        for &page_index in &self.block_table {
-            let page = self.pages.get(page_index).ok_or_else(|| {
-                AgentError::Execution(format!("Invalid device KV page index {}", page_index))
+        for span in &self.block_table {
+            let page = self.pages.get(span.page_index).ok_or_else(|| {
+                AgentError::Execution(format!("Invalid device KV page index {}", span.page_index))
             })?;
-            if page.used_rows == 0 {
+            if span.row_count == 0 {
                 continue;
             }
             key_chunks.push(
                 page.keys
-                    .narrow(0, 0, page.used_rows)
+                    .narrow(0, span.start_row, span.row_count)
                     .map_err(device_error)?,
             );
             value_chunks.push(
                 page.values
-                    .narrow(0, 0, page.used_rows)
+                    .narrow(0, span.start_row, span.row_count)
                     .map_err(device_error)?,
             );
         }
@@ -449,8 +645,10 @@ impl DeviceLayerKVCache {
 
     fn active_tensors(&mut self) -> Result<(CandleTensor, CandleTensor, usize)> {
         if let Some((keys, values, seq_len)) = &self.cached_active {
+            record_runtime_device_kv_active_view_cache_hit();
             return Ok((keys.clone(), values.clone(), *seq_len));
         }
+        record_runtime_device_kv_active_view_cache_miss();
         let active = self.build_active_tensors()?;
         self.cached_active = Some((active.0.clone(), active.1.clone(), active.2));
         Ok(active)
@@ -461,8 +659,10 @@ impl DeviceLayerKVCache {
         head_dim: usize,
     ) -> Result<(CandleTensor, CandleTensor, usize, usize)> {
         if let Some((keys, values, seq_len, local_kv_heads)) = &self.cached_heads {
+            record_runtime_device_kv_head_view_cache_hit();
             return Ok((keys.clone(), values.clone(), *seq_len, *local_kv_heads));
         }
+        record_runtime_device_kv_head_view_cache_miss();
 
         let (cached_k, cached_v, cached_seq_len) = self.active_tensors()?;
         let k_dims = cached_k.dims();
@@ -509,17 +709,17 @@ impl DeviceLayerKVCache {
         selection_signature: u64,
         local_kv_head_indices: &CandleTensor,
     ) -> Result<SelectedDeviceKvHeads> {
-        if let Some((cached_signature, selected_k_t, selected_v, cached_seq_len)) =
-            &self.cached_selected_heads
-        {
-            if *cached_signature == selection_signature {
+        if let Some(cached) = &self.cached_selected_heads {
+            if cached.selection_signature == selection_signature {
+                record_runtime_device_kv_selected_head_view_cache_hit();
                 return Ok(SelectedDeviceKvHeads {
-                    keys_for_scores: selected_k_t.clone(),
-                    values: selected_v.clone(),
-                    seq_len: *cached_seq_len,
+                    keys_for_scores: cached.keys_for_scores.clone(),
+                    values: cached.values.clone(),
+                    seq_len: cached.seq_len,
                 });
             }
         }
+        record_runtime_device_kv_selected_head_view_cache_miss();
 
         let (k_heads, v_heads, cached_seq_len, _local_kv_heads) = self.active_heads(head_dim)?;
         let selected_k_t = k_heads
@@ -534,12 +734,15 @@ impl DeviceLayerKVCache {
             .map_err(device_error)?
             .contiguous()
             .map_err(device_error)?;
-        self.cached_selected_heads = Some((
+        self.cached_selected_heads = Some(CachedSelectedDeviceKvHeads {
             selection_signature,
-            selected_k_t.clone(),
-            selected_v.clone(),
-            cached_seq_len,
-        ));
+            local_kv_head_indices: local_kv_head_indices.clone(),
+            local_kv_heads: self.cols / head_dim,
+            head_dim,
+            keys_for_scores: selected_k_t.clone(),
+            values: selected_v.clone(),
+            seq_len: cached_seq_len,
+        });
         Ok(SelectedDeviceKvHeads {
             keys_for_scores: selected_k_t,
             values: selected_v,
@@ -552,11 +755,18 @@ impl DeviceLayerKVCache {
         self.block_table.len()
     }
 
+    #[cfg(test)]
+    fn allocated_page_count(&self) -> usize {
+        self.pages.len()
+    }
+
     fn clear(&mut self) {
         self.invalidate_active_cache();
         for page in &mut self.pages {
             page.used_rows = 0;
         }
+        self.free_pages.clear();
+        self.free_pages.extend(0..self.pages.len());
         self.block_table.clear();
         self.seq_len = 0;
     }
@@ -569,16 +779,26 @@ impl DeviceLayerKVCache {
             self.clear();
             return Ok(());
         }
-        let (active_keys, active_values, active_rows) = self.build_active_tensors()?;
-        let start_row = active_rows - keep_rows;
-        let kept_keys = active_keys
-            .narrow(0, start_row, keep_rows)
-            .map_err(device_error)?;
-        let kept_values = active_values
-            .narrow(0, start_row, keep_rows)
-            .map_err(device_error)?;
-        self.clear();
-        self.append(&kept_keys, &kept_values)?;
+        self.invalidate_active_cache();
+        let mut drop_rows = self.seq_len - keep_rows;
+        while drop_rows > 0 {
+            let front_span = self.block_table.first_mut().ok_or_else(|| {
+                AgentError::Execution("Device KV block table unexpectedly empty".to_string())
+            })?;
+            if drop_rows >= front_span.row_count {
+                drop_rows -= front_span.row_count;
+                let page_index = front_span.page_index;
+                self.block_table.remove(0);
+                self.release_page(page_index)?;
+                continue;
+            }
+
+            front_span.start_row += drop_rows;
+            front_span.row_count -= drop_rows;
+            drop_rows = 0;
+        }
+        self.seq_len = keep_rows;
+        self.reclaim_unused_pages()?;
         Ok(())
     }
 
@@ -590,6 +810,12 @@ impl DeviceLayerKVCache {
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_mul(2)
     }
+}
+
+struct AppendCacheUpdates {
+    active: Option<(CandleTensor, CandleTensor, usize)>,
+    heads: Option<(CandleTensor, CandleTensor, usize, usize)>,
+    selected: Option<CachedSelectedDeviceKvHeads>,
 }
 
 #[derive(Clone)]
@@ -770,6 +996,14 @@ impl DeviceKVCache {
         self.layers
             .get(layer_idx)
             .map(DeviceLayerKVCache::block_table_len)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))
+    }
+
+    #[cfg(test)]
+    fn allocated_page_count(&self, layer_idx: usize) -> Result<usize> {
+        self.layers
+            .get(layer_idx)
+            .map(DeviceLayerKVCache::allocated_page_count)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))
     }
 
@@ -1141,6 +1375,20 @@ struct DeviceModelWeights {
     lm_head: CandleTensor,
 }
 
+struct AttentionPhaseOutput {
+    o_partial: CandleTensor,
+}
+
+struct MlpPhaseOutput {
+    post_attn: CandleTensor,
+    down_partial: CandleTensor,
+}
+
+struct StagedDeviceCollective {
+    template: CandleTensor,
+    buffer: DeviceCollectiveBuffer,
+}
+
 fn device_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
     tensor
         .dims()
@@ -1363,6 +1611,7 @@ pub struct ForwardPass {
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
+    collective_residency: CollectiveResidency,
 
     /// This worker's shard column range
     pub shard_start: usize,
@@ -1384,6 +1633,7 @@ pub struct ForwardPass {
 impl ForwardPass {
     pub fn from_residency(
         residency: Arc<SharedModelResidency>,
+        collective_residency: CollectiveResidency,
         worker_position: u32,
         shard_start: usize,
         shard_end: usize,
@@ -1416,6 +1666,7 @@ impl ForwardPass {
             local_kv_head_indices,
             local_kv_head_indices_signature,
             device_kv_cache: DeviceKVCache::new(kv_config),
+            collective_residency,
             shard_start,
             shard_end,
             worker_position,
@@ -1437,6 +1688,7 @@ impl ForwardPass {
         let residency = Arc::new(SharedModelResidency::from_host(weights)?);
         Self::from_residency(
             residency,
+            CollectiveResidency::StagedRuntime,
             worker_position,
             shard_start,
             shard_end,
@@ -1457,6 +1709,92 @@ impl ForwardPass {
         })
     }
 
+    fn prepare_attention_phase(
+        &mut self,
+        hidden: &CandleTensor,
+        layer_idx: usize,
+        absolute_positions: &[u32],
+    ) -> Result<AttentionPhaseOutput> {
+        let layer = &self.device_weights.layers[layer_idx];
+        let normed = rms_norm_candle(hidden, &layer.attn_norm, self.config.rms_norm_eps)?;
+        let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, layer)?;
+        let hidden_dims = hidden.dims();
+
+        debug!(
+            "Layer {} QKV partial computed: {}x{} -> {}x{}",
+            layer_idx,
+            hidden_dims[0],
+            hidden_dims[1],
+            q_partial.dims()[0],
+            q_partial.dims()[1]
+        );
+
+        info!(
+            layer_idx,
+            "Layer attention partials prepared; entering KV/attention path"
+        );
+
+        let attn_output = attention_output_device(
+            &mut self.device_kv_cache,
+            &self.config,
+            self.attention_layout,
+            layer_idx,
+            absolute_positions,
+            self.local_kv_head_indices_signature,
+            &self.local_kv_head_indices,
+            q_partial,
+            k_partial,
+            v_partial,
+        )?;
+
+        info!(
+            layer_idx,
+            "Layer attention output materialized; projecting local O partial"
+        );
+
+        let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+
+        Ok(AttentionPhaseOutput { o_partial })
+    }
+
+    fn prepare_mlp_phase(
+        &self,
+        hidden: &CandleTensor,
+        o_full: &CandleTensor,
+        layer_idx: usize,
+    ) -> Result<MlpPhaseOutput> {
+        let layer = &self.device_weights.layers[layer_idx];
+        let post_attn = hidden.broadcast_add(o_full).map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+        let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, self.config.rms_norm_eps)?;
+        let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, layer)?;
+        let gate_activated = silu_candle(&gate_partial)?;
+        let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+        let down_partial = mlp_hidden.matmul(&layer.w_down).map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })?;
+
+        Ok(MlpPhaseOutput {
+            post_attn,
+            down_partial,
+        })
+    }
+
+    fn finalize_layer_output(
+        &self,
+        post_attn: &CandleTensor,
+        down_full: &CandleTensor,
+    ) -> Result<CandleTensor> {
+        post_attn.broadcast_add(down_full).map_err(|e| {
+            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
+        })
+    }
+
     /// Execute a single layer of the canonical forward pass implementation.
     async fn forward_layer(
         &mut self,
@@ -1466,7 +1804,6 @@ impl ForwardPass {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<CandleTensor> {
-        let rms_norm_eps = self.config.rms_norm_eps;
         let start = Instant::now();
         let hidden_dims = hidden.dims();
         let hidden_rows = hidden_dims[0];
@@ -1481,98 +1818,55 @@ impl ForwardPass {
             "Starting forward layer"
         );
 
-        let o_partial = run_in_blocking_region(|| -> Result<_> {
-            let layer = &self.device_weights.layers[layer_idx];
-            // These CPU-side tensor ops can run long enough under concurrent inference
-            // to starve async control loops if they stay on Tokio worker threads.
-            let normed = rms_norm_candle(hidden, &layer.attn_norm, rms_norm_eps)?;
-
-            let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
-
-            debug!(
-                "Layer {} QKV partial computed: {}x{} -> {}x{}",
-                layer_idx,
-                hidden_rows,
-                hidden_cols,
-                q_partial.dims()[0],
-                q_partial.dims()[1]
-            );
-
-            info!(
-                layer_idx,
-                "Layer attention partials prepared; entering KV/attention path"
-            );
-
-            let attn_output = attention_output_device(
-                &mut self.device_kv_cache,
-                &self.config,
-                self.attention_layout,
-                layer_idx,
-                absolute_positions,
-                self.local_kv_head_indices_signature,
-                &self.local_kv_head_indices,
-                q_partial,
-                k_partial,
-                v_partial,
-            )?;
-
-            info!(
-                layer_idx,
-                "Layer attention output materialized; projecting local O partial"
-            );
-
-            let o_partial = attn_output.matmul(&layer.w_o).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-
-            Ok(o_partial)
-        })?;
+        let AttentionPhaseOutput { o_partial } =
+            self.prepare_attention_phase(hidden, layer_idx, absolute_positions)?;
         info!(
             layer_idx,
-            "Layer O partial ready; entering first ring all-reduce"
+            "Layer O partial ready; staging first ring all-reduce"
         );
+        let staged_o = Self::stage_device_collective(
+            self.collective_residency,
+            &o_partial,
+            layer_idx as u32,
+            0,
+        )?;
         let o_full = self
-            .ring_allreduce_device(&o_partial, worker_ring, job_id, layer_idx as u32, 0)
+            .complete_staged_device_collective(staged_o, worker_ring, job_id, layer_idx as u32, 0)
             .await?;
         info!(
             layer_idx,
             "Layer first ring all-reduce complete; entering MLP preparation"
         );
 
-        let (post_attn, down_partial) = run_in_blocking_region(|| -> Result<_> {
-            let layer = &self.device_weights.layers[layer_idx];
-            let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-
-            let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, rms_norm_eps)?;
-            let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
-            let gate_activated = silu_candle(&gate_partial)?;
-            let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let down_partial = mlp_hidden.matmul(&layer.w_down).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            Ok((post_attn, down_partial))
-        })?;
+        let MlpPhaseOutput {
+            post_attn,
+            down_partial,
+        } = self.prepare_mlp_phase(hidden, &o_full, layer_idx)?;
         info!(
             layer_idx,
-            "Layer MLP down partial ready; entering second ring all-reduce"
+            "Layer MLP down partial ready; staging second ring all-reduce"
         );
+        let staged_down = Self::stage_device_collective(
+            self.collective_residency,
+            &down_partial,
+            layer_idx as u32,
+            1,
+        )?;
         let down_full = self
-            .ring_allreduce_device(&down_partial, worker_ring, job_id, layer_idx as u32, 1)
+            .complete_staged_device_collective(
+                staged_down,
+                worker_ring,
+                job_id,
+                layer_idx as u32,
+                1,
+            )
             .await?;
         info!(
             layer_idx,
             "Layer second ring all-reduce complete; finalizing layer output"
         );
 
-        let output = run_in_blocking_region(|| {
-            post_attn.broadcast_add(&down_full).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })
-        })?;
+        let output = self.finalize_layer_output(&post_attn, &down_full)?;
 
         debug!(
             "Layer {} forward complete in {:?}",
@@ -1610,33 +1904,28 @@ impl ForwardPass {
         seed: u64,
     ) -> Result<u32> {
         match logits {
-            BackendLogits::Host(logits) => Ok({
-                if temperature <= 0.0 || temperature == 1.0 && top_p >= 1.0 {
+            BackendLogits::Host(logits) => {
+                let started = Instant::now();
+                let token = if temperature <= 0.0 || temperature == 1.0 && top_p >= 1.0 {
                     sample_greedy(logits)
                 } else {
                     sample_token(logits, temperature, top_p, seed)
-                }
-            }),
+                };
+                record_runtime_host_sampling(1, started.elapsed().as_millis() as u64);
+                Ok(token)
+            }
             BackendLogits::Device(logits) => {
+                let started = Instant::now();
                 if temperature <= 0.0 || temperature == 1.0 && top_p >= 1.0 {
                     let token_ids = logits
                         .argmax(1)
                         .and_then(|idx| idx.to_vec1::<u32>())
-                        .map_err(device_error)
-                        .or_else(|device_err| {
-                            let _ = logits
-                                .flatten_all()
-                                .map_err(device_error)?
-                                .to_vec1::<f32>()
-                                .map_err(device_error)?;
-                            Err::<Vec<u32>, AgentError>(AgentError::Execution(format!(
-                                "Device argmax sampling failed after logits materialization: {}",
-                                device_err
-                            )))
-                        })?;
-                    token_ids.into_iter().next().ok_or_else(|| {
+                        .map_err(device_error)?;
+                    let token = token_ids.into_iter().next().ok_or_else(|| {
                         AgentError::Execution("Device argmax produced no token ids".to_string())
-                    })
+                    })?;
+                    record_runtime_device_sampling(1, started.elapsed().as_millis() as u64);
+                    Ok(token)
                 } else {
                     sample_token_device(logits, temperature, top_p, seed).map_err(|device_err| {
                         AgentError::Execution(format!(
@@ -1725,45 +2014,71 @@ impl ForwardPass {
             )));
         }
 
-        let (config, device_weights, local_kv_head_indices, allreduce_timeout) = {
+        let (
+            config,
+            device_weights,
+            local_kv_head_indices,
+            allreduce_timeout,
+            collective_residency,
+        ) = {
             let template = &backends[0].forward_pass;
             (
                 template.config.clone(),
                 template.device_weights.clone(),
                 template.local_kv_head_indices.clone(),
                 template.allreduce_timeout,
+                template.collective_residency,
             )
         };
         let batch_job_id = collective_batch_job_id(job_ids);
 
-        let mut positions = Vec::with_capacity(backends.len());
-        let mut sequence_lengths = Vec::with_capacity(backends.len());
-        for backend in backends.iter() {
-            let forward_pass = &backend.forward_pass;
-            if forward_pass.position == 0 {
-                return Err(crate::errors::AgentError::Execution(
-                    "Decode microbatch requested before prompt prefill".to_string(),
-                ));
-            }
-            if forward_pass.device_kv_cache.next_position() != forward_pass.position {
-                return Err(crate::errors::AgentError::Execution(format!(
-                    "Forward pass position {} diverged from KV cache next position {}",
-                    forward_pass.position,
-                    forward_pass.device_kv_cache.next_position()
-                )));
-            }
-            positions.push(forward_pass.position as u32);
-            sequence_lengths.push(forward_pass.device_kv_cache.next_position() as u32);
-        }
-
+        let owned_positions;
         let (positions, token_ids) = if let Some(workspace) = workspace.as_deref_mut() {
-            workspace.stage(tokens, &positions, &sequence_lengths)?;
+            workspace.stage_from_slot_reader(tokens, |slot_idx| {
+                let forward_pass = &backends[slot_idx].forward_pass;
+                if forward_pass.position == 0 {
+                    return Err(crate::errors::AgentError::Execution(
+                        "Decode microbatch requested before prompt prefill".to_string(),
+                    ));
+                }
+                if forward_pass.device_kv_cache.next_position() != forward_pass.position {
+                    return Err(crate::errors::AgentError::Execution(format!(
+                        "Forward pass position {} diverged from KV cache next position {}",
+                        forward_pass.position,
+                        forward_pass.device_kv_cache.next_position()
+                    )));
+                }
+                Ok((
+                    forward_pass.position as u32,
+                    forward_pass.device_kv_cache.seq_len() as u32,
+                ))
+            })?;
             (
                 workspace.positions(tokens.len()),
                 workspace.token_ids(tokens.len()),
             )
         } else {
-            (positions.as_slice(), tokens)
+            owned_positions = {
+                let mut positions = Vec::with_capacity(backends.len());
+                for backend in backends.iter() {
+                    let forward_pass = &backend.forward_pass;
+                    if forward_pass.position == 0 {
+                        return Err(crate::errors::AgentError::Execution(
+                            "Decode microbatch requested before prompt prefill".to_string(),
+                        ));
+                    }
+                    if forward_pass.device_kv_cache.next_position() != forward_pass.position {
+                        return Err(crate::errors::AgentError::Execution(format!(
+                            "Forward pass position {} diverged from KV cache next position {}",
+                            forward_pass.position,
+                            forward_pass.device_kv_cache.next_position()
+                        )));
+                    }
+                    positions.push(forward_pass.position as u32);
+                }
+                positions
+            };
+            (owned_positions.as_slice(), tokens)
         };
 
         let ids =
@@ -1810,6 +2125,7 @@ impl ForwardPass {
                 batch_job_id,
                 layer_idx as u32,
                 0,
+                collective_residency,
                 allreduce_timeout,
                 &mut metrics,
             )
@@ -1834,6 +2150,7 @@ impl ForwardPass {
                 batch_job_id,
                 layer_idx as u32,
                 1,
+                collective_residency,
                 allreduce_timeout,
                 &mut metrics,
             )
@@ -1855,45 +2172,71 @@ impl ForwardPass {
         Ok(logits_2d)
     }
 
-    /// Materialize a single collective buffer from a device tensor and restore
-    /// the reduced result directly back onto the execution device.
-    async fn ring_allreduce_device(
-        &mut self,
+    /// Stage a device tensor for collective submission without forcing the surrounding
+    /// decode phase into a broader blocking region than required.
+    fn stage_device_collective(
+        collective_residency: CollectiveResidency,
         tensor: &CandleTensor,
-        worker_ring: &mut WorkerRing<'_>,
-        job_id: Uuid,
         layer_idx: u32,
         collective_seq: u32,
-    ) -> Result<CandleTensor> {
-        if worker_ring.total_workers <= 1 {
-            return Ok(tensor.clone());
+    ) -> Result<StagedDeviceCollective> {
+        if !matches!(collective_residency, CollectiveResidency::StagedRuntime) {
+            return Err(AgentError::Execution(format!(
+                "Execution contract {:?} does not permit staged runtime collectives",
+                collective_residency
+            )));
         }
         info!(
             layer_idx,
             collective_seq,
             rows = tensor.dims()[0],
             cols = tensor.dims()[1],
-            "Starting collective tensor staging"
+            device = ?tensor.device().location(),
+            "Preparing collective submission"
         );
-        let flat = run_in_blocking_region(|| collective_buffer_from_candle_2d(tensor))?;
+        let buffer = DeviceCollectiveBuffer::from_device_tensor(tensor)?;
         info!(
             layer_idx,
             collective_seq,
-            elements = flat.len(),
-            "Collective tensor staging complete; entering ring all-reduce"
+            elements = buffer.len(),
+            "Collective submission is staying device-resident"
         );
-        let reduced = worker_ring
-            .ring_all_reduce_matrix_with_timeout(
-                flat,
+        Ok(StagedDeviceCollective {
+            template: tensor.clone(),
+            buffer,
+        })
+    }
+
+    /// Complete a previously staged collective submission and restore the reduced
+    /// result directly onto the execution device.
+    async fn complete_staged_device_collective(
+        &mut self,
+        staged: StagedDeviceCollective,
+        worker_ring: &mut WorkerRing<'_>,
+        job_id: Uuid,
+        layer_idx: u32,
+        collective_seq: u32,
+    ) -> Result<CandleTensor> {
+        if worker_ring.total_workers <= 1 {
+            return Ok(staged.template);
+        }
+        let StagedDeviceCollective {
+            template,
+            mut buffer,
+        } = staged;
+        worker_ring
+            .ring_all_reduce_staged_with_timeout(
+                &mut buffer,
                 job_id,
                 layer_idx,
                 collective_seq,
                 self.allreduce_timeout,
             )
             .await?;
-        self.last_allreduce_metrics
-            .accumulate(worker_ring.last_run_metrics());
-        candle_2d_from_collective_buffer_owned_like(reduced, tensor)
+        let mut metrics = worker_ring.last_run_metrics();
+        metrics.device_resident_collective_count += 1;
+        self.last_allreduce_metrics.accumulate(metrics);
+        buffer.into_device_tensor_like(&template)
     }
 
     async fn ring_allreduce_device_batch(
@@ -1902,37 +2245,32 @@ impl ForwardPass {
         job_id: Uuid,
         layer_idx: u32,
         collective_seq: u32,
+        collective_residency: CollectiveResidency,
         allreduce_timeout: std::time::Duration,
         metrics: &mut RingAllReduceMetrics,
     ) -> Result<CandleTensor> {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        info!(
-            layer_idx,
-            collective_seq,
-            rows = tensor.dims()[0],
-            cols = tensor.dims()[1],
-            "Starting batch collective tensor staging"
-        );
-        let flat = run_in_blocking_region(|| collective_buffer_from_candle_2d(tensor))?;
-        info!(
-            layer_idx,
-            collective_seq,
-            elements = flat.len(),
-            "Batch collective tensor staging complete; entering ring all-reduce"
-        );
-        let reduced = worker_ring
-            .ring_all_reduce_matrix_with_timeout(
-                flat,
+        let staged =
+            Self::stage_device_collective(collective_residency, tensor, layer_idx, collective_seq)?;
+        let StagedDeviceCollective {
+            template,
+            mut buffer,
+        } = staged;
+        worker_ring
+            .ring_all_reduce_staged_with_timeout(
+                &mut buffer,
                 job_id,
                 layer_idx,
                 collective_seq,
                 allreduce_timeout,
             )
             .await?;
-        metrics.accumulate(worker_ring.last_run_metrics());
-        candle_2d_from_collective_buffer_owned_like(reduced, tensor)
+        let mut run_metrics = worker_ring.last_run_metrics();
+        run_metrics.device_resident_collective_count += 1;
+        metrics.accumulate(run_metrics);
+        buffer.into_device_tensor_like(&template)
     }
 
     /// Clear KV cache (for new sequence)
@@ -1999,7 +2337,7 @@ impl ForwardPass {
             "Starting forward token segment"
         );
 
-        let mut hidden = run_in_blocking_region(|| self.embed(tokens))?;
+        let mut hidden = self.embed(tokens)?;
         let hidden_dims = hidden.dims();
         debug!(
             "Embedded {} tokens -> {:?} at positions {}..{}",
@@ -2023,13 +2361,11 @@ impl ForwardPass {
                 .await?;
         }
 
-        hidden = run_in_blocking_region(|| {
-            rms_norm_candle(
-                &hidden,
-                &self.device_weights.final_norm,
-                self.config.rms_norm_eps,
-            )
-        })?;
+        hidden = rms_norm_candle(
+            &hidden,
+            &self.device_weights.final_norm,
+            self.config.rms_norm_eps,
+        )?;
 
         info!(
             positions = format!(
@@ -2412,6 +2748,60 @@ fn attention_output_device_cached_single_query_from_heads(
         .map_err(device_error)
 }
 
+fn concat_rows(existing: &CandleTensor, appended: &CandleTensor) -> Result<CandleTensor> {
+    let tensors = [existing, appended];
+    CandleTensor::cat(&tensors, 0).map_err(device_error)
+}
+
+fn concat_head_sequence(existing: &CandleTensor, appended: &CandleTensor) -> Result<CandleTensor> {
+    let tensors = [existing, appended];
+    CandleTensor::cat(&tensors, 1).map_err(device_error)
+}
+
+fn concat_selected_keys_for_scores(
+    existing: &CandleTensor,
+    appended: &CandleTensor,
+) -> Result<CandleTensor> {
+    let tensors = [existing, appended];
+    CandleTensor::cat(&tensors, 2).map_err(device_error)
+}
+
+fn concat_selected_values(
+    existing: &CandleTensor,
+    appended: &CandleTensor,
+) -> Result<CandleTensor> {
+    let tensors = [existing, appended];
+    CandleTensor::cat(&tensors, 1).map_err(device_error)
+}
+
+fn reshape_device_kv_heads(
+    tensor: &CandleTensor,
+    local_kv_heads: usize,
+    head_dim: usize,
+) -> Result<CandleTensor> {
+    let dims = tensor.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Device KV head reshape expects rank-2 tensors, got {:?}",
+            dims
+        )));
+    }
+    if dims[1] != local_kv_heads.saturating_mul(head_dim) {
+        return Err(AgentError::Execution(format!(
+            "Device KV head reshape width mismatch: expected {}, got {}",
+            local_kv_heads.saturating_mul(head_dim),
+            dims[1]
+        )));
+    }
+    tensor
+        .reshape((dims[0], local_kv_heads, head_dim))
+        .map_err(device_error)?
+        .transpose(0, 1)
+        .map_err(device_error)?
+        .contiguous()
+        .map_err(device_error)
+}
+
 fn build_local_kv_head_indices(attention_layout: AttentionShardLayout) -> Result<Vec<u32>> {
     let mut indices = Vec::with_capacity(attention_layout.local_q_heads);
     for local_q_idx in 0..attention_layout.local_q_heads {
@@ -2615,9 +3005,12 @@ mod tests {
     use super::*;
     use crate::inference::backend::ProviderRuntimeCore;
     use crate::inference::engine::InferenceRuntimeMode;
+    use crate::inference::stats::InferenceStats;
     use crate::network::{TensorPlane, TensorPlaneConfig};
     use crate::provider::ExecutionProviderKind;
     use libp2p::PeerId;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn create_test_config() -> ModelConfig {
@@ -3094,6 +3487,136 @@ mod tests {
         assert_eq!(updated_heads.seq_len, 3);
         assert_eq!(updated_heads.keys_for_scores.dims(), &[2, 2, 3]);
         assert_eq!(updated_heads.values.dims(), &[2, 3, 2]);
+    }
+
+    #[test]
+    fn test_device_kv_cache_metrics_track_runtime_view_reuse() {
+        let stats = Arc::new(InferenceStats::new());
+        InferenceStats::install_as_runtime_collector(&stats);
+
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 2,
+            max_seq_len: 8,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let selection = CandleTensor::new(&[1u32, 0u32], &RuntimeDevice::Cpu).unwrap();
+        let first_keys = to_candle_2d(&Tensor2D::filled(2, 4, 1.0)).unwrap();
+        let first_values = to_candle_2d(&Tensor2D::filled(2, 4, 2.0)).unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+
+        let _ = kv_cache.get_layer_active_heads(0, 2).unwrap();
+        let _ = kv_cache.get_layer_active_heads(0, 2).unwrap();
+        let _ = kv_cache
+            .get_layer_selected_heads(0, 2, 7, &selection)
+            .unwrap();
+        let _ = kv_cache
+            .get_layer_selected_heads(0, 2, 7, &selection)
+            .unwrap();
+
+        assert_eq!(
+            stats
+                .device_kv_active_view_cache_misses
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .device_kv_active_view_cache_hits
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .device_kv_head_view_cache_misses
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats.device_kv_head_view_cache_hits.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .device_kv_selected_head_view_cache_misses
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .device_kv_selected_head_view_cache_hits
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_device_kv_retain_suffix_keeps_partial_page_without_rebuild() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 2,
+            max_seq_len: 32,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let first_keys =
+            to_candle_2d(&Tensor2D::new((0..36).map(|v| v as f32).collect(), 18, 2).unwrap())
+                .unwrap();
+        let first_values =
+            to_candle_2d(&Tensor2D::new((100..136).map(|v| v as f32).collect(), 18, 2).unwrap())
+                .unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+
+        kv_cache.retain_suffix(17).unwrap();
+
+        let second_keys = to_candle_2d(&Tensor2D::new(vec![36.0, 37.0], 1, 2).unwrap()).unwrap();
+        let second_values =
+            to_candle_2d(&Tensor2D::new(vec![136.0, 137.0], 1, 2).unwrap()).unwrap();
+        kv_cache
+            .append_layer(0, &second_keys, &second_values)
+            .unwrap();
+
+        let (active_keys, active_values, active_rows) = kv_cache.get_layer_active_kv(0).unwrap();
+        assert_eq!(active_rows, 18);
+        let host_keys = from_candle_2d(&active_keys).unwrap();
+        let host_values = from_candle_2d(&active_values).unwrap();
+        let expected_keys = (2..38).map(|v| v as f32).collect::<Vec<_>>();
+        let expected_values = (102..138).map(|v| v as f32).collect::<Vec<_>>();
+        assert_eq!(host_keys.data, expected_keys);
+        assert_eq!(host_values.data, expected_values);
+    }
+
+    #[test]
+    fn test_device_kv_reuses_released_pages_after_suffix_trim() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 2,
+            max_seq_len: 32,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let first_keys = to_candle_2d(&Tensor2D::filled(32, 2, 1.0)).unwrap();
+        let first_values = to_candle_2d(&Tensor2D::filled(32, 2, 2.0)).unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+        assert_eq!(kv_cache.allocated_page_count(0).unwrap(), 2);
+
+        kv_cache.retain_suffix(16).unwrap();
+
+        let second_keys = to_candle_2d(&Tensor2D::filled(16, 2, 3.0)).unwrap();
+        let second_values = to_candle_2d(&Tensor2D::filled(16, 2, 4.0)).unwrap();
+        kv_cache
+            .append_layer(0, &second_keys, &second_values)
+            .unwrap();
+
+        assert_eq!(kv_cache.allocated_page_count(0).unwrap(), 2);
+        assert_eq!(kv_cache.live_block_table_len(0).unwrap(), 2);
     }
 
     #[tokio::test]

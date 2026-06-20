@@ -451,13 +451,15 @@ impl InferenceCoordinator {
             Arc::new(ShardRegistry::with_defaults().expect("Failed to create shard registry"));
 
         let loader: Arc<dyn ShardLoader> = Arc::new(ArtifactShardLoader::with_defaults());
+        let stats = Arc::new(InferenceStats::new());
+        InferenceStats::install_as_runtime_collector(&stats);
 
         Self {
             swarm_control: Self::spawn_swarm_driver(swarm),
             tensor_plane,
             config,
             position: None,
-            stats: Arc::new(InferenceStats::new()),
+            stats,
             active_job: RwLock::new(None),
             checkpoint_manager: None,
             shard_registry,

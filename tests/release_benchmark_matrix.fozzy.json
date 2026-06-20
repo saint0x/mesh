@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "name": "release-benchmark-matrix",
+  "steps": [
+    {
+      "name": "provider contracts still expose the expected serving optimization profile matrix",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::backend::tests::backend_optimization_profile_tracks_provider_kind",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "two-worker collectives keep the deterministic pairwise runtime path healthy",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "executor::ring_allreduce::tests::test_two_worker_pairwise_matrix_allreduce_with_prepared_channels_and_large_stagger",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "three-worker collectives keep the deterministic larger-ring topology path healthy",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "executor::ring_allreduce::tests::test_three_worker_matrix_allreduce_uses_correct_send_slots",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "release proof metrics retain deterministic decode batching and runtime-overhead attribution",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::stats::tests::test_stats_runtime_overhead_metrics",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

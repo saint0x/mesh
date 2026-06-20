@@ -18,6 +18,7 @@ use std::sync::Arc;
 use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
 use super::runtime::{runtime_error, sample_tokens_device_with_seeds, DeviceTensor};
+use super::stats::record_runtime_device_sampling_fallback;
 use super::tensor_ops::Tensor1D;
 
 #[derive(Clone)]
@@ -244,18 +245,20 @@ impl ProviderRuntimeCore {
         total_workers: u32,
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
+        let executor_contract = LocalExecutorContract::for_provider(provider);
         Ok(Self {
             model_id: model.model_id().to_string(),
             provider,
-            executor_contract: LocalExecutorContract::for_provider(provider),
             forward_pass: ForwardPass::from_residency(
                 model,
+                executor_contract.collective_residency,
                 worker_position,
                 shard_start,
                 shard_end,
                 total_workers,
                 allreduce_timeout,
             )?,
+            executor_contract,
         })
     }
 
@@ -553,6 +556,7 @@ impl ProviderExecutionBackend {
             provider = %expected_provider.as_str(),
             "batched provider sampling failed, falling back to per-session logits sampling"
         );
+        record_runtime_device_sampling_fallback(requests.len() as u64);
 
         Ok(Some(
             ProviderRuntimeCore::split_logits_rows(&logits_2d)?
@@ -886,10 +890,13 @@ mod tests {
 
         assert!(cpu.is_fast_path());
         assert!(cpu.supports_decode_microbatch());
+        assert!(cpu.uses_staged_runtime_collectives());
         assert!(metal.is_fast_path());
         assert!(metal.supports_decode_microbatch());
+        assert!(metal.uses_staged_runtime_collectives());
         assert!(cuda.is_fast_path());
         assert!(cuda.supports_decode_microbatch());
+        assert!(cuda.uses_staged_runtime_collectives());
     }
 
     #[test]

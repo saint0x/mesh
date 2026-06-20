@@ -131,6 +131,13 @@ pub enum FusedKernelStage {
     DeviceSampling,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectiveResidency {
+    HostOwned,
+    StagedRuntime,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorPhasePlan {
     pub phase: ExecutionPhase,
@@ -154,6 +161,7 @@ pub struct LocalExecutorContract {
     pub optimization_profile: BackendOptimizationProfile,
     pub host_kernels: Vec<HostKernel>,
     pub fused_stages: Vec<FusedKernelStage>,
+    pub collective_residency: CollectiveResidency,
     pub prefill: ExecutorPhasePlan,
     pub decode: ExecutorPhasePlan,
     pub kv_runtime: KvRuntimeContract,
@@ -172,6 +180,7 @@ impl LocalExecutorContract {
                     HostKernel::HostAssistedSampling,
                 ],
                 fused_stages: Vec::new(),
+                collective_residency: CollectiveResidency::StagedRuntime,
                 prefill: ExecutorPhasePlan {
                     phase: ExecutionPhase::Prefill,
                     class: LocalExecutorClass::FastPath,
@@ -205,6 +214,7 @@ impl LocalExecutorContract {
                     FusedKernelStage::ResidualMlp,
                     FusedKernelStage::DeviceSampling,
                 ],
+                collective_residency: CollectiveResidency::StagedRuntime,
                 prefill: ExecutorPhasePlan {
                     phase: ExecutionPhase::Prefill,
                     class: LocalExecutorClass::FastPath,
@@ -238,6 +248,7 @@ impl LocalExecutorContract {
                     FusedKernelStage::ResidualMlp,
                     FusedKernelStage::DeviceSampling,
                 ],
+                collective_residency: CollectiveResidency::StagedRuntime,
                 prefill: ExecutorPhasePlan {
                     phase: ExecutionPhase::Prefill,
                     class: LocalExecutorClass::FastPath,
@@ -269,6 +280,13 @@ impl LocalExecutorContract {
 
     pub fn is_fast_path(&self) -> bool {
         matches!(self.class, LocalExecutorClass::FastPath)
+    }
+
+    pub fn uses_staged_runtime_collectives(&self) -> bool {
+        matches!(
+            self.collective_residency,
+            CollectiveResidency::StagedRuntime
+        )
     }
 }
 

@@ -43,6 +43,9 @@ pub struct RingAllReduceMetrics {
     pub larger_ring_operations: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub host_materialization_count: u64,
+    pub host_materialization_bytes: u64,
+    pub device_resident_collective_count: u64,
 }
 
 impl RingAllReduceMetrics {
@@ -57,6 +60,9 @@ impl RingAllReduceMetrics {
         self.larger_ring_operations += other.larger_ring_operations;
         self.bytes_sent += other.bytes_sent;
         self.bytes_received += other.bytes_received;
+        self.host_materialization_count += other.host_materialization_count;
+        self.host_materialization_bytes += other.host_materialization_bytes;
+        self.device_resident_collective_count += other.device_resident_collective_count;
     }
 }
 
@@ -439,6 +445,16 @@ impl PartialEq for CollectiveMatrix {
             && self.cols == other.cols
             && self.to_host_vec() == other.to_host_vec()
     }
+}
+
+pub trait StagedCollectiveBuffer: Send {
+    fn len(&self) -> usize;
+
+    fn stage_send_chunk(&mut self, range: Range<usize>) -> Result<Vec<f32>>;
+
+    fn accumulate_recv_chunk(&mut self, range: Range<usize>, payload_bytes: &[u8]) -> Result<()>;
+
+    fn copy_recv_chunk(&mut self, range: Range<usize>, payload_bytes: &[u8]) -> Result<()>;
 }
 
 impl Tensor {
@@ -987,6 +1003,119 @@ impl<'a> WorkerRing<'a> {
 
         self.last_run_metrics = run_metrics;
         Ok(partial_result)
+    }
+
+    pub async fn ring_all_reduce_staged_with_timeout(
+        &mut self,
+        partial_result: &mut dyn StagedCollectiveBuffer,
+        job_id: Uuid,
+        layer_idx: u32,
+        collective_seq: u32,
+        timeout: Duration,
+    ) -> Result<()> {
+        tokio::time::timeout(
+            timeout,
+            self.ring_all_reduce_staged(partial_result, job_id, layer_idx, collective_seq),
+        )
+        .await
+        .map_err(|_| {
+            AgentError::Execution(format!(
+                "Ring all-reduce staged collective timed out after {:?}",
+                timeout
+            ))
+        })?
+    }
+
+    async fn ring_all_reduce_staged(
+        &mut self,
+        partial_result: &mut dyn StagedCollectiveBuffer,
+        job_id: Uuid,
+        layer_idx: u32,
+        collective_seq: u32,
+    ) -> Result<()> {
+        self.reap_completed_background_transfers().await?;
+        if self.total_workers <= 1 {
+            self.last_run_metrics = RingAllReduceMetrics::default();
+            return Ok(());
+        }
+
+        let n = self.total_workers as usize;
+        let mut run_metrics = RingAllReduceMetrics::default();
+        run_metrics.collective_operations = 1;
+        run_metrics.collective_worker_participants = self.total_workers as u64;
+        run_metrics.larger_ring_operations = 1;
+        let plan = self.cached_collective_plan_for_len(partial_result.len());
+
+        for step in 0..(n - 1) {
+            let step_plan = &plan.reduce_scatter_steps[step];
+            let staged_chunk = partial_result.stage_send_chunk(step_plan.send_range.clone())?;
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    collective_seq,
+                    layer_idx,
+                    step as u32,
+                    step_plan.send_slot,
+                    step_plan.recv_slot,
+                    &staged_chunk,
+                )
+                .await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
+
+            if recv_msg.element_count() != step_plan.recv_range.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received reduce-scatter chunk len {} but expected {}",
+                    recv_msg.element_count(),
+                    step_plan.recv_range.len()
+                )));
+            }
+            partial_result
+                .accumulate_recv_chunk(step_plan.recv_range.clone(), recv_msg.payload_bytes())?;
+        }
+
+        for step in 0..(n - 1) {
+            let step_plan = &plan.all_gather_steps[step];
+            let staged_chunk = partial_result.stage_send_chunk(step_plan.send_range.clone())?;
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::AllGather,
+                    job_id,
+                    collective_seq,
+                    layer_idx,
+                    step as u32,
+                    step_plan.send_slot,
+                    step_plan.recv_slot,
+                    &staged_chunk,
+                )
+                .await?;
+            run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
+
+            if recv_msg.element_count() != step_plan.recv_range.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received all-gather chunk len {} but expected {}",
+                    recv_msg.element_count(),
+                    step_plan.recv_range.len()
+                )));
+            }
+            partial_result
+                .copy_recv_chunk(step_plan.recv_range.clone(), recv_msg.payload_bytes())?;
+        }
+
+        self.last_run_metrics = run_metrics;
+        Ok(())
     }
 
     pub async fn ring_all_reduce_matrix_with_timeout(

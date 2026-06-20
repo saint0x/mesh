@@ -2,7 +2,10 @@
 //!
 //! This module provides metrics tracking for distributed inference operations.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, OnceLock, Weak,
+};
 use std::time::Instant;
 use tracing::info;
 
@@ -180,6 +183,69 @@ pub struct InferenceStats {
     pub total_larger_ring_operations: AtomicU64,
     pub total_collective_bytes_sent: AtomicU64,
     pub total_collective_bytes_received: AtomicU64,
+    pub total_collective_host_materializations: AtomicU64,
+    pub total_collective_host_materialization_bytes: AtomicU64,
+    pub total_device_resident_collectives: AtomicU64,
+
+    /// Number of accelerated collective submissions that staged through host memory.
+    pub collective_host_stage_to_host_events: AtomicU64,
+
+    /// Number of bytes copied from accelerated device memory into host-resident collective buffers.
+    pub collective_host_stage_to_host_bytes: AtomicU64,
+
+    /// Number of accelerated collective results restored from host-resident buffers back onto device.
+    pub collective_host_restore_to_device_events: AtomicU64,
+
+    /// Number of bytes restored from host-resident collective buffers back onto device.
+    pub collective_host_restore_to_device_bytes: AtomicU64,
+
+    /// Number of KV snapshot payloads exported by the runtime.
+    pub kv_snapshot_exports: AtomicU64,
+
+    /// Total bytes serialized into KV snapshot payloads.
+    pub kv_snapshot_export_bytes: AtomicU64,
+
+    /// Number of KV snapshot payloads materialized back into runtime cache state.
+    pub kv_snapshot_materializations: AtomicU64,
+
+    /// Total bytes materialized back into runtime cache state from KV snapshot payloads.
+    pub kv_snapshot_materialized_bytes: AtomicU64,
+
+    /// Number of token rows successfully sampled on device.
+    pub device_sampling_requests: AtomicU64,
+
+    /// Number of token rows that attempted device sampling but fell back before completion.
+    pub device_sampling_fallback_requests: AtomicU64,
+
+    /// Number of token rows sampled through host logic.
+    pub host_sampling_requests: AtomicU64,
+
+    /// Total time spent in all sampling paths.
+    pub total_sampling_time_ms: AtomicU64,
+
+    /// Total time spent in device sampling paths.
+    pub device_sampling_time_ms: AtomicU64,
+
+    /// Total time spent in host sampling paths.
+    pub host_sampling_time_ms: AtomicU64,
+
+    /// Number of active KV view accesses served from the existing cache.
+    pub device_kv_active_view_cache_hits: AtomicU64,
+
+    /// Number of active KV view accesses that had to rebuild the view.
+    pub device_kv_active_view_cache_misses: AtomicU64,
+
+    /// Number of head-expanded KV view accesses served from the existing cache.
+    pub device_kv_head_view_cache_hits: AtomicU64,
+
+    /// Number of head-expanded KV view accesses that had to rebuild the view.
+    pub device_kv_head_view_cache_misses: AtomicU64,
+
+    /// Number of selected-head KV view accesses served from the existing cache.
+    pub device_kv_selected_head_view_cache_hits: AtomicU64,
+
+    /// Number of selected-head KV view accesses that had to rebuild the view.
+    pub device_kv_selected_head_view_cache_misses: AtomicU64,
 }
 
 impl Default for InferenceStats {
@@ -268,7 +334,37 @@ impl InferenceStats {
             total_larger_ring_operations: AtomicU64::new(0),
             total_collective_bytes_sent: AtomicU64::new(0),
             total_collective_bytes_received: AtomicU64::new(0),
+            total_collective_host_materializations: AtomicU64::new(0),
+            total_collective_host_materialization_bytes: AtomicU64::new(0),
+            total_device_resident_collectives: AtomicU64::new(0),
+            collective_host_stage_to_host_events: AtomicU64::new(0),
+            collective_host_stage_to_host_bytes: AtomicU64::new(0),
+            collective_host_restore_to_device_events: AtomicU64::new(0),
+            collective_host_restore_to_device_bytes: AtomicU64::new(0),
+            kv_snapshot_exports: AtomicU64::new(0),
+            kv_snapshot_export_bytes: AtomicU64::new(0),
+            kv_snapshot_materializations: AtomicU64::new(0),
+            kv_snapshot_materialized_bytes: AtomicU64::new(0),
+            device_sampling_requests: AtomicU64::new(0),
+            device_sampling_fallback_requests: AtomicU64::new(0),
+            host_sampling_requests: AtomicU64::new(0),
+            total_sampling_time_ms: AtomicU64::new(0),
+            device_sampling_time_ms: AtomicU64::new(0),
+            host_sampling_time_ms: AtomicU64::new(0),
+            device_kv_active_view_cache_hits: AtomicU64::new(0),
+            device_kv_active_view_cache_misses: AtomicU64::new(0),
+            device_kv_head_view_cache_hits: AtomicU64::new(0),
+            device_kv_head_view_cache_misses: AtomicU64::new(0),
+            device_kv_selected_head_view_cache_hits: AtomicU64::new(0),
+            device_kv_selected_head_view_cache_misses: AtomicU64::new(0),
         }
+    }
+
+    pub fn install_as_runtime_collector(stats: &Arc<Self>) {
+        let mut slot = active_runtime_stats_slot()
+            .lock()
+            .expect("active runtime stats mutex poisoned");
+        *slot = Arc::downgrade(stats);
     }
 
     /// Record a successful inference job
@@ -404,6 +500,92 @@ impl InferenceStats {
             .fetch_add(metrics.bytes_sent, Ordering::Relaxed);
         self.total_collective_bytes_received
             .fetch_add(metrics.bytes_received, Ordering::Relaxed);
+        self.total_collective_host_materializations
+            .fetch_add(metrics.host_materialization_count, Ordering::Relaxed);
+        self.total_collective_host_materialization_bytes
+            .fetch_add(metrics.host_materialization_bytes, Ordering::Relaxed);
+        self.total_device_resident_collectives
+            .fetch_add(metrics.device_resident_collective_count, Ordering::Relaxed);
+    }
+
+    pub fn record_collective_host_stage_to_host(&self, bytes: u64) {
+        self.collective_host_stage_to_host_events
+            .fetch_add(1, Ordering::Relaxed);
+        self.collective_host_stage_to_host_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_collective_host_restore_to_device(&self, bytes: u64) {
+        self.collective_host_restore_to_device_events
+            .fetch_add(1, Ordering::Relaxed);
+        self.collective_host_restore_to_device_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_kv_snapshot_export(&self, bytes: u64) {
+        self.kv_snapshot_exports.fetch_add(1, Ordering::Relaxed);
+        self.kv_snapshot_export_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_kv_snapshot_materialization(&self, bytes: u64) {
+        self.kv_snapshot_materializations
+            .fetch_add(1, Ordering::Relaxed);
+        self.kv_snapshot_materialized_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_device_sampling(&self, requests: u64, duration_ms: u64) {
+        self.device_sampling_requests
+            .fetch_add(requests, Ordering::Relaxed);
+        self.device_sampling_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        self.total_sampling_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_device_sampling_fallback(&self, requests: u64) {
+        self.device_sampling_fallback_requests
+            .fetch_add(requests, Ordering::Relaxed);
+    }
+
+    pub fn record_host_sampling(&self, requests: u64, duration_ms: u64) {
+        self.host_sampling_requests
+            .fetch_add(requests, Ordering::Relaxed);
+        self.host_sampling_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        self.total_sampling_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_device_kv_active_view_cache_hit(&self) {
+        self.device_kv_active_view_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_device_kv_active_view_cache_miss(&self) {
+        self.device_kv_active_view_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_device_kv_head_view_cache_hit(&self) {
+        self.device_kv_head_view_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_device_kv_head_view_cache_miss(&self) {
+        self.device_kv_head_view_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_device_kv_selected_head_view_cache_hit(&self) {
+        self.device_kv_selected_head_view_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_device_kv_selected_head_view_cache_miss(&self) {
+        self.device_kv_selected_head_view_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a checkpoint creation
@@ -672,6 +854,127 @@ impl InferenceStats {
         self.total_collective_bytes_received.load(Ordering::Relaxed) as f64 / operations as f64
     }
 
+    pub fn device_resident_collective_rate(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_device_resident_collectives
+            .load(Ordering::Relaxed) as f64
+            / operations as f64
+    }
+
+    pub fn collective_host_materialization_rate(&self) -> f64 {
+        let operations = self.total_collective_operations.load(Ordering::Relaxed);
+        if operations == 0 {
+            return 0.0;
+        }
+        self.total_collective_host_materializations
+            .load(Ordering::Relaxed) as f64
+            / operations as f64
+    }
+
+    pub fn collective_host_staging_events(&self) -> u64 {
+        self.collective_host_stage_to_host_events
+            .load(Ordering::Relaxed)
+            + self
+                .collective_host_restore_to_device_events
+                .load(Ordering::Relaxed)
+    }
+
+    pub fn collective_host_staging_bytes(&self) -> u64 {
+        self.collective_host_stage_to_host_bytes
+            .load(Ordering::Relaxed)
+            + self
+                .collective_host_restore_to_device_bytes
+                .load(Ordering::Relaxed)
+    }
+
+    pub fn sampling_share_of_runtime(&self) -> f64 {
+        let total_runtime = self.total_inference_time_ms.load(Ordering::Relaxed);
+        if total_runtime == 0 {
+            return 0.0;
+        }
+        self.total_sampling_time_ms.load(Ordering::Relaxed) as f64 / total_runtime as f64
+    }
+
+    pub fn device_sampling_fallback_rate(&self) -> f64 {
+        let attempted = self.device_sampling_requests.load(Ordering::Relaxed)
+            + self
+                .device_sampling_fallback_requests
+                .load(Ordering::Relaxed);
+        if attempted == 0 {
+            return 0.0;
+        }
+        self.device_sampling_fallback_requests
+            .load(Ordering::Relaxed) as f64
+            / attempted as f64
+    }
+
+    pub fn avg_generated_token_latency_ms(&self) -> f64 {
+        let generated_tokens = self.total_tokens_generated.load(Ordering::Relaxed);
+        if generated_tokens == 0 {
+            return 0.0;
+        }
+        self.total_inference_time_ms.load(Ordering::Relaxed) as f64 / generated_tokens as f64
+    }
+
+    pub fn kv_snapshot_avg_export_bytes(&self) -> f64 {
+        let exports = self.kv_snapshot_exports.load(Ordering::Relaxed);
+        if exports == 0 {
+            return 0.0;
+        }
+        self.kv_snapshot_export_bytes.load(Ordering::Relaxed) as f64 / exports as f64
+    }
+
+    pub fn kv_snapshot_avg_materialized_bytes(&self) -> f64 {
+        let materializations = self.kv_snapshot_materializations.load(Ordering::Relaxed);
+        if materializations == 0 {
+            return 0.0;
+        }
+        self.kv_snapshot_materialized_bytes.load(Ordering::Relaxed) as f64 / materializations as f64
+    }
+
+    pub fn device_kv_active_view_cache_hit_rate(&self) -> f64 {
+        let hits = self
+            .device_kv_active_view_cache_hits
+            .load(Ordering::Relaxed);
+        let misses = self
+            .device_kv_active_view_cache_misses
+            .load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            return 0.0;
+        }
+        hits as f64 / total as f64
+    }
+
+    pub fn device_kv_head_view_cache_hit_rate(&self) -> f64 {
+        let hits = self.device_kv_head_view_cache_hits.load(Ordering::Relaxed);
+        let misses = self
+            .device_kv_head_view_cache_misses
+            .load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            return 0.0;
+        }
+        hits as f64 / total as f64
+    }
+
+    pub fn device_kv_selected_head_view_cache_hit_rate(&self) -> f64 {
+        let hits = self
+            .device_kv_selected_head_view_cache_hits
+            .load(Ordering::Relaxed);
+        let misses = self
+            .device_kv_selected_head_view_cache_misses
+            .load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            return 0.0;
+        }
+        hits as f64 / total as f64
+    }
+
     pub fn collective_wait_share_of_collective_runtime(&self) -> f64 {
         let total_collective = self.total_reduce_scatter_time_ms.load(Ordering::Relaxed)
             + self.total_all_gather_time_ms.load(Ordering::Relaxed)
@@ -777,6 +1080,16 @@ impl InferenceStats {
                 "{:.3}",
                 self.pairwise_fast_path_collective_rate()
             ),
+            device_resident_collective_rate = format!(
+                "{:.3}",
+                self.device_resident_collective_rate()
+            ),
+            collective_host_materialization_rate = format!(
+                "{:.3}",
+                self.collective_host_materialization_rate()
+            ),
+            collective_host_staging_events = self.collective_host_staging_events(),
+            collective_host_staging_bytes = self.collective_host_staging_bytes(),
             decode_multi_session_microbatches = self
                 .decode_multi_session_microbatches
                 .load(Ordering::Relaxed),
@@ -848,6 +1161,44 @@ impl InferenceStats {
             tensor_connection_evicts = self
                 .tensor_connection_evict_count
                 .load(Ordering::Relaxed),
+            kv_snapshot_exports = self.kv_snapshot_exports.load(Ordering::Relaxed),
+            kv_snapshot_export_bytes = self.kv_snapshot_export_bytes.load(Ordering::Relaxed),
+            kv_snapshot_materializations = self.kv_snapshot_materializations.load(Ordering::Relaxed),
+            kv_snapshot_materialized_bytes = self
+                .kv_snapshot_materialized_bytes
+                .load(Ordering::Relaxed),
+            kv_snapshot_avg_export_bytes = format!("{:.2}", self.kv_snapshot_avg_export_bytes()),
+            kv_snapshot_avg_materialized_bytes = format!(
+                "{:.2}",
+                self.kv_snapshot_avg_materialized_bytes()
+            ),
+            device_sampling_requests = self.device_sampling_requests.load(Ordering::Relaxed),
+            device_sampling_fallback_requests = self
+                .device_sampling_fallback_requests
+                .load(Ordering::Relaxed),
+            host_sampling_requests = self.host_sampling_requests.load(Ordering::Relaxed),
+            total_sampling_time_ms = self.total_sampling_time_ms.load(Ordering::Relaxed),
+            sampling_share_of_runtime = format!("{:.3}", self.sampling_share_of_runtime()),
+            device_sampling_fallback_rate = format!(
+                "{:.3}",
+                self.device_sampling_fallback_rate()
+            ),
+            avg_generated_token_latency_ms = format!(
+                "{:.3}",
+                self.avg_generated_token_latency_ms()
+            ),
+            device_kv_active_view_cache_hit_rate = format!(
+                "{:.3}",
+                self.device_kv_active_view_cache_hit_rate()
+            ),
+            device_kv_head_view_cache_hit_rate = format!(
+                "{:.3}",
+                self.device_kv_head_view_cache_hit_rate()
+            ),
+            device_kv_selected_head_view_cache_hit_rate = format!(
+                "{:.3}",
+                self.device_kv_selected_head_view_cache_hit_rate()
+            ),
             uptime = %self.uptime_string(),
             "Inference statistics"
         );
@@ -973,8 +1324,24 @@ impl InferenceStats {
             self.pairwise_fast_path_collective_rate() * 100.0
         );
         println!(
+            "  Device Resident:    {:.1}%",
+            self.device_resident_collective_rate() * 100.0
+        );
+        println!(
+            "  Host Materialized:  {:.1}%",
+            self.collective_host_materialization_rate() * 100.0
+        );
+        println!(
             "  Coll Wait Share:     {:.1}%",
             self.collective_wait_share_of_collective_runtime() * 100.0
+        );
+        println!(
+            "  Host Staging Events: {}",
+            self.collective_host_staging_events()
+        );
+        println!(
+            "  Host Staging Bytes:  {}",
+            self.collective_host_staging_bytes()
         );
 
         println!("\n{}", "Decode Batching:".bold());
@@ -1054,6 +1421,77 @@ impl InferenceStats {
             "  Peak Prefill Bucket: {}",
             self.fast_path_prefill_token_ceiling_peak
                 .load(Ordering::Relaxed)
+        );
+
+        println!("\n{}", "KV Residency:".bold());
+        println!(
+            "  Snapshot Exports:    {}",
+            self.kv_snapshot_exports.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Snapshot Export Bytes:{}",
+            self.kv_snapshot_export_bytes.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Materializations:    {}",
+            self.kv_snapshot_materializations.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Materialized Bytes:  {}",
+            self.kv_snapshot_materialized_bytes.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Avg Export Bytes:    {:.2}",
+            self.kv_snapshot_avg_export_bytes()
+        );
+        println!(
+            "  Avg Materialized:    {:.2}",
+            self.kv_snapshot_avg_materialized_bytes()
+        );
+
+        println!("\n{}", "Sampling:".bold());
+        println!(
+            "  Device Requests:     {}",
+            self.device_sampling_requests.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Device Fallbacks:    {}",
+            self.device_sampling_fallback_requests
+                .load(Ordering::Relaxed)
+        );
+        println!(
+            "  Host Requests:       {}",
+            self.host_sampling_requests.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Sampling Time:       {}ms",
+            self.total_sampling_time_ms.load(Ordering::Relaxed)
+        );
+        println!(
+            "  Sampling Share:      {:.1}%",
+            self.sampling_share_of_runtime() * 100.0
+        );
+        println!(
+            "  Device Fallback Rate:{:.1}%",
+            self.device_sampling_fallback_rate() * 100.0
+        );
+        println!(
+            "  Token Latency:       {:.3}ms",
+            self.avg_generated_token_latency_ms()
+        );
+
+        println!("\n{}", "KV View Reuse:".bold());
+        println!(
+            "  Active View Hit Rate:{:.1}%",
+            self.device_kv_active_view_cache_hit_rate() * 100.0
+        );
+        println!(
+            "  Head View Hit Rate:  {:.1}%",
+            self.device_kv_head_view_cache_hit_rate() * 100.0
+        );
+        println!(
+            "  Selected View Hit:   {:.1}%",
+            self.device_kv_selected_head_view_cache_hit_rate() * 100.0
         );
 
         println!("\n{}", "Fault Tolerance:".bold());
@@ -1507,6 +1945,144 @@ impl InferenceStats {
             "total_collective_bytes_received",
             self.total_collective_bytes_received.load(Ordering::Relaxed),
         );
+        insert_u64(
+            &mut map,
+            "total_collective_host_materializations",
+            self.total_collective_host_materializations
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_collective_host_materialization_bytes",
+            self.total_collective_host_materialization_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_device_resident_collectives",
+            self.total_device_resident_collectives
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "collective_host_stage_to_host_events",
+            self.collective_host_stage_to_host_events
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "collective_host_stage_to_host_bytes",
+            self.collective_host_stage_to_host_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "collective_host_restore_to_device_events",
+            self.collective_host_restore_to_device_events
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "collective_host_restore_to_device_bytes",
+            self.collective_host_restore_to_device_bytes
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "collective_host_staging_events",
+            self.collective_host_staging_events(),
+        );
+        insert_u64(
+            &mut map,
+            "collective_host_staging_bytes",
+            self.collective_host_staging_bytes(),
+        );
+        insert_u64(
+            &mut map,
+            "kv_snapshot_exports",
+            self.kv_snapshot_exports.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "kv_snapshot_export_bytes",
+            self.kv_snapshot_export_bytes.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "kv_snapshot_materializations",
+            self.kv_snapshot_materializations.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "kv_snapshot_materialized_bytes",
+            self.kv_snapshot_materialized_bytes.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_sampling_requests",
+            self.device_sampling_requests.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_sampling_fallback_requests",
+            self.device_sampling_fallback_requests
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "host_sampling_requests",
+            self.host_sampling_requests.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "total_sampling_time_ms",
+            self.total_sampling_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_sampling_time_ms",
+            self.device_sampling_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "host_sampling_time_ms",
+            self.host_sampling_time_ms.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_kv_active_view_cache_hits",
+            self.device_kv_active_view_cache_hits
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_kv_active_view_cache_misses",
+            self.device_kv_active_view_cache_misses
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_kv_head_view_cache_hits",
+            self.device_kv_head_view_cache_hits.load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_kv_head_view_cache_misses",
+            self.device_kv_head_view_cache_misses
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_kv_selected_head_view_cache_hits",
+            self.device_kv_selected_head_view_cache_hits
+                .load(Ordering::Relaxed),
+        );
+        insert_u64(
+            &mut map,
+            "device_kv_selected_head_view_cache_misses",
+            self.device_kv_selected_head_view_cache_misses
+                .load(Ordering::Relaxed),
+        );
 
         map.insert(
             "success_rate".to_string(),
@@ -1569,8 +2145,69 @@ impl InferenceStats {
             serde_json::Value::from(self.avg_collective_receive_bytes()),
         );
         map.insert(
+            "device_resident_collective_rate".to_string(),
+            serde_json::Value::from(self.device_resident_collective_rate()),
+        );
+        map.insert(
+            "collective_host_materialization_rate".to_string(),
+            serde_json::Value::from(self.collective_host_materialization_rate()),
+        );
+        map.insert(
             "collective_wait_share_of_collective_runtime".to_string(),
             serde_json::Value::from(self.collective_wait_share_of_collective_runtime()),
+        );
+        map.insert(
+            "sampling_share_of_runtime".to_string(),
+            serde_json::Value::from(self.sampling_share_of_runtime()),
+        );
+        map.insert(
+            "device_sampling_fallback_rate".to_string(),
+            serde_json::Value::from(self.device_sampling_fallback_rate()),
+        );
+        map.insert(
+            "avg_generated_token_latency_ms".to_string(),
+            serde_json::Value::from(self.avg_generated_token_latency_ms()),
+        );
+        map.insert(
+            "kv_snapshot_avg_export_bytes".to_string(),
+            serde_json::Value::from(self.kv_snapshot_avg_export_bytes()),
+        );
+        map.insert(
+            "kv_snapshot_avg_materialized_bytes".to_string(),
+            serde_json::Value::from(self.kv_snapshot_avg_materialized_bytes()),
+        );
+        map.insert(
+            "device_kv_active_view_cache_hit_rate".to_string(),
+            serde_json::Value::from(self.device_kv_active_view_cache_hit_rate()),
+        );
+        map.insert(
+            "device_kv_head_view_cache_hit_rate".to_string(),
+            serde_json::Value::from(self.device_kv_head_view_cache_hit_rate()),
+        );
+        map.insert(
+            "device_kv_selected_head_view_cache_hit_rate".to_string(),
+            serde_json::Value::from(self.device_kv_selected_head_view_cache_hit_rate()),
+        );
+        map.insert(
+            "release_gate_metrics".to_string(),
+            serde_json::json!({
+                "avg_generated_token_latency_ms": self.avg_generated_token_latency_ms(),
+                "collective_wait_share_of_collective_runtime": self.collective_wait_share_of_collective_runtime(),
+                "collective_transport_share_of_runtime": self.collective_transport_share_of_runtime(),
+                "device_resident_collective_rate": self.device_resident_collective_rate(),
+                "collective_host_materialization_rate": self.collective_host_materialization_rate(),
+                "collective_host_staging_events": self.collective_host_staging_events(),
+                "collective_host_staging_bytes": self.collective_host_staging_bytes(),
+                "avg_decode_batch_size": self.avg_decode_batch_size(),
+                "multi_session_batch_rate": self.multi_session_batch_rate(),
+                "kv_snapshot_avg_export_bytes": self.kv_snapshot_avg_export_bytes(),
+                "kv_snapshot_avg_materialized_bytes": self.kv_snapshot_avg_materialized_bytes(),
+                "sampling_share_of_runtime": self.sampling_share_of_runtime(),
+                "device_sampling_fallback_rate": self.device_sampling_fallback_rate(),
+                "device_kv_active_view_cache_hit_rate": self.device_kv_active_view_cache_hit_rate(),
+                "device_kv_head_view_cache_hit_rate": self.device_kv_head_view_cache_hit_rate(),
+                "device_kv_selected_head_view_cache_hit_rate": self.device_kv_selected_head_view_cache_hit_rate(),
+            }),
         );
         map.insert(
             "recovery_success_rate".to_string(),
@@ -1609,6 +2246,75 @@ impl InferenceStats {
         std::fs::write(&stats_path, json)?;
         Ok(())
     }
+}
+
+static ACTIVE_RUNTIME_STATS: OnceLock<Mutex<Weak<InferenceStats>>> = OnceLock::new();
+
+fn active_runtime_stats_slot() -> &'static Mutex<Weak<InferenceStats>> {
+    ACTIVE_RUNTIME_STATS.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+fn with_active_runtime_stats<T>(f: impl FnOnce(&InferenceStats) -> T) -> Option<T> {
+    let stats = active_runtime_stats_slot()
+        .lock()
+        .expect("active runtime stats mutex poisoned")
+        .upgrade()?;
+    Some(f(&stats))
+}
+
+pub(crate) fn record_runtime_collective_host_stage(bytes: u64) {
+    let _ = with_active_runtime_stats(|stats| stats.record_collective_host_stage_to_host(bytes));
+}
+
+pub(crate) fn record_runtime_collective_host_restore(bytes: u64) {
+    let _ =
+        with_active_runtime_stats(|stats| stats.record_collective_host_restore_to_device(bytes));
+}
+
+pub(crate) fn record_runtime_kv_snapshot_export(bytes: u64) {
+    let _ = with_active_runtime_stats(|stats| stats.record_kv_snapshot_export(bytes));
+}
+
+pub(crate) fn record_runtime_kv_snapshot_materialization(bytes: u64) {
+    let _ = with_active_runtime_stats(|stats| stats.record_kv_snapshot_materialization(bytes));
+}
+
+pub(crate) fn record_runtime_device_sampling(requests: u64, duration_ms: u64) {
+    let _ = with_active_runtime_stats(|stats| stats.record_device_sampling(requests, duration_ms));
+}
+
+pub(crate) fn record_runtime_device_sampling_fallback(requests: u64) {
+    let _ = with_active_runtime_stats(|stats| stats.record_device_sampling_fallback(requests));
+}
+
+pub(crate) fn record_runtime_host_sampling(requests: u64, duration_ms: u64) {
+    let _ = with_active_runtime_stats(|stats| stats.record_host_sampling(requests, duration_ms));
+}
+
+pub(crate) fn record_runtime_device_kv_active_view_cache_hit() {
+    let _ = with_active_runtime_stats(|stats| stats.record_device_kv_active_view_cache_hit());
+}
+
+pub(crate) fn record_runtime_device_kv_active_view_cache_miss() {
+    let _ = with_active_runtime_stats(|stats| stats.record_device_kv_active_view_cache_miss());
+}
+
+pub(crate) fn record_runtime_device_kv_head_view_cache_hit() {
+    let _ = with_active_runtime_stats(|stats| stats.record_device_kv_head_view_cache_hit());
+}
+
+pub(crate) fn record_runtime_device_kv_head_view_cache_miss() {
+    let _ = with_active_runtime_stats(|stats| stats.record_device_kv_head_view_cache_miss());
+}
+
+pub(crate) fn record_runtime_device_kv_selected_head_view_cache_hit() {
+    let _ =
+        with_active_runtime_stats(|stats| stats.record_device_kv_selected_head_view_cache_hit());
+}
+
+pub(crate) fn record_runtime_device_kv_selected_head_view_cache_miss() {
+    let _ =
+        with_active_runtime_stats(|stats| stats.record_device_kv_selected_head_view_cache_miss());
 }
 
 #[cfg(test)]
@@ -1741,6 +2447,32 @@ mod tests {
     fn test_stats_to_json() {
         let stats = InferenceStats::new();
         stats.record_success(10, 50, 1000);
+        stats.record_allreduce_breakdown(RingAllReduceMetrics {
+            reduce_scatter_step_time_ms: 10,
+            all_gather_step_time_ms: 12,
+            send_wait_time_ms: 4,
+            receive_wait_time_ms: 6,
+            collective_operations: 2,
+            collective_worker_participants: 5,
+            pairwise_fast_path_operations: 1,
+            larger_ring_operations: 1,
+            bytes_sent: 128,
+            bytes_received: 160,
+            host_materialization_count: 1,
+            host_materialization_bytes: 96,
+            device_resident_collective_count: 1,
+        });
+        stats.record_collective_host_stage_to_host(64);
+        stats.record_collective_host_restore_to_device(64);
+        stats.record_kv_snapshot_export(128);
+        stats.record_kv_snapshot_materialization(96);
+        stats.record_device_sampling(2, 7);
+        stats.record_device_sampling_fallback(1);
+        stats.record_host_sampling(1, 5);
+        stats.record_device_kv_active_view_cache_miss();
+        stats.record_device_kv_active_view_cache_hit();
+        stats.record_device_kv_head_view_cache_miss();
+        stats.record_device_kv_selected_head_view_cache_miss();
 
         let json = stats.to_json();
 
@@ -1748,6 +2480,23 @@ mod tests {
         assert_eq!(json["total_tokens_generated"], 50);
         assert_eq!(json["avg_decode_batch_size"], 0.0);
         assert_eq!(json["fast_path_decode_plan_rate"], 0.0);
+        assert_eq!(json["collective_host_staging_events"], 2);
+        assert_eq!(json["collective_host_staging_bytes"], 128);
+        assert_eq!(json["kv_snapshot_exports"], 1);
+        assert_eq!(json["kv_snapshot_materializations"], 1);
+        assert_eq!(json["device_sampling_requests"], 2);
+        assert_eq!(json["device_sampling_fallback_requests"], 1);
+        assert_eq!(json["host_sampling_requests"], 1);
+        assert_eq!(json["total_collective_host_materializations"], 1);
+        assert_eq!(json["total_device_resident_collectives"], 1);
+        assert_eq!(json["device_kv_active_view_cache_hits"], 1);
+        assert_eq!(json["device_kv_active_view_cache_misses"], 1);
+        assert_eq!(json["device_resident_collective_rate"], 0.5);
+        assert_eq!(json["collective_host_materialization_rate"], 0.5);
+        assert_eq!(
+            json["release_gate_metrics"]["device_kv_active_view_cache_hit_rate"],
+            0.5
+        );
     }
 
     #[test]
@@ -1816,6 +2565,9 @@ mod tests {
             larger_ring_operations: 1,
             bytes_sent: 128,
             bytes_received: 160,
+            host_materialization_count: 0,
+            host_materialization_bytes: 0,
+            device_resident_collective_count: 0,
         });
 
         assert!((stats.allreduce_send_wait_share() - 0.1).abs() < f64::EPSILON);
@@ -1830,6 +2582,77 @@ mod tests {
             (stats.collective_wait_share_of_collective_runtime() - (10.0 / 32.0)).abs()
                 < f64::EPSILON
         );
+    }
+
+    #[test]
+    fn test_stats_runtime_overhead_metrics() {
+        let stats = InferenceStats::new();
+        stats.record_success(16, 32, 200);
+        stats.record_allreduce_breakdown(RingAllReduceMetrics {
+            reduce_scatter_step_time_ms: 30,
+            all_gather_step_time_ms: 20,
+            send_wait_time_ms: 10,
+            receive_wait_time_ms: 20,
+            collective_operations: 4,
+            collective_worker_participants: 10,
+            pairwise_fast_path_operations: 1,
+            larger_ring_operations: 3,
+            bytes_sent: 1024,
+            bytes_received: 2048,
+            host_materialization_count: 1,
+            host_materialization_bytes: 64,
+            device_resident_collective_count: 3,
+        });
+        stats.record_collective_host_stage_to_host(64);
+        stats.record_collective_host_restore_to_device(32);
+        stats.record_kv_snapshot_export(256);
+        stats.record_kv_snapshot_materialization(128);
+        stats.record_device_sampling(3, 9);
+        stats.record_device_sampling_fallback(1);
+        stats.record_host_sampling(1, 5);
+        stats.record_device_kv_active_view_cache_miss();
+        stats.record_device_kv_active_view_cache_hit();
+        stats.record_device_kv_active_view_cache_hit();
+        stats.record_device_kv_head_view_cache_miss();
+        stats.record_device_kv_head_view_cache_hit();
+        stats.record_device_kv_selected_head_view_cache_miss();
+        stats.record_device_kv_selected_head_view_cache_hit();
+
+        assert_eq!(stats.collective_host_staging_events(), 2);
+        assert_eq!(stats.collective_host_staging_bytes(), 96);
+        assert_eq!(
+            stats
+                .total_collective_host_materializations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .total_device_resident_collectives
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(stats.kv_snapshot_exports.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.kv_snapshot_export_bytes.load(Ordering::Relaxed), 256);
+        assert_eq!(
+            stats.kv_snapshot_materializations.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats.kv_snapshot_materialized_bytes.load(Ordering::Relaxed),
+            128
+        );
+        assert_eq!(stats.total_sampling_time_ms.load(Ordering::Relaxed), 14);
+        assert!((stats.sampling_share_of_runtime() - 0.07).abs() < f64::EPSILON);
+        assert!((stats.device_sampling_fallback_rate() - 0.25).abs() < f64::EPSILON);
+        assert!((stats.avg_generated_token_latency_ms() - 6.25).abs() < f64::EPSILON);
+        assert!((stats.device_resident_collective_rate() - 0.75).abs() < f64::EPSILON);
+        assert!((stats.collective_host_materialization_rate() - 0.25).abs() < f64::EPSILON);
+        assert!((stats.kv_snapshot_avg_export_bytes() - 256.0).abs() < f64::EPSILON);
+        assert!((stats.kv_snapshot_avg_materialized_bytes() - 128.0).abs() < f64::EPSILON);
+        assert!((stats.device_kv_active_view_cache_hit_rate() - (2.0 / 3.0)).abs() < f64::EPSILON);
+        assert!((stats.device_kv_head_view_cache_hit_rate() - 0.5).abs() < f64::EPSILON);
+        assert!((stats.device_kv_selected_head_view_cache_hit_rate() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

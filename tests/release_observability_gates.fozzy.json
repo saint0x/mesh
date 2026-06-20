@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "name": "release-observability-gates",
+  "steps": [
+    {
+      "name": "inference stats expose collective staging sampling and kv residency proofs",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::stats::tests::test_stats_runtime_overhead_metrics",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "release gate summary derives per-token latency collective residency and cache-view churn metrics",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::forward_pass::tests::test_device_kv_cache_metrics_track_runtime_view_reuse",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "stats json persists the release-gate metrics expected by operator tooling",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::stats::tests::test_stats_to_json",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "kv snapshot sequence metadata survives nonzero base-position windows",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::kv_cache::tests::test_kv_snapshot_tracks_nonzero_base_position",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    },
+    {
+      "name": "collective buffer round trips still restore the same tensor shape and data",
+      "type": "proc_when",
+      "cmd": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "agent",
+        "inference::tensor_ops::tests::test_collective_buffer_round_trip_from_candle_2d",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "stdout": "test result: ok.\n",
+      "times": 1
+    }
+  ]
+}

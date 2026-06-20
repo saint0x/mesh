@@ -7,19 +7,15 @@
 //! - Softmax for attention and sampling
 //! - Token embedding lookup
 
-use crate::errors::{AgentError, Result};
-use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use serde::{Deserialize, Serialize};
-
+#[cfg(test)]
 use super::runtime::{
-    add_tensor2d, apply_rope_tensor2d,
-    collective_matrix_from_device_tensor as collective_buffer_from_candle_2d,
-    device_tensor_from_2d as to_candle_2d,
-    device_tensor_from_collective_matrix as candle_2d_from_collective_buffer, embed_tokens_device,
-    gelu_tensor2d, host_tensor_2d_from_device as from_candle_2d, layer_norm_tensor2d,
-    matmul_tensor2d, mul_tensor2d, narrow_tensor2d_columns, rms_norm_tensor2d, sample_token_device,
-    scale_tensor2d, silu_tensor2d, softmax_tensor2d, transpose_tensor2d,
+    device_tensor_from_2d as to_candle_2d, host_tensor_2d_from_device as from_candle_2d,
+    sample_token_device, DeviceCollectiveBuffer,
 };
+use crate::errors::{AgentError, Result};
+#[cfg(test)]
+use crate::executor::ring_allreduce::StagedCollectiveBuffer;
+use serde::{Deserialize, Serialize};
 
 /// 2D Tensor for transformer computations
 ///
@@ -103,18 +99,13 @@ impl Tensor2D {
                 self.rows, self.cols, other.rows, other.cols
             )));
         }
-
-        if is_cpu_provider() {
-            let data = self
-                .data
-                .iter()
-                .zip(&other.data)
-                .map(|(lhs, rhs)| lhs + rhs)
-                .collect();
-            return Tensor2D::new(data, self.rows, self.cols);
-        }
-
-        add_tensor2d(self, other)
+        let data = self
+            .data
+            .iter()
+            .zip(&other.data)
+            .map(|(lhs, rhs)| lhs + rhs)
+            .collect();
+        Tensor2D::new(data, self.rows, self.cols)
     }
 
     /// Element-wise multiplication (Hadamard product)
@@ -126,47 +117,37 @@ impl Tensor2D {
             )));
         }
 
-        if is_cpu_provider() {
-            let data = self
-                .data
-                .iter()
-                .zip(&other.data)
-                .map(|(lhs, rhs)| lhs * rhs)
-                .collect();
-            return Tensor2D::new(data, self.rows, self.cols);
-        }
-
-        mul_tensor2d(self, other)
+        let data = self
+            .data
+            .iter()
+            .zip(&other.data)
+            .map(|(lhs, rhs)| lhs * rhs)
+            .collect();
+        Tensor2D::new(data, self.rows, self.cols)
     }
 
     /// Scale by a scalar
     pub fn scale(&self, scalar: f32) -> Tensor2D {
-        if is_cpu_provider() {
-            return Tensor2D {
-                data: self.data.iter().map(|value| value * scalar).collect(),
-                rows: self.rows,
-                cols: self.cols,
-            };
+        Tensor2D {
+            data: self.data.iter().map(|value| value * scalar).collect(),
+            rows: self.rows,
+            cols: self.cols,
         }
-        scale_tensor2d(self, scalar).expect("GPU tensor scaling failed")
     }
 
     /// Transpose the tensor
     pub fn transpose(&self) -> Tensor2D {
-        if is_cpu_provider() {
-            let mut data = vec![0.0; self.len()];
-            for row in 0..self.rows {
-                for col in 0..self.cols {
-                    data[col * self.rows + row] = self.get(row, col);
-                }
+        let mut data = vec![0.0; self.len()];
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                data[col * self.rows + row] = self.get(row, col);
             }
-            return Tensor2D {
-                data,
-                rows: self.cols,
-                cols: self.rows,
-            };
         }
-        transpose_tensor2d(self).expect("GPU tensor transpose failed")
+        Tensor2D {
+            data,
+            rows: self.cols,
+            cols: self.rows,
+        }
     }
 
     /// Convert to 1D tensor (flatten)
@@ -188,16 +169,13 @@ impl Tensor2D {
         }
 
         let slice_cols = col_end - col_start;
-        if is_cpu_provider() {
-            let mut data = Vec::with_capacity(self.rows * slice_cols);
-            for row in 0..self.rows {
-                let start = row * self.cols + col_start;
-                let end = start + slice_cols;
-                data.extend_from_slice(&self.data[start..end]);
-            }
-            return Tensor2D::new(data, self.rows, slice_cols);
+        let mut data = Vec::with_capacity(self.rows * slice_cols);
+        for row in 0..self.rows {
+            let start = row * self.cols + col_start;
+            let end = start + slice_cols;
+            data.extend_from_slice(&self.data[start..end]);
         }
-        narrow_tensor2d_columns(self, col_start, slice_cols)
+        Tensor2D::new(data, self.rows, slice_cols)
     }
 }
 
@@ -246,23 +224,19 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
         )));
     }
 
-    if is_cpu_provider() {
-        let mut out = vec![0.0; a.rows * b.cols];
-        for i in 0..a.rows {
-            let a_row = &a.data[i * a.cols..(i + 1) * a.cols];
-            for k in 0..a.cols {
-                let a_ik = a_row[k];
-                let b_row = &b.data[k * b.cols..(k + 1) * b.cols];
-                let out_row = &mut out[i * b.cols..(i + 1) * b.cols];
-                for j in 0..b.cols {
-                    out_row[j] += a_ik * b_row[j];
-                }
+    let mut out = vec![0.0; a.rows * b.cols];
+    for i in 0..a.rows {
+        let a_row = &a.data[i * a.cols..(i + 1) * a.cols];
+        for k in 0..a.cols {
+            let a_ik = a_row[k];
+            let b_row = &b.data[k * b.cols..(k + 1) * b.cols];
+            let out_row = &mut out[i * b.cols..(i + 1) * b.cols];
+            for j in 0..b.cols {
+                out_row[j] += a_ik * b_row[j];
             }
         }
-        return Tensor2D::new(out, a.rows, b.cols);
     }
-
-    matmul_tensor2d(a, b)
+    Tensor2D::new(out, a.rows, b.cols)
 }
 
 // ============== Activation Functions ==============
@@ -272,7 +246,19 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
 /// Used in GPT-2, BERT, and many modern transformers.
 /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
-    gelu_tensor2d(tensor).expect("GPU GELU failed")
+    let sqrt_2_over_pi = (2.0 / std::f32::consts::PI).sqrt();
+    Tensor2D {
+        data: tensor
+            .data
+            .iter()
+            .map(|value| {
+                let cubic = value * value * value;
+                0.5 * value * (1.0 + (sqrt_2_over_pi * (value + 0.044715 * cubic)).tanh())
+            })
+            .collect(),
+        rows: tensor.rows,
+        cols: tensor.cols,
+    }
 }
 
 /// SiLU (Sigmoid Linear Unit) / Swish activation
@@ -280,18 +266,15 @@ pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
 /// Used in LLaMA and other modern models.
 /// silu(x) = x * sigmoid(x)
 pub fn silu(tensor: &Tensor2D) -> Tensor2D {
-    if is_cpu_provider() {
-        return Tensor2D {
-            data: tensor
-                .data
-                .iter()
-                .map(|value| value / (1.0 + (-value).exp()))
-                .collect(),
-            rows: tensor.rows,
-            cols: tensor.cols,
-        };
+    Tensor2D {
+        data: tensor
+            .data
+            .iter()
+            .map(|value| value / (1.0 + (-value).exp()))
+            .collect(),
+        rows: tensor.rows,
+        cols: tensor.cols,
     }
-    silu_tensor2d(tensor).expect("GPU SiLU failed")
 }
 
 // ============== Normalization ==============
@@ -308,21 +291,16 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
         )));
     }
 
-    if is_cpu_provider() {
-        let mut out = vec![0.0; tensor.len()];
-        for row in 0..tensor.rows {
-            let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
-            let mean_square =
-                slice.iter().map(|value| value * value).sum::<f32>() / tensor.cols as f32;
-            let inv_rms = 1.0 / (mean_square + eps).sqrt();
-            for col in 0..tensor.cols {
-                out[row * tensor.cols + col] = slice[col] * inv_rms * gamma.data[col];
-            }
+    let mut out = vec![0.0; tensor.len()];
+    for row in 0..tensor.rows {
+        let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
+        let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / tensor.cols as f32;
+        let inv_rms = 1.0 / (mean_square + eps).sqrt();
+        for col in 0..tensor.cols {
+            out[row * tensor.cols + col] = slice[col] * inv_rms * gamma.data[col];
         }
-        return Tensor2D::new(out, tensor.rows, tensor.cols);
     }
-
-    rms_norm_tensor2d(tensor, gamma, eps)
+    Tensor2D::new(out, tensor.rows, tensor.cols)
 }
 
 /// Standard Layer Normalization
@@ -343,7 +321,25 @@ pub fn layer_norm(
         )));
     }
 
-    layer_norm_tensor2d(tensor, gamma, beta, eps)
+    let mut out = vec![0.0; tensor.len()];
+    for row in 0..tensor.rows {
+        let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
+        let mean = slice.iter().sum::<f32>() / tensor.cols as f32;
+        let variance = slice
+            .iter()
+            .map(|value| {
+                let centered = value - mean;
+                centered * centered
+            })
+            .sum::<f32>()
+            / tensor.cols as f32;
+        let inv_std = 1.0 / (variance + eps).sqrt();
+        for col in 0..tensor.cols {
+            out[row * tensor.cols + col] =
+                ((slice[col] - mean) * inv_std * gamma.data[col]) + beta.data[col];
+        }
+    }
+    Tensor2D::new(out, tensor.rows, tensor.cols)
 }
 
 // ============== Softmax ==============
@@ -352,29 +348,41 @@ pub fn layer_norm(
 ///
 /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
 pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
-    if is_cpu_provider() {
-        let mut out = vec![0.0; tensor.len()];
-        for row in 0..tensor.rows {
-            let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
-            let max_val = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_sum = 0.0f32;
-            for value in slice {
-                exp_sum += (value - max_val).exp();
-            }
-            for col in 0..tensor.cols {
-                out[row * tensor.cols + col] = (slice[col] - max_val).exp() / exp_sum;
-            }
+    let mut out = vec![0.0; tensor.len()];
+    for row in 0..tensor.rows {
+        let slice = &tensor.data[row * tensor.cols..(row + 1) * tensor.cols];
+        let max_val = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut exp_sum = 0.0f32;
+        for value in slice {
+            exp_sum += (value - max_val).exp();
         }
-        return Tensor2D {
-            data: out,
-            rows: tensor.rows,
-            cols: tensor.cols,
-        };
+        for col in 0..tensor.cols {
+            out[row * tensor.cols + col] = (slice[col] - max_val).exp() / exp_sum;
+        }
     }
-    softmax_tensor2d(tensor).expect("GPU softmax failed")
+    Tensor2D {
+        data: out,
+        rows: tensor.rows,
+        cols: tensor.cols,
+    }
 }
 
 // ============== Token Sampling ==============
+
+fn deterministic_sample_threshold(rng_seed: u64) -> f32 {
+    const MIX_A: u64 = 0x9E37_79B9_7F4A_7C15;
+    const MIX_B: u64 = 0xBF58_476D_1CE4_E5B9;
+    const MIX_C: u64 = 0x94D0_49BB_1331_11EB;
+
+    let mut x = rng_seed.wrapping_add(MIX_A);
+    x = (x ^ (x >> 30)).wrapping_mul(MIX_B);
+    x = (x ^ (x >> 27)).wrapping_mul(MIX_C);
+    x ^= x >> 31;
+
+    let upper = (x >> 40) as u32;
+    let threshold = (upper as f64) / ((1u64 << 24) as f64);
+    threshold.clamp(0.0, 1.0 - f64::EPSILON) as f32
+}
 
 /// Sample a token from logits with temperature and top-p (nucleus) sampling
 ///
@@ -423,12 +431,18 @@ pub fn sample_token(logits: &Tensor1D, temperature: f32, top_p: f32, rng_seed: u
         .map(|(idx, p)| (*idx, p / selected_sum))
         .collect();
 
-    // Simple LCG random number generator for reproducibility
-    let mut rng_state = rng_seed;
-    let random_val = {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((rng_state >> 33) as f32) / (u32::MAX as f32)
-    };
+    let random_val = deterministic_sample_threshold(rng_seed);
+
+    if top_p >= 1.0 {
+        let mut cumsum = 0.0;
+        for (idx, prob) in probs.iter().copied().enumerate() {
+            cumsum += prob;
+            if random_val < cumsum {
+                return idx as u32;
+            }
+        }
+        return indexed_probs[0].0 as u32;
+    }
 
     // Sample from the distribution
     let mut cumsum = 0.0;
@@ -476,18 +490,14 @@ pub fn embed_tokens(embedding_table: &Tensor2D, tokens: &[u32]) -> Result<Tensor
         }
     }
 
-    if is_cpu_provider() {
-        let mut data = Vec::with_capacity(tokens.len() * embedding_table.cols);
-        for &token in tokens {
-            let token_idx = token as usize;
-            let start = token_idx * embedding_table.cols;
-            let end = start + embedding_table.cols;
-            data.extend_from_slice(&embedding_table.data[start..end]);
-        }
-        return Tensor2D::new(data, tokens.len(), embedding_table.cols);
+    let mut data = Vec::with_capacity(tokens.len() * embedding_table.cols);
+    for &token in tokens {
+        let token_idx = token as usize;
+        let start = token_idx * embedding_table.cols;
+        let end = start + embedding_table.cols;
+        data.extend_from_slice(&embedding_table.data[start..end]);
     }
-
-    embed_tokens_device(embedding_table, tokens)
+    Tensor2D::new(data, tokens.len(), embedding_table.cols)
 }
 
 // ============== Rotary Position Embedding (RoPE) ==============
@@ -523,15 +533,30 @@ pub fn apply_rope(
         )));
     }
 
-    apply_rope_tensor2d(tensor, positions, head_dim, base)
-}
+    let half_dim = head_dim / 2;
+    let inv_freq = (0..half_dim)
+        .map(|idx| 1.0 / base.powf(idx as f32 * 2.0 / head_dim as f32))
+        .collect::<Vec<_>>();
+    let num_heads = tensor.cols / head_dim;
+    let mut out = vec![0.0; tensor.len()];
 
-#[inline]
-fn is_cpu_provider() -> bool {
-    matches!(
-        selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
-        ExecutionProviderKind::Cpu
-    )
+    for (row, position) in positions.iter().copied().enumerate() {
+        let position = position as f32;
+        for head in 0..num_heads {
+            let head_offset = row * tensor.cols + head * head_dim;
+            for dim in 0..half_dim {
+                let theta = position * inv_freq[dim];
+                let cos = theta.cos();
+                let sin = theta.sin();
+                let left = tensor.data[head_offset + dim];
+                let right = tensor.data[head_offset + half_dim + dim];
+                out[head_offset + dim] = left * cos - right * sin;
+                out[head_offset + half_dim + dim] = left * sin + right * cos;
+            }
+        }
+    }
+
+    Tensor2D::new(out, tensor.rows, tensor.cols)
 }
 
 #[cfg(test)]
@@ -696,14 +721,14 @@ mod tests {
     fn test_collective_buffer_round_trip_from_candle_2d() {
         let source = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
         let candle = to_candle_2d(&source).unwrap();
-        let buffer = collective_buffer_from_candle_2d(&candle).unwrap();
+        let mut buffer = DeviceCollectiveBuffer::from_device_tensor(&candle).unwrap();
 
-        assert_eq!(buffer.rows, 2);
-        assert_eq!(buffer.cols, 2);
+        assert_eq!(buffer.rows(), 2);
+        assert_eq!(buffer.cols(), 2);
         assert_eq!(buffer.len(), 4);
-        assert_eq!(buffer.to_host_vec(), source.data);
+        assert_eq!(buffer.stage_send_chunk(0..4).unwrap(), source.data);
 
-        let restored = candle_2d_from_collective_buffer(&buffer).unwrap();
+        let restored = buffer.into_device_tensor_like(&candle).unwrap();
         let round_trip = from_candle_2d(&restored).unwrap();
         assert_eq!(round_trip.rows, source.rows);
         assert_eq!(round_trip.cols, source.cols);

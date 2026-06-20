@@ -235,20 +235,11 @@ pub struct PrefillWorkspaceLease {
 }
 
 impl DecodeWorkspaceLease {
-    pub fn stage(
+    fn stage_with_slot_reader(
         &mut self,
         tokens: &[u32],
-        positions: &[u32],
-        sequence_lengths: &[u32],
+        mut slot_reader: impl FnMut(usize) -> Result<(u32, u32)>,
     ) -> Result<()> {
-        if tokens.len() != positions.len() || tokens.len() != sequence_lengths.len() {
-            return Err(AgentError::Execution(format!(
-                "decode workspace staging mismatch: tokens={} positions={} sequence_lengths={}",
-                tokens.len(),
-                positions.len(),
-                sequence_lengths.len()
-            )));
-        }
         if tokens.len() > self.bucket.batch_size_ceiling {
             return Err(FastPathInvariantError::CaptureUnsafe {
                 bucket_label: Self::bucket_label(&self.bucket),
@@ -269,11 +260,12 @@ impl DecodeWorkspaceLease {
         buffers.reset();
 
         buffers.token_ids[..tokens.len()].copy_from_slice(tokens);
-        buffers.positions[..positions.len()].copy_from_slice(positions);
-        buffers.slot_sequence_lengths[..sequence_lengths.len()].copy_from_slice(sequence_lengths);
-        buffers.slot_positions[..positions.len()].copy_from_slice(positions);
 
-        for (slot_idx, &sequence_len) in sequence_lengths.iter().enumerate() {
+        for slot_idx in 0..tokens.len() {
+            let (position, sequence_len) = slot_reader(slot_idx)?;
+            buffers.positions[slot_idx] = position;
+            buffers.slot_sequence_lengths[slot_idx] = sequence_len;
+            buffers.slot_positions[slot_idx] = position;
             buffers.slot_mapping[slot_idx] = slot_idx as u32;
             let pages = (sequence_len as usize)
                 .div_ceil(KV_PAGE_TOKENS)
@@ -285,6 +277,33 @@ impl DecodeWorkspaceLease {
         }
 
         Ok(())
+    }
+
+    pub fn stage(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        sequence_lengths: &[u32],
+    ) -> Result<()> {
+        if tokens.len() != positions.len() || tokens.len() != sequence_lengths.len() {
+            return Err(AgentError::Execution(format!(
+                "decode workspace staging mismatch: tokens={} positions={} sequence_lengths={}",
+                tokens.len(),
+                positions.len(),
+                sequence_lengths.len()
+            )));
+        }
+        self.stage_with_slot_reader(tokens, |slot_idx| {
+            Ok((positions[slot_idx], sequence_lengths[slot_idx]))
+        })
+    }
+
+    pub fn stage_from_slot_reader(
+        &mut self,
+        tokens: &[u32],
+        slot_reader: impl FnMut(usize) -> Result<(u32, u32)>,
+    ) -> Result<()> {
+        self.stage_with_slot_reader(tokens, slot_reader)
     }
 
     pub fn token_ids(&self, len: usize) -> &[u32] {
@@ -301,6 +320,15 @@ impl DecodeWorkspaceLease {
             .as_ref()
             .expect("decode workspace lease missing buffers")
             .positions[..len]
+    }
+
+    #[cfg(test)]
+    pub fn sequence_lengths(&self, len: usize) -> &[u32] {
+        &self
+            .buffers
+            .as_ref()
+            .expect("decode workspace lease missing buffers")
+            .slot_sequence_lengths[..len]
     }
 
     fn bucket_label(bucket: &FastPathBucketKey) -> String {
@@ -878,20 +906,39 @@ mod tests {
             FastPathRuntime::checkout_decode_workspace(&plan).expect("first checkout");
         assert!(!first_reservation.reused_existing_arena);
         first_lease
-            .stage(&[11, 12, 13], &[31, 32, 33], &[31, 32, 33])
+            .stage(&[11, 12, 13], &[31, 32, 33], &[7, 8, 9])
             .expect("workspace stage should succeed");
         assert_eq!(first_lease.token_ids(3), &[11, 12, 13]);
         assert_eq!(first_lease.positions(3), &[31, 32, 33]);
+        assert_eq!(first_lease.sequence_lengths(3), &[7, 8, 9]);
         drop(first_lease);
 
         let (second_reservation, mut second_lease) =
             FastPathRuntime::checkout_decode_workspace(&plan).expect("second checkout");
         assert!(second_reservation.reused_existing_arena);
         second_lease
-            .stage(&[21, 22], &[41, 42], &[41, 42])
+            .stage(&[21, 22], &[41, 42], &[3, 4])
             .expect("workspace restage should succeed");
         assert_eq!(second_lease.token_ids(2), &[21, 22]);
         assert_eq!(second_lease.positions(2), &[41, 42]);
+        assert_eq!(second_lease.sequence_lengths(2), &[3, 4]);
+    }
+
+    #[test]
+    fn decode_workspace_lease_stages_batch_metadata_from_slot_reader() {
+        let plan = FastPathPlanner::plan_decode(&cuda_context(), 3, 5_000, 2_048)
+            .expect("decode plan should resolve");
+        let (_reservation, mut lease) =
+            FastPathRuntime::checkout_decode_workspace(&plan).expect("checkout");
+        lease
+            .stage_from_slot_reader(&[11, 12, 13], |slot_idx| {
+                Ok(((31 + slot_idx) as u32, (7 + slot_idx) as u32))
+            })
+            .expect("workspace stage should succeed");
+
+        assert_eq!(lease.token_ids(3), &[11, 12, 13]);
+        assert_eq!(lease.positions(3), &[31, 32, 33]);
+        assert_eq!(lease.sequence_lengths(3), &[7, 8, 9]);
     }
 
     #[test]
