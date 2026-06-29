@@ -10,11 +10,36 @@ use crate::errors::{AgentError, Result};
 use crate::provider::ExecutionProviderKind;
 
 use super::engine::{BackendOptimizationProfile, ExecutionPhase};
+use super::kv_cache::{LiveKVBlockTable, LiveKVWindow, DEFAULT_LIVE_KV_PAGE_TOKENS};
 
-const KV_PAGE_TOKENS: usize = 16;
 const DECODE_BUCKET_BATCHES: &[usize] = &[1, 2, 4, 8];
 const DECODE_BUCKET_KV_TOKENS: &[usize] = &[2_048, 8_192, 16_384, 32_768, 65_536];
 const PREFILL_BUCKET_TOKENS: &[usize] = &[128, 512, 2_048, 8_192, 16_384];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeSlotState {
+    pub position: u32,
+    pub block_table: LiveKVBlockTable,
+}
+
+impl DecodeSlotState {
+    pub fn new(position: u32, block_table: LiveKVBlockTable) -> Result<Self> {
+        let window = LiveKVWindow::new(
+            position,
+            position.saturating_sub(block_table.cached_tokens() as u32),
+            block_table.cached_tokens() as u32,
+        )?;
+        block_table.validate_window(&window)?;
+        Ok(Self {
+            position,
+            block_table,
+        })
+    }
+
+    pub fn sequence_len(&self) -> u32 {
+        self.block_table.cached_tokens() as u32
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -196,7 +221,7 @@ impl PrefillWorkspaceBuffers {
 
 impl DecodeWorkspaceBuffers {
     fn for_bucket(bucket: &FastPathBucketKey) -> Self {
-        let page_slots = bucket.token_ceiling.div_ceil(KV_PAGE_TOKENS);
+        let page_slots = bucket.token_ceiling.div_ceil(DEFAULT_LIVE_KV_PAGE_TOKENS);
         let metadata_bytes = FastPathPlanner::metadata_fields(bucket)
             .iter()
             .map(|field| field.stride_bytes)
@@ -238,7 +263,7 @@ impl DecodeWorkspaceLease {
     fn stage_with_slot_reader(
         &mut self,
         tokens: &[u32],
-        mut slot_reader: impl FnMut(usize) -> Result<(u32, u32)>,
+        mut slot_reader: impl FnMut(usize) -> Result<DecodeSlotState>,
     ) -> Result<()> {
         if tokens.len() > self.bucket.batch_size_ceiling {
             return Err(FastPathInvariantError::CaptureUnsafe {
@@ -252,7 +277,10 @@ impl DecodeWorkspaceLease {
             .into());
         }
 
-        let page_slots = self.bucket.token_ceiling.div_ceil(KV_PAGE_TOKENS);
+        let page_slots = self
+            .bucket
+            .token_ceiling
+            .div_ceil(DEFAULT_LIVE_KV_PAGE_TOKENS);
         let buffers = self
             .buffers
             .as_mut()
@@ -262,46 +290,68 @@ impl DecodeWorkspaceLease {
         buffers.token_ids[..tokens.len()].copy_from_slice(tokens);
 
         for slot_idx in 0..tokens.len() {
-            let (position, sequence_len) = slot_reader(slot_idx)?;
-            buffers.positions[slot_idx] = position;
+            let slot_state = slot_reader(slot_idx)?;
+            let sequence_len = slot_state.sequence_len();
+            if slot_state.block_table.page_tokens != DEFAULT_LIVE_KV_PAGE_TOKENS {
+                return Err(FastPathInvariantError::CaptureUnsafe {
+                    bucket_label: Self::bucket_label(&self.bucket),
+                    detail: format!(
+                        "slot {} exported live page size {} but fast path requires {}",
+                        slot_idx, slot_state.block_table.page_tokens, DEFAULT_LIVE_KV_PAGE_TOKENS
+                    ),
+                }
+                .into());
+            }
+            if sequence_len as usize > self.bucket.token_ceiling {
+                return Err(FastPathInvariantError::CaptureUnsafe {
+                    bucket_label: Self::bucket_label(&self.bucket),
+                    detail: format!(
+                        "slot {} sequence length {} exceeds bucket token ceiling {}",
+                        slot_idx, sequence_len, self.bucket.token_ceiling
+                    ),
+                }
+                .into());
+            }
+            if slot_state.block_table.block_table_len() > page_slots {
+                return Err(FastPathInvariantError::CaptureUnsafe {
+                    bucket_label: Self::bucket_label(&self.bucket),
+                    detail: format!(
+                        "slot {} block table length {} exceeds workspace capacity {}",
+                        slot_idx,
+                        slot_state.block_table.block_table_len(),
+                        page_slots
+                    ),
+                }
+                .into());
+            }
+            buffers.positions[slot_idx] = slot_state.position;
             buffers.slot_sequence_lengths[slot_idx] = sequence_len;
-            buffers.slot_positions[slot_idx] = position;
+            buffers.slot_positions[slot_idx] = slot_state.position;
             buffers.slot_mapping[slot_idx] = slot_idx as u32;
-            let pages = (sequence_len as usize)
-                .div_ceil(KV_PAGE_TOKENS)
-                .min(page_slots);
             let table_start = slot_idx * page_slots;
-            for page_idx in 0..pages {
-                buffers.slot_block_tables[table_start + page_idx] = page_idx as u32;
+            for (page_idx, page_id) in slot_state.block_table.page_ids().enumerate() {
+                buffers.slot_block_tables[table_start + page_idx] = page_id;
             }
         }
 
         Ok(())
     }
 
-    pub fn stage(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        sequence_lengths: &[u32],
-    ) -> Result<()> {
-        if tokens.len() != positions.len() || tokens.len() != sequence_lengths.len() {
+    pub fn stage(&mut self, tokens: &[u32], slot_states: &[DecodeSlotState]) -> Result<()> {
+        if tokens.len() != slot_states.len() {
             return Err(AgentError::Execution(format!(
-                "decode workspace staging mismatch: tokens={} positions={} sequence_lengths={}",
+                "decode workspace staging mismatch: tokens={} slot_states={}",
                 tokens.len(),
-                positions.len(),
-                sequence_lengths.len()
+                slot_states.len(),
             )));
         }
-        self.stage_with_slot_reader(tokens, |slot_idx| {
-            Ok((positions[slot_idx], sequence_lengths[slot_idx]))
-        })
+        self.stage_with_slot_reader(tokens, |slot_idx| Ok(slot_states[slot_idx].clone()))
     }
 
     pub fn stage_from_slot_reader(
         &mut self,
         tokens: &[u32],
-        slot_reader: impl FnMut(usize) -> Result<(u32, u32)>,
+        slot_reader: impl FnMut(usize) -> Result<DecodeSlotState>,
     ) -> Result<()> {
         self.stage_with_slot_reader(tokens, slot_reader)
     }
@@ -329,6 +379,20 @@ impl DecodeWorkspaceLease {
             .as_ref()
             .expect("decode workspace lease missing buffers")
             .slot_sequence_lengths[..len]
+    }
+
+    #[cfg(test)]
+    pub fn block_table(&self, slot_idx: usize) -> &[u32] {
+        let buffers = self
+            .buffers
+            .as_ref()
+            .expect("decode workspace lease missing buffers");
+        let page_slots = self
+            .bucket
+            .token_ceiling
+            .div_ceil(DEFAULT_LIVE_KV_PAGE_TOKENS);
+        let table_start = slot_idx * page_slots;
+        &buffers.slot_block_tables[table_start..table_start + page_slots]
     }
 
     fn bucket_label(bucket: &FastPathBucketKey) -> String {
@@ -773,7 +837,7 @@ impl FastPathPlanner {
     }
 
     fn metadata_fields(bucket: &FastPathBucketKey) -> Vec<MetadataFieldLayout> {
-        let page_slots = bucket.token_ceiling.div_ceil(KV_PAGE_TOKENS);
+        let page_slots = bucket.token_ceiling.div_ceil(DEFAULT_LIVE_KV_PAGE_TOKENS);
         vec![
             MetadataFieldLayout {
                 name: "slot_sequence_lengths".to_string(),
@@ -841,6 +905,7 @@ impl FastPathPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::kv_cache::LiveKVBlockSpan;
 
     fn cuda_context() -> FastPathBackendContext {
         FastPathBackendContext {
@@ -849,6 +914,14 @@ mod tests {
             model_id: Some("llama-70b".to_string()),
             logical_kv_tokens: 1_024,
         }
+    }
+
+    fn slot_state(position: u32, cached_tokens: usize) -> DecodeSlotState {
+        DecodeSlotState::new(
+            position,
+            LiveKVBlockTable::sequential(DEFAULT_LIVE_KV_PAGE_TOKENS, cached_tokens),
+        )
+        .expect("slot state")
     }
 
     #[test]
@@ -906,7 +979,10 @@ mod tests {
             FastPathRuntime::checkout_decode_workspace(&plan).expect("first checkout");
         assert!(!first_reservation.reused_existing_arena);
         first_lease
-            .stage(&[11, 12, 13], &[31, 32, 33], &[7, 8, 9])
+            .stage(
+                &[11, 12, 13],
+                &[slot_state(31, 7), slot_state(32, 8), slot_state(33, 9)],
+            )
             .expect("workspace stage should succeed");
         assert_eq!(first_lease.token_ids(3), &[11, 12, 13]);
         assert_eq!(first_lease.positions(3), &[31, 32, 33]);
@@ -917,7 +993,7 @@ mod tests {
             FastPathRuntime::checkout_decode_workspace(&plan).expect("second checkout");
         assert!(second_reservation.reused_existing_arena);
         second_lease
-            .stage(&[21, 22], &[41, 42], &[3, 4])
+            .stage(&[21, 22], &[slot_state(41, 3), slot_state(42, 4)])
             .expect("workspace restage should succeed");
         assert_eq!(second_lease.token_ids(2), &[21, 22]);
         assert_eq!(second_lease.positions(2), &[41, 42]);
@@ -932,13 +1008,51 @@ mod tests {
             FastPathRuntime::checkout_decode_workspace(&plan).expect("checkout");
         lease
             .stage_from_slot_reader(&[11, 12, 13], |slot_idx| {
-                Ok(((31 + slot_idx) as u32, (7 + slot_idx) as u32))
+                Ok(slot_state((31 + slot_idx) as u32, 7 + slot_idx))
             })
             .expect("workspace stage should succeed");
 
         assert_eq!(lease.token_ids(3), &[11, 12, 13]);
         assert_eq!(lease.positions(3), &[31, 32, 33]);
         assert_eq!(lease.sequence_lengths(3), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn decode_workspace_lease_preserves_real_block_table_page_ids() {
+        let plan = FastPathPlanner::plan_decode(&cuda_context(), 1, 5_000, 2_048)
+            .expect("decode plan should resolve");
+        let (_reservation, mut lease) =
+            FastPathRuntime::checkout_decode_workspace(&plan).expect("checkout");
+        let slot = DecodeSlotState::new(
+            48,
+            LiveKVBlockTable {
+                page_tokens: DEFAULT_LIVE_KV_PAGE_TOKENS,
+                spans: vec![
+                    LiveKVBlockSpan {
+                        page_id: 9,
+                        start_token: 2,
+                        token_count: 14,
+                    },
+                    LiveKVBlockSpan {
+                        page_id: 4,
+                        start_token: 0,
+                        token_count: 16,
+                    },
+                    LiveKVBlockSpan {
+                        page_id: 1,
+                        start_token: 0,
+                        token_count: 16,
+                    },
+                ],
+            },
+        )
+        .expect("slot state");
+        lease
+            .stage(&[11], &[slot])
+            .expect("workspace stage should succeed");
+
+        let block_table = lease.block_table(0);
+        assert_eq!(&block_table[..3], &[9, 4, 1]);
     }
 
     #[test]

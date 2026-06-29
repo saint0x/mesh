@@ -81,6 +81,9 @@ pub use job::{
     DecodeBatchTargets, GenerationConfig, InferenceJob, InferenceProgressUpdate, InferenceRequest,
     InferenceResult, SegmentExecutionResult,
 };
-pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};
+pub use kv_cache::{
+    KVCache, KVCacheConfig, LayerKVCache, LiveKVBlockSpan, LiveKVBlockTable, LiveKVLayout,
+    LiveKVResidency, LiveKVSequenceMetadata, LiveKVWindow,
+};
 pub use stats::InferenceStats;
 pub use tensor_ops::{Tensor1D, Tensor2D};

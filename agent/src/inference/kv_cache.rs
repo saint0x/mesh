@@ -151,19 +151,24 @@ impl KVCacheSnapshot {
         owner_session_id: Option<String>,
         owner_worker_id: Option<String>,
     ) -> LiveKVSequenceMetadata {
-        let page_tokens = config.live_page_tokens();
-        let cached_tokens = self.sequence.cached_tokens as usize;
-        LiveKVSequenceMetadata {
-            next_position: self.sequence.next_position,
-            first_cached_position: self.sequence.first_cached_position(),
-            cached_tokens: self.sequence.cached_tokens,
-            page_tokens,
-            block_table_len: cached_tokens.div_ceil(page_tokens),
-            tail_tokens: cached_tokens % page_tokens,
+        let window = LiveKVWindow::new(
+            self.sequence.next_position,
+            self.sequence.first_cached_position(),
+            self.sequence.cached_tokens,
+        )
+        .expect("validated snapshot sequence must produce a valid live KV window");
+        let block_table = LiveKVBlockTable::sequential(
+            config.live_page_tokens(),
+            self.sequence.cached_tokens as usize,
+        );
+        LiveKVSequenceMetadata::from_window_and_block_table(
+            window,
+            &block_table,
             residency,
             owner_session_id,
             owner_worker_id,
-        }
+        )
+        .expect("snapshot-derived live metadata must satisfy the canonical block-table contract")
     }
 
     pub fn transfer_hooks(
@@ -211,7 +216,7 @@ pub const DEFAULT_LIVE_KV_PAGE_TOKENS: usize = 16;
 impl KVCacheConfig {
     /// Fixed live page size used by the paged execution cache.
     pub fn live_page_tokens(&self) -> usize {
-        self.max_seq_len.clamp(1, DEFAULT_LIVE_KV_PAGE_TOKENS)
+        DEFAULT_LIVE_KV_PAGE_TOKENS
     }
 }
 
@@ -255,6 +260,183 @@ impl LiveKVLayout {
     }
 }
 
+/// Absolute logical window represented by a live KV cache.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveKVWindow {
+    /// Absolute sequence position of the next token to execute.
+    pub next_position: u32,
+    /// First absolute position still represented by the live cache.
+    pub first_cached_position: u32,
+    /// Number of cached tokens currently resident.
+    pub cached_tokens: u32,
+}
+
+impl LiveKVWindow {
+    pub fn new(next_position: u32, first_cached_position: u32, cached_tokens: u32) -> Result<Self> {
+        let window = Self {
+            next_position,
+            first_cached_position,
+            cached_tokens,
+        };
+        window.validate()?;
+        Ok(window)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.first_cached_position > self.next_position {
+            return Err(AgentError::Execution(format!(
+                "Live KV window is invalid: first_cached_position {} exceeds next_position {}",
+                self.first_cached_position, self.next_position
+            )));
+        }
+        let observed_tokens = self
+            .next_position
+            .saturating_sub(self.first_cached_position);
+        if observed_tokens != self.cached_tokens {
+            return Err(AgentError::Execution(format!(
+                "Live KV window is invalid: cached_tokens {} does not match next_position {} - first_cached_position {} = {}",
+                self.cached_tokens,
+                self.next_position,
+                self.first_cached_position,
+                observed_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cached_tokens == 0
+    }
+}
+
+/// One logical span in a live KV block table.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveKVBlockSpan {
+    /// Stable page identifier for the active live window.
+    pub page_id: u32,
+    /// First token row used inside the page.
+    pub start_token: usize,
+    /// Number of live rows owned by this span.
+    pub token_count: usize,
+}
+
+/// Canonical page/block projection of the live KV window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveKVBlockTable {
+    /// Fixed token capacity per page.
+    pub page_tokens: usize,
+    /// Active logical spans in order from oldest to newest.
+    pub spans: Vec<LiveKVBlockSpan>,
+}
+
+impl LiveKVBlockTable {
+    pub fn sequential(page_tokens: usize, cached_tokens: usize) -> Self {
+        let page_tokens = page_tokens.max(1);
+        let block_count = cached_tokens.div_ceil(page_tokens);
+        let mut spans = Vec::with_capacity(block_count);
+        for page_idx in 0..block_count {
+            let remaining = cached_tokens.saturating_sub(page_idx.saturating_mul(page_tokens));
+            let token_count = remaining.min(page_tokens);
+            spans.push(LiveKVBlockSpan {
+                page_id: page_idx as u32,
+                start_token: 0,
+                token_count,
+            });
+        }
+        Self { page_tokens, spans }
+    }
+
+    pub fn from_page_ids(
+        page_tokens: usize,
+        page_ids: impl IntoIterator<Item = u32>,
+        cached_tokens: usize,
+    ) -> Self {
+        let page_tokens = page_tokens.max(1);
+        let mut remaining = cached_tokens;
+        let mut spans = Vec::new();
+        for page_id in page_ids {
+            if remaining == 0 {
+                break;
+            }
+            let token_count = remaining.min(page_tokens);
+            spans.push(LiveKVBlockSpan {
+                page_id,
+                start_token: 0,
+                token_count,
+            });
+            remaining = remaining.saturating_sub(token_count);
+        }
+        Self { page_tokens, spans }
+    }
+
+    pub fn validate_cached_tokens(&self, cached_tokens: usize) -> Result<()> {
+        if self.page_tokens == 0 {
+            return Err(AgentError::Execution(
+                "Live KV block table cannot use a zero-sized page".to_string(),
+            ));
+        }
+
+        let mut total_tokens = 0usize;
+        for (idx, span) in self.spans.iter().enumerate() {
+            if span.token_count == 0 {
+                return Err(AgentError::Execution(format!(
+                    "Live KV block table span {} is empty",
+                    idx
+                )));
+            }
+            if span.start_token >= self.page_tokens {
+                return Err(AgentError::Execution(format!(
+                    "Live KV block table span {} starts outside page bounds: {} >= {}",
+                    idx, span.start_token, self.page_tokens
+                )));
+            }
+            let span_end = span.start_token.saturating_add(span.token_count);
+            if span_end > self.page_tokens {
+                return Err(AgentError::Execution(format!(
+                    "Live KV block table span {} exceeds page bounds: {} > {}",
+                    idx, span_end, self.page_tokens
+                )));
+            }
+            total_tokens = total_tokens.saturating_add(span.token_count);
+        }
+
+        if total_tokens != cached_tokens {
+            return Err(AgentError::Execution(format!(
+                "Live KV block table token mismatch: spans cover {}, cached_tokens says {}",
+                total_tokens, cached_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_window(&self, window: &LiveKVWindow) -> Result<()> {
+        window.validate()?;
+        self.validate_cached_tokens(window.cached_tokens as usize)
+    }
+
+    pub fn cached_tokens(&self) -> usize {
+        self.spans
+            .iter()
+            .map(|span| span.token_count)
+            .sum::<usize>()
+    }
+
+    pub fn block_table_len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn tail_tokens(&self) -> usize {
+        self.spans
+            .last()
+            .map(|span| span.token_count % self.page_tokens)
+            .unwrap_or(0)
+    }
+
+    pub fn page_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.spans.iter().map(|span| span.page_id)
+    }
+}
+
 /// Minimal session metadata the executor needs to reason about live KV residency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveKVSequenceMetadata {
@@ -276,6 +458,37 @@ pub struct LiveKVSequenceMetadata {
     pub owner_session_id: Option<String>,
     /// Optional distributed worker owner identifier.
     pub owner_worker_id: Option<String>,
+}
+
+impl LiveKVSequenceMetadata {
+    pub fn from_window_and_block_table(
+        window: LiveKVWindow,
+        block_table: &LiveKVBlockTable,
+        residency: LiveKVResidency,
+        owner_session_id: Option<String>,
+        owner_worker_id: Option<String>,
+    ) -> Result<Self> {
+        block_table.validate_window(&window)?;
+        Ok(Self {
+            next_position: window.next_position,
+            first_cached_position: window.first_cached_position,
+            cached_tokens: window.cached_tokens,
+            page_tokens: block_table.page_tokens,
+            block_table_len: block_table.block_table_len(),
+            tail_tokens: block_table.tail_tokens(),
+            residency,
+            owner_session_id,
+            owner_worker_id,
+        })
+    }
+
+    pub fn window(&self) -> Result<LiveKVWindow> {
+        LiveKVWindow::new(
+            self.next_position,
+            self.first_cached_position,
+            self.cached_tokens,
+        )
+    }
 }
 
 /// Export/import hooks for converting the live layout into transfer-friendly blobs.
@@ -548,8 +761,21 @@ impl KVCache {
         self.base_position.saturating_add(self.seq_len())
     }
 
+    pub fn live_window(&self) -> LiveKVWindow {
+        LiveKVWindow::new(
+            self.next_position() as u32,
+            self.base_position as u32,
+            self.seq_len() as u32,
+        )
+        .expect("host KV cache window should always be internally consistent")
+    }
+
     pub fn live_layout(&self) -> LiveKVLayout {
         LiveKVLayout::from_config(&self.config)
+    }
+
+    pub fn live_block_table(&self) -> LiveKVBlockTable {
+        LiveKVBlockTable::sequential(self.config.live_page_tokens(), self.seq_len())
     }
 
     pub fn live_sequence_metadata(
@@ -558,19 +784,14 @@ impl KVCache {
         owner_session_id: Option<String>,
         owner_worker_id: Option<String>,
     ) -> LiveKVSequenceMetadata {
-        let page_tokens = self.config.live_page_tokens();
-        let seq_len = self.seq_len();
-        LiveKVSequenceMetadata {
-            next_position: self.next_position() as u32,
-            first_cached_position: self.base_position as u32,
-            cached_tokens: seq_len as u32,
-            page_tokens,
-            block_table_len: seq_len.div_ceil(page_tokens),
-            tail_tokens: seq_len % page_tokens,
+        LiveKVSequenceMetadata::from_window_and_block_table(
+            self.live_window(),
+            &self.live_block_table(),
             residency,
             owner_session_id,
             owner_worker_id,
-        }
+        )
+        .expect("host KV cache must always satisfy the canonical live-KV contract")
     }
 
     pub fn transfer_hooks(

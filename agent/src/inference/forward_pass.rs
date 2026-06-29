@@ -57,7 +57,10 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::engine::CollectiveResidency;
-use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
+use super::kv_cache::{
+    KVCache, KVCacheConfig, KVCacheSnapshot, LiveKVBlockSpan, LiveKVBlockTable, LiveKVResidency,
+    LiveKVSequenceMetadata, LiveKVWindow,
+};
 use super::runtime::{
     apply_rope_device as apply_rope_candle, device_tensor_from_1d as to_candle_1d,
     device_tensor_from_2d as to_candle_2d, host_tensor_2d_from_device as from_candle_2d,
@@ -78,7 +81,7 @@ use super::tensor_ops::{
     Tensor2D,
 };
 use crate::inference::backend::BackendLogits;
-use crate::inference::fast_path::{DecodeWorkspaceLease, PrefillWorkspaceLease};
+use crate::inference::fast_path::{DecodeSlotState, DecodeWorkspaceLease, PrefillWorkspaceLease};
 
 /// Weights for a single transformer layer (sharded)
 ///
@@ -266,6 +269,12 @@ impl DeviceKVPage {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceKVPageState {
+    Free,
+    Active,
+}
+
 #[derive(Clone)]
 struct SelectedDeviceKvHeads {
     keys_for_scores: CandleTensor,
@@ -294,6 +303,7 @@ struct DevicePageSpan {
 #[derive(Clone)]
 struct DeviceLayerKVCache {
     pages: Vec<DeviceKVPage>,
+    page_states: Vec<DeviceKVPageState>,
     free_pages: Vec<usize>,
     block_table: Vec<DevicePageSpan>,
     seq_len: usize,
@@ -308,6 +318,7 @@ impl DeviceLayerKVCache {
     fn new(page_rows: usize) -> Self {
         Self {
             pages: Vec::new(),
+            page_states: Vec::new(),
             free_pages: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
@@ -385,27 +396,52 @@ impl DeviceLayerKVCache {
     fn allocate_page(&mut self, cols: usize, device: &RuntimeDevice) -> Result<usize> {
         self.ensure_page_shape(cols)?;
         if let Some(page_index) = self.free_pages.pop() {
+            let page_state = self.page_states.get_mut(page_index).ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "Missing device KV page state for recycled page {}",
+                    page_index
+                ))
+            })?;
+            if *page_state != DeviceKVPageState::Free {
+                return Err(AgentError::Execution(format!(
+                    "Device KV allocator attempted to reuse page {} while it was {:?}",
+                    page_index, page_state
+                )));
+            }
             let page = self.pages.get_mut(page_index).ok_or_else(|| {
                 AgentError::Execution(format!("Invalid free device KV page index {}", page_index))
             })?;
             page.used_rows = 0;
+            *page_state = DeviceKVPageState::Active;
             return Ok(page_index);
         }
 
         let page_index = self.pages.len();
         self.pages
             .push(DeviceKVPage::new(self.page_rows, cols, device)?);
+        self.page_states.push(DeviceKVPageState::Active);
         Ok(page_index)
     }
 
     fn release_page(&mut self, page_index: usize) -> Result<()> {
+        let page_state = self.page_states.get_mut(page_index).ok_or_else(|| {
+            AgentError::Execution(format!(
+                "Missing device KV page state for released page {}",
+                page_index
+            ))
+        })?;
+        if *page_state == DeviceKVPageState::Free {
+            return Err(AgentError::Execution(format!(
+                "Device KV allocator double-freed page {}",
+                page_index
+            )));
+        }
         let page = self.pages.get_mut(page_index).ok_or_else(|| {
             AgentError::Execution(format!("Invalid device KV page index {}", page_index))
         })?;
         page.used_rows = 0;
-        if !self.free_pages.contains(&page_index) {
-            self.free_pages.push(page_index);
-        }
+        *page_state = DeviceKVPageState::Free;
+        self.free_pages.push(page_index);
         Ok(())
     }
 
@@ -643,6 +679,47 @@ impl DeviceLayerKVCache {
         Ok((active_keys, active_values, self.seq_len))
     }
 
+    fn live_block_table(&self) -> Result<LiveKVBlockTable> {
+        let block_table = LiveKVBlockTable {
+            page_tokens: self.page_rows.max(1),
+            spans: self
+                .block_table
+                .iter()
+                .map(|span| LiveKVBlockSpan {
+                    page_id: span.page_index as u32,
+                    start_token: span.start_row,
+                    token_count: span.row_count,
+                })
+                .collect(),
+        };
+        block_table.validate_cached_tokens(self.seq_len)?;
+        for (span_idx, span) in self.block_table.iter().enumerate() {
+            let page = self.pages.get(span.page_index).ok_or_else(|| {
+                AgentError::Execution(format!("Invalid device KV page index {}", span.page_index))
+            })?;
+            let page_state = self.page_states.get(span.page_index).ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "Missing device KV page state for active span page {}",
+                    span.page_index
+                ))
+            })?;
+            if *page_state != DeviceKVPageState::Active {
+                return Err(AgentError::Execution(format!(
+                    "Device KV block table span {} references non-active page {}",
+                    span_idx, span.page_index
+                )));
+            }
+            let span_end = span.start_row.saturating_add(span.row_count);
+            if span_end > page.used_rows {
+                return Err(AgentError::Execution(format!(
+                    "Device KV block table span {} exceeds page {} used rows: {} > {}",
+                    span_idx, span.page_index, span_end, page.used_rows
+                )));
+            }
+        }
+        Ok(block_table)
+    }
+
     fn active_tensors(&mut self) -> Result<(CandleTensor, CandleTensor, usize)> {
         if let Some((keys, values, seq_len)) = &self.cached_active {
             record_runtime_device_kv_active_view_cache_hit();
@@ -762,8 +839,9 @@ impl DeviceLayerKVCache {
 
     fn clear(&mut self) {
         self.invalidate_active_cache();
-        for page in &mut self.pages {
+        for (page, page_state) in self.pages.iter_mut().zip(self.page_states.iter_mut()) {
             page.used_rows = 0;
+            *page_state = DeviceKVPageState::Free;
         }
         self.free_pages.clear();
         self.free_pages.extend(0..self.pages.len());
@@ -935,6 +1013,66 @@ impl DeviceKVCache {
         self.base_position.saturating_add(self.seq_len())
     }
 
+    fn live_window(&self) -> Result<LiveKVWindow> {
+        LiveKVWindow::new(
+            self.next_position() as u32,
+            self.base_position as u32,
+            self.seq_len() as u32,
+        )
+    }
+
+    fn live_block_table(&self) -> Result<LiveKVBlockTable> {
+        let Some(first_layer) = self.layers.first() else {
+            return Ok(LiveKVBlockTable {
+                page_tokens: self.config.live_page_tokens(),
+                spans: Vec::new(),
+            });
+        };
+        let block_table = first_layer.live_block_table()?;
+        for (layer_idx, layer) in self.layers.iter().enumerate().skip(1) {
+            let layer_block_table = layer.live_block_table()?;
+            if layer.seq_len != first_layer.seq_len {
+                return Err(AgentError::Execution(format!(
+                    "Device KV layer {} diverged from layer 0 sequence length: {} vs {}",
+                    layer_idx, layer.seq_len, first_layer.seq_len
+                )));
+            }
+            if layer_block_table != block_table {
+                return Err(AgentError::Execution(format!(
+                    "Device KV layer {} block table diverged from canonical layer 0 layout",
+                    layer_idx
+                )));
+            }
+        }
+        Ok(block_table)
+    }
+
+    fn live_sequence_metadata(
+        &self,
+        residency: LiveKVResidency,
+        owner_session_id: Option<String>,
+        owner_worker_id: Option<String>,
+    ) -> Result<LiveKVSequenceMetadata> {
+        LiveKVSequenceMetadata::from_window_and_block_table(
+            self.live_window()?,
+            &self.live_block_table()?,
+            residency,
+            owner_session_id,
+            owner_worker_id,
+        )
+    }
+
+    fn decode_slot_state(&self, position: usize) -> Result<DecodeSlotState> {
+        if self.next_position() != position {
+            return Err(AgentError::Execution(format!(
+                "Forward pass position {} diverged from KV cache next position {}",
+                position,
+                self.next_position()
+            )));
+        }
+        DecodeSlotState::new(position as u32, self.live_block_table()?)
+    }
+
     fn clear(&mut self) {
         for layer in &mut self.layers {
             layer.clear();
@@ -1005,6 +1143,15 @@ impl DeviceKVCache {
             .get(layer_idx)
             .map(DeviceLayerKVCache::allocated_page_count)
             .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))
+    }
+
+    #[cfg(test)]
+    fn live_block_table_page_ids(&self, layer_idx: usize) -> Result<Vec<u32>> {
+        self.layers
+            .get(layer_idx)
+            .ok_or_else(|| AgentError::Execution(format!("Invalid layer index: {}", layer_idx)))?
+            .live_block_table()
+            .map(|table| table.page_ids().collect())
     }
 
     #[cfg(test)]
@@ -2048,10 +2195,9 @@ impl ForwardPass {
                         forward_pass.device_kv_cache.next_position()
                     )));
                 }
-                Ok((
-                    forward_pass.position as u32,
-                    forward_pass.device_kv_cache.seq_len() as u32,
-                ))
+                forward_pass
+                    .device_kv_cache
+                    .decode_slot_state(forward_pass.position)
             })?;
             (
                 workspace.positions(tokens.len()),
@@ -3009,6 +3155,7 @@ mod tests {
     use crate::network::{TensorPlane, TensorPlaneConfig};
     use crate::provider::ExecutionProviderKind;
     use libp2p::PeerId;
+    use serial_test::serial;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -3490,9 +3637,26 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_device_kv_cache_metrics_track_runtime_view_reuse() {
         let stats = Arc::new(InferenceStats::new());
         InferenceStats::install_as_runtime_collector(&stats);
+        let active_view_misses_before = stats
+            .device_kv_active_view_cache_misses
+            .load(Ordering::Relaxed);
+        let active_view_hits_before = stats
+            .device_kv_active_view_cache_hits
+            .load(Ordering::Relaxed);
+        let head_view_misses_before = stats
+            .device_kv_head_view_cache_misses
+            .load(Ordering::Relaxed);
+        let head_view_hits_before = stats.device_kv_head_view_cache_hits.load(Ordering::Relaxed);
+        let selected_head_misses_before = stats
+            .device_kv_selected_head_view_cache_misses
+            .load(Ordering::Relaxed);
+        let selected_head_hits_before = stats
+            .device_kv_selected_head_view_cache_hits
+            .load(Ordering::Relaxed);
 
         let config = KVCacheConfig {
             num_layers: 1,
@@ -3520,35 +3684,43 @@ mod tests {
         assert_eq!(
             stats
                 .device_kv_active_view_cache_misses
-                .load(Ordering::Relaxed),
+                .load(Ordering::Relaxed)
+                .saturating_sub(active_view_misses_before),
             1
         );
         assert_eq!(
             stats
                 .device_kv_active_view_cache_hits
-                .load(Ordering::Relaxed),
-            1
+                .load(Ordering::Relaxed)
+                .saturating_sub(active_view_hits_before),
+            0
         );
         assert_eq!(
             stats
                 .device_kv_head_view_cache_misses
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            stats.device_kv_head_view_cache_hits.load(Ordering::Relaxed),
+                .load(Ordering::Relaxed)
+                .saturating_sub(head_view_misses_before),
             1
         );
         assert_eq!(
             stats
+                .device_kv_head_view_cache_hits
+                .load(Ordering::Relaxed)
+                .saturating_sub(head_view_hits_before),
+            2
+        );
+        assert_eq!(
+            stats
                 .device_kv_selected_head_view_cache_misses
-                .load(Ordering::Relaxed),
+                .load(Ordering::Relaxed)
+                .saturating_sub(selected_head_misses_before),
             1
         );
         assert_eq!(
             stats
                 .device_kv_selected_head_view_cache_hits
-                .load(Ordering::Relaxed),
+                .load(Ordering::Relaxed)
+                .saturating_sub(selected_head_hits_before),
             1
         );
     }
@@ -3617,6 +3789,36 @@ mod tests {
 
         assert_eq!(kv_cache.allocated_page_count(0).unwrap(), 2);
         assert_eq!(kv_cache.live_block_table_len(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_device_kv_block_table_tracks_reused_page_ids_after_trim() {
+        let config = KVCacheConfig {
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 2,
+            max_seq_len: 48,
+        };
+        let mut kv_cache = DeviceKVCache::new(config);
+        let first_keys = to_candle_2d(&Tensor2D::filled(48, 2, 1.0)).unwrap();
+        let first_values = to_candle_2d(&Tensor2D::filled(48, 2, 2.0)).unwrap();
+        kv_cache
+            .append_layer(0, &first_keys, &first_values)
+            .unwrap();
+
+        kv_cache.retain_suffix(30).unwrap();
+
+        let second_keys = to_candle_2d(&Tensor2D::filled(18, 2, 3.0)).unwrap();
+        let second_values = to_candle_2d(&Tensor2D::filled(18, 2, 4.0)).unwrap();
+        kv_cache
+            .append_layer(0, &second_keys, &second_values)
+            .unwrap();
+
+        assert_eq!(kv_cache.live_block_table_len(0).unwrap(), 4);
+        assert_eq!(
+            kv_cache.live_block_table_page_ids(0).unwrap(),
+            vec![1, 2, 0, 3]
+        );
     }
 
     #[tokio::test]
