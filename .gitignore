@@ -66,6 +66,9 @@ $RECYCLE.BIN/
 *.dylib
 *.a
 *.lib
+node_modules/
+.astro/
+dist/
 
 # Test coverage
 *.profraw
@@ -92,5 +95,9 @@ $RECYCLE.BIN/
 /TUNEUP.md
 /WORKING.md
 /ZIPPERF.md
+/ARXIV.md
+/aegis_current_body.txt
+/meshnet-request-flow-slideshow.html
+/study-gym/
 /meshnet-viz.html
 /iron_sights_ads_walkthrough.html
