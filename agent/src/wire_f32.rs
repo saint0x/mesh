@@ -33,6 +33,16 @@ pub(crate) fn accumulate_into_f32_slice(dst: &mut [f32], src: &[u8]) {
         src.len(),
         expected_bytes
     );
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let (prefix, values, suffix) = src.align_to::<f32>();
+        if prefix.is_empty() && suffix.is_empty() {
+            for (slot, value) in dst.iter_mut().zip(values.iter()) {
+                *slot += *value;
+            }
+            return;
+        }
+    }
     for (slot, chunk) in dst
         .iter_mut()
         .zip(src.chunks_exact(std::mem::size_of::<f32>()))
@@ -59,4 +69,54 @@ pub(crate) fn decode_into_f32_scratch<'a>(
     scratch.resize(expected_len, 0.0);
     copy_into_f32_slice(scratch.as_mut_slice(), payload_bytes);
     Ok(scratch.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch};
+
+    fn bytes_from_f32(values: &[f32]) -> &[u8] {
+        let byte_len = std::mem::size_of_val(values);
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) }
+    }
+
+    #[test]
+    fn copy_into_f32_slice_round_trips_little_endian_bytes() {
+        let src = [1.5f32, -2.25, 8.0, 0.125];
+        let mut dst = [0.0f32; 4];
+        copy_into_f32_slice(&mut dst, bytes_from_f32(&src));
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn accumulate_into_f32_slice_supports_aligned_payloads() {
+        let src = [1.0f32, 2.0, 3.0, 4.0];
+        let mut dst = [10.0f32, 20.0, 30.0, 40.0];
+        accumulate_into_f32_slice(&mut dst, bytes_from_f32(&src));
+        assert_eq!(dst, [11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn accumulate_into_f32_slice_supports_unaligned_payloads() {
+        let src = [1.0f32, 2.0, 3.0, 4.0];
+        let aligned_bytes = bytes_from_f32(&src);
+        let mut misaligned = Vec::with_capacity(aligned_bytes.len() + 1);
+        misaligned.push(0);
+        misaligned.extend_from_slice(aligned_bytes);
+        let payload = &misaligned[1..];
+
+        let mut dst = [10.0f32, 20.0, 30.0, 40.0];
+        accumulate_into_f32_slice(&mut dst, payload);
+        assert_eq!(dst, [11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn decode_into_f32_scratch_reuses_buffer() {
+        let src = [5.0f32, 6.0, 7.0];
+        let mut scratch = vec![0.0f32; 8];
+        let original_capacity = scratch.capacity();
+        let decoded = decode_into_f32_scratch(src.len(), bytes_from_f32(&src), &mut scratch).unwrap();
+        assert_eq!(decoded, src);
+        assert_eq!(scratch.capacity(), original_capacity);
+    }
 }
