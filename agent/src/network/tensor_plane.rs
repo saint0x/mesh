@@ -16,7 +16,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::errors::{AgentError, Result};
-use crate::inference::InferenceRuntimeMode;
 use crate::provider::ExecutionProviderKind;
 use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice};
 
@@ -1327,10 +1326,8 @@ impl TensorPlane {
     pub async fn prepare_serving_peer_channels(
         &self,
         peers: &[SocketAddr],
-        runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
     ) -> Result<()> {
-        let _ = runtime_mode;
         let hot_lane_plans = serving_lane_plans(
             self.state.profile,
             provider,
@@ -1364,11 +1361,9 @@ impl TensorPlane {
         &self,
         left_peer: SocketAddr,
         right_peer: SocketAddr,
-        runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
     ) -> Result<ServingSessionTransport> {
         reset_serving_connection_pool(&self.state, right_peer).await;
-        let _ = runtime_mode;
         let mut reduce_scatter_plan = lane_plan(
             CollectiveLane::ReduceScatter,
             self.state.profile,
@@ -1415,7 +1410,6 @@ impl TensorPlane {
             tensor_plane_state = format_args!("{:p}", Arc::as_ptr(&self.state)),
             left_peer = %left_peer,
             right_peer = %right_peer,
-            runtime_mode = ?runtime_mode,
             provider = ?provider,
             inbound_id = format_args!("{:p}", Arc::as_ptr(&self.state.inbound)),
             reduce_scatter_streams = reduce_scatter_plan.desired_stream_count,
@@ -2556,7 +2550,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2565,7 +2558,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2612,7 +2604,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2680,7 +2671,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2755,7 +2745,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2809,7 +2798,6 @@ mod tests {
         plane
             .prepare_serving_peer_channels(
                 &[plane.local_addr()],
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cuda,
             )
             .await
@@ -2841,7 +2829,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 left_peer,
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cuda,
             )
             .await
@@ -2864,7 +2851,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 target,
                 target,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2889,7 +2875,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 target,
                 target,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2903,7 +2888,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 target,
                 target,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2962,7 +2946,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 left_peer,
                 plane.local_addr(),
-                InferenceRuntimeMode::LatencyFirst,
                 ExecutionProviderKind::Cuda,
             )
             .await
@@ -2984,7 +2967,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -3111,7 +3093,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -3173,7 +3154,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ResilientEdge,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -3221,7 +3201,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::LatencyFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -3261,7 +3240,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -3306,7 +3284,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 plane.local_addr(),
                 plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await

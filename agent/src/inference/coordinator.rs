@@ -2191,7 +2191,6 @@ impl InferenceCoordinator {
                 position.right_neighbor,
                 position.left_neighbor_tensor_addr,
                 position.right_neighbor_tensor_addr,
-                session.job.request.runtime_mode,
                 session.backend.provider_kind(),
                 session.backend.executor_contract().clone(),
                 None,
@@ -2311,10 +2310,6 @@ impl InferenceCoordinator {
             batch_sessions.push((slot.session_id, session, decode_token));
         }
 
-        let runtime_mode = batch_sessions
-            .first()
-            .map(|(_, session, _)| session.job.request.runtime_mode)
-            .unwrap_or_default();
         let provider = batch_sessions
             .first()
             .map(|(_, session, _)| session.backend.provider_kind())
@@ -2326,7 +2321,6 @@ impl InferenceCoordinator {
             position.right_neighbor,
             position.left_neighbor_tensor_addr,
             position.right_neighbor_tensor_addr,
-            runtime_mode,
             provider,
             batch_sessions
                 .first()

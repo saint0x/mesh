@@ -3150,7 +3150,6 @@ impl LocalForwardPass {
 mod tests {
     use super::*;
     use crate::inference::backend::ProviderRuntimeCore;
-    use crate::inference::engine::InferenceRuntimeMode;
     use crate::inference::stats::InferenceStats;
     use crate::network::{TensorPlane, TensorPlaneConfig};
     use crate::provider::ExecutionProviderKind;
@@ -3861,7 +3860,6 @@ mod tests {
             peer_id,
             local_addr,
             local_addr,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             crate::inference::LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             None,

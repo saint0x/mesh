@@ -2943,7 +2943,6 @@ async fn maybe_serve_live_kv_transfer_request(
         .serving_transport_for_neighbors(
             target_addr,
             target_addr,
-            agent::zip::InferenceRuntimeMode::ResilientEdge,
             agent::ExecutionProviderKind::Cpu,
         )
         .await?;
@@ -2981,7 +2980,6 @@ async fn consume_live_kv_transfer_from_source(
         .serving_transport_for_neighbors(
             source_addr,
             source_addr,
-            agent::zip::InferenceRuntimeMode::ResilientEdge,
             agent::ExecutionProviderKind::Cpu,
         )
         .await?;

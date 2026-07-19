@@ -12,7 +12,7 @@
 //! bandwidth-optimal gradient aggregation in distributed training.
 
 use crate::errors::{AgentError, Result};
-use crate::inference::{InferenceRuntimeMode, LocalExecutorContract};
+use crate::inference::LocalExecutorContract;
 use crate::network::{
     CollectiveLane, ServingBackgroundTransfer, ServingFrameBytes, ServingReceiveSpec,
     ServingSessionTransport, TensorPlane,
@@ -609,8 +609,6 @@ pub struct WorkerRing<'a> {
     pub tensor_plane: &'a mut TensorPlane,
     /// Long-lived collective-native serving transport.
     serving_transport: Option<ServingSessionTransport>,
-    /// Runtime mode for transport fallback and scheduling intent.
-    runtime_mode: InferenceRuntimeMode,
     /// Provider kind used by the local execution backend.
     provider: ExecutionProviderKind,
     /// Executor contract supplied by the local fast path owner.
@@ -704,7 +702,6 @@ impl<'a> WorkerRing<'a> {
         right_neighbor: PeerId,
         left_tensor_addr: SocketAddr,
         right_tensor_addr: SocketAddr,
-        runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
         executor_contract: LocalExecutorContract,
         serving_transport: Option<ServingSessionTransport>,
@@ -720,7 +717,6 @@ impl<'a> WorkerRing<'a> {
             right_tensor_addr,
             tensor_plane,
             serving_transport,
-            runtime_mode,
             provider,
             executor_contract,
             collective_profile,
@@ -742,7 +738,6 @@ impl<'a> WorkerRing<'a> {
             total_workers = self.total_workers,
             left_tensor_addr = %self.left_tensor_addr,
             right_tensor_addr = %self.right_tensor_addr,
-            runtime_mode = ?self.runtime_mode,
             provider = ?self.provider,
             "Preparing serving dataplane channels for worker ring"
         );
@@ -751,7 +746,6 @@ impl<'a> WorkerRing<'a> {
             .serving_transport_for_neighbors(
                 self.left_tensor_addr,
                 self.right_tensor_addr,
-                self.runtime_mode,
                 self.provider,
             )
             .await?;
@@ -1916,7 +1910,6 @@ mod tests {
             peer_id,
             addr,
             addr,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -1955,7 +1948,6 @@ mod tests {
             peer_id,
             addr,
             addr,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -1986,7 +1978,6 @@ mod tests {
             peer_id,
             addr,
             addr,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -2013,7 +2004,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 transport_plane.local_addr(),
                 transport_plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cuda,
             )
             .await
@@ -2035,7 +2025,6 @@ mod tests {
             peer_b,
             addr_b,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             Some(session.clone()),
@@ -2048,7 +2037,6 @@ mod tests {
             peer_a,
             addr_a,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             Some(session),
@@ -2095,7 +2083,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 transport_plane.local_addr(),
                 transport_plane.local_addr(),
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cuda,
             )
             .await
@@ -2117,7 +2104,6 @@ mod tests {
             peer_b,
             addr_b,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             Some(session.clone()),
@@ -2130,7 +2116,6 @@ mod tests {
             peer_a,
             addr_a,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             Some(session),
@@ -2183,7 +2168,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 addr_b,
                 addr_b,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2192,7 +2176,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 addr_a,
                 addr_a,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2205,7 +2188,6 @@ mod tests {
             peer_b,
             addr_b,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             Some(session_a),
@@ -2218,7 +2200,6 @@ mod tests {
             peer_a,
             addr_a,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             Some(session_b),
@@ -2271,7 +2252,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 addr_b,
                 addr_b,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2280,7 +2260,6 @@ mod tests {
             .serving_transport_for_neighbors(
                 addr_a,
                 addr_a,
-                InferenceRuntimeMode::ThroughputFirst,
                 ExecutionProviderKind::Cpu,
             )
             .await
@@ -2293,7 +2272,6 @@ mod tests {
             peer_b,
             addr_b,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             Some(session_a),
@@ -2306,7 +2284,6 @@ mod tests {
             peer_a,
             addr_a,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             Some(session_b),
@@ -2389,7 +2366,6 @@ mod tests {
             peer_b,
             addr_b,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             None,
@@ -2402,7 +2378,6 @@ mod tests {
             peer_a,
             addr_a,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             None,
@@ -2500,7 +2475,6 @@ mod tests {
             peer_id,
             addr,
             addr,
-            InferenceRuntimeMode::LatencyFirst,
             ExecutionProviderKind::Metal,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Metal),
             None,
@@ -2560,7 +2534,6 @@ mod tests {
             peer_b,
             addr_c,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -2573,7 +2546,6 @@ mod tests {
             peer_c,
             addr_a,
             addr_c,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -2586,7 +2558,6 @@ mod tests {
             peer_a,
             addr_b,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -2657,7 +2628,6 @@ mod tests {
             peer_b,
             addr_c,
             addr_b,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -2670,7 +2640,6 @@ mod tests {
             peer_c,
             addr_a,
             addr_c,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
@@ -2683,7 +2652,6 @@ mod tests {
             peer_a,
             addr_b,
             addr_a,
-            InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             None,
