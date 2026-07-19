@@ -245,6 +245,7 @@ pub fn matmul(a: &Tensor2D, b: &Tensor2D) -> Result<Tensor2D> {
 ///
 /// Used in GPT-2, BERT, and many modern transformers.
 /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+#[cfg(test)]
 pub fn gelu(tensor: &Tensor2D) -> Tensor2D {
     let sqrt_2_over_pi = (2.0 / std::f32::consts::PI).sqrt();
     Tensor2D {
@@ -306,6 +307,7 @@ pub fn rms_norm(tensor: &Tensor2D, gamma: &Tensor1D, eps: f32) -> Result<Tensor2
 /// Standard Layer Normalization
 ///
 /// LayerNorm(x) = (x - mean(x)) / sqrt(var(x) + eps) * gamma + beta
+#[cfg(test)]
 pub fn layer_norm(
     tensor: &Tensor2D,
     gamma: &Tensor1D,
@@ -347,6 +349,7 @@ pub fn layer_norm(
 /// Softmax over the last dimension (columns)
 ///
 /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
+#[cfg(test)]
 pub fn softmax(tensor: &Tensor2D) -> Tensor2D {
     let mut out = vec![0.0; tensor.len()];
     for row in 0..tensor.rows {

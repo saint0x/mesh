@@ -1,6 +1,4 @@
 use crate::errors::{AgentError, Result};
-#[cfg(test)]
-use crate::executor::ring_allreduce::CollectiveMatrix;
 use crate::executor::ring_allreduce::{
     StageSendChunkMode, StageSendScratch, StagedCollectiveBuffer,
 };
@@ -13,10 +11,7 @@ use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
 #[cfg(target_os = "linux")]
 use candle_core::Storage;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use candle_core::{
-    backend::BackendStorage, CustomOp1, Layout, MetalStorage, Result as CandleResult, Shape,
-    Storage,
-};
+use candle_core::{backend::BackendStorage, MetalStorage, Storage};
 use candle_core::{DType, Device, Tensor as CandleTensor, D};
 use candle_nn::ops as candle_ops;
 use std::collections::HashMap;
@@ -35,255 +30,6 @@ pub(crate) type DeviceTensor = CandleTensor;
 pub(crate) type DeviceDType = DType;
 pub(crate) type RuntimeDevice = Device;
 pub(crate) type RuntimeError = candle_core::Error;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TensorResidency {
-    Host,
-    Device(ExecutionProviderKind),
-}
-
-#[derive(Debug, Clone)]
-pub enum RuntimeTensor1D {
-    Host(Tensor1D),
-    Device(DeviceTensor),
-}
-
-impl RuntimeTensor1D {
-    pub fn from_host(tensor: Tensor1D) -> Self {
-        Self::Host(tensor)
-    }
-
-    pub fn from_device(tensor: DeviceTensor) -> Result<Self> {
-        let dims = tensor.dims();
-        if dims.len() != 1 {
-            return Err(AgentError::Execution(format!(
-                "Expected 1D device tensor, got shape {:?}",
-                dims
-            )));
-        }
-        Ok(Self::Device(tensor))
-    }
-
-    pub fn residency(&self) -> TensorResidency {
-        match self {
-            Self::Host(_) => TensorResidency::Host,
-            Self::Device(_) => TensorResidency::Device(
-                selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
-            ),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Host(tensor) => tensor.len(),
-            Self::Device(tensor) => tensor.dims().first().copied().unwrap_or(0),
-        }
-    }
-
-    pub fn to_host(&self) -> Result<Tensor1D> {
-        match self {
-            Self::Host(tensor) => Ok(tensor.clone()),
-            Self::Device(tensor) => {
-                let data = tensor
-                    .flatten_all()
-                    .map_err(runtime_error)?
-                    .to_dtype(DeviceDType::F32)
-                    .map_err(runtime_error)?
-                    .to_vec1::<f32>()
-                    .map_err(runtime_error)?;
-                Ok(Tensor1D::new(data))
-            }
-        }
-    }
-
-    pub fn to_device(&self) -> Result<DeviceTensor> {
-        match self {
-            Self::Host(tensor) => device_tensor_from_1d(tensor),
-            Self::Device(tensor) => Ok(tensor.clone()),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum RuntimeTensor2D {
-    Host(Tensor2D),
-    Device(DeviceTensor),
-}
-
-impl RuntimeTensor2D {
-    pub fn from_host(tensor: Tensor2D) -> Self {
-        Self::Host(tensor)
-    }
-
-    pub fn from_device(tensor: DeviceTensor) -> Result<Self> {
-        let dims = tensor.dims();
-        if dims.len() != 2 {
-            return Err(AgentError::Execution(format!(
-                "Expected 2D device tensor, got shape {:?}",
-                dims
-            )));
-        }
-        Ok(Self::Device(tensor))
-    }
-
-    pub fn residency(&self) -> TensorResidency {
-        match self {
-            Self::Host(_) => TensorResidency::Host,
-            Self::Device(_) => TensorResidency::Device(
-                selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
-            ),
-        }
-    }
-
-    pub fn rows(&self) -> usize {
-        match self {
-            Self::Host(tensor) => tensor.rows,
-            Self::Device(tensor) => tensor.dims().first().copied().unwrap_or(0),
-        }
-    }
-
-    pub fn cols(&self) -> usize {
-        match self {
-            Self::Host(tensor) => tensor.cols,
-            Self::Device(tensor) => tensor.dims().get(1).copied().unwrap_or(0),
-        }
-    }
-
-    pub fn to_host(&self) -> Result<Tensor2D> {
-        match self {
-            Self::Host(tensor) => Ok(tensor.clone()),
-            Self::Device(tensor) => host_tensor_2d_from_device(tensor),
-        }
-    }
-
-    pub fn to_device(&self) -> Result<DeviceTensor> {
-        match self {
-            Self::Host(tensor) => device_tensor_from_2d(tensor),
-            Self::Device(tensor) => Ok(tensor.clone()),
-        }
-    }
-
-    pub fn add(&self, other: &Self) -> Result<Self> {
-        if self.rows() != other.rows() || self.cols() != other.cols() {
-            return Err(AgentError::Execution(format!(
-                "Shape mismatch for add: {}x{} vs {}x{}",
-                self.rows(),
-                self.cols(),
-                other.rows(),
-                other.cols()
-            )));
-        }
-        let lhs = self.to_device()?;
-        let rhs = other.to_device()?;
-        Ok(Self::Device(
-            lhs.broadcast_add(&rhs).map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn mul(&self, other: &Self) -> Result<Self> {
-        if self.rows() != other.rows() || self.cols() != other.cols() {
-            return Err(AgentError::Execution(format!(
-                "Shape mismatch for mul: {}x{} vs {}x{}",
-                self.rows(),
-                self.cols(),
-                other.rows(),
-                other.cols()
-            )));
-        }
-        let lhs = self.to_device()?;
-        let rhs = other.to_device()?;
-        Ok(Self::Device(
-            lhs.broadcast_mul(&rhs).map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn scale(&self, scalar: f32) -> Result<Self> {
-        Ok(Self::Device(
-            self.to_device()?
-                .affine(scalar as f64, 0.0)
-                .map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn transpose(&self) -> Result<Self> {
-        Ok(Self::Device(
-            self.to_device()?.transpose(0, 1).map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn column_slice(&self, col_start: usize, width: usize) -> Result<Self> {
-        Ok(Self::Device(
-            self.to_device()?
-                .narrow(1, col_start, width)
-                .map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn matmul(&self, other: &Self) -> Result<Self> {
-        if self.cols() != other.rows() {
-            return Err(AgentError::Execution(format!(
-                "Matmul shape mismatch: {}x{} @ {}x{}",
-                self.rows(),
-                self.cols(),
-                other.rows(),
-                other.cols()
-            )));
-        }
-        let lhs = self.to_device()?;
-        let rhs = other.to_device()?;
-        Ok(Self::Device(lhs.matmul(&rhs).map_err(runtime_error)?))
-    }
-
-    pub fn gelu(&self) -> Result<Self> {
-        let sqrt_2_over_pi = (2.0 / std::f32::consts::PI).sqrt() as f64;
-        let x = self.to_device()?;
-        let x3 = x
-            .sqr()
-            .map_err(runtime_error)?
-            .broadcast_mul(&x)
-            .map_err(runtime_error)?;
-        let inner = x
-            .affine(0.044715, 0.0)
-            .map_err(runtime_error)?
-            .broadcast_mul(&x3)
-            .map_err(runtime_error)?;
-        let inner = x.broadcast_add(&inner).map_err(runtime_error)?;
-        let inner = inner
-            .affine(sqrt_2_over_pi, 0.0)
-            .map_err(runtime_error)?
-            .tanh()
-            .map_err(runtime_error)?;
-        let one_plus = inner.affine(1.0, 1.0).map_err(runtime_error)?;
-        let scaled = x.affine(0.5, 0.0).map_err(runtime_error)?;
-        Ok(Self::Device(
-            scaled.broadcast_mul(&one_plus).map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn silu(&self) -> Result<Self> {
-        Ok(Self::Device(
-            candle_ops::silu(&self.to_device()?).map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn softmax(&self) -> Result<Self> {
-        Ok(Self::Device(
-            candle_ops::softmax(&self.to_device()?, 1).map_err(runtime_error)?,
-        ))
-    }
-
-    pub fn apply_rope(&self, positions: &[u32], head_dim: usize, base: f32) -> Result<Self> {
-        let tensor = self.to_device()?;
-        Ok(Self::Device(apply_rope_device(
-            &tensor,
-            self.rows(),
-            self.cols(),
-            positions,
-            head_dim,
-            base,
-        )?))
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RopeFrequencyKey {
@@ -643,44 +389,6 @@ pub(crate) fn sample_token_device(
         .ok_or_else(|| AgentError::Execution("Device sampling returned no token ids".to_string()))
 }
 
-#[cfg(test)]
-pub(crate) fn collective_matrix_from_device_tensor(
-    tensor: &DeviceTensor,
-) -> Result<CollectiveMatrix> {
-    let dims = tensor.dims();
-    if dims.len() != 2 {
-        return Err(AgentError::Execution(format!(
-            "Expected 2D device tensor for collective buffer conversion, got shape {:?}",
-            dims
-        )));
-    }
-
-    let flattened = tensor
-        .flatten_all()
-        .map_err(runtime_error)?
-        .to_dtype(DeviceDType::F32)
-        .map_err(runtime_error)?
-        .contiguous()
-        .map_err(runtime_error)?;
-
-    if let Some(matrix) = collective_matrix_from_dense_cuda_tensor(&flattened, dims[0], dims[1])? {
-        record_runtime_collective_host_stage(
-            (matrix.len().saturating_mul(std::mem::size_of::<f32>())) as u64,
-        );
-        return Ok(matrix);
-    }
-
-    let data = flattened.to_vec1::<f32>().map_err(runtime_error)?;
-    if selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu)
-        != ExecutionProviderKind::Cpu
-    {
-        record_runtime_collective_host_stage(
-            (data.len().saturating_mul(std::mem::size_of::<f32>())) as u64,
-        );
-    }
-    Ok(CollectiveMatrix::new(data, dims[0], dims[1]))
-}
-
 pub(crate) struct DeviceCollectiveBuffer {
     flat: DeviceTensor,
     rows: usize,
@@ -728,10 +436,12 @@ impl DeviceCollectiveBuffer {
         self.rows.saturating_mul(self.cols)
     }
 
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> usize {
         self.rows
     }
 
+    #[cfg(test)]
     pub(crate) fn cols(&self) -> usize {
         self.cols
     }
@@ -990,125 +700,6 @@ fn shared_metal_collective_storage(tensor: &DeviceTensor) -> Option<MetalStorage
     None
 }
 
-#[cfg(all(test, target_os = "linux"))]
-fn collective_matrix_from_dense_cuda_tensor(
-    tensor: &DeviceTensor,
-    rows: usize,
-    cols: usize,
-) -> Result<Option<CollectiveMatrix>> {
-    let elem_count = tensor.elem_count();
-    let (storage, layout) = tensor.storage_and_layout();
-    if let Storage::Cuda(cuda_storage) = &*storage {
-        if let Some((start, end)) = layout.contiguous_offsets() {
-            let total_len = end.saturating_sub(start);
-            if start == 0 && total_len == elem_count {
-                let src = cuda_storage.as_cuda_slice::<f32>().map_err(runtime_error)?;
-                let device = cuda_storage.device();
-                let mut matrix = CollectiveMatrix::from_pooled_host_buffer(rows, cols);
-                device
-                    .memcpy_dtoh(src, matrix.host_slice_mut())
-                    .map_err(runtime_error)?;
-                return Ok(Some(matrix));
-            }
-        }
-    }
-    drop(storage);
-    Ok(None)
-}
-
-#[cfg(all(test, not(target_os = "linux")))]
-fn collective_matrix_from_dense_cuda_tensor(
-    _tensor: &DeviceTensor,
-    _rows: usize,
-    _cols: usize,
-) -> Result<Option<CollectiveMatrix>> {
-    Ok(None)
-}
-
-#[cfg(test)]
-pub(crate) fn device_tensor_from_collective_matrix(
-    tensor: &CollectiveMatrix,
-) -> Result<DeviceTensor> {
-    DeviceTensor::from_vec(
-        tensor.to_host_vec(),
-        (tensor.rows, tensor.cols),
-        execution_device()?,
-    )
-    .map_err(runtime_error)
-}
-
-#[cfg(test)]
-pub(crate) fn device_tensor_from_collective_owned_like(
-    tensor: CollectiveMatrix,
-    template: &DeviceTensor,
-) -> Result<DeviceTensor> {
-    let rows = tensor.rows;
-    let cols = tensor.cols;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(storage) = tensor.metal_shared_storage() {
-        return restore_shared_metal_collective(storage, rows, cols, template)
-            .map_err(runtime_error);
-    }
-
-    if selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu)
-        != ExecutionProviderKind::Cpu
-    {
-        record_runtime_collective_host_restore(
-            (rows
-                .saturating_mul(cols)
-                .saturating_mul(std::mem::size_of::<f32>())) as u64,
-        );
-    }
-
-    DeviceTensor::from_vec(tensor.into_host_vec(), (rows, cols), template.device())
-        .map_err(runtime_error)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
-struct RestoreSharedMetalCollective {
-    storage: MetalStorage,
-    shape: Shape,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl CustomOp1 for RestoreSharedMetalCollective {
-    fn name(&self) -> &'static str {
-        "restore-shared-metal-collective"
-    }
-
-    fn cpu_fwd(
-        &self,
-        _storage: &candle_core::CpuStorage,
-        _layout: &Layout,
-    ) -> CandleResult<(candle_core::CpuStorage, Shape)> {
-        Err(RuntimeError::Msg(
-            "restore-shared-metal-collective requires a metal tensor".into(),
-        ))
-    }
-
-    fn metal_fwd(
-        &self,
-        _storage: &MetalStorage,
-        _layout: &Layout,
-    ) -> CandleResult<(MetalStorage, Shape)> {
-        Ok((self.storage.clone(), self.shape.clone()))
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn restore_shared_metal_collective(
-    storage: MetalStorage,
-    rows: usize,
-    cols: usize,
-    template: &DeviceTensor,
-) -> CandleResult<DeviceTensor> {
-    template.apply_op1_no_bwd(&RestoreSharedMetalCollective {
-        storage,
-        shape: Shape::from((rows, cols)),
-    })
-}
-
 pub(crate) fn rms_norm_device(
     tensor: &DeviceTensor,
     gamma: &DeviceTensor,
@@ -1200,30 +791,6 @@ pub(crate) fn apply_rope_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn runtime_tensor_residency_is_explicit() {
-        let host = RuntimeTensor2D::from_host(Tensor2D::filled(2, 2, 1.5));
-        assert_eq!(host.residency(), TensorResidency::Host);
-
-        let device_tensor = device_tensor_from_2d(&Tensor2D::filled(1, 2, 2.0)).unwrap();
-        let device = RuntimeTensor2D::from_device(device_tensor).unwrap();
-        assert!(matches!(device.residency(), TensorResidency::Device(_)));
-    }
-
-    #[test]
-    fn runtime_tensor_ops_stay_device_resident_until_materialized() {
-        let lhs =
-            RuntimeTensor2D::from_host(Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap());
-        let rhs =
-            RuntimeTensor2D::from_host(Tensor2D::new(vec![5.0, 6.0, 7.0, 8.0], 2, 2).unwrap());
-
-        let added = lhs.add(&rhs).unwrap();
-        assert!(matches!(added, RuntimeTensor2D::Device(_)));
-
-        let host = added.to_host().unwrap();
-        assert_eq!(host.data, vec![6.0, 8.0, 10.0, 12.0]);
-    }
 
     #[test]
     fn staged_collective_buffer_updates_device_resident_tensor() {

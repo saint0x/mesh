@@ -915,6 +915,7 @@ impl KVCache {
 /// Sliding window cache for memory efficiency
 ///
 /// Keeps only the last N tokens in the cache, useful for long sequences.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct SlidingWindowCache {
     /// Inner KV cache
@@ -923,6 +924,7 @@ pub struct SlidingWindowCache {
     window_size: usize,
 }
 
+#[cfg(test)]
 impl SlidingWindowCache {
     /// Create a new sliding window cache
     pub fn new(config: KVCacheConfig, window_size: usize) -> Self {

@@ -165,6 +165,7 @@ pub(crate) struct ProviderRuntimeCore {
 }
 
 impl ProviderRuntimeCore {
+    #[cfg(test)]
     pub fn new(
         model: Arc<SharedModelResidency>,
         worker_position: u32,

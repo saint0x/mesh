@@ -58,8 +58,7 @@ use uuid::Uuid;
 
 use super::engine::CollectiveResidency;
 use super::kv_cache::{
-    KVCache, KVCacheConfig, KVCacheSnapshot, LiveKVBlockSpan, LiveKVBlockTable, LiveKVResidency,
-    LiveKVSequenceMetadata, LiveKVWindow,
+    KVCache, KVCacheConfig, KVCacheSnapshot, LiveKVBlockSpan, LiveKVBlockTable,
 };
 use super::runtime::{
     apply_rope_device as apply_rope_candle, device_tensor_from_1d as to_candle_1d,
@@ -973,6 +972,7 @@ impl DeviceKVCache {
         layer.active_tensors()
     }
 
+    #[cfg(test)]
     fn get_layer_active_heads(
         &mut self,
         layer_idx: usize,
@@ -1011,14 +1011,6 @@ impl DeviceKVCache {
         self.base_position.saturating_add(self.seq_len())
     }
 
-    fn live_window(&self) -> Result<LiveKVWindow> {
-        LiveKVWindow::new(
-            self.next_position() as u32,
-            self.base_position as u32,
-            self.seq_len() as u32,
-        )
-    }
-
     fn live_block_table(&self) -> Result<LiveKVBlockTable> {
         let Some(first_layer) = self.layers.first() else {
             return Ok(LiveKVBlockTable {
@@ -1043,21 +1035,6 @@ impl DeviceKVCache {
             }
         }
         Ok(block_table)
-    }
-
-    fn live_sequence_metadata(
-        &self,
-        residency: LiveKVResidency,
-        owner_session_id: Option<String>,
-        owner_worker_id: Option<String>,
-    ) -> Result<LiveKVSequenceMetadata> {
-        LiveKVSequenceMetadata::from_window_and_block_table(
-            self.live_window()?,
-            &self.live_block_table()?,
-            residency,
-            owner_session_id,
-            owner_worker_id,
-        )
     }
 
     fn decode_slot_state(&self, position: usize) -> Result<DecodeSlotState> {
