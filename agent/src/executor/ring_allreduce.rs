@@ -151,7 +151,6 @@ impl Drop for PooledHostBuffer {
             let mut pool = pool.borrow_mut();
             if pool.len() < 8 {
                 recycled.clear();
-                recycled.shrink_to_fit();
                 pool.push(recycled);
             }
         });

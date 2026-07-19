@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::IoSlice;
@@ -29,6 +30,61 @@ pub const DEFAULT_MAX_INBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_OUTBOUND_STREAMS_PER_PEER: usize = 3;
 static NEXT_TENSOR_PLANE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static SERVING_PAYLOAD_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug)]
+struct PooledPayloadBuffer {
+    data: Vec<u8>,
+}
+
+impl PooledPayloadBuffer {
+    fn new(len: usize) -> Self {
+        let data = SERVING_PAYLOAD_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(index) = pool.iter().position(|buffer| buffer.capacity() >= len) {
+                let mut buffer = pool.swap_remove(index);
+                buffer.resize(len, 0);
+                buffer
+            } else {
+                vec![0u8; len]
+            }
+        });
+        Self { data }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.data.as_mut_slice()
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+}
+
+impl Drop for PooledPayloadBuffer {
+    fn drop(&mut self) {
+        if self.data.is_empty() {
+            return;
+        }
+        let mut recycled = Vec::new();
+        std::mem::swap(&mut recycled, &mut self.data);
+        SERVING_PAYLOAD_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < 32 {
+                recycled.clear();
+                pool.push(recycled);
+            }
+        });
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,7 +294,7 @@ struct InboundServingFrame {
 #[derive(Debug)]
 pub struct ServingFrameBytes {
     header: ServingFrameHeader,
-    payload_bytes: Vec<u8>,
+    payload_bytes: PooledPayloadBuffer,
 }
 
 impl ServingFrameBytes {
@@ -247,7 +303,7 @@ impl ServingFrameBytes {
     }
 
     pub fn payload_bytes(&self) -> &[u8] {
-        &self.payload_bytes
+        self.payload_bytes.as_slice()
     }
 
     pub fn element_count(&self) -> usize {
@@ -255,20 +311,20 @@ impl ServingFrameBytes {
     }
 
     pub fn decode_payload_vec(&self) -> Vec<f32> {
-        decode_f32_slice_wire(&self.payload_bytes)
+        decode_f32_slice_wire(self.payload_bytes())
     }
 
     pub fn first_f32(&self) -> Result<f32> {
-        if self.payload_bytes.len() < std::mem::size_of::<f32>() {
+        if self.payload_bytes().len() < std::mem::size_of::<f32>() {
             return Err(AgentError::Network(
                 "Serving frame payload missing first f32 value".to_string(),
             ));
         }
         Ok(f32::from_bits(u32::from_le_bytes([
-            self.payload_bytes[0],
-            self.payload_bytes[1],
-            self.payload_bytes[2],
-            self.payload_bytes[3],
+            self.payload_bytes()[0],
+            self.payload_bytes()[1],
+            self.payload_bytes()[2],
+            self.payload_bytes()[3],
         ])))
     }
 
@@ -282,7 +338,7 @@ impl ServingFrameBytes {
         }
         for (slot, chunk) in dst
             .iter_mut()
-            .zip(self.payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+            .zip(self.payload_bytes().chunks_exact(std::mem::size_of::<f32>()))
         {
             *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
@@ -297,8 +353,13 @@ impl ServingFrameBytes {
                 dst.len()
             )));
         }
-        copy_wire_f32_bytes_into_slice(dst, &self.payload_bytes);
+        copy_wire_f32_bytes_into_slice(dst, self.payload_bytes());
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn payload_capacity(&self) -> usize {
+        self.payload_bytes.capacity()
     }
 }
 
@@ -2485,8 +2546,8 @@ where
         ));
     }
     let payload_bytes = header.element_count as usize * std::mem::size_of::<f32>();
-    let mut payload_buf = vec![0u8; payload_bytes];
-    reader.read_exact(&mut payload_buf).await?;
+    let mut payload_buf = PooledPayloadBuffer::new(payload_bytes);
+    reader.read_exact(payload_buf.as_mut_slice()).await?;
     Ok(ServingFrameBytes {
         header,
         payload_bytes: payload_buf,
@@ -3069,7 +3130,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(frame.header, header);
-        assert_eq!(decode_f32_slice_wire(&frame.payload_bytes), chunk_data);
+        assert_eq!(decode_f32_slice_wire(frame.payload_bytes()), chunk_data);
+    }
+
+    #[tokio::test]
+    async fn test_serving_frame_read_reuses_pooled_payload_buffer_capacity() {
+        let first_header = ServingFrameHeader::new(
+            Uuid::new_v4(),
+            1,
+            2,
+            3,
+            4,
+            5,
+            0,
+            CollectiveLane::ReduceScatter,
+            8,
+        );
+        let second_header = ServingFrameHeader::new(
+            Uuid::new_v4(),
+            1,
+            2,
+            3,
+            4,
+            6,
+            0,
+            CollectiveLane::ReduceScatter,
+            4,
+        );
+        let first_chunk = [0.5_f32; 8];
+        let second_chunk = [1.5_f32; 4];
+
+        let (mut writer, mut reader) = tokio::io::duplex(2048);
+        write_serving_frame(&mut writer, first_header, &first_chunk)
+            .await
+            .unwrap();
+        let first_frame = read_serving_frame(&mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
+        let first_capacity = first_frame.payload_capacity();
+        drop(first_frame);
+
+        write_serving_frame(&mut writer, second_header, &second_chunk)
+            .await
+            .unwrap();
+        let second_frame = read_serving_frame(&mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
+
+        assert!(second_frame.payload_capacity() >= second_frame.payload_bytes().len());
+        assert!(
+            second_frame.payload_capacity() >= first_capacity,
+            "smaller follow-up frame should be able to reuse prior pooled capacity"
+        );
     }
 
     #[tokio::test]
