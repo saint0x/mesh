@@ -1901,8 +1901,7 @@ async fn recv_slot(
     loop {
         let notified = inbound.notify.notified();
         tokio::pin!(notified);
-        let inbound_id = format!("{:p}", Arc::as_ptr(inbound));
-        let (delivered, queued_slot_keys) = {
+        let delivered = {
             let mut slots = inbound.slots.lock().await;
             let mut should_remove = false;
             let delivered = slots.get_mut(&slot_key).and_then(|queue| {
@@ -1913,30 +1912,7 @@ async fn recv_slot(
             if should_remove {
                 slots.remove(&slot_key);
             }
-            let queued_slot_keys = if delivered.is_some() {
-                None
-            } else {
-                Some(
-                    slots
-                        .iter()
-                        .map(|(key, queue)| {
-                            format!(
-                                "{}:{}:{}:{:?}:{}:{}:{}:{}(len={})",
-                                key.collective_id,
-                                key.collective_seq,
-                                key.sender_position,
-                                key.lane,
-                                key.layer_idx,
-                                key.step,
-                                key.slot,
-                                key.stream_id,
-                                queue.len()
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            };
-            (delivered, queued_slot_keys)
+            delivered
         };
         if let Some(message) = delivered {
             if matches!(
@@ -1946,7 +1922,7 @@ async fn recv_slot(
                 info!(
                     tensor_plane_instance = state.instance_id,
                     tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
-                    inbound_id = %inbound_id,
+                    inbound_id = format_args!("{:p}", Arc::as_ptr(inbound)),
                     collective_id = %slot_key.collective_id,
                     collective_seq = slot_key.collective_seq,
                     sender_position = slot_key.sender_position,
@@ -1962,7 +1938,7 @@ async fn recv_slot(
                 debug!(
                     tensor_plane_instance = state.instance_id,
                     tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
-                    inbound_id = %inbound_id,
+                    inbound_id = format_args!("{:p}", Arc::as_ptr(inbound)),
                     collective_id = %slot_key.collective_id,
                     collective_seq = slot_key.collective_seq,
                     sender_position = slot_key.sender_position,
@@ -1988,6 +1964,19 @@ async fn recv_slot(
                 .fetch_add(wait_ms, Ordering::Relaxed);
             return Ok(message.frame);
         }
+        let should_log_wait = if matches!(
+            slot_key.lane,
+            CollectiveLane::ReduceScatter | CollectiveLane::AllGather
+        ) {
+            tracing::enabled!(tracing::Level::INFO)
+        } else {
+            tracing::enabled!(tracing::Level::DEBUG)
+        };
+        let queued_slot_keys = if should_log_wait {
+            Some(snapshot_inbound_slot_keys(inbound).await)
+        } else {
+            None
+        };
         if matches!(
             slot_key.lane,
             CollectiveLane::ReduceScatter | CollectiveLane::AllGather
@@ -1995,7 +1984,7 @@ async fn recv_slot(
             info!(
                 tensor_plane_instance = state.instance_id,
                 tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
-                inbound_id = %inbound_id,
+                inbound_id = format_args!("{:p}", Arc::as_ptr(inbound)),
                 collective_id = %slot_key.collective_id,
                 collective_seq = slot_key.collective_seq,
                 sender_position = slot_key.sender_position,
@@ -2011,7 +2000,7 @@ async fn recv_slot(
             debug!(
                 tensor_plane_instance = state.instance_id,
                 tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
-                inbound_id = %inbound_id,
+                inbound_id = format_args!("{:p}", Arc::as_ptr(inbound)),
                 collective_id = %slot_key.collective_id,
                 collective_seq = slot_key.collective_seq,
                 sender_position = slot_key.sender_position,
@@ -2026,6 +2015,27 @@ async fn recv_slot(
         }
         notified.await;
     }
+}
+
+async fn snapshot_inbound_slot_keys(inbound: &Arc<ServingInboundState>) -> Vec<String> {
+    let slots = inbound.slots.lock().await;
+    slots
+        .iter()
+        .map(|(key, queue)| {
+            format!(
+                "{}:{}:{}:{:?}:{}:{}:{}:{}(len={})",
+                key.collective_id,
+                key.collective_seq,
+                key.sender_position,
+                key.lane,
+                key.layer_idx,
+                key.step,
+                key.slot,
+                key.stream_id,
+                queue.len()
+            )
+        })
+        .collect()
 }
 
 fn try_reserve_inbound_message_slot(inbound: &ServingInboundState, capacity: usize) -> bool {
