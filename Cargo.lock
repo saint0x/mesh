@@ -58,6 +58,7 @@ dependencies = [
  "hex",
  "libc",
  "libp2p",
+ "memmap2",
  "multibase",
  "quickcheck",
  "quickcheck_macros",

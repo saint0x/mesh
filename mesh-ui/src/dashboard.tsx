@@ -5,6 +5,7 @@ import type { DashboardShellProps } from './dashboard/lib/pageProps'
 import { useDashboardState } from './dashboard/lib/useDashboardState'
 
 const OverviewPage = lazy(async () => import('./dashboard/pages/OverviewPage').then((module) => ({ default: module.OverviewPage })))
+const ArchitecturePage = lazy(async () => import('./dashboard/pages/ArchitecturePage').then((module) => ({ default: module.ArchitecturePage })))
 const NetworksPage = lazy(async () => import('./dashboard/pages/NetworksPage').then((module) => ({ default: module.NetworksPage })))
 const DevicesPage = lazy(async () => import('./dashboard/pages/DevicesPage').then((module) => ({ default: module.DevicesPage })))
 const TopologyPage = lazy(async () => import('./dashboard/pages/TopologyPage').then((module) => ({ default: module.TopologyPage })))
@@ -61,6 +62,8 @@ function renderPage(
   const pageProps = { controller, onNavigateSection }
 
   switch (section) {
+    case 'architecture':
+      return <ArchitecturePage {...pageProps} />
     case 'overview':
       return <OverviewPage {...pageProps} />
     case 'networks':

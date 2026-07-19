@@ -1,4 +1,5 @@
 export type DashboardSection =
+  | 'architecture'
   | 'overview'
   | 'networks'
   | 'devices'
@@ -366,6 +367,7 @@ export type SidebarGroup = {
 }
 
 export const sections: SectionDefinition[] = [
+  { id: 'architecture', label: 'Architecture', summary: 'Granular request walkthrough across MeshNet and ZIP' },
   { id: 'overview', label: 'Overview', summary: 'Live local control-plane snapshot' },
   { id: 'networks', label: 'Networks', summary: 'Scheduling, relay attachments, and mesh policy' },
   { id: 'devices', label: 'Devices', summary: 'Provider, capability, runtime, and identity truth' },
@@ -384,6 +386,7 @@ export const navGroups: SidebarGroup[] = [
     id: 'workspace',
     label: 'Workspace',
     items: [
+      { id: 'architecture', label: 'Architecture' },
       { id: 'overview', label: 'Overview' },
       { id: 'jobs', label: 'Jobs' },
       { id: 'ledger', label: 'Ledger' },
@@ -412,6 +415,10 @@ export const navGroups: SidebarGroup[] = [
 ]
 
 export const pageMeta: Record<DashboardSection, { title: string; subtitle: string }> = {
+  architecture: {
+    title: 'Architecture',
+    subtitle: 'A swipeable, step-by-step walkthrough of how a request moves through MeshNet and the embedded ZIP engine.',
+  },
   overview: {
     title: 'Overview',
     subtitle: 'A local snapshot of real MeshNet state sourced from ~/.meshnet and the control-plane database.',
@@ -459,6 +466,7 @@ export const pageMeta: Record<DashboardSection, { title: string; subtitle: strin
 }
 
 export const dashboardPathBySection: Record<DashboardSection, string> = {
+  architecture: '/dashboard/architecture',
   overview: '/dashboard',
   networks: '/dashboard/networks',
   devices: '/dashboard/devices',
