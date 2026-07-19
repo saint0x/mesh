@@ -53,6 +53,7 @@ pub enum GraphCaptureStrategy {
 #[serde(rename_all = "snake_case")]
 pub enum PrefillBucketStrategy {
     SingleSequenceBuckets,
+    ChunkedSingleSequenceBuckets,
     MultiSequenceReserved,
 }
 
@@ -641,6 +642,13 @@ impl FastPathPlanner {
             .collect()
     }
 
+    pub fn prefill_token_ceiling_for_context(context: &FastPathBackendContext) -> Option<usize> {
+        Self::supported_prefill_buckets(context.provider, context.optimization_profile)
+            .into_iter()
+            .map(|bucket| bucket.token_ceiling)
+            .max()
+    }
+
     pub fn plan_decode(
         context: &FastPathBackendContext,
         batch_size: usize,
@@ -681,23 +689,38 @@ impl FastPathPlanner {
         context: &FastPathBackendContext,
         prompt_tokens: usize,
     ) -> Result<FastPathExecutionPlan> {
-        let bucket =
+        let supported =
             Self::supported_prefill_buckets(context.provider, context.optimization_profile)
                 .into_iter()
-                .find(|bucket| prompt_tokens <= bucket.token_ceiling)
-                .ok_or_else(|| FastPathInvariantError::UnsupportedBucket {
-                    phase: ExecutionPhase::Prefill,
-                    batch_size: 1,
-                    token_count: prompt_tokens,
-                    profile: context.optimization_profile,
-                })?;
+                .collect::<Vec<_>>();
+        let Some(largest_bucket) = supported.last().cloned() else {
+            return Err(FastPathInvariantError::UnsupportedBucket {
+                phase: ExecutionPhase::Prefill,
+                batch_size: 1,
+                token_count: prompt_tokens,
+                profile: context.optimization_profile,
+            }
+            .into());
+        };
+
+        let bucket = supported
+            .iter()
+            .find(|bucket| prompt_tokens <= bucket.token_ceiling)
+            .cloned()
+            .unwrap_or(largest_bucket);
+        let actual_token_count = prompt_tokens.min(bucket.token_ceiling);
+        let prefill_strategy = if prompt_tokens <= bucket.token_ceiling {
+            Some(PrefillBucketStrategy::SingleSequenceBuckets)
+        } else {
+            Some(PrefillBucketStrategy::ChunkedSingleSequenceBuckets)
+        };
 
         Ok(Self::build_plan(
             bucket,
             1,
-            prompt_tokens,
-            prompt_tokens,
-            Some(PrefillBucketStrategy::SingleSequenceBuckets),
+            actual_token_count,
+            actual_token_count,
+            prefill_strategy,
         ))
     }
 
@@ -943,6 +966,20 @@ mod tests {
         assert_eq!(
             plan.prefill_strategy,
             Some(PrefillBucketStrategy::SingleSequenceBuckets)
+        );
+    }
+
+    #[test]
+    fn prefill_plan_falls_back_to_chunked_single_sequence_strategy_for_long_prompts() {
+        let plan = FastPathPlanner::plan_prefill(&cuda_context(), 32_000)
+            .expect("chunked prefill plan should work");
+        assert_eq!(plan.bucket.phase, ExecutionPhase::Prefill);
+        assert_eq!(plan.bucket.batch_size_ceiling, 1);
+        assert_eq!(plan.bucket.token_ceiling, 16_384);
+        assert_eq!(plan.actual_token_count, 16_384);
+        assert_eq!(
+            plan.prefill_strategy,
+            Some(PrefillBucketStrategy::ChunkedSingleSequenceBuckets)
         );
     }
 

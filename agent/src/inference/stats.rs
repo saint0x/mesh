@@ -214,20 +214,11 @@ pub struct InferenceStats {
     /// Number of token rows successfully sampled on device.
     pub device_sampling_requests: AtomicU64,
 
-    /// Number of token rows that attempted device sampling but fell back before completion.
-    pub device_sampling_fallback_requests: AtomicU64,
-
-    /// Number of token rows sampled through host logic.
-    pub host_sampling_requests: AtomicU64,
-
     /// Total time spent in all sampling paths.
     pub total_sampling_time_ms: AtomicU64,
 
     /// Total time spent in device sampling paths.
     pub device_sampling_time_ms: AtomicU64,
-
-    /// Total time spent in host sampling paths.
-    pub host_sampling_time_ms: AtomicU64,
 
     /// Number of active KV view accesses served from the existing cache.
     pub device_kv_active_view_cache_hits: AtomicU64,
@@ -346,11 +337,8 @@ impl InferenceStats {
             kv_snapshot_materializations: AtomicU64::new(0),
             kv_snapshot_materialized_bytes: AtomicU64::new(0),
             device_sampling_requests: AtomicU64::new(0),
-            device_sampling_fallback_requests: AtomicU64::new(0),
-            host_sampling_requests: AtomicU64::new(0),
             total_sampling_time_ms: AtomicU64::new(0),
             device_sampling_time_ms: AtomicU64::new(0),
-            host_sampling_time_ms: AtomicU64::new(0),
             device_kv_active_view_cache_hits: AtomicU64::new(0),
             device_kv_active_view_cache_misses: AtomicU64::new(0),
             device_kv_head_view_cache_hits: AtomicU64::new(0),
@@ -539,20 +527,6 @@ impl InferenceStats {
         self.device_sampling_requests
             .fetch_add(requests, Ordering::Relaxed);
         self.device_sampling_time_ms
-            .fetch_add(duration_ms, Ordering::Relaxed);
-        self.total_sampling_time_ms
-            .fetch_add(duration_ms, Ordering::Relaxed);
-    }
-
-    pub fn record_device_sampling_fallback(&self, requests: u64) {
-        self.device_sampling_fallback_requests
-            .fetch_add(requests, Ordering::Relaxed);
-    }
-
-    pub fn record_host_sampling(&self, requests: u64, duration_ms: u64) {
-        self.host_sampling_requests
-            .fetch_add(requests, Ordering::Relaxed);
-        self.host_sampling_time_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
         self.total_sampling_time_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
@@ -898,19 +872,6 @@ impl InferenceStats {
         self.total_sampling_time_ms.load(Ordering::Relaxed) as f64 / total_runtime as f64
     }
 
-    pub fn device_sampling_fallback_rate(&self) -> f64 {
-        let attempted = self.device_sampling_requests.load(Ordering::Relaxed)
-            + self
-                .device_sampling_fallback_requests
-                .load(Ordering::Relaxed);
-        if attempted == 0 {
-            return 0.0;
-        }
-        self.device_sampling_fallback_requests
-            .load(Ordering::Relaxed) as f64
-            / attempted as f64
-    }
-
     pub fn avg_generated_token_latency_ms(&self) -> f64 {
         let generated_tokens = self.total_tokens_generated.load(Ordering::Relaxed);
         if generated_tokens == 0 {
@@ -1173,16 +1134,8 @@ impl InferenceStats {
                 self.kv_snapshot_avg_materialized_bytes()
             ),
             device_sampling_requests = self.device_sampling_requests.load(Ordering::Relaxed),
-            device_sampling_fallback_requests = self
-                .device_sampling_fallback_requests
-                .load(Ordering::Relaxed),
-            host_sampling_requests = self.host_sampling_requests.load(Ordering::Relaxed),
             total_sampling_time_ms = self.total_sampling_time_ms.load(Ordering::Relaxed),
             sampling_share_of_runtime = format!("{:.3}", self.sampling_share_of_runtime()),
-            device_sampling_fallback_rate = format!(
-                "{:.3}",
-                self.device_sampling_fallback_rate()
-            ),
             avg_generated_token_latency_ms = format!(
                 "{:.3}",
                 self.avg_generated_token_latency_ms()
@@ -1455,25 +1408,12 @@ impl InferenceStats {
             self.device_sampling_requests.load(Ordering::Relaxed)
         );
         println!(
-            "  Device Fallbacks:    {}",
-            self.device_sampling_fallback_requests
-                .load(Ordering::Relaxed)
-        );
-        println!(
-            "  Host Requests:       {}",
-            self.host_sampling_requests.load(Ordering::Relaxed)
-        );
-        println!(
             "  Sampling Time:       {}ms",
             self.total_sampling_time_ms.load(Ordering::Relaxed)
         );
         println!(
             "  Sampling Share:      {:.1}%",
             self.sampling_share_of_runtime() * 100.0
-        );
-        println!(
-            "  Device Fallback Rate:{:.1}%",
-            self.device_sampling_fallback_rate() * 100.0
         );
         println!(
             "  Token Latency:       {:.3}ms",
@@ -2024,17 +1964,6 @@ impl InferenceStats {
         );
         insert_u64(
             &mut map,
-            "device_sampling_fallback_requests",
-            self.device_sampling_fallback_requests
-                .load(Ordering::Relaxed),
-        );
-        insert_u64(
-            &mut map,
-            "host_sampling_requests",
-            self.host_sampling_requests.load(Ordering::Relaxed),
-        );
-        insert_u64(
-            &mut map,
             "total_sampling_time_ms",
             self.total_sampling_time_ms.load(Ordering::Relaxed),
         );
@@ -2042,11 +1971,6 @@ impl InferenceStats {
             &mut map,
             "device_sampling_time_ms",
             self.device_sampling_time_ms.load(Ordering::Relaxed),
-        );
-        insert_u64(
-            &mut map,
-            "host_sampling_time_ms",
-            self.host_sampling_time_ms.load(Ordering::Relaxed),
         );
         insert_u64(
             &mut map,
@@ -2161,10 +2085,6 @@ impl InferenceStats {
             serde_json::Value::from(self.sampling_share_of_runtime()),
         );
         map.insert(
-            "device_sampling_fallback_rate".to_string(),
-            serde_json::Value::from(self.device_sampling_fallback_rate()),
-        );
-        map.insert(
             "avg_generated_token_latency_ms".to_string(),
             serde_json::Value::from(self.avg_generated_token_latency_ms()),
         );
@@ -2203,7 +2123,6 @@ impl InferenceStats {
                 "kv_snapshot_avg_export_bytes": self.kv_snapshot_avg_export_bytes(),
                 "kv_snapshot_avg_materialized_bytes": self.kv_snapshot_avg_materialized_bytes(),
                 "sampling_share_of_runtime": self.sampling_share_of_runtime(),
-                "device_sampling_fallback_rate": self.device_sampling_fallback_rate(),
                 "device_kv_active_view_cache_hit_rate": self.device_kv_active_view_cache_hit_rate(),
                 "device_kv_head_view_cache_hit_rate": self.device_kv_head_view_cache_hit_rate(),
                 "device_kv_selected_head_view_cache_hit_rate": self.device_kv_selected_head_view_cache_hit_rate(),
@@ -2281,14 +2200,6 @@ pub(crate) fn record_runtime_kv_snapshot_materialization(bytes: u64) {
 
 pub(crate) fn record_runtime_device_sampling(requests: u64, duration_ms: u64) {
     let _ = with_active_runtime_stats(|stats| stats.record_device_sampling(requests, duration_ms));
-}
-
-pub(crate) fn record_runtime_device_sampling_fallback(requests: u64) {
-    let _ = with_active_runtime_stats(|stats| stats.record_device_sampling_fallback(requests));
-}
-
-pub(crate) fn record_runtime_host_sampling(requests: u64, duration_ms: u64) {
-    let _ = with_active_runtime_stats(|stats| stats.record_host_sampling(requests, duration_ms));
 }
 
 pub(crate) fn record_runtime_device_kv_active_view_cache_hit() {
@@ -2467,8 +2378,6 @@ mod tests {
         stats.record_kv_snapshot_export(128);
         stats.record_kv_snapshot_materialization(96);
         stats.record_device_sampling(2, 7);
-        stats.record_device_sampling_fallback(1);
-        stats.record_host_sampling(1, 5);
         stats.record_device_kv_active_view_cache_miss();
         stats.record_device_kv_active_view_cache_hit();
         stats.record_device_kv_head_view_cache_miss();
@@ -2485,8 +2394,6 @@ mod tests {
         assert_eq!(json["kv_snapshot_exports"], 1);
         assert_eq!(json["kv_snapshot_materializations"], 1);
         assert_eq!(json["device_sampling_requests"], 2);
-        assert_eq!(json["device_sampling_fallback_requests"], 1);
-        assert_eq!(json["host_sampling_requests"], 1);
         assert_eq!(json["total_collective_host_materializations"], 1);
         assert_eq!(json["total_device_resident_collectives"], 1);
         assert_eq!(json["device_kv_active_view_cache_hits"], 1);
@@ -2608,8 +2515,6 @@ mod tests {
         stats.record_kv_snapshot_export(256);
         stats.record_kv_snapshot_materialization(128);
         stats.record_device_sampling(3, 9);
-        stats.record_device_sampling_fallback(1);
-        stats.record_host_sampling(1, 5);
         stats.record_device_kv_active_view_cache_miss();
         stats.record_device_kv_active_view_cache_hit();
         stats.record_device_kv_active_view_cache_hit();
@@ -2642,9 +2547,8 @@ mod tests {
             stats.kv_snapshot_materialized_bytes.load(Ordering::Relaxed),
             128
         );
-        assert_eq!(stats.total_sampling_time_ms.load(Ordering::Relaxed), 14);
-        assert!((stats.sampling_share_of_runtime() - 0.07).abs() < f64::EPSILON);
-        assert!((stats.device_sampling_fallback_rate() - 0.25).abs() < f64::EPSILON);
+        assert_eq!(stats.total_sampling_time_ms.load(Ordering::Relaxed), 9);
+        assert!((stats.sampling_share_of_runtime() - 0.045).abs() < f64::EPSILON);
         assert!((stats.avg_generated_token_latency_ms() - 6.25).abs() < f64::EPSILON);
         assert!((stats.device_resident_collective_rate() - 0.75).abs() < f64::EPSILON);
         assert!((stats.collective_host_materialization_rate() - 0.25).abs() < f64::EPSILON);

@@ -5,11 +5,12 @@ use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
 use crate::wire_f32::decode_to_f32_vec;
 use async_trait::async_trait;
+use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -116,19 +117,28 @@ impl ArtifactShardLoader {
         Ok(())
     }
 
-    fn read_and_verify_weights(
+    fn map_and_verify_weights(
         &self,
         assignment: &ShardAssignment,
         manifest: &ShardArtifactManifest,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Mmap> {
         let weights_path = self.weights_path(assignment);
-        let bytes = fs::read(&weights_path).map_err(|e| {
+        let file = File::open(&weights_path).map_err(|e| {
             AgentError::Config(format!(
                 "Failed to read shard artifact {}: {}",
                 weights_path.display(),
                 e
             ))
         })?;
+        let bytes = unsafe {
+            Mmap::map(&file).map_err(|e| {
+                AgentError::Config(format!(
+                    "Failed to memory-map shard artifact {}: {}",
+                    weights_path.display(),
+                    e
+                ))
+            })?
+        };
 
         let digest = hex::encode(Sha256::digest(&bytes));
         if digest != manifest.expected_sha256 {
@@ -218,7 +228,7 @@ impl ShardLoader for ArtifactShardLoader {
         self.validate_manifest(model_id, assignment, &manifest)?;
 
         let weights_path = self.weights_path(assignment);
-        let bytes = self.read_and_verify_weights(assignment, &manifest)?;
+        let bytes = self.map_and_verify_weights(assignment, &manifest)?;
         registry
             .mark_downloaded(
                 model_id,
@@ -227,7 +237,7 @@ impl ShardLoader for ArtifactShardLoader {
             )
             .await?;
 
-        let weights = self.decode_weights(model_id, assignment, &bytes)?;
+        let weights = self.decode_weights(model_id, assignment, bytes.as_ref())?;
 
         registry
             .mark_loaded(model_id, weights.memory_usage() as u64)

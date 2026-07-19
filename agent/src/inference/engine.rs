@@ -117,8 +117,6 @@ pub enum LocalExecutorClass {
 #[serde(rename_all = "snake_case")]
 pub enum HostKernel {
     ForwardPass,
-    SerialDecode,
-    HostAssistedSampling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,11 +172,7 @@ impl LocalExecutorContract {
             ExecutionProviderKind::Cpu => Self {
                 class: LocalExecutorClass::FastPath,
                 optimization_profile: BackendOptimizationProfile::CpuSerial,
-                host_kernels: vec![
-                    HostKernel::ForwardPass,
-                    HostKernel::SerialDecode,
-                    HostKernel::HostAssistedSampling,
-                ],
+                host_kernels: vec![HostKernel::ForwardPass],
                 fused_stages: Vec::new(),
                 collective_residency: CollectiveResidency::StagedRuntime,
                 prefill: ExecutorPhasePlan {
@@ -186,14 +180,14 @@ impl LocalExecutorContract {
                     class: LocalExecutorClass::FastPath,
                     supports_microbatch: false,
                     requires_static_workspace: false,
-                    uses_device_sampling: false,
+                    uses_device_sampling: true,
                 },
                 decode: ExecutorPhasePlan {
                     phase: ExecutionPhase::Decode,
                     class: LocalExecutorClass::FastPath,
                     supports_microbatch: true,
                     requires_static_workspace: false,
-                    uses_device_sampling: false,
+                    uses_device_sampling: true,
                 },
                 kv_runtime: KvRuntimeContract {
                     requires_paged_cache: true,
@@ -206,7 +200,7 @@ impl LocalExecutorContract {
             ExecutionProviderKind::Metal => Self {
                 class: LocalExecutorClass::FastPath,
                 optimization_profile: BackendOptimizationProfile::MetalVectorized,
-                host_kernels: vec![HostKernel::HostAssistedSampling],
+                host_kernels: Vec::new(),
                 fused_stages: vec![
                     FusedKernelStage::NormQkv,
                     FusedKernelStage::RopeKvWrite,
@@ -240,7 +234,7 @@ impl LocalExecutorContract {
             ExecutionProviderKind::Cuda => Self {
                 class: LocalExecutorClass::FastPath,
                 optimization_profile: BackendOptimizationProfile::CudaFused,
-                host_kernels: vec![HostKernel::HostAssistedSampling],
+                host_kernels: Vec::new(),
                 fused_stages: vec![
                     FusedKernelStage::NormQkv,
                     FusedKernelStage::RopeKvWrite,

@@ -100,7 +100,7 @@ impl BackendContractDescriptor {
         let supports_decode_microbatch = true;
         let supports_paged_kv = true;
         let supports_checkpoint_handoff = true;
-        let supports_device_sampling = !matches!(provider, ExecutionProviderKind::Cpu);
+        let supports_device_sampling = true;
         let fast_path_eligible = true;
         let memory_model = match provider {
             ExecutionProviderKind::Cpu => MemoryModel::SystemRam,
@@ -121,7 +121,7 @@ impl BackendContractDescriptor {
                 decode_microbatch: true,
                 paged_kv: true,
                 checkpoint_handoff: true,
-                device_sampling: false,
+                device_sampling: true,
             },
             ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
                 fast_path_serving: true,
@@ -153,9 +153,11 @@ impl BackendContractDescriptor {
         self.fast_path_eligible
             && self.supports_decode_microbatch
             && self.supports_paged_kv
+            && self.supports_device_sampling
             && self.verified_runtime.fast_path_serving
             && self.verified_runtime.decode_microbatch
             && self.verified_runtime.paged_kv
+            && self.verified_runtime.device_sampling
     }
 
     pub fn production_readiness_summary(&self) -> String {
