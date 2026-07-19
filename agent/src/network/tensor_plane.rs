@@ -639,8 +639,14 @@ impl ServingSessionTransport {
         sender_position: u32,
         payload_bytes: &[u8],
     ) -> Result<()> {
-        let payload_bytes = wire_bytes_for_raw_payload(payload_bytes);
-        send_serving_frame_bytes_on_bound_lane(
+        let framed_len = framed_raw_payload_len(payload_bytes.len());
+        let element_count = framed_len
+            .checked_div(std::mem::size_of::<f32>())
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| {
+                AgentError::Network("checkpoint payload too large for serving frame".to_string())
+            })?;
+        send_serving_frame_raw_payload_on_bound_lane(
             &self.state,
             &self.checkpoint_lane,
             ServingFrameHeader::new(
@@ -652,9 +658,9 @@ impl ServingSessionTransport {
                 slot,
                 stream_id,
                 CollectiveLane::Checkpoint,
-                (payload_bytes.len() / std::mem::size_of::<f32>()) as u32,
+                element_count,
             ),
-            &payload_bytes,
+            payload_bytes,
         )
         .await
     }
@@ -1571,6 +1577,104 @@ async fn send_serving_frame_bytes_on_bound_lane(
     }
 }
 
+async fn send_serving_frame_raw_payload_on_bound_lane(
+    state: &Arc<TensorPlaneState>,
+    lane: &BoundServingLane,
+    header: ServingFrameHeader,
+    raw_payload_bytes: &[u8],
+) -> Result<()> {
+    let message_bytes = header.size_bytes().max(1);
+    if message_bytes > state.max_message_bytes {
+        state
+            .metrics
+            .oversized_message_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(AgentError::Network(format!(
+            "Serving frame size {} exceeds limit {}",
+            message_bytes, state.max_message_bytes
+        )));
+    }
+
+    let message_bytes_u32: u32 = message_bytes.try_into().map_err(|_| {
+        AgentError::Network("Serving frame too large for byte accounting".to_string())
+    })?;
+    let send_started = Instant::now();
+    let wait_started = Instant::now();
+    let outbound_permit = match state
+        .outbound_inflight_bytes
+        .clone()
+        .try_acquire_many_owned(message_bytes_u32)
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            state
+                .metrics
+                .outbound_backpressure_wait_count
+                .fetch_add(1, Ordering::Relaxed);
+            let permit = state
+                .outbound_inflight_bytes
+                .clone()
+                .acquire_many_owned(message_bytes_u32)
+                .await
+                .map_err(|_| {
+                    AgentError::Network(
+                        "Serving dataplane outbound byte budget unexpectedly closed".to_string(),
+                    )
+                })?;
+            state
+                .metrics
+                .outbound_backpressure_wait_ms
+                .fetch_add(wait_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            permit
+        }
+    };
+    update_peak(
+        &state.metrics.peak_outbound_inflight_bytes,
+        (state.outbound_inflight_byte_capacity
+            - state.outbound_inflight_bytes.available_permits() as usize) as u64,
+    );
+
+    let class_permit =
+        acquire_lane_budget(state, lane.target, lane.plan.traffic_class, message_bytes).await?;
+    let selected_stream_index = if lane.plan.desired_stream_count <= 1 {
+        0
+    } else {
+        header.stream_id as usize % lane.plan.desired_stream_count
+    };
+    let send_result = send_serving_frame_raw_payload_with_refresh(
+        state,
+        lane,
+        selected_stream_index,
+        header,
+        raw_payload_bytes,
+    )
+    .await;
+
+    match send_result {
+        Ok(()) => {
+            state
+                .metrics
+                .bytes_sent
+                .fetch_add(message_bytes as u64, Ordering::Relaxed);
+            record_phase_bytes(&state.metrics, header.lane, message_bytes as u64, true);
+            state.metrics.send_count.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .send_latency_ms
+                .fetch_add(send_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            record_traffic_class_send(&state.metrics, lane.plan.traffic_class);
+            drop(class_permit);
+            drop(outbound_permit);
+            Ok(())
+        }
+        Err(error) => {
+            drop(class_permit);
+            drop(outbound_permit);
+            Err(error)
+        }
+    }
+}
+
 async fn send_serving_frame_bytes_with_refresh(
     state: &Arc<TensorPlaneState>,
     lane: &BoundServingLane,
@@ -1636,6 +1740,79 @@ async fn send_serving_frame_bytes_with_refresh(
                         .fetch_add(1, Ordering::Relaxed);
                     Err(AgentError::Network(format!(
                         "Timed out sending serving frame to {}",
+                        lane.target
+                    )))
+                }
+            }
+        }
+    }
+}
+
+async fn send_serving_frame_raw_payload_with_refresh(
+    state: &Arc<TensorPlaneState>,
+    lane: &BoundServingLane,
+    stream_index: usize,
+    header: ServingFrameHeader,
+    raw_payload_bytes: &[u8],
+) -> Result<()> {
+    let initial_stream = {
+        let streams = lane.streams.lock().await;
+        Arc::clone(&streams[stream_index])
+    };
+    let first_result = {
+        let mut stream_guard = initial_stream.lock().await;
+        tokio::time::timeout(
+            state.io_timeout,
+            write_serving_frame_raw_payload(&mut *stream_guard, header, raw_payload_bytes),
+        )
+        .await
+    };
+    match first_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => {
+            state
+                .metrics
+                .connection_refresh_attempt_count
+                .fetch_add(1, Ordering::Relaxed);
+            evict_connection(state, lane.target, lane.plan.lane).await;
+            let refreshed_stream = ensure_connection_pool(
+                state,
+                lane.target,
+                lane.plan.lane,
+                lane.plan.desired_stream_count,
+                header.stream_id,
+                true,
+            )
+            .await?;
+            {
+                let mut streams = lane.streams.lock().await;
+                streams[stream_index] = Arc::clone(&refreshed_stream);
+            }
+            let mut stream_guard = refreshed_stream.lock().await;
+            match tokio::time::timeout(
+                state.io_timeout,
+                write_serving_frame_raw_payload(&mut *stream_guard, header, raw_payload_bytes),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    state
+                        .metrics
+                        .connection_refresh_success_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(AgentError::Network(format!(
+                    "Failed to send serving frame to {}: {}",
+                    lane.target, error
+                ))),
+                Err(_) => {
+                    state
+                        .metrics
+                        .send_timeout_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(AgentError::Network(format!(
+                        "Timed out sending serving frame to {} after refresh",
                         lane.target
                     )))
                 }
@@ -2214,6 +2391,79 @@ where
     Ok(())
 }
 
+async fn write_serving_frame_raw_payload<W>(
+    writer: &mut W,
+    header: ServingFrameHeader,
+    raw_payload_bytes: &[u8],
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let header_bytes = header.encode_binary();
+    let raw_len_prefix = (raw_payload_bytes.len() as u32).to_le_bytes();
+    let pad_len = framed_raw_payload_padding(raw_payload_bytes.len());
+    let zero_pad = [0u8; std::mem::size_of::<f32>() - 1];
+    let mut header_offset = 0usize;
+    let mut prefix_offset = 0usize;
+    let mut payload_offset = 0usize;
+    let mut pad_offset = 0usize;
+    while header_offset < header_bytes.len()
+        || prefix_offset < raw_len_prefix.len()
+        || payload_offset < raw_payload_bytes.len()
+        || pad_offset < pad_len
+    {
+        let mut bufs = [
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+        ];
+        let mut count = 0usize;
+        if header_offset < header_bytes.len() {
+            bufs[count] = IoSlice::new(&header_bytes[header_offset..]);
+            count += 1;
+        }
+        if prefix_offset < raw_len_prefix.len() {
+            bufs[count] = IoSlice::new(&raw_len_prefix[prefix_offset..]);
+            count += 1;
+        }
+        if payload_offset < raw_payload_bytes.len() {
+            bufs[count] = IoSlice::new(&raw_payload_bytes[payload_offset..]);
+            count += 1;
+        }
+        if pad_offset < pad_len {
+            bufs[count] = IoSlice::new(&zero_pad[pad_offset..pad_len]);
+            count += 1;
+        }
+        let written = writer.write_vectored(&bufs[..count]).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write serving raw payload frame bytes",
+            ));
+        }
+        let remaining_header = header_bytes.len().saturating_sub(header_offset);
+        let consumed_header = written.min(remaining_header);
+        header_offset += consumed_header;
+
+        let remaining_prefix = raw_len_prefix.len().saturating_sub(prefix_offset);
+        let consumed_prefix = written
+            .saturating_sub(consumed_header)
+            .min(remaining_prefix);
+        prefix_offset += consumed_prefix;
+
+        let remaining_payload = raw_payload_bytes.len().saturating_sub(payload_offset);
+        let consumed_payload = written
+            .saturating_sub(consumed_header + consumed_prefix)
+            .min(remaining_payload);
+        payload_offset += consumed_payload;
+
+        let consumed_pad = written.saturating_sub(consumed_header + consumed_prefix + consumed_payload);
+        pad_offset += consumed_pad.min(pad_len.saturating_sub(pad_offset));
+    }
+    Ok(())
+}
+
 async fn read_serving_frame<R>(
     reader: &mut R,
     max_message_bytes: usize,
@@ -2261,16 +2511,14 @@ fn wire_bytes_for_f32_slice(chunk_data: &[f32]) -> Cow<'_, [u8]> {
     }
 }
 
-fn wire_bytes_for_raw_payload(payload_bytes: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(4 + payload_bytes.len() + 3);
-    framed.extend_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
-    framed.extend_from_slice(payload_bytes);
-    let padding = (std::mem::size_of::<f32>() - (framed.len() % std::mem::size_of::<f32>()))
-        % std::mem::size_of::<f32>();
-    if padding > 0 {
-        framed.resize(framed.len() + padding, 0);
-    }
-    framed
+fn framed_raw_payload_padding(payload_len: usize) -> usize {
+    let framed_len = std::mem::size_of::<u32>() + payload_len;
+    (std::mem::size_of::<f32>() - (framed_len % std::mem::size_of::<f32>()))
+        % std::mem::size_of::<f32>()
+}
+
+fn framed_raw_payload_len(payload_len: usize) -> usize {
+    std::mem::size_of::<u32>() + payload_len + framed_raw_payload_padding(payload_len)
 }
 
 fn decode_f32_slice_wire(buf: &[u8]) -> Vec<f32> {
@@ -2884,6 +3132,54 @@ mod tests {
         assert!(snapshot.bulk_transfer_bytes_received > 0);
         assert!(snapshot.checkpoint_bytes_sent > 0);
         assert!(snapshot.checkpoint_bytes_received > 0);
+    }
+
+    #[tokio::test]
+    async fn test_send_checkpoint_bytes_preserves_raw_payload_frame_without_reencoding() {
+        let plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = plane
+            .serving_transport_for_neighbors(
+                plane.local_addr(),
+                plane.local_addr(),
+                InferenceRuntimeMode::ResilientEdge,
+                ExecutionProviderKind::Cpu,
+            )
+            .await
+            .unwrap();
+        let collective_id = Uuid::new_v4();
+        let payload = br#"{"kind":"checkpoint","seq":7}"#;
+
+        session
+            .send_checkpoint_bytes(collective_id, 0, 5, 2, 0, 0, 9, payload)
+            .await
+            .unwrap();
+
+        let frame = session
+            .recv_frame_bytes(ServingReceiveSpec {
+                collective_id,
+                collective_seq: 0,
+                lane: CollectiveLane::Checkpoint,
+                layer_idx: 5,
+                step: 2,
+                slot: 0,
+                stream_id: 0,
+                expected_sender_position: 9,
+            })
+            .await
+            .unwrap();
+
+        let expected_len = framed_raw_payload_len(payload.len());
+        assert_eq!(frame.payload_bytes().len(), expected_len);
+        assert_eq!(
+            u32::from_le_bytes(frame.payload_bytes()[0..4].try_into().unwrap()) as usize,
+            payload.len()
+        );
+        assert_eq!(&frame.payload_bytes()[4..4 + payload.len()], payload);
+        assert!(frame.payload_bytes()[4 + payload.len()..]
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[tokio::test]

@@ -18,6 +18,8 @@ use crate::network::{
     ServingSessionTransport, TensorPlane,
 };
 use crate::provider::ExecutionProviderKind;
+#[cfg(target_os = "linux")]
+use candle_core::cuda_backend::cudarc::driver::{CudaStream, PinnedHostSlice};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use candle_core::{backend::BackendStorage, DType, MetalStorage};
 use libp2p::PeerId;
@@ -450,11 +452,87 @@ impl PartialEq for CollectiveMatrix {
 pub trait StagedCollectiveBuffer: Send {
     fn len(&self) -> usize;
 
-    fn stage_send_chunk(&mut self, range: Range<usize>) -> Result<Vec<f32>>;
+    fn stage_send_chunk(
+        &mut self,
+        range: Range<usize>,
+        scratch: &mut StageSendScratch,
+    ) -> Result<StageSendChunkMode>;
 
     fn accumulate_recv_chunk(&mut self, range: Range<usize>, payload_bytes: &[u8]) -> Result<()>;
 
     fn copy_recv_chunk(&mut self, range: Range<usize>, payload_bytes: &[u8]) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageSendChunkMode {
+    SharedVisibleScratch,
+    HostMaterializedScratch,
+}
+
+#[derive(Debug)]
+pub enum StageSendScratch {
+    Vec(Vec<f32>),
+    #[cfg(target_os = "linux")]
+    CudaPinned(PinnedHostSlice<f32>),
+}
+
+impl Default for StageSendScratch {
+    fn default() -> Self {
+        Self::Vec(Vec::new())
+    }
+}
+
+impl StageSendScratch {
+    pub fn ensure_vec(&mut self, len: usize) -> &mut Vec<f32> {
+        if !matches!(self, Self::Vec(_)) {
+            *self = Self::Vec(Vec::new());
+        }
+        match self {
+            Self::Vec(buffer) => {
+                buffer.clear();
+                buffer.reserve(len.saturating_sub(buffer.capacity()));
+                buffer
+            }
+            #[cfg(target_os = "linux")]
+            Self::CudaPinned(_) => unreachable!("scratch was normalized to Vec"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn ensure_cuda_pinned(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> Result<&mut PinnedHostSlice<f32>> {
+        let needs_realloc = match self {
+            Self::CudaPinned(buffer) => buffer.len() < len,
+            Self::Vec(_) => true,
+        };
+        if needs_realloc {
+            let pinned = unsafe { stream.context().alloc_pinned::<f32>(len) }
+                .map_err(|err| AgentError::Execution(format!("CUDA pinned host allocation failed: {err}")))?;
+            *self = Self::CudaPinned(pinned);
+        }
+        match self {
+            Self::CudaPinned(buffer) => Ok(buffer),
+            Self::Vec(_) => unreachable!("scratch was normalized to CUDA pinned"),
+        }
+    }
+
+    pub fn as_slice(&self, len: usize) -> Result<&[f32]> {
+        match self {
+            Self::Vec(buffer) => Ok(&buffer[..len]),
+            #[cfg(target_os = "linux")]
+            Self::CudaPinned(buffer) => {
+                let slice = buffer.as_slice().map_err(|err| {
+                    AgentError::Execution(format!(
+                        "CUDA pinned host staging synchronization failed: {err}"
+                    ))
+                })?;
+                Ok(&slice[..len])
+            }
+        }
+    }
 }
 
 impl Tensor {
@@ -673,6 +751,16 @@ impl CollectiveOptimizationProfile {
 }
 
 impl<'a> WorkerRing<'a> {
+    fn pairwise_fast_path_metrics(&self) -> RingAllReduceMetrics {
+        RingAllReduceMetrics {
+            collective_operations: 1,
+            collective_worker_participants: self.total_workers as u64,
+            pairwise_fast_path_operations: 1,
+            larger_ring_operations: 0,
+            ..RingAllReduceMetrics::default()
+        }
+    }
+
     /// Create a new worker ring
     ///
     /// # Arguments
@@ -784,6 +872,11 @@ impl<'a> WorkerRing<'a> {
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
+        }
+        if self.total_workers == 2 {
+            return self
+                .pairwise_all_reduce_tensor(partial_result, job_id, layer_idx, collective_seq)
+                .await;
         }
         let n = self.total_workers as usize;
         let original_shape = partial_result.shape.clone();
@@ -924,6 +1017,11 @@ impl<'a> WorkerRing<'a> {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
         }
+        if self.total_workers == 2 {
+            return self
+                .pairwise_all_reduce_matrix(partial_result, job_id, layer_idx, collective_seq)
+                .await;
+        }
         let n = self.total_workers as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
         run_metrics.collective_operations = 1;
@@ -1038,6 +1136,11 @@ impl<'a> WorkerRing<'a> {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(());
         }
+        if self.total_workers == 2 {
+            return self
+                .pairwise_all_reduce_staged(partial_result, job_id, layer_idx, collective_seq)
+                .await;
+        }
 
         let n = self.total_workers as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
@@ -1045,10 +1148,20 @@ impl<'a> WorkerRing<'a> {
         run_metrics.collective_worker_participants = self.total_workers as u64;
         run_metrics.larger_ring_operations = 1;
         let plan = self.cached_collective_plan_for_len(partial_result.len());
+        let mut send_stage_scratch = StageSendScratch::default();
+        let mut host_materialized_this_collective = false;
 
         for step in 0..(n - 1) {
             let step_plan = &plan.reduce_scatter_steps[step];
-            let staged_chunk = partial_result.stage_send_chunk(step_plan.send_range.clone())?;
+            let stage_mode = partial_result.stage_send_chunk(
+                step_plan.send_range.clone(),
+                &mut send_stage_scratch,
+            )?;
+            if matches!(stage_mode, StageSendChunkMode::HostMaterializedScratch) {
+                host_materialized_this_collective = true;
+                run_metrics.host_materialization_bytes +=
+                    (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            }
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
                 .send_chunk_to_right_recv_from_left(
@@ -1059,7 +1172,7 @@ impl<'a> WorkerRing<'a> {
                     step as u32,
                     step_plan.send_slot,
                     step_plan.recv_slot,
-                    &staged_chunk,
+                    send_stage_scratch.as_slice(step_plan.send_range.len())?,
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -1082,7 +1195,15 @@ impl<'a> WorkerRing<'a> {
 
         for step in 0..(n - 1) {
             let step_plan = &plan.all_gather_steps[step];
-            let staged_chunk = partial_result.stage_send_chunk(step_plan.send_range.clone())?;
+            let stage_mode = partial_result.stage_send_chunk(
+                step_plan.send_range.clone(),
+                &mut send_stage_scratch,
+            )?;
+            if matches!(stage_mode, StageSendChunkMode::HostMaterializedScratch) {
+                host_materialized_this_collective = true;
+                run_metrics.host_materialization_bytes +=
+                    (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            }
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
                 .send_chunk_to_right_recv_from_left(
@@ -1093,7 +1214,7 @@ impl<'a> WorkerRing<'a> {
                     step as u32,
                     step_plan.send_slot,
                     step_plan.recv_slot,
-                    &staged_chunk,
+                    send_stage_scratch.as_slice(step_plan.send_range.len())?,
                 )
                 .await?;
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
@@ -1114,6 +1235,135 @@ impl<'a> WorkerRing<'a> {
                 .copy_recv_chunk(step_plan.recv_range.clone(), recv_msg.payload_bytes())?;
         }
 
+        if host_materialized_this_collective {
+            run_metrics.host_materialization_count = 1;
+        }
+        self.last_run_metrics = run_metrics;
+        Ok(())
+    }
+
+    async fn pairwise_all_reduce_tensor(
+        &mut self,
+        mut partial_result: Tensor,
+        job_id: Uuid,
+        layer_idx: u32,
+        collective_seq: u32,
+    ) -> Result<Tensor> {
+        let mut run_metrics = self.pairwise_fast_path_metrics();
+        let step_started = std::time::Instant::now();
+        let (recv_msg, send_wait_ms, receive_wait_ms) = self
+            .send_chunk_to_right_recv_from_left(
+                CollectiveLane::ReduceScatter,
+                job_id,
+                collective_seq,
+                layer_idx,
+                0,
+                0,
+                0,
+                &partial_result.data,
+            )
+            .await?;
+        run_metrics.reduce_scatter_step_time_ms = step_started.elapsed().as_millis() as u64;
+        run_metrics.send_wait_time_ms = send_wait_ms;
+        run_metrics.receive_wait_time_ms = receive_wait_ms;
+        run_metrics.bytes_sent =
+            (partial_result.data.len() * std::mem::size_of::<f32>()) as u64;
+        run_metrics.bytes_received = recv_msg.payload_bytes().len() as u64;
+
+        if recv_msg.element_count() != partial_result.data.len() {
+            return Err(AgentError::Execution(format!(
+                "Received pairwise tensor payload len {} but expected {}",
+                recv_msg.element_count(),
+                partial_result.data.len()
+            )));
+        }
+        accumulate_wire_f32_bytes_into_slice(&mut partial_result.data, recv_msg.payload_bytes());
+        self.last_run_metrics = run_metrics;
+        Ok(partial_result)
+    }
+
+    async fn pairwise_all_reduce_matrix(
+        &mut self,
+        mut partial_result: CollectiveMatrix,
+        job_id: Uuid,
+        layer_idx: u32,
+        collective_seq: u32,
+    ) -> Result<CollectiveMatrix> {
+        let mut run_metrics = self.pairwise_fast_path_metrics();
+        let step_started = std::time::Instant::now();
+        let (recv_msg, send_wait_ms, receive_wait_ms) = self
+            .send_chunk_to_right_recv_from_left(
+                CollectiveLane::ReduceScatter,
+                job_id,
+                collective_seq,
+                layer_idx,
+                0,
+                0,
+                0,
+                partial_result.host_range(0..partial_result.len()),
+            )
+            .await?;
+        run_metrics.reduce_scatter_step_time_ms = step_started.elapsed().as_millis() as u64;
+        run_metrics.send_wait_time_ms = send_wait_ms;
+        run_metrics.receive_wait_time_ms = receive_wait_ms;
+        run_metrics.bytes_sent = (partial_result.len() * std::mem::size_of::<f32>()) as u64;
+        run_metrics.bytes_received = recv_msg.payload_bytes().len() as u64;
+
+        if recv_msg.element_count() != partial_result.len() {
+            return Err(AgentError::Execution(format!(
+                "Received pairwise matrix payload len {} but expected {}",
+                recv_msg.element_count(),
+                partial_result.len()
+            )));
+        }
+        partial_result.accumulate_range_from_wire_bytes(0..partial_result.len(), recv_msg.payload_bytes());
+        self.last_run_metrics = run_metrics;
+        Ok(partial_result)
+    }
+
+    async fn pairwise_all_reduce_staged(
+        &mut self,
+        partial_result: &mut dyn StagedCollectiveBuffer,
+        job_id: Uuid,
+        layer_idx: u32,
+        collective_seq: u32,
+    ) -> Result<()> {
+        let len = partial_result.len();
+        let mut send_stage_scratch = StageSendScratch::default();
+        let stage_mode = partial_result.stage_send_chunk(0..len, &mut send_stage_scratch)?;
+        let mut run_metrics = self.pairwise_fast_path_metrics();
+        if matches!(stage_mode, StageSendChunkMode::HostMaterializedScratch) {
+            run_metrics.host_materialization_count = 1;
+            run_metrics.host_materialization_bytes =
+                (len * std::mem::size_of::<f32>()) as u64;
+        }
+        let step_started = std::time::Instant::now();
+        let (recv_msg, send_wait_ms, receive_wait_ms) = self
+            .send_chunk_to_right_recv_from_left(
+                CollectiveLane::ReduceScatter,
+                job_id,
+                collective_seq,
+                layer_idx,
+                0,
+                0,
+                0,
+                send_stage_scratch.as_slice(len)?,
+            )
+            .await?;
+        run_metrics.reduce_scatter_step_time_ms = step_started.elapsed().as_millis() as u64;
+        run_metrics.send_wait_time_ms = send_wait_ms;
+        run_metrics.receive_wait_time_ms = receive_wait_ms;
+        run_metrics.bytes_sent = (len * std::mem::size_of::<f32>()) as u64;
+        run_metrics.bytes_received = recv_msg.payload_bytes().len() as u64;
+
+        if recv_msg.element_count() != len {
+            return Err(AgentError::Execution(format!(
+                "Received pairwise staged payload len {} but expected {}",
+                recv_msg.element_count(),
+                len
+            )));
+        }
+        partial_result.accumulate_recv_chunk(0..len, recv_msg.payload_bytes())?;
         self.last_run_metrics = run_metrics;
         Ok(())
     }
@@ -1991,10 +2241,10 @@ mod tests {
 
         assert_eq!(result_a.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
         assert_eq!(result_b.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
-        assert_eq!(ring_a.last_run_metrics().pairwise_fast_path_operations, 0);
-        assert_eq!(ring_b.last_run_metrics().pairwise_fast_path_operations, 0);
-        assert_eq!(ring_a.last_run_metrics().larger_ring_operations, 1);
-        assert_eq!(ring_b.last_run_metrics().larger_ring_operations, 1);
+        assert_eq!(ring_a.last_run_metrics().pairwise_fast_path_operations, 1);
+        assert_eq!(ring_b.last_run_metrics().pairwise_fast_path_operations, 1);
+        assert_eq!(ring_a.last_run_metrics().larger_ring_operations, 0);
+        assert_eq!(ring_b.last_run_metrics().larger_ring_operations, 0);
     }
 
     #[tokio::test]

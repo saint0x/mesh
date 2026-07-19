@@ -14,7 +14,7 @@ use super::runtime::{
 };
 use crate::errors::{AgentError, Result};
 #[cfg(test)]
-use crate::executor::ring_allreduce::StagedCollectiveBuffer;
+use crate::executor::ring_allreduce::{StageSendScratch, StagedCollectiveBuffer};
 use serde::{Deserialize, Serialize};
 
 /// 2D Tensor for transformer computations
@@ -722,11 +722,13 @@ mod tests {
         let source = Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
         let candle = to_candle_2d(&source).unwrap();
         let mut buffer = DeviceCollectiveBuffer::from_device_tensor(&candle).unwrap();
+        let mut send_scratch = StageSendScratch::default();
 
         assert_eq!(buffer.rows(), 2);
         assert_eq!(buffer.cols(), 2);
         assert_eq!(buffer.len(), 4);
-        assert_eq!(buffer.stage_send_chunk(0..4).unwrap(), source.data);
+        buffer.stage_send_chunk(0..4, &mut send_scratch).unwrap();
+        assert_eq!(send_scratch.as_slice(4).unwrap(), source.data.as_slice());
 
         let restored = buffer.into_device_tensor_like(&candle).unwrap();
         let round_trip = from_candle_2d(&restored).unwrap();

@@ -1,22 +1,31 @@
 use crate::errors::{AgentError, Result};
 #[cfg(test)]
 use crate::executor::ring_allreduce::CollectiveMatrix;
-use crate::executor::ring_allreduce::StagedCollectiveBuffer;
+use crate::executor::ring_allreduce::{
+    StageSendChunkMode, StageSendScratch, StagedCollectiveBuffer,
+};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+#[cfg(target_os = "linux")]
+use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
 #[cfg(target_os = "linux")]
 use candle_core::Storage;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use candle_core::{CustomOp1, Layout, MetalStorage, Result as CandleResult, Shape};
+use candle_core::{
+    backend::BackendStorage, CustomOp1, Layout, MetalStorage, Result as CandleResult, Shape,
+    Storage,
+};
 use candle_core::{DType, Device, Tensor as CandleTensor, D};
 use candle_nn::ops as candle_ops;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use super::stats::record_runtime_device_sampling;
-#[cfg(test)]
-use super::stats::{record_runtime_collective_host_restore, record_runtime_collective_host_stage};
+use super::stats::{
+    record_runtime_collective_host_restore, record_runtime_collective_host_stage,
+    record_runtime_device_sampling,
+};
 use super::tensor_ops::{Tensor1D, Tensor2D};
 
 pub(crate) type DeviceTensor = CandleTensor;
@@ -673,6 +682,11 @@ pub(crate) struct DeviceCollectiveBuffer {
     flat: DeviceTensor,
     rows: usize,
     cols: usize,
+    receive_decode_scratch: Vec<f32>,
+    #[cfg(target_os = "linux")]
+    cuda_receive_pinned: Option<PinnedHostSlice<f32>>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    shared_metal: Option<MetalStorage>,
 }
 
 impl DeviceCollectiveBuffer {
@@ -692,11 +706,18 @@ impl DeviceCollectiveBuffer {
             .map_err(runtime_error)?
             .contiguous()
             .map_err(runtime_error)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let shared_metal = shared_metal_collective_storage(&flat);
 
         Ok(Self {
             flat,
             rows: dims[0],
             cols: dims[1],
+            receive_decode_scratch: Vec::new(),
+            #[cfg(target_os = "linux")]
+            cuda_receive_pinned: None,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            shared_metal,
         })
     }
 
@@ -712,12 +733,42 @@ impl DeviceCollectiveBuffer {
         self.cols
     }
 
-    fn stage_send_chunk_impl(&mut self, range: Range<usize>) -> Result<Vec<f32>> {
-        self.flat
+    fn stage_send_chunk_impl(
+        &mut self,
+        range: Range<usize>,
+        scratch: &mut StageSendScratch,
+    ) -> Result<StageSendChunkMode> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(storage) = &self.shared_metal {
+            let scratch = scratch.ensure_vec(range.len());
+            let len = self.len();
+            let staged =
+                unsafe { &slice::from_raw_parts(storage.buffer().contents() as *const f32, len)[range] };
+            scratch.extend_from_slice(staged);
+            return Ok(StageSendChunkMode::SharedVisibleScratch);
+        }
+
+        if let Some(stage_mode) =
+            stage_send_chunk_from_dense_cuda_tensor(&self.flat, range.clone(), scratch)?
+        {
+            record_runtime_collective_host_stage(
+                (range.len().saturating_mul(std::mem::size_of::<f32>())) as u64,
+            );
+            return Ok(stage_mode);
+        }
+
+        let staged = self
+            .flat
             .narrow(0, range.start, range.len())
             .map_err(runtime_error)?
             .to_vec1::<f32>()
-            .map_err(runtime_error)
+            .map_err(runtime_error)?;
+        record_runtime_collective_host_stage(
+            (range.len().saturating_mul(std::mem::size_of::<f32>())) as u64,
+        );
+        let scratch = scratch.ensure_vec(range.len());
+        scratch.extend(staged);
+        Ok(StageSendChunkMode::HostMaterializedScratch)
     }
 
     fn accumulate_range_from_wire_bytes_impl(
@@ -725,9 +776,23 @@ impl DeviceCollectiveBuffer {
         range: Range<usize>,
         payload_bytes: &[u8],
     ) -> Result<()> {
-        let payload = wire_bytes_to_f32_vec(range.len(), payload_bytes)?;
-        let update = DeviceTensor::from_vec(payload, range.len(), self.flat.device())
-            .map_err(runtime_error)?;
+        if payload_bytes.len() != range.len().saturating_mul(std::mem::size_of::<f32>()) {
+            return Err(AgentError::Execution(format!(
+                "Wire payload byte length {} did not match expected byte length {}",
+                payload_bytes.len(),
+                range.len().saturating_mul(std::mem::size_of::<f32>())
+            )));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(storage) = &self.shared_metal {
+            let len = self.len();
+            let dst = unsafe {
+                &mut slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)[range]
+            };
+            accumulate_wire_f32_bytes_into_slice(dst, payload_bytes);
+            return Ok(());
+        }
+        let update = self.device_tensor_from_wire_bytes(range.len(), payload_bytes)?;
         let current = self
             .flat
             .narrow(0, range.start, range.len())
@@ -743,12 +808,102 @@ impl DeviceCollectiveBuffer {
         range: Range<usize>,
         payload_bytes: &[u8],
     ) -> Result<()> {
-        let payload = wire_bytes_to_f32_vec(range.len(), payload_bytes)?;
-        let update = DeviceTensor::from_vec(payload, range.len(), self.flat.device())
-            .map_err(runtime_error)?;
+        if payload_bytes.len() != range.len().saturating_mul(std::mem::size_of::<f32>()) {
+            return Err(AgentError::Execution(format!(
+                "Wire payload byte length {} did not match expected byte length {}",
+                payload_bytes.len(),
+                range.len().saturating_mul(std::mem::size_of::<f32>())
+            )));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(storage) = &self.shared_metal {
+            let len = self.len();
+            let dst = unsafe {
+                &mut slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)[range]
+            };
+            copy_wire_f32_bytes_into_slice(dst, payload_bytes);
+            return Ok(());
+        }
+        let update = self.device_tensor_from_wire_bytes(range.len(), payload_bytes)?;
         self.flat
             .slice_set(&update, 0, range.start)
             .map_err(runtime_error)
+    }
+
+    fn device_tensor_from_wire_bytes(
+        &mut self,
+        expected_len: usize,
+        payload_bytes: &[u8],
+    ) -> Result<DeviceTensor> {
+        #[cfg(target_os = "linux")]
+        if let Some(tensor) = self.cuda_upload_tensor_from_wire_bytes(expected_len, payload_bytes)? {
+            record_runtime_collective_host_restore(
+                payload_bytes.len() as u64,
+            );
+            return Ok(tensor);
+        }
+
+        let payload = decode_wire_f32_bytes_into_scratch(
+            expected_len,
+            payload_bytes,
+            &mut self.receive_decode_scratch,
+        )?;
+        let update = DeviceTensor::from_slice(payload, payload.len(), self.flat.device())
+            .map_err(runtime_error)?;
+        record_runtime_collective_host_restore(
+            payload_bytes.len() as u64,
+        );
+        Ok(update)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cuda_upload_tensor_from_wire_bytes(
+        &mut self,
+        expected_len: usize,
+        payload_bytes: &[u8],
+    ) -> Result<Option<DeviceTensor>> {
+        let (storage, _) = self.flat.storage_and_layout();
+        let Storage::Cuda(cuda_storage) = &*storage else {
+            return Ok(None);
+        };
+        let pinned =
+            self.ensure_cuda_receive_pinned(&cuda_storage.device().cuda_stream(), expected_len)?;
+        copy_wire_f32_bytes_into_slice(
+            &mut pinned.as_mut_slice().map_err(runtime_error)?[..expected_len],
+            payload_bytes,
+        );
+        let upload = cuda_storage
+            .device()
+            .clone_htod(pinned)
+            .map_err(runtime_error)?;
+        let tensor = DeviceTensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(upload, cuda_storage.device().clone())),
+            payload.len(),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        Ok(Some(tensor))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_cuda_receive_pinned(
+        &mut self,
+        stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+        len: usize,
+    ) -> Result<&mut PinnedHostSlice<f32>> {
+        let needs_realloc = match &self.cuda_receive_pinned {
+            Some(buffer) => buffer.len() != len,
+            None => true,
+        };
+        if needs_realloc {
+            let pinned = unsafe { stream.context().alloc_pinned::<f32>(len) }.map_err(|err| {
+                AgentError::Execution(format!("CUDA pinned receive host allocation failed: {err}"))
+            })?;
+            self.cuda_receive_pinned = Some(pinned);
+        }
+        self.cuda_receive_pinned
+            .as_mut()
+            .ok_or_else(|| AgentError::Execution("CUDA pinned receive host buffer missing".to_string()))
     }
 
     pub(crate) fn into_device_tensor_like(self, template: &DeviceTensor) -> Result<DeviceTensor> {
@@ -768,20 +923,85 @@ impl StagedCollectiveBuffer for DeviceCollectiveBuffer {
         DeviceCollectiveBuffer::len(self)
     }
 
-    fn stage_send_chunk(&mut self, range: Range<usize>) -> Result<Vec<f32>> {
-        self.stage_send_chunk_impl(range)
+    fn stage_send_chunk(
+        &mut self,
+        range: Range<usize>,
+        scratch: &mut StageSendScratch,
+    ) -> Result<StageSendChunkMode> {
+        self.stage_send_chunk_impl(range, scratch)
     }
 
-    fn accumulate_recv_chunk(&mut self, range: Range<usize>, payload_bytes: &[u8]) -> Result<()> {
-        self.accumulate_range_from_wire_bytes_impl(range, payload_bytes)
+    fn accumulate_recv_chunk(&mut self, range: Range<usize>, payload: &[u8]) -> Result<()> {
+        self.accumulate_range_from_wire_bytes_impl(range, payload)
     }
 
-    fn copy_recv_chunk(&mut self, range: Range<usize>, payload_bytes: &[u8]) -> Result<()> {
-        self.copy_range_from_wire_bytes_impl(range, payload_bytes)
+    fn copy_recv_chunk(&mut self, range: Range<usize>, payload: &[u8]) -> Result<()> {
+        self.copy_range_from_wire_bytes_impl(range, payload)
     }
 }
 
-fn wire_bytes_to_f32_vec(expected_len: usize, payload_bytes: &[u8]) -> Result<Vec<f32>> {
+#[cfg(target_os = "linux")]
+fn stage_send_chunk_from_dense_cuda_tensor(
+    tensor: &DeviceTensor,
+    range: Range<usize>,
+    scratch: &mut StageSendScratch,
+) -> Result<Option<StageSendChunkMode>> {
+    let elem_count = tensor.elem_count();
+    let (storage, layout) = tensor.storage_and_layout();
+    if let Storage::Cuda(cuda_storage) = &*storage {
+        if let Some((start, end)) = layout.contiguous_offsets() {
+            let total_len = end.saturating_sub(start);
+            if start == 0 && total_len == elem_count {
+                let src = cuda_storage.as_cuda_slice::<f32>().map_err(runtime_error)?;
+                let src = src.slice(range.start..range.end);
+                let pinned = scratch.ensure_cuda_pinned(&cuda_storage.device().cuda_stream(), range.len())?;
+                cuda_storage.device().memcpy_dtoh(&src, pinned).map_err(runtime_error)?;
+                return Ok(Some(StageSendChunkMode::HostMaterializedScratch));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn copy_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
+    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
+    assert_eq!(
+        src.len(),
+        expected_bytes,
+        "wire payload byte length {} did not match destination byte length {}",
+        src.len(),
+        expected_bytes
+    );
+    for (slot, chunk) in dst
+        .iter_mut()
+        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
+    {
+        *slot = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+}
+
+fn accumulate_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
+    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
+    assert_eq!(
+        src.len(),
+        expected_bytes,
+        "wire payload byte length {} did not match destination byte length {}",
+        src.len(),
+        expected_bytes
+    );
+    for (slot, chunk) in dst
+        .iter_mut()
+        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
+    {
+        *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+}
+
+fn decode_wire_f32_bytes_into_scratch<'a>(
+    expected_len: usize,
+    payload_bytes: &[u8],
+    scratch: &'a mut Vec<f32>,
+) -> Result<&'a [f32]> {
     let expected_bytes = expected_len.saturating_mul(std::mem::size_of::<f32>());
     if payload_bytes.len() != expected_bytes {
         return Err(AgentError::Execution(format!(
@@ -791,10 +1011,40 @@ fn wire_bytes_to_f32_vec(expected_len: usize, payload_bytes: &[u8]) -> Result<Ve
         )));
     }
 
-    Ok(payload_bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
-        .collect())
+    scratch.clear();
+    scratch.reserve(expected_len.saturating_sub(scratch.capacity()));
+    scratch.extend(
+        payload_bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|chunk| {
+                f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            }),
+    );
+    Ok(scratch.as_slice())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stage_send_chunk_from_dense_cuda_tensor(
+    _tensor: &DeviceTensor,
+    _range: Range<usize>,
+    _scratch: &mut StageSendScratch,
+) -> Result<Option<StageSendChunkMode>> {
+    Ok(None)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn shared_metal_collective_storage(tensor: &DeviceTensor) -> Option<MetalStorage> {
+    let elem_count = tensor.elem_count();
+    let (storage, layout) = tensor.storage_and_layout();
+    if let Storage::Metal(metal_storage) = &*storage {
+        if let Some((start, end)) = layout.contiguous_offsets() {
+            let total_len = end.saturating_sub(start);
+            if start == 0 && total_len == elem_count && metal_storage.dtype() == DType::F32 {
+                return Some(metal_storage.clone());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1037,23 +1287,31 @@ mod tests {
         let template =
             device_tensor_from_2d(&Tensor2D::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap()).unwrap();
         let mut buffer = DeviceCollectiveBuffer::from_device_tensor(&template).unwrap();
+        let mut send_scratch = StageSendScratch::default();
 
-        let first_row = buffer.stage_send_chunk_impl(0..2).unwrap();
+        let _ = buffer.stage_send_chunk_impl(0..2, &mut send_scratch).unwrap();
+        let first_row = send_scratch.as_slice(2).unwrap().to_vec();
         assert_eq!(first_row, vec![1.0, 2.0]);
 
-        let accumulate = [10.0f32.to_le_bytes(), 20.0f32.to_le_bytes()].concat();
+        let accumulate = wire_bytes(&[10.0f32, 20.0f32]);
         buffer
             .accumulate_range_from_wire_bytes_impl(0..2, &accumulate)
             .unwrap();
 
-        let replace = [7.0f32.to_le_bytes(), 8.0f32.to_le_bytes()].concat();
-        buffer
-            .copy_range_from_wire_bytes_impl(2..4, &replace)
-            .unwrap();
+        let replace = wire_bytes(&[7.0f32, 8.0f32]);
+        buffer.copy_range_from_wire_bytes_impl(2..4, &replace).unwrap();
 
         let restored =
             host_tensor_2d_from_device(&buffer.into_device_tensor_like(&template).unwrap())
                 .unwrap();
         assert_eq!(restored.data, vec![11.0, 22.0, 7.0, 8.0]);
+    }
+
+    fn wire_bytes(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+        for value in values {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        bytes
     }
 }
