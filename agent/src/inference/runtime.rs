@@ -5,6 +5,9 @@ use crate::executor::ring_allreduce::{
     StageSendChunkMode, StageSendScratch, StagedCollectiveBuffer,
 };
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+use crate::wire_f32::{
+    accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch,
+};
 #[cfg(target_os = "linux")]
 use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
 #[cfg(target_os = "linux")]
@@ -789,7 +792,7 @@ impl DeviceCollectiveBuffer {
             let dst = unsafe {
                 &mut slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)[range]
             };
-            accumulate_wire_f32_bytes_into_slice(dst, payload_bytes);
+            accumulate_into_f32_slice(dst, payload_bytes);
             return Ok(());
         }
         let update = self.device_tensor_from_wire_bytes(range.len(), payload_bytes)?;
@@ -821,7 +824,7 @@ impl DeviceCollectiveBuffer {
             let dst = unsafe {
                 &mut slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)[range]
             };
-            copy_wire_f32_bytes_into_slice(dst, payload_bytes);
+            copy_into_f32_slice(dst, payload_bytes);
             return Ok(());
         }
         let update = self.device_tensor_from_wire_bytes(range.len(), payload_bytes)?;
@@ -843,7 +846,7 @@ impl DeviceCollectiveBuffer {
             return Ok(tensor);
         }
 
-        let payload = decode_wire_f32_bytes_into_scratch(
+        let payload = decode_into_f32_scratch(
             expected_len,
             payload_bytes,
             &mut self.receive_decode_scratch,
@@ -961,66 +964,6 @@ fn stage_send_chunk_from_dense_cuda_tensor(
         }
     }
     Ok(None)
-}
-
-fn copy_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
-    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
-    assert_eq!(
-        src.len(),
-        expected_bytes,
-        "wire payload byte length {} did not match destination byte length {}",
-        src.len(),
-        expected_bytes
-    );
-    for (slot, chunk) in dst
-        .iter_mut()
-        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
-    {
-        *slot = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-}
-
-fn accumulate_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
-    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
-    assert_eq!(
-        src.len(),
-        expected_bytes,
-        "wire payload byte length {} did not match destination byte length {}",
-        src.len(),
-        expected_bytes
-    );
-    for (slot, chunk) in dst
-        .iter_mut()
-        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
-    {
-        *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-}
-
-fn decode_wire_f32_bytes_into_scratch<'a>(
-    expected_len: usize,
-    payload_bytes: &[u8],
-    scratch: &'a mut Vec<f32>,
-) -> Result<&'a [f32]> {
-    let expected_bytes = expected_len.saturating_mul(std::mem::size_of::<f32>());
-    if payload_bytes.len() != expected_bytes {
-        return Err(AgentError::Execution(format!(
-            "Wire payload byte length {} did not match expected byte length {}",
-            payload_bytes.len(),
-            expected_bytes
-        )));
-    }
-
-    scratch.clear();
-    scratch.reserve(expected_len.saturating_sub(scratch.capacity()));
-    scratch.extend(
-        payload_bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|chunk| {
-                f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            }),
-    );
-    Ok(scratch.as_slice())
 }
 
 #[cfg(not(target_os = "linux"))]

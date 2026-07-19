@@ -16,6 +16,7 @@ pub mod telemetry;
 pub mod zip;
 
 mod inference;
+mod wire_f32;
 
 pub use api::RegistrationClient;
 pub use checkpoint::{
