@@ -1083,17 +1083,12 @@ impl InferenceCoordinator {
                 continue;
             }
 
-            if let Some((runtime_mode, provider, optimization_profile, executor_contract)) =
+            if let Some((_runtime_mode, provider, optimization_profile, executor_contract)) =
                 primary_batch_class.as_ref()
             {
-                let same_class = match runtime_mode {
-                    InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst => {
-                        session.backend.provider_kind() == *provider
-                            && session.backend.optimization_profile() == *optimization_profile
-                            && session.backend.executor_contract() == executor_contract
-                    }
-                    InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
-                };
+                let same_class = session.backend.provider_kind() == *provider
+                    && session.backend.optimization_profile() == *optimization_profile
+                    && session.backend.executor_contract() == executor_contract;
                 if !same_class {
                     deferred_for_guardrail = deferred_for_guardrail.saturating_add(1);
                     deferred.push(DecodeTask {
@@ -1309,17 +1304,12 @@ impl InferenceCoordinator {
                 )));
             }
 
-            if let Some((runtime_mode, provider, optimization_profile, executor_contract)) =
+            if let Some((_runtime_mode, provider, optimization_profile, executor_contract)) =
                 primary_batch_class.as_ref()
             {
-                let same_class = match runtime_mode {
-                    InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst => {
-                        session.backend.provider_kind() == *provider
-                            && session.backend.optimization_profile() == *optimization_profile
-                            && session.backend.executor_contract() == executor_contract
-                    }
-                    InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
-                };
+                let same_class = session.backend.provider_kind() == *provider
+                    && session.backend.optimization_profile() == *optimization_profile
+                    && session.backend.executor_contract() == executor_contract;
                 if !same_class {
                     return Err(AgentError::Execution(format!(
                         "decode lease cohort mixes incompatible backend classes for session {}",
@@ -1492,9 +1482,6 @@ impl InferenceCoordinator {
         }
 
         match runtime_mode {
-            InferenceRuntimeMode::ThroughputFirst => {
-                max_kv_tokens <= min_kv_tokens.saturating_mul(2).max(min_kv_tokens + 512)
-            }
             InferenceRuntimeMode::LatencyFirst => {
                 max_kv_tokens
                     <= min_kv_tokens
@@ -1502,15 +1489,17 @@ impl InferenceCoordinator {
                         .div_ceil(2)
                         .max(min_kv_tokens + 256)
             }
-            InferenceRuntimeMode::FitFirst | InferenceRuntimeMode::ResilientEdge => true,
+            InferenceRuntimeMode::ThroughputFirst
+            | InferenceRuntimeMode::FitFirst
+            | InferenceRuntimeMode::ResilientEdge => {
+                max_kv_tokens <= min_kv_tokens.saturating_mul(2).max(min_kv_tokens + 512)
+            }
         }
     }
 
     fn requires_fast_path_bucket_cohesion(runtime_mode: InferenceRuntimeMode) -> bool {
-        matches!(
-            runtime_mode,
-            InferenceRuntimeMode::ThroughputFirst | InferenceRuntimeMode::LatencyFirst
-        )
+        let _ = runtime_mode;
+        true
     }
 
     fn active_decode_session_count(&self) -> usize {
@@ -3431,7 +3420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_first_batch_allows_extreme_kv_skew_for_capacity_admission() {
+    fn test_fit_first_batch_rejects_extreme_kv_skew_for_production_decode() {
         let mut coordinator = test_coordinator(InferenceConfig {
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 16_384,
@@ -3463,7 +3452,7 @@ mod tests {
         coordinator.enqueue_decode_task(short_session).unwrap();
         coordinator.enqueue_decode_task(long_session).unwrap();
 
-        let batch = coordinator
+        let error = coordinator
             .build_next_decode_batch(
                 short_session,
                 DecodeBatchTargets {
@@ -3471,9 +3460,12 @@ mod tests {
                     ..DecodeBatchTargets::default()
                 },
             )
-            .unwrap();
-        assert_eq!(batch.slots.len(), 2);
-        assert_eq!(batch.deferred_for_guardrail, 0);
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("exceeds runtime skew guardrail")
+                || message.contains("incompatible fast-path buckets")
+        );
     }
 
     #[test]
@@ -3605,11 +3597,9 @@ mod tests {
                 },
             )
             .unwrap_err();
-        let message = error.to_string();
-        assert!(
-            message.contains("mixed provider/profile contexts cannot reuse a single fast-path bucket")
-                || message.contains("does not satisfy the production fast-path backend contract")
-        );
+        assert!(error
+            .to_string()
+            .contains("incompatible backend classes"));
     }
 
     #[test]
