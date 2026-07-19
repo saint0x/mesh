@@ -1591,9 +1591,6 @@ fn build_runtime_inference_request(
                 agent::zip::InferenceRuntimeMode::ResilientEdge
             }
         },
-        fast_path_permitted: active_group(assignment)
-            .map(|group| group.fast_path_eligible)
-            .unwrap_or(false),
         executor_id: device_id.to_string(),
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5508,12 +5505,6 @@ async fn cmd_inference_stats() -> Result<()> {
     if let Some(requests) = stats.get("device_sampling_requests") {
         println!("  Device Requests:   {}", requests);
     }
-    if let Some(fallbacks) = stats.get("device_sampling_fallback_requests") {
-        println!("  Device Fallbacks:  {}", fallbacks);
-    }
-    if let Some(requests) = stats.get("host_sampling_requests") {
-        println!("  Host Requests:     {}", requests);
-    }
     if let Some(ms) = stats.get("total_sampling_time_ms") {
         println!("  Sampling Time:     {}ms", ms);
     }
@@ -5521,12 +5512,6 @@ async fn cmd_inference_stats() -> Result<()> {
         println!(
             "  Sampling Share:    {:.1}%",
             share.as_f64().unwrap_or(0.0) * 100.0
-        );
-    }
-    if let Some(rate) = stats.get("device_sampling_fallback_rate") {
-        println!(
-            "  Fallback Rate:     {:.1}%",
-            rate.as_f64().unwrap_or(0.0) * 100.0
         );
     }
     if let Some(latency) = stats.get("avg_generated_token_latency_ms") {

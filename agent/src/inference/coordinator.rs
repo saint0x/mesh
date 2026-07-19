@@ -1028,14 +1028,16 @@ impl InferenceCoordinator {
                         session.backend.optimization_profile(),
                         session.backend.executor_contract().clone(),
                     ));
-                    if session.job.request.fast_path_permitted
-                        && session.backend.is_fast_path_backend()
-                    {
-                        primary_decode_token_ceiling =
-                            FastPathPlanner::decode_token_ceiling_for_context(
-                                &session.backend.fast_path_context(),
-                            );
+                    if !session.backend.is_fast_path_backend() {
+                        return Err(AgentError::Execution(format!(
+                            "decode session {} does not satisfy the production fast-path backend contract",
+                            task.session_id
+                        )));
                     }
+                    primary_decode_token_ceiling =
+                        FastPathPlanner::decode_token_ceiling_for_context(
+                            &session.backend.fast_path_context(),
+                        );
                     slots.push(DecodeBatchSlot {
                         session_id: task.session_id,
                         fairness_epoch: task.fairness_epoch,
@@ -1107,13 +1109,15 @@ impl InferenceCoordinator {
                     session.backend.optimization_profile(),
                     session.backend.executor_contract().clone(),
                 ));
-                if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend()
-                {
-                    primary_decode_token_ceiling =
-                        FastPathPlanner::decode_token_ceiling_for_context(
-                            &session.backend.fast_path_context(),
-                        );
+                if !session.backend.is_fast_path_backend() {
+                    return Err(AgentError::Execution(format!(
+                        "decode session {} does not satisfy the production fast-path backend contract",
+                        task.session_id
+                    )));
                 }
+                primary_decode_token_ceiling = FastPathPlanner::decode_token_ceiling_for_context(
+                    &session.backend.fast_path_context(),
+                );
             }
 
             let kv_tokens = Self::session_decode_kv_tokens(session);
@@ -1201,41 +1205,47 @@ impl InferenceCoordinator {
         } else {
             let sessions = slots
                 .iter()
-                .filter_map(|slot| self.sessions.get(&slot.session_id))
-                .collect::<Vec<_>>();
-            if sessions
-                .iter()
-                .any(|session| !session.job.request.fast_path_permitted)
-            {
-                None
-            } else if sessions
-                .iter()
-                .any(|session| !session.backend.is_fast_path_backend())
-            {
-                None
-            } else {
-                let contexts = sessions
-                    .iter()
-                    .map(|session| session.backend.fast_path_context())
-                    .collect::<Vec<_>>();
-                let max_sequence_len = contexts
-                    .iter()
-                    .map(|context| context.logical_kv_tokens)
-                    .max()
-                    .unwrap_or(total_kv_tokens);
-
-                contexts.first().and_then(|context| {
-                    let plan = FastPathPlanner::plan_decode(
-                        context,
-                        slots.len(),
-                        total_kv_tokens,
-                        max_sequence_len,
-                    )
-                    .ok()?;
-                    FastPathPlanner::validate_decode_contexts(&plan, &contexts).ok()?;
-                    Some(plan)
+                .map(|slot| {
+                    self.sessions.get(&slot.session_id).ok_or_else(|| {
+                        AgentError::Execution(format!(
+                            "decode session {} disappeared before fast-path planning",
+                            slot.session_id
+                        ))
+                    })
                 })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(session) = sessions
+                .iter()
+                .find(|session| !session.backend.is_fast_path_backend())
+            {
+                return Err(AgentError::Execution(format!(
+                    "decode session {} does not satisfy the production fast-path backend contract",
+                    session.job.request.session_id
+                )));
             }
+            let contexts = sessions
+                .iter()
+                .map(|session| session.backend.fast_path_context())
+                .collect::<Vec<_>>();
+            let max_sequence_len = contexts
+                .iter()
+                .map(|context| context.logical_kv_tokens)
+                .max()
+                .unwrap_or(total_kv_tokens);
+            let context = contexts.first().ok_or_else(|| {
+                AgentError::Execution(
+                    "decode microbatch planning requires at least one fast-path context"
+                        .to_string(),
+                )
+            })?;
+            let plan = FastPathPlanner::plan_decode(
+                context,
+                slots.len(),
+                total_kv_tokens,
+                max_sequence_len,
+            )?;
+            FastPathPlanner::validate_decode_contexts(&plan, &contexts)?;
+            Some(plan)
         };
 
         Ok(DecodeBatchPlan {
@@ -1323,13 +1333,15 @@ impl InferenceCoordinator {
                     session.backend.optimization_profile(),
                     session.backend.executor_contract().clone(),
                 ));
-                if session.job.request.fast_path_permitted && session.backend.is_fast_path_backend()
-                {
-                    primary_decode_token_ceiling =
-                        FastPathPlanner::decode_token_ceiling_for_context(
-                            &session.backend.fast_path_context(),
-                        );
+                if !session.backend.is_fast_path_backend() {
+                    return Err(AgentError::Execution(format!(
+                        "decode lease cohort session {} does not satisfy the production fast-path backend contract",
+                        session_id
+                    )));
                 }
+                primary_decode_token_ceiling = FastPathPlanner::decode_token_ceiling_for_context(
+                    &session.backend.fast_path_context(),
+                );
             }
 
             let kv_tokens = Self::session_decode_kv_tokens(session);
@@ -1416,41 +1428,47 @@ impl InferenceCoordinator {
         } else {
             let sessions = slots
                 .iter()
-                .filter_map(|slot| self.sessions.get(&slot.session_id))
-                .collect::<Vec<_>>();
-            if sessions
-                .iter()
-                .any(|session| !session.job.request.fast_path_permitted)
-            {
-                None
-            } else if sessions
-                .iter()
-                .any(|session| !session.backend.is_fast_path_backend())
-            {
-                None
-            } else {
-                let contexts = sessions
-                    .iter()
-                    .map(|session| session.backend.fast_path_context())
-                    .collect::<Vec<_>>();
-                let max_sequence_len = contexts
-                    .iter()
-                    .map(|context| context.logical_kv_tokens)
-                    .max()
-                    .unwrap_or(total_kv_tokens);
-
-                contexts.first().and_then(|context| {
-                    let plan = FastPathPlanner::plan_decode(
-                        context,
-                        slots.len(),
-                        total_kv_tokens,
-                        max_sequence_len,
-                    )
-                    .ok()?;
-                    FastPathPlanner::validate_decode_contexts(&plan, &contexts).ok()?;
-                    Some(plan)
+                .map(|slot| {
+                    self.sessions.get(&slot.session_id).ok_or_else(|| {
+                        AgentError::Execution(format!(
+                            "decode session {} disappeared before fast-path planning",
+                            slot.session_id
+                        ))
+                    })
                 })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(session) = sessions
+                .iter()
+                .find(|session| !session.backend.is_fast_path_backend())
+            {
+                return Err(AgentError::Execution(format!(
+                    "decode lease cohort session {} does not satisfy the production fast-path backend contract",
+                    session.job.request.session_id
+                )));
             }
+            let contexts = sessions
+                .iter()
+                .map(|session| session.backend.fast_path_context())
+                .collect::<Vec<_>>();
+            let max_sequence_len = contexts
+                .iter()
+                .map(|context| context.logical_kv_tokens)
+                .max()
+                .unwrap_or(total_kv_tokens);
+            let context = contexts.first().ok_or_else(|| {
+                AgentError::Execution(
+                    "decode microbatch planning requires at least one fast-path context"
+                        .to_string(),
+                )
+            })?;
+            let plan = FastPathPlanner::plan_decode(
+                context,
+                slots.len(),
+                total_kv_tokens,
+                max_sequence_len,
+            )?;
+            FastPathPlanner::validate_decode_contexts(&plan, &contexts)?;
+            Some(plan)
         };
 
         Ok(DecodeBatchPlan {
@@ -2161,23 +2179,22 @@ impl InferenceCoordinator {
                     "session backend missing at prefill execution time".to_string(),
                 )
             })?;
-            let mut prefill_workspace = if session.job.request.fast_path_permitted
-                && session.backend.is_fast_path_backend()
-            {
-                let prefill_plan = FastPathPlanner::plan_prefill(
-                    &session.backend.fast_path_context(),
-                    request.prompt_tokens.len(),
-                )?;
-                let (reservation, workspace) =
-                    FastPathRuntime::checkout_prefill_workspace(&prefill_plan)?;
-                self.stats.record_prefill_fast_path_plan(
-                    &prefill_plan,
-                    reservation.reused_existing_arena,
-                );
-                Some(workspace)
-            } else {
-                None
-            };
+            if !session.backend.is_fast_path_backend() {
+                return Err(AgentError::Execution(format!(
+                    "session {} does not satisfy the production fast-path backend contract",
+                    request.session_id
+                )));
+            }
+            let prefill_plan = FastPathPlanner::plan_prefill(
+                &session.backend.fast_path_context(),
+                request.prompt_tokens.len(),
+            )?;
+            let (reservation, mut prefill_workspace) =
+                FastPathRuntime::checkout_prefill_workspace(&prefill_plan)?;
+            self.stats.record_prefill_fast_path_plan(
+                &prefill_plan,
+                reservation.reused_existing_arena,
+            );
             let mut worker_ring = WorkerRing::new(
                 position.position,
                 position.total_workers,
@@ -2223,7 +2240,7 @@ impl InferenceCoordinator {
                     &request.prompt_tokens,
                     &mut worker_ring,
                     request.job_id,
-                    prefill_workspace.as_mut(),
+                    Some(&mut prefill_workspace),
                 )
                 .await?;
             info!(
@@ -2277,15 +2294,15 @@ impl InferenceCoordinator {
             return Ok(Vec::new());
         }
 
-        let fast_path = batch.fast_path.clone();
-        let mut decode_workspace = if let Some(plan) = fast_path.as_ref() {
-            let (reservation, workspace) = FastPathRuntime::checkout_decode_workspace(plan)?;
-            self.stats
-                .record_decode_fast_path_plan(plan, reservation.reused_existing_arena);
-            Some(workspace)
-        } else {
-            None
-        };
+        let fast_path = batch.fast_path.clone().ok_or_else(|| {
+            AgentError::Execution(
+                "decode microbatch execution requires a production fast-path plan".to_string(),
+            )
+        })?;
+        let (reservation, mut decode_workspace) =
+            FastPathRuntime::checkout_decode_workspace(&fast_path)?;
+        self.stats
+            .record_decode_fast_path_plan(&fast_path, reservation.reused_existing_arena);
 
         let mut batch_sessions = Vec::with_capacity(batch.slots.len());
         for slot in batch.slots {
@@ -2351,9 +2368,9 @@ impl InferenceCoordinator {
             .collect::<Vec<_>>();
         let outputs = BackendMicrobatchExecutor::decode_step_batch(
             &mut requests,
-            fast_path.as_ref(),
+            &fast_path,
             &mut worker_ring,
-            decode_workspace.as_mut(),
+            &mut decode_workspace,
         )
         .await?;
 
@@ -3547,7 +3564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_first_batch_allows_mixed_provider_sessions() {
+    fn test_fit_first_batch_rejects_mixed_provider_sessions() {
         let mut coordinator = test_coordinator(InferenceConfig {
             max_decode_batch_size: 4,
             max_decode_batch_kv_tokens: 1024,
@@ -3579,7 +3596,7 @@ mod tests {
         coordinator.enqueue_decode_task(session_metal).unwrap();
         coordinator.enqueue_decode_task(session_cpu).unwrap();
 
-        let batch = coordinator
+        let error = coordinator
             .build_next_decode_batch(
                 session_metal,
                 DecodeBatchTargets {
@@ -3587,10 +3604,12 @@ mod tests {
                     ..DecodeBatchTargets::default()
                 },
             )
-            .unwrap();
-        assert_eq!(batch.slots.len(), 2);
-        assert_eq!(batch.deferred_for_guardrail, 0);
-        assert!(batch.fast_path.is_none());
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("mixed provider/profile contexts cannot reuse a single fast-path bucket")
+                || message.contains("does not satisfy the production fast-path backend contract")
+        );
     }
 
     #[test]

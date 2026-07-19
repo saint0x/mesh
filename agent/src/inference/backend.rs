@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use std::any::Any;
 use std::time::Instant;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::errors::Result;
@@ -18,7 +17,6 @@ use std::sync::Arc;
 use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
 use super::runtime::{runtime_error, sample_tokens_device_with_seeds, DeviceTensor};
-use super::stats::record_runtime_device_sampling_fallback;
 use super::tensor_ops::Tensor1D;
 
 #[derive(Clone)]
@@ -109,45 +107,24 @@ pub struct BackendMicrobatchExecutor;
 impl BackendMicrobatchExecutor {
     pub async fn decode_step_batch(
         requests: &mut [DecodeMicrobatchRequest<'_>],
-        plan: Option<&FastPathExecutionPlan>,
+        plan: &FastPathExecutionPlan,
         worker_ring: &mut WorkerRing<'_>,
-        workspace: Option<&mut DecodeWorkspaceLease>,
+        workspace: &mut DecodeWorkspaceLease,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
-        if let Some(plan) = plan {
-            let contexts = requests
-                .iter()
-                .map(|request| request.backend.fast_path_context())
-                .collect::<Vec<_>>();
-            FastPathPlanner::validate_decode_contexts(plan, &contexts)?;
-        }
+        let contexts = requests
+            .iter()
+            .map(|request| request.backend.fast_path_context())
+            .collect::<Vec<_>>();
+        FastPathPlanner::validate_decode_contexts(plan, &contexts)?;
 
         if !Self::can_use_accelerated_decode_batch(requests) {
-            return Self::decode_step_batch_serial(requests, worker_ring).await;
+            return Err(crate::errors::AgentError::Execution(
+                "decode microbatch execution requires a uniform fast-path backend contract"
+                    .to_string(),
+            ));
         }
 
-        let profile = requests
-            .first()
-            .map(|request| request.backend.optimization_profile())
-            .unwrap_or(BackendOptimizationProfile::CpuSerial);
-        let supports_decode_microbatch = requests
-            .first()
-            .map(|request| request.backend.supports_decode_microbatch())
-            .unwrap_or(false);
-        match profile {
-            BackendOptimizationProfile::CpuSerial => {
-                if supports_decode_microbatch {
-                    Self::decode_step_batch_fast_path(requests, worker_ring, workspace).await
-                } else {
-                    Self::decode_step_batch_serial(requests, worker_ring).await
-                }
-            }
-            BackendOptimizationProfile::MetalVectorized => {
-                Self::decode_step_batch_fast_path(requests, worker_ring, workspace).await
-            }
-            BackendOptimizationProfile::CudaFused => {
-                Self::decode_step_batch_fast_path(requests, worker_ring, workspace).await
-            }
-        }
+        Self::decode_step_batch_fast_path(requests, worker_ring, workspace).await
     }
 
     fn can_use_accelerated_decode_batch(requests: &[DecodeMicrobatchRequest<'_>]) -> bool {
@@ -168,31 +145,10 @@ impl BackendMicrobatchExecutor {
         })
     }
 
-    async fn decode_step_batch_serial(
-        requests: &mut [DecodeMicrobatchRequest<'_>],
-        worker_ring: &mut WorkerRing<'_>,
-    ) -> Result<Vec<DecodeMicrobatchOutput>> {
-        let mut outputs = Vec::with_capacity(requests.len());
-        for request in requests.iter_mut() {
-            let step_start = Instant::now();
-            let logits = request
-                .backend
-                .decode_step(request.token, worker_ring, request.job_id)
-                .await?;
-            outputs.push(DecodeMicrobatchOutput {
-                session_id: request.session_id,
-                logits: Some(logits),
-                sampled_token: None,
-                execution_time_ms: step_start.elapsed().as_millis() as u64,
-            });
-        }
-        Ok(outputs)
-    }
-
     async fn decode_step_batch_fast_path(
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
-        workspace: Option<&mut DecodeWorkspaceLease>,
+        workspace: &mut DecodeWorkspaceLease,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
         if let Some(outputs) =
             ProviderExecutionBackend::decode_step_batch_fast_path(requests, worker_ring, workspace)
@@ -260,16 +216,6 @@ impl ProviderRuntimeCore {
             )?,
             executor_contract,
         })
-    }
-
-    fn split_logits_rows(logits_2d: &DeviceTensor) -> Result<Vec<BackendLogits>> {
-        let dims = logits_2d.dims();
-        let mut logits = Vec::with_capacity(dims.first().copied().unwrap_or(0));
-        for row_idx in 0..dims.first().copied().unwrap_or(0) {
-            let row = logits_2d.narrow(0, row_idx, 1).map_err(runtime_error)?;
-            logits.push(BackendLogits::Device(row));
-        }
-        Ok(logits)
     }
 
     fn sample_fast_path_logits_batch(
@@ -459,7 +405,7 @@ impl ProviderExecutionBackend {
     async fn decode_step_batch_fast_path(
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
-        workspace: Option<&mut DecodeWorkspaceLease>,
+        workspace: &mut DecodeWorkspaceLease,
     ) -> Result<Option<Vec<DecodeMicrobatchOutput>>> {
         let Some(first_request) = requests.first() else {
             return Ok(Some(Vec::new()));
@@ -473,7 +419,7 @@ impl ProviderExecutionBackend {
         expected_provider: ExecutionProviderKind,
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
-        workspace: Option<&mut DecodeWorkspaceLease>,
+        workspace: &mut DecodeWorkspaceLease,
     ) -> Result<Option<Vec<DecodeMicrobatchOutput>>> {
         let mut backends = Vec::with_capacity(requests.len());
         let mut job_ids = Vec::with_capacity(requests.len());
@@ -529,43 +475,28 @@ impl ProviderExecutionBackend {
             &tokens,
             &job_ids,
             worker_ring,
-            workspace,
+            Some(workspace),
         )
         .await?;
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
-        if let Ok(sampled_tokens) =
-            ProviderRuntimeCore::sample_fast_path_logits_batch(&logits_2d, requests)
-        {
-            return Ok(Some(
-                requests
-                    .iter()
-                    .map(|request| request.session_id)
-                    .zip(sampled_tokens)
-                    .map(|(session_id, sampled_token)| DecodeMicrobatchOutput {
-                        session_id,
-                        logits: None,
-                        sampled_token: Some(sampled_token),
-                        execution_time_ms,
-                    })
-                    .collect(),
-            ));
-        }
-
-        warn!(
-            provider = %expected_provider.as_str(),
-            "batched provider sampling failed, falling back to per-session logits sampling"
-        );
-        record_runtime_device_sampling_fallback(requests.len() as u64);
-
+        let sampled_tokens = ProviderRuntimeCore::sample_fast_path_logits_batch(&logits_2d, requests)
+            .map_err(|err| {
+                crate::errors::AgentError::Execution(format!(
+                    "production batched sampling failed for provider {}: {}",
+                    expected_provider.as_str(),
+                    err
+                ))
+            })?;
         Ok(Some(
-            ProviderRuntimeCore::split_logits_rows(&logits_2d)?
-                .into_iter()
-                .zip(requests.iter().map(|request| request.session_id))
-                .map(|(logits, session_id)| DecodeMicrobatchOutput {
+            requests
+                .iter()
+                .map(|request| request.session_id)
+                .zip(sampled_tokens)
+                .map(|(session_id, sampled_token)| DecodeMicrobatchOutput {
                     session_id,
-                    logits: Some(logits),
-                    sampled_token: None,
+                    logits: None,
+                    sampled_token: Some(sampled_token),
                     execution_time_ms,
                 })
                 .collect(),
@@ -686,8 +617,11 @@ impl ExecutionBackend for ProviderRuntimeCore {
         job_id: Uuid,
         workspace: Option<&mut PrefillWorkspaceLease>,
     ) -> Result<BackendLogits> {
+        let prefill_segment_ceiling =
+            FastPathPlanner::prefill_token_ceiling_for_context(&self.fast_path_context())
+                .unwrap_or(tokens.len().max(1));
         self.forward_pass
-            .prefill(tokens, worker_ring, job_id, workspace)
+            .prefill(tokens, worker_ring, job_id, workspace, prefill_segment_ceiling)
             .await
     }
 
