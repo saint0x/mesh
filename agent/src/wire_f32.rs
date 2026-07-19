@@ -71,9 +71,29 @@ pub(crate) fn decode_into_f32_scratch<'a>(
     Ok(scratch.as_slice())
 }
 
+pub(crate) fn decode_to_f32_vec(payload_bytes: &[u8]) -> Result<Vec<f32>> {
+    let expected_len = payload_bytes
+        .len()
+        .checked_div(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            AgentError::Execution("wire payload length overflow while decoding f32 vec".to_string())
+        })?;
+    if payload_bytes.len() != expected_len.saturating_mul(std::mem::size_of::<f32>()) {
+        return Err(AgentError::Execution(format!(
+            "Wire payload byte length {} did not align to f32 element width",
+            payload_bytes.len()
+        )));
+    }
+    let mut out = vec![0.0f32; expected_len];
+    copy_into_f32_slice(out.as_mut_slice(), payload_bytes);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch};
+    use super::{
+        accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch, decode_to_f32_vec,
+    };
 
     fn bytes_from_f32(values: &[f32]) -> &[u8] {
         let byte_len = std::mem::size_of_val(values);
@@ -118,5 +138,12 @@ mod tests {
         let decoded = decode_into_f32_scratch(src.len(), bytes_from_f32(&src), &mut scratch).unwrap();
         assert_eq!(decoded, src);
         assert_eq!(scratch.capacity(), original_capacity);
+    }
+
+    #[test]
+    fn decode_to_f32_vec_round_trips_bytes() {
+        let src = [9.0f32, -1.5, 2.25];
+        let decoded = decode_to_f32_vec(bytes_from_f32(&src)).unwrap();
+        assert_eq!(decoded, src);
     }
 }

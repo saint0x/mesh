@@ -3,6 +3,7 @@ use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
 use crate::inference::tensor_ops::{Tensor1D, Tensor2D};
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
+use crate::wire_f32::decode_to_f32_vec;
 use async_trait::async_trait;
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
@@ -452,7 +453,7 @@ fn load_tensor_1d(tensors: &SafeTensors<'_>, name: &str) -> Result<Tensor1D> {
 }
 
 fn bytes_to_f32_vec(bytes: &[u8], name: &str) -> Result<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
         return Err(AgentError::Config(format!(
             "Tensor {} byte length {} is not divisible by 4",
             name,
@@ -460,10 +461,9 @@ fn bytes_to_f32_vec(bytes: &[u8], name: &str) -> Result<Vec<f32>> {
         )));
     }
 
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+    decode_to_f32_vec(bytes).map_err(|err| {
+        AgentError::Config(format!("Tensor {} float decode failed: {}", name, err))
+    })
 }
 
 fn validate_weight_shapes(
