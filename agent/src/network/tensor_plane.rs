@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::errors::{AgentError, Result};
 use crate::inference::InferenceRuntimeMode;
 use crate::provider::ExecutionProviderKind;
-use crate::wire_f32::copy_into_f32_slice;
+use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice};
 
 use super::tensor_message::{
     CollectiveLane, ServingFrame, ServingFrameHeader, ServingSlotKey, TensorTrafficClass,
@@ -337,12 +337,7 @@ impl ServingFrameBytes {
                 dst.len()
             )));
         }
-        for (slot, chunk) in dst
-            .iter_mut()
-            .zip(self.payload_bytes().chunks_exact(std::mem::size_of::<f32>()))
-        {
-            *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
+        accumulate_into_f32_slice(dst, self.payload_bytes());
         Ok(())
     }
 

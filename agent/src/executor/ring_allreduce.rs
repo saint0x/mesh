@@ -311,24 +311,10 @@ impl CollectiveMatrix {
         );
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => {
-                for (dst, chunk) in data[range]
-                    .iter_mut()
-                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
-                {
-                    *dst += f32::from_bits(u32::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
-                }
+                accumulate_into_f32_slice(&mut data[range], payload_bytes);
             }
             CollectiveMatrixBacking::PooledHost(data) => {
-                for (dst, chunk) in data.as_mut_slice()[range]
-                    .iter_mut()
-                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
-                {
-                    *dst += f32::from_bits(u32::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
-                }
+                accumulate_into_f32_slice(&mut data.as_mut_slice()[range], payload_bytes);
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             CollectiveMatrixBacking::MetalShared(storage) => unsafe {
@@ -336,14 +322,7 @@ impl CollectiveMatrix {
                     storage.buffer().contents() as *mut f32,
                     self.len(),
                 )[range];
-                for (slot, chunk) in dst
-                    .iter_mut()
-                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
-                {
-                    *slot += f32::from_bits(u32::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
-                }
+                accumulate_into_f32_slice(dst, payload_bytes);
             },
         }
     }
