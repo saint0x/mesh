@@ -1157,7 +1157,7 @@ impl TensorPlane {
             prioritized_traffic_classes: true,
             persistent_serving_peer_channels: true,
             per_peer_bulk_fairness: true,
-            runtime_mode_aware_traffic_policies: true,
+            runtime_mode_aware_traffic_policies: false,
             provider_specialized_collectives: true,
         }
     }
@@ -1330,9 +1330,9 @@ impl TensorPlane {
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
     ) -> Result<()> {
+        let _ = runtime_mode;
         let hot_lane_plans = serving_lane_plans(
             self.state.profile,
-            runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
@@ -1368,38 +1368,34 @@ impl TensorPlane {
         provider: ExecutionProviderKind,
     ) -> Result<ServingSessionTransport> {
         reset_serving_connection_pool(&self.state, right_peer).await;
+        let _ = runtime_mode;
         let mut reduce_scatter_plan = lane_plan(
             CollectiveLane::ReduceScatter,
             self.state.profile,
-            runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let mut all_gather_plan = lane_plan(
             CollectiveLane::AllGather,
             self.state.profile,
-            runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let mut control_plan = lane_plan(
             CollectiveLane::Control,
             self.state.profile,
-            runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let mut bulk_transfer_plan = lane_plan(
             CollectiveLane::BulkTransfer,
             self.state.profile,
-            runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
         let mut checkpoint_plan = lane_plan(
             CollectiveLane::Checkpoint,
             self.state.profile,
-            runtime_mode,
             provider,
             self.state.max_concurrent_outbound_streams_per_peer,
         );
@@ -2181,39 +2177,20 @@ fn update_peak(metric: &AtomicU64, value: u64) {
 
 fn preferred_serving_stream_count(
     profile: TensorPlaneProfile,
-    runtime_mode: InferenceRuntimeMode,
     provider: ExecutionProviderKind,
     max_streams: usize,
 ) -> usize {
     let max_streams = max_streams.max(1);
     match profile {
-        TensorPlaneProfile::Conservative => match (provider, runtime_mode) {
-            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => max_streams,
-            (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
-                2.min(max_streams)
-            }
-            (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst) => {
-                2.min(max_streams)
-            }
-            (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => 1,
-            _ => 1.max(max_streams / 2),
+        TensorPlaneProfile::Conservative => match provider {
+            ExecutionProviderKind::Cuda => max_streams,
+            ExecutionProviderKind::Metal => 2.min(max_streams),
+            ExecutionProviderKind::Cpu => 1,
         },
-        TensorPlaneProfile::Lan => match (provider, runtime_mode) {
-            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => max_streams,
-            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::LatencyFirst) => {
-                max_streams.min(3).max(2)
-            }
-            (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
-                max_streams.min(3).max(2)
-            }
-            (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst) => {
-                2.min(max_streams)
-            }
-            (ExecutionProviderKind::Cpu, InferenceRuntimeMode::ThroughputFirst) => {
-                2.min(max_streams)
-            }
-            (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => 1,
-            _ => 1.max(max_streams / 2),
+        TensorPlaneProfile::Lan => match provider {
+            ExecutionProviderKind::Cuda => max_streams,
+            ExecutionProviderKind::Metal => max_streams.min(3).max(2),
+            ExecutionProviderKind::Cpu => 1,
         },
     }
 }
@@ -2221,33 +2198,22 @@ fn preferred_serving_stream_count(
 fn lane_plan(
     lane: CollectiveLane,
     profile: TensorPlaneProfile,
-    runtime_mode: InferenceRuntimeMode,
     provider: ExecutionProviderKind,
     max_streams: usize,
 ) -> ServingLanePlan {
-    let bulk_streams = preferred_serving_stream_count(profile, runtime_mode, provider, max_streams);
+    let bulk_streams = preferred_serving_stream_count(profile, provider, max_streams);
     let interactive_streams = match profile {
         TensorPlaneProfile::Conservative => bulk_streams.min(2).max(1),
         TensorPlaneProfile::Lan => bulk_streams.min(3).max(1),
     };
     let control_streams = 1;
-    let checkpoint_streams = match (profile, provider, runtime_mode) {
-        (
-            TensorPlaneProfile::Lan,
-            ExecutionProviderKind::Cuda,
-            InferenceRuntimeMode::ThroughputFirst,
-        ) => bulk_streams.min(3).max(1),
-        (
-            TensorPlaneProfile::Lan,
-            ExecutionProviderKind::Metal,
-            InferenceRuntimeMode::ThroughputFirst,
-        ) => interactive_streams,
-        (_, ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => {
-            interactive_streams
+    let checkpoint_streams = match (profile, provider) {
+        (TensorPlaneProfile::Lan, ExecutionProviderKind::Cuda) => {
+            bulk_streams.min(3).max(1)
         }
-        (_, ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
-            interactive_streams
-        }
+        (TensorPlaneProfile::Lan, ExecutionProviderKind::Metal)
+        | (TensorPlaneProfile::Conservative, ExecutionProviderKind::Cuda)
+        | (TensorPlaneProfile::Conservative, ExecutionProviderKind::Metal) => interactive_streams,
         _ => 1,
     };
     let desired_stream_count = match lane {
@@ -2266,46 +2232,15 @@ fn lane_plan(
 
 fn serving_lane_plans(
     profile: TensorPlaneProfile,
-    runtime_mode: InferenceRuntimeMode,
     provider: ExecutionProviderKind,
     max_streams: usize,
 ) -> [ServingLanePlan; 5] {
     [
-        lane_plan(
-            CollectiveLane::ReduceScatter,
-            profile,
-            runtime_mode,
-            provider,
-            max_streams,
-        ),
-        lane_plan(
-            CollectiveLane::AllGather,
-            profile,
-            runtime_mode,
-            provider,
-            max_streams,
-        ),
-        lane_plan(
-            CollectiveLane::Control,
-            profile,
-            runtime_mode,
-            provider,
-            max_streams,
-        ),
-        lane_plan(
-            CollectiveLane::BulkTransfer,
-            profile,
-            runtime_mode,
-            provider,
-            max_streams,
-        ),
-        lane_plan(
-            CollectiveLane::Checkpoint,
-            profile,
-            runtime_mode,
-            provider,
-            max_streams,
-        ),
+        lane_plan(CollectiveLane::ReduceScatter, profile, provider, max_streams),
+        lane_plan(CollectiveLane::AllGather, profile, provider, max_streams),
+        lane_plan(CollectiveLane::Control, profile, provider, max_streams),
+        lane_plan(CollectiveLane::BulkTransfer, profile, provider, max_streams),
+        lane_plan(CollectiveLane::Checkpoint, profile, provider, max_streams),
     ]
 }
 
@@ -3014,7 +2949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lan_profile_opens_more_cuda_latency_streams() {
+    async fn test_lan_profile_opens_provider_driven_cuda_streams() {
         let plane = TensorPlane::bind(TensorPlaneConfig {
             profile: TensorPlaneProfile::Lan,
             max_concurrent_outbound_streams_per_peer: 4,

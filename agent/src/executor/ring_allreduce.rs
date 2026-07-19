@@ -669,22 +669,11 @@ pub enum CollectiveOptimizationProfile {
 }
 
 impl CollectiveOptimizationProfile {
-    fn for_provider_and_mode(
-        provider: ExecutionProviderKind,
-        runtime_mode: InferenceRuntimeMode,
-    ) -> Self {
-        match (provider, runtime_mode) {
-            (ExecutionProviderKind::Cuda, InferenceRuntimeMode::ThroughputFirst) => {
-                Self::CudaHighThroughput
-            }
-            (ExecutionProviderKind::Metal, InferenceRuntimeMode::LatencyFirst)
-            | (ExecutionProviderKind::Metal, InferenceRuntimeMode::ThroughputFirst) => {
-                Self::MetalBalanced
-            }
-            (ExecutionProviderKind::Cpu, _) | (_, InferenceRuntimeMode::FitFirst) => {
-                Self::CpuLowFanout
-            }
-            _ => Self::GenericStable,
+    fn for_provider(provider: ExecutionProviderKind) -> Self {
+        match provider {
+            ExecutionProviderKind::Cuda => Self::CudaHighThroughput,
+            ExecutionProviderKind::Metal => Self::MetalBalanced,
+            ExecutionProviderKind::Cpu => Self::CpuLowFanout,
         }
     }
 }
@@ -721,8 +710,7 @@ impl<'a> WorkerRing<'a> {
         serving_transport: Option<ServingSessionTransport>,
         tensor_plane: &'a mut TensorPlane,
     ) -> Self {
-        let collective_profile =
-            CollectiveOptimizationProfile::for_provider_and_mode(provider, runtime_mode);
+        let collective_profile = CollectiveOptimizationProfile::for_provider(provider);
         Self {
             my_position,
             total_workers,
@@ -1899,26 +1887,17 @@ mod tests {
     }
 
     #[test]
-    fn test_collective_optimization_profile_tracks_provider_and_runtime_mode() {
+    fn test_collective_optimization_profile_tracks_provider_contract() {
         assert_eq!(
-            CollectiveOptimizationProfile::for_provider_and_mode(
-                ExecutionProviderKind::Cuda,
-                InferenceRuntimeMode::ThroughputFirst,
-            ),
+            CollectiveOptimizationProfile::for_provider(ExecutionProviderKind::Cuda),
             CollectiveOptimizationProfile::CudaHighThroughput
         );
         assert_eq!(
-            CollectiveOptimizationProfile::for_provider_and_mode(
-                ExecutionProviderKind::Metal,
-                InferenceRuntimeMode::LatencyFirst,
-            ),
+            CollectiveOptimizationProfile::for_provider(ExecutionProviderKind::Metal),
             CollectiveOptimizationProfile::MetalBalanced
         );
         assert_eq!(
-            CollectiveOptimizationProfile::for_provider_and_mode(
-                ExecutionProviderKind::Cpu,
-                InferenceRuntimeMode::ResilientEdge,
-            ),
+            CollectiveOptimizationProfile::for_provider(ExecutionProviderKind::Cpu),
             CollectiveOptimizationProfile::CpuLowFanout
         );
     }
