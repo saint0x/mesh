@@ -17,13 +17,6 @@ use std::sync::Arc;
 use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
 use super::runtime::{runtime_error, sample_tokens_device_with_seeds, DeviceTensor};
-use super::tensor_ops::Tensor1D;
-
-#[derive(Clone)]
-pub enum BackendLogits {
-    Host(Tensor1D),
-    Device(DeviceTensor),
-}
 
 #[async_trait]
 pub trait ExecutionBackend: Send {
@@ -41,18 +34,18 @@ pub trait ExecutionBackend: Send {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         workspace: Option<&mut PrefillWorkspaceLease>,
-    ) -> Result<BackendLogits>;
+    ) -> Result<DeviceTensor>;
 
     async fn decode_step(
         &mut self,
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<BackendLogits>;
+    ) -> Result<DeviceTensor>;
 
     fn sample(
         &self,
-        logits: &BackendLogits,
+        logits: &DeviceTensor,
         temperature: f32,
         top_p: f32,
         seed: u64,
@@ -97,7 +90,7 @@ pub struct DecodeMicrobatchRequest<'a> {
 
 pub struct DecodeMicrobatchOutput {
     pub session_id: Uuid,
-    pub logits: Option<BackendLogits>,
+    pub logits: Option<DeviceTensor>,
     pub sampled_token: Option<u32>,
     pub execution_time_ms: u64,
 }
@@ -528,7 +521,7 @@ impl ExecutionBackend for ProviderExecutionBackend {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         workspace: Option<&mut PrefillWorkspaceLease>,
-    ) -> Result<BackendLogits> {
+    ) -> Result<DeviceTensor> {
         self.core_mut()
             .prefill(tokens, worker_ring, job_id, workspace)
             .await
@@ -539,7 +532,7 @@ impl ExecutionBackend for ProviderExecutionBackend {
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<BackendLogits> {
+    ) -> Result<DeviceTensor> {
         self.core_mut()
             .decode_step(token, worker_ring, job_id)
             .await
@@ -547,7 +540,7 @@ impl ExecutionBackend for ProviderExecutionBackend {
 
     fn sample(
         &self,
-        logits: &BackendLogits,
+        logits: &DeviceTensor,
         temperature: f32,
         top_p: f32,
         seed: u64,
@@ -616,7 +609,7 @@ impl ExecutionBackend for ProviderRuntimeCore {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         workspace: Option<&mut PrefillWorkspaceLease>,
-    ) -> Result<BackendLogits> {
+    ) -> Result<DeviceTensor> {
         let prefill_segment_ceiling =
             FastPathPlanner::prefill_token_ceiling_for_context(&self.fast_path_context())
                 .unwrap_or(tokens.len().max(1));
@@ -630,7 +623,7 @@ impl ExecutionBackend for ProviderRuntimeCore {
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<BackendLogits> {
+    ) -> Result<DeviceTensor> {
         self.forward_pass
             .decode_step(token, worker_ring, job_id)
             .await
@@ -638,7 +631,7 @@ impl ExecutionBackend for ProviderRuntimeCore {
 
     fn sample(
         &self,
-        logits: &BackendLogits,
+        logits: &DeviceTensor,
         temperature: f32,
         top_p: f32,
         seed: u64,
@@ -692,6 +685,8 @@ impl ExecutionBackend for ProviderRuntimeCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::runtime::device_tensor_from_1d;
+    use crate::inference::tensor_ops::Tensor1D;
 
     struct ProfileBackend {
         provider: ExecutionProviderKind,
@@ -722,8 +717,8 @@ mod tests {
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
             _workspace: Option<&mut PrefillWorkspaceLease>,
-        ) -> Result<BackendLogits> {
-            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
+        ) -> Result<DeviceTensor> {
+            device_tensor_from_1d(&Tensor1D::zeros(1))
         }
 
         async fn decode_step(
@@ -731,13 +726,13 @@ mod tests {
             _token: u32,
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<BackendLogits> {
-            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
+        ) -> Result<DeviceTensor> {
+            device_tensor_from_1d(&Tensor1D::zeros(1))
         }
 
         fn sample(
             &self,
-            _logits: &BackendLogits,
+            _logits: &DeviceTensor,
             _temperature: f32,
             _top_p: f32,
             _seed: u64,

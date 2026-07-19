@@ -2785,7 +2785,7 @@ impl InferenceCoordinator {
 mod tests {
     use super::*;
     use crate::executor::ring_allreduce::RingAllReduceMetrics;
-    use crate::inference::backend::BackendLogits;
+    use crate::inference::runtime::{device_tensor_from_1d, DeviceTensor};
     use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
     use crate::inference::job::InferenceRequest;
     use crate::inference::kv_cache::KVCacheSnapshot;
@@ -2826,8 +2826,8 @@ mod tests {
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
             _workspace: Option<&mut crate::inference::PrefillWorkspaceLease>,
-        ) -> Result<BackendLogits> {
-            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
+        ) -> Result<DeviceTensor> {
+            device_tensor_from_1d(&Tensor1D::zeros(1))
         }
 
         async fn decode_step(
@@ -2835,13 +2835,13 @@ mod tests {
             _token: u32,
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<BackendLogits> {
-            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
+        ) -> Result<DeviceTensor> {
+            device_tensor_from_1d(&Tensor1D::zeros(1))
         }
 
         fn sample(
             &self,
-            _logits: &BackendLogits,
+            _logits: &DeviceTensor,
             _temperature: f32,
             _top_p: f32,
             _seed: u64,
