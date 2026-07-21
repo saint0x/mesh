@@ -104,7 +104,7 @@ pub enum BackendOptimizationProfile {
     CpuSerial,
     MetalVectorized,
     CudaFused,
-    RocmFused,
+    RocmUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,38 +267,32 @@ impl LocalExecutorContract {
                 collective_tensors_per_layer: 2,
             },
             ExecutionProviderKind::Rocm => Self {
-                class: LocalExecutorClass::FastPath,
-                optimization_profile: BackendOptimizationProfile::RocmFused,
+                class: LocalExecutorClass::Baseline,
+                optimization_profile: BackendOptimizationProfile::RocmUnavailable,
                 host_kernels: Vec::new(),
-                fused_stages: vec![
-                    FusedKernelStage::NormQkv,
-                    FusedKernelStage::RopeKvWrite,
-                    FusedKernelStage::PagedAttention,
-                    FusedKernelStage::ResidualMlp,
-                    FusedKernelStage::DeviceSampling,
-                ],
+                fused_stages: Vec::new(),
                 collective_residency: CollectiveResidency::StagedRuntime,
                 prefill: ExecutorPhasePlan {
                     phase: ExecutionPhase::Prefill,
-                    class: LocalExecutorClass::FastPath,
+                    class: LocalExecutorClass::Baseline,
                     supports_microbatch: false,
-                    requires_static_workspace: true,
-                    uses_device_sampling: true,
+                    requires_static_workspace: false,
+                    uses_device_sampling: false,
                 },
                 decode: ExecutorPhasePlan {
                     phase: ExecutionPhase::Decode,
-                    class: LocalExecutorClass::FastPath,
-                    supports_microbatch: true,
-                    requires_static_workspace: true,
-                    uses_device_sampling: true,
+                    class: LocalExecutorClass::Baseline,
+                    supports_microbatch: false,
+                    requires_static_workspace: false,
+                    uses_device_sampling: false,
                 },
                 kv_runtime: KvRuntimeContract {
-                    requires_paged_cache: true,
-                    append_only_decode: true,
-                    supports_prefill: true,
-                    supports_decode: true,
+                    requires_paged_cache: false,
+                    append_only_decode: false,
+                    supports_prefill: false,
+                    supports_decode: false,
                 },
-                collective_tensors_per_layer: 2,
+                collective_tensors_per_layer: 0,
             },
         }
     }

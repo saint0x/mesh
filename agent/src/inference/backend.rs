@@ -3,7 +3,7 @@ use std::any::Any;
 use std::time::Instant;
 use uuid::Uuid;
 
-use crate::errors::Result;
+use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
 
@@ -332,38 +332,10 @@ impl CudaExecutionBackend {
     }
 }
 
-pub struct RocmExecutionBackend {
-    core: ProviderRuntimeCore,
-}
-
-impl RocmExecutionBackend {
-    pub fn new(
-        model: Arc<SharedModelResidency>,
-        worker_position: u32,
-        shard_start: usize,
-        shard_end: usize,
-        total_workers: u32,
-        allreduce_timeout: std::time::Duration,
-    ) -> Result<Self> {
-        Ok(Self {
-            core: ProviderRuntimeCore::new_for_provider(
-                ExecutionProviderKind::Rocm,
-                model,
-                worker_position,
-                shard_start,
-                shard_end,
-                total_workers,
-                allreduce_timeout,
-            )?,
-        })
-    }
-}
-
 pub enum ProviderExecutionBackend {
     Cpu(CpuExecutionBackend),
     Metal(MetalExecutionBackend),
     Cuda(CudaExecutionBackend),
-    Rocm(RocmExecutionBackend),
 }
 
 impl ProviderExecutionBackend {
@@ -375,7 +347,28 @@ impl ProviderExecutionBackend {
         total_workers: u32,
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
-        match selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu) {
+        Self::new_for_provider(
+            selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
+            model,
+            worker_position,
+            shard_start,
+            shard_end,
+            total_workers,
+            allreduce_timeout,
+        )
+    }
+
+    pub fn new_for_provider(
+        provider: ExecutionProviderKind,
+        model: Arc<SharedModelResidency>,
+        worker_position: u32,
+        shard_start: usize,
+        shard_end: usize,
+        total_workers: u32,
+        allreduce_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        Self::ensure_provider_runtime_available(provider)?;
+        match provider {
             ExecutionProviderKind::Cpu => Ok(Self::Cpu(CpuExecutionBackend::new(
                 model,
                 worker_position,
@@ -400,14 +393,17 @@ impl ProviderExecutionBackend {
                 total_workers,
                 allreduce_timeout,
             )?)),
-            ExecutionProviderKind::Rocm => Ok(Self::Rocm(RocmExecutionBackend::new(
-                model,
-                worker_position,
-                shard_start,
-                shard_end,
-                total_workers,
-                allreduce_timeout,
-            )?)),
+            ExecutionProviderKind::Rocm => unreachable!("rocm provider was rejected by preflight"),
+        }
+    }
+
+    pub fn ensure_provider_runtime_available(provider: ExecutionProviderKind) -> Result<()> {
+        match provider {
+            ExecutionProviderKind::Cpu | ExecutionProviderKind::Metal | ExecutionProviderKind::Cuda => Ok(()),
+            ExecutionProviderKind::Rocm => Err(AgentError::Execution(
+                "rocm execution backend is unavailable because this Mesh agent does not link a native HIP/ROCm tensor runtime"
+                    .to_string(),
+            )),
         }
     }
 
@@ -416,7 +412,6 @@ impl ProviderExecutionBackend {
             Self::Cpu(backend) => &backend.core,
             Self::Metal(backend) => &backend.core,
             Self::Cuda(backend) => &backend.core,
-            Self::Rocm(backend) => &backend.core,
         }
     }
 
@@ -425,7 +420,6 @@ impl ProviderExecutionBackend {
             Self::Cpu(backend) => &mut backend.core,
             Self::Metal(backend) => &mut backend.core,
             Self::Cuda(backend) => &mut backend.core,
-            Self::Rocm(backend) => &mut backend.core,
         }
     }
 
@@ -857,7 +851,7 @@ mod tests {
                 contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Rocm),
             }
             .optimization_profile(),
-            BackendOptimizationProfile::RocmFused
+            BackendOptimizationProfile::RocmUnavailable
         );
     }
 
@@ -877,9 +871,19 @@ mod tests {
         assert!(cuda.is_fast_path());
         assert!(cuda.supports_decode_microbatch());
         assert!(cuda.uses_staged_runtime_collectives());
-        assert!(rocm.is_fast_path());
-        assert!(rocm.supports_decode_microbatch());
-        assert!(rocm.uses_staged_runtime_collectives());
+        assert!(!rocm.is_fast_path());
+        assert!(!rocm.supports_decode_microbatch());
+        assert!(!rocm.kv_runtime.supports_prefill);
+        assert!(!rocm.kv_runtime.supports_decode);
+    }
+
+    #[test]
+    fn rocm_backend_construction_fails_until_native_runtime_exists() {
+        let error = ProviderExecutionBackend::ensure_provider_runtime_available(
+            ExecutionProviderKind::Rocm,
+        )
+        .expect_err("rocm backend must fail closed");
+        assert!(error.to_string().contains("native HIP/ROCm tensor runtime"));
     }
 
     #[test]

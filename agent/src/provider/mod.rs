@@ -59,6 +59,7 @@ pub enum MemoryModel {
 pub enum ProviderImplementationMaturity {
     #[default]
     VerifiedFastPath,
+    RuntimeUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -90,17 +91,34 @@ pub struct BackendContractDescriptor {
 
 impl BackendContractDescriptor {
     pub fn for_provider(provider: ExecutionProviderKind) -> Self {
+        Self::for_provider_with_maturity(provider, ProviderImplementationMaturity::VerifiedFastPath)
+    }
+
+    pub fn runtime_unavailable(provider: ExecutionProviderKind) -> Self {
+        Self::for_provider_with_maturity(
+            provider,
+            ProviderImplementationMaturity::RuntimeUnavailable,
+        )
+    }
+
+    fn for_provider_with_maturity(
+        provider: ExecutionProviderKind,
+        implementation_maturity: ProviderImplementationMaturity,
+    ) -> Self {
         let compatibility_class = match provider {
             ExecutionProviderKind::Cpu => ProviderCompatibilityClass::CpuPortable,
             ExecutionProviderKind::Metal => ProviderCompatibilityClass::MetalFastPath,
             ExecutionProviderKind::Cuda => ProviderCompatibilityClass::CudaFastPath,
             ExecutionProviderKind::Rocm => ProviderCompatibilityClass::RocmFastPath,
         };
-        let optimization_profile = match provider {
-            ExecutionProviderKind::Cpu => "cpu_serial",
-            ExecutionProviderKind::Metal => "metal_vectorized",
-            ExecutionProviderKind::Cuda => "cuda_fused",
-            ExecutionProviderKind::Rocm => "rocm_fused",
+        let optimization_profile = match implementation_maturity {
+            ProviderImplementationMaturity::RuntimeUnavailable => "runtime_unavailable",
+            ProviderImplementationMaturity::VerifiedFastPath => match provider {
+                ExecutionProviderKind::Cpu => "cpu_serial",
+                ExecutionProviderKind::Metal => "metal_vectorized",
+                ExecutionProviderKind::Cuda => "cuda_fused",
+                ExecutionProviderKind::Rocm => "rocm_fused",
+            },
         }
         .to_string();
         let supports_decode_microbatch = true;
@@ -114,37 +132,66 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Cuda => MemoryModel::DiscreteVram,
             ExecutionProviderKind::Rocm => MemoryModel::DiscreteVram,
         };
-        let implementation_maturity = ProviderImplementationMaturity::VerifiedFastPath;
-        let verified_runtime = match provider {
-            ExecutionProviderKind::Metal => VerifiedRuntimeCapabilities {
-                fast_path_serving: true,
-                decode_microbatch: true,
-                paged_kv: true,
-                checkpoint_handoff: true,
-                device_sampling: true,
-            },
-            ExecutionProviderKind::Cpu => VerifiedRuntimeCapabilities {
-                fast_path_serving: true,
-                decode_microbatch: true,
-                paged_kv: true,
-                checkpoint_handoff: true,
-                device_sampling: true,
-            },
-            ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
-                fast_path_serving: true,
-                decode_microbatch: true,
-                paged_kv: true,
-                checkpoint_handoff: true,
-                device_sampling: true,
-            },
-            ExecutionProviderKind::Rocm => VerifiedRuntimeCapabilities {
-                fast_path_serving: true,
-                decode_microbatch: true,
-                paged_kv: true,
-                checkpoint_handoff: true,
-                device_sampling: true,
+        let verified_runtime = match implementation_maturity {
+            ProviderImplementationMaturity::RuntimeUnavailable => {
+                VerifiedRuntimeCapabilities::default()
+            }
+            ProviderImplementationMaturity::VerifiedFastPath => match provider {
+                ExecutionProviderKind::Metal => VerifiedRuntimeCapabilities {
+                    fast_path_serving: true,
+                    decode_microbatch: true,
+                    paged_kv: true,
+                    checkpoint_handoff: true,
+                    device_sampling: true,
+                },
+                ExecutionProviderKind::Cpu => VerifiedRuntimeCapabilities {
+                    fast_path_serving: true,
+                    decode_microbatch: true,
+                    paged_kv: true,
+                    checkpoint_handoff: true,
+                    device_sampling: true,
+                },
+                ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
+                    fast_path_serving: true,
+                    decode_microbatch: true,
+                    paged_kv: true,
+                    checkpoint_handoff: true,
+                    device_sampling: true,
+                },
+                ExecutionProviderKind::Rocm => VerifiedRuntimeCapabilities {
+                    fast_path_serving: true,
+                    decode_microbatch: true,
+                    paged_kv: true,
+                    checkpoint_handoff: true,
+                    device_sampling: true,
+                },
             },
         };
+        let supports_decode_microbatch = supports_decode_microbatch
+            && matches!(
+                implementation_maturity,
+                ProviderImplementationMaturity::VerifiedFastPath
+            );
+        let supports_paged_kv = supports_paged_kv
+            && matches!(
+                implementation_maturity,
+                ProviderImplementationMaturity::VerifiedFastPath
+            );
+        let supports_checkpoint_handoff = supports_checkpoint_handoff
+            && matches!(
+                implementation_maturity,
+                ProviderImplementationMaturity::VerifiedFastPath
+            );
+        let supports_device_sampling = supports_device_sampling
+            && matches!(
+                implementation_maturity,
+                ProviderImplementationMaturity::VerifiedFastPath
+            );
+        let fast_path_eligible = fast_path_eligible
+            && matches!(
+                implementation_maturity,
+                ProviderImplementationMaturity::VerifiedFastPath
+            );
         let mut descriptor = Self {
             provider,
             compatibility_class,
@@ -292,11 +339,16 @@ fn build_provider_info(
     probe: (bool, Option<String>),
 ) -> ExecutionProviderInfo {
     let (available, reason) = probe;
+    let contract = if available {
+        BackendContractDescriptor::for_provider(kind)
+    } else {
+        BackendContractDescriptor::runtime_unavailable(kind)
+    };
     ExecutionProviderInfo {
         kind,
         available,
         reason,
-        contract: BackendContractDescriptor::for_provider(kind),
+        contract,
     }
 }
 
@@ -399,6 +451,22 @@ mod tests {
         assert_eq!(contract.optimization_profile, "rocm_fused");
         assert_eq!(contract.memory_model, MemoryModel::DiscreteVram);
         assert!(contract.supports_production_serving());
+    }
+
+    #[test]
+    fn unavailable_rocm_contract_is_not_production_serving() {
+        let contract = BackendContractDescriptor::runtime_unavailable(ExecutionProviderKind::Rocm);
+
+        assert_eq!(
+            contract.implementation_maturity,
+            ProviderImplementationMaturity::RuntimeUnavailable
+        );
+        assert!(!contract.fast_path_eligible);
+        assert!(!contract.supports_decode_microbatch);
+        assert!(!contract.supports_paged_kv);
+        assert!(!contract.supports_device_sampling);
+        assert!(!contract.supports_production_serving());
+        contract.validate_runtime_consistency().unwrap();
     }
 
     #[test]
