@@ -163,6 +163,10 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     /// Intermediate size for MLP
     pub intermediate_size: usize,
+    /// First intermediate column resident in this worker shard.
+    pub local_mlp_start: usize,
+    /// End-exclusive intermediate column resident in this worker shard.
+    pub local_mlp_end: usize,
     /// RMS norm epsilon
     pub rms_norm_eps: f32,
     /// RoPE base frequency
@@ -179,6 +183,8 @@ impl Default for ModelConfig {
             num_layers: 80,
             vocab_size: 32000,
             intermediate_size: 28672,
+            local_mlp_start: 0,
+            local_mlp_end: 28672,
             rms_norm_eps: 1e-5,
             rope_base: 10000.0,
         }
@@ -3205,6 +3211,8 @@ mod tests {
             num_layers: 2,
             vocab_size: 100,
             intermediate_size: 128,
+            local_mlp_start: 0,
+            local_mlp_end: 128,
             rms_norm_eps: 1e-5,
             rope_base: 10000.0,
         }
@@ -3368,6 +3376,8 @@ mod tests {
             num_layers: 2,
             vocab_size: 100,
             intermediate_size: 1536,
+            local_mlp_start: 0,
+            local_mlp_end: 512,
             rms_norm_eps: 1e-5,
             rope_base: 10000.0,
         };

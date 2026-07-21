@@ -3170,6 +3170,8 @@ mod tests {
             num_layers: 2,
             vocab_size: 64,
             intermediate_size: 64,
+            local_mlp_start: 0,
+            local_mlp_end: 16,
             rms_norm_eps: 1e-5,
             rope_base: 10_000.0,
         };

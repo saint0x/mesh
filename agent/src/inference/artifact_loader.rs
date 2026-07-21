@@ -319,6 +319,8 @@ fn load_model_config(metadata: Option<&HashMap<String, String>>) -> Result<Model
         num_layers: metadata_usize(metadata, "mesh.num_layers")?,
         vocab_size: metadata_usize(metadata, "mesh.vocab_size")?,
         intermediate_size: metadata_usize(metadata, "mesh.intermediate_size")?,
+        local_mlp_start: metadata_usize(metadata, "mesh.mlp_start")?,
+        local_mlp_end: metadata_usize(metadata, "mesh.mlp_end")?,
         rms_norm_eps: metadata_f32(metadata, "mesh.rms_norm_eps")?,
         rope_base: metadata_f32(metadata, "mesh.rope_base")?,
     })
@@ -357,23 +359,6 @@ fn validate_metadata(
     }
 
     Ok(())
-}
-
-fn partition_columns(total_columns: usize, worker_position: u32, total_workers: u32) -> usize {
-    if total_workers == 0 {
-        return total_columns;
-    }
-
-    let total_workers = total_workers as usize;
-    let worker_position = worker_position as usize;
-    let columns_per_worker = total_columns / total_workers;
-    let remainder = total_columns % total_workers;
-
-    if worker_position < remainder {
-        columns_per_worker + 1
-    } else {
-        columns_per_worker
-    }
 }
 
 fn resolve_attention_shard_widths(
@@ -416,6 +401,18 @@ fn resolve_attention_shard_widths(
     let local_group_count = q_cols / q_group_width;
     let kv_cols = local_group_count * head_dim;
     Ok((q_cols, kv_cols))
+}
+
+fn resolve_mlp_shard_width(config: &ModelConfig) -> Result<usize> {
+    if config.local_mlp_start >= config.local_mlp_end
+        || config.local_mlp_end > config.intermediate_size
+    {
+        return Err(AgentError::Config(format!(
+            "Invalid MLP shard range {}..{} for intermediate_size {}",
+            config.local_mlp_start, config.local_mlp_end, config.intermediate_size
+        )));
+    }
+    Ok(config.local_mlp_end - config.local_mlp_start)
 }
 
 fn load_tensor_2d(tensors: &SafeTensors<'_>, name: &str) -> Result<Tensor2D> {
@@ -497,11 +494,7 @@ fn validate_weight_shapes(
     }
 
     let (expected_cols, expected_kv_cols) = resolve_attention_shard_widths(config, assignment)?;
-    let expected_mlp_cols = partition_columns(
-        config.intermediate_size,
-        assignment.worker_position,
-        assignment.total_workers,
-    );
+    let expected_mlp_cols = resolve_mlp_shard_width(config)?;
 
     if embedding.rows != config.vocab_size || embedding.cols != config.hidden_dim {
         return Err(AgentError::Config(format!(
@@ -672,6 +665,18 @@ mod tests {
         let num_layers = 2usize;
         let num_heads = 2usize;
         let num_kv_heads = 2usize;
+        let total_workers = assignment.total_workers as usize;
+        let worker_position = assignment.worker_position as usize;
+        let mlp_columns_per_worker = intermediate_size / total_workers;
+        let mlp_remainder = intermediate_size % total_workers;
+        let local_mlp_start = if worker_position < mlp_remainder {
+            worker_position * (mlp_columns_per_worker + 1)
+        } else {
+            mlp_remainder * (mlp_columns_per_worker + 1)
+                + (worker_position - mlp_remainder) * mlp_columns_per_worker
+        };
+        let mlp_shard_cols = mlp_columns_per_worker + usize::from(worker_position < mlp_remainder);
+        let local_mlp_end = local_mlp_start + mlp_shard_cols;
         let config = ModelConfig {
             hidden_dim,
             num_heads,
@@ -679,15 +684,12 @@ mod tests {
             num_layers,
             vocab_size,
             intermediate_size,
+            local_mlp_start,
+            local_mlp_end,
             rms_norm_eps: 1e-5,
             rope_base: 10000.0,
         };
         let (q_shard_cols, kv_shard_cols) = resolve_attention_shard_widths(&config, assignment)?;
-        let mlp_shard_cols = partition_columns(
-            intermediate_size,
-            assignment.worker_position,
-            assignment.total_workers,
-        );
 
         let model_dir = root.join(&assignment.model_id);
         fs::create_dir_all(&model_dir)?;
@@ -773,6 +775,8 @@ mod tests {
                 "mesh.intermediate_size".to_string(),
                 intermediate_size.to_string(),
             ),
+            ("mesh.mlp_start".to_string(), local_mlp_start.to_string()),
+            ("mesh.mlp_end".to_string(), local_mlp_end.to_string()),
             ("mesh.rms_norm_eps".to_string(), "0.00001".to_string()),
             ("mesh.rope_base".to_string(), "10000".to_string()),
         ]);

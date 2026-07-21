@@ -824,6 +824,8 @@ mod tests {
             num_layers: 1,
             vocab_size: 8,
             intermediate_size: 6,
+            local_mlp_start: 0,
+            local_mlp_end: 3,
             rms_norm_eps: 1e-5,
             rope_base: 10000.0,
         };
@@ -926,6 +928,8 @@ mod tests {
             num_layers: 1,
             vocab_size: 8,
             intermediate_size: 4,
+            local_mlp_start: 0,
+            local_mlp_end: 4,
             rms_norm_eps: 1e-5,
             rope_base: 10000.0,
         };

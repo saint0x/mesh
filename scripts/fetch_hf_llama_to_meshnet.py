@@ -19,35 +19,53 @@ except ImportError:  # pragma: no cover - optional dependency for bf16 source we
     load_torch_file = None
 
 
-def partition_start(total_columns: int, worker_position: int, total_workers: int) -> int:
-    if total_workers == 0:
-        return 0
-    columns_per_worker = total_columns // total_workers
-    remainder = total_columns % total_workers
-    if worker_position < remainder:
-        return worker_position * (columns_per_worker + 1)
-    return remainder * (columns_per_worker + 1) + (worker_position - remainder) * columns_per_worker
+def parse_positive_ints(value: str, *, expected_len: int, field_name: str) -> list[int]:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(parts) != expected_len:
+        raise ValueError(f"{field_name} must contain {expected_len} comma-separated integers")
+    parsed = [int(part) for part in parts]
+    if any(part <= 0 for part in parsed):
+        raise ValueError(f"{field_name} values must be positive")
+    return parsed
 
 
-def partition_columns(total_columns: int, worker_position: int, total_workers: int) -> int:
-    if total_workers == 0:
-        return total_columns
-    columns_per_worker = total_columns // total_workers
-    remainder = total_columns % total_workers
-    if worker_position < remainder:
-        return columns_per_worker + 1
-    return columns_per_worker
-
-
-def allocate_weighted_groups(total_groups: int, total_workers: int) -> list[tuple[int, int]]:
+def allocate_even_counts(total: int, total_workers: int) -> list[int]:
     if total_workers <= 0:
-        return [(0, total_groups)]
-    groups_per_worker = total_groups // total_workers
-    remainder = total_groups % total_workers
+        raise ValueError("workers must be positive")
+    if total < total_workers:
+        raise ValueError(f"cannot allocate {total} units across {total_workers} non-empty workers")
+    base = total // total_workers
+    remainder = total % total_workers
+    return [base + (1 if worker < remainder else 0) for worker in range(total_workers)]
+
+
+def allocate_weighted_counts(total: int, weights: list[int]) -> list[int]:
+    if total < len(weights):
+        raise ValueError(f"cannot allocate {total} units across {len(weights)} non-empty workers")
+    weight_sum = sum(weights)
+    raw = [(total * weight) / weight_sum for weight in weights]
+    counts = [max(1, int(value)) for value in raw]
+    while sum(counts) > total:
+        candidates = [
+            (raw[idx] - counts[idx], idx)
+            for idx in range(len(counts))
+            if counts[idx] > 1
+        ]
+        if not candidates:
+            raise ValueError("unable to reduce weighted allocation without emptying a worker")
+        _, idx = min(candidates)
+        counts[idx] -= 1
+    while sum(counts) < total:
+        candidates = [(raw[idx] - counts[idx], idx) for idx in range(len(counts))]
+        _, idx = max(candidates)
+        counts[idx] += 1
+    return counts
+
+
+def ranges_from_counts(counts: list[int]) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     start = 0
-    for worker_position in range(total_workers):
-        width = groups_per_worker + (1 if worker_position < remainder else 0)
+    for width in counts:
         end = start + width
         ranges.append((start, end))
         start = end
@@ -58,7 +76,7 @@ def attention_shard_geometry(
     hidden_dim: int,
     num_heads: int,
     num_kv_heads: int,
-    total_workers: int,
+    group_ranges: list[tuple[int, int]],
     worker_position: int,
 ) -> tuple[int, int, int, int]:
     if hidden_dim % num_heads != 0:
@@ -70,7 +88,6 @@ def attention_shard_geometry(
     head_dim = hidden_dim // num_heads
     q_heads_per_kv_head = num_heads // num_kv_heads
     q_group_width = q_heads_per_kv_head * head_dim
-    group_ranges = allocate_weighted_groups(num_kv_heads, total_workers)
     group_start, group_end = group_ranges[worker_position]
     group_count = group_end - group_start
     q_start = group_start * q_group_width
@@ -165,6 +182,18 @@ def main() -> None:
     parser.add_argument("--model-id", default="smollm2-135m-instruct")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--kv-groups-per-worker",
+        help="Comma-separated explicit GQA KV-group counts per worker; must sum to num_key_value_heads.",
+    )
+    parser.add_argument(
+        "--worker-weights",
+        help="Comma-separated positive worker weights used for KV groups and MLP columns when explicit counts are not provided.",
+    )
+    parser.add_argument(
+        "--mlp-weights",
+        help="Comma-separated positive worker weights for MLP intermediate columns; defaults to --worker-weights or even split.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).expanduser().resolve() / args.model_id
@@ -183,7 +212,34 @@ def main() -> None:
     rms_norm_eps = float(config["rms_norm_eps"])
     rope_base = float(config.get("rope_theta", 10000.0))
     head_dim = hidden_dim // num_heads
-    kv_hidden_dim = num_kv_heads * head_dim
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive")
+    if args.kv_groups_per_worker:
+        kv_group_counts = parse_positive_ints(
+            args.kv_groups_per_worker,
+            expected_len=args.workers,
+            field_name="--kv-groups-per-worker",
+        )
+        if sum(kv_group_counts) != num_kv_heads:
+            raise ValueError(
+                f"--kv-groups-per-worker must sum to num_key_value_heads={num_kv_heads}, got {sum(kv_group_counts)}"
+            )
+    elif args.worker_weights:
+        kv_group_counts = allocate_weighted_counts(
+            num_kv_heads,
+            parse_positive_ints(args.worker_weights, expected_len=args.workers, field_name="--worker-weights"),
+        )
+    else:
+        kv_group_counts = allocate_even_counts(num_kv_heads, args.workers)
+    group_ranges = ranges_from_counts(kv_group_counts)
+
+    if args.mlp_weights:
+        mlp_weights = parse_positive_ints(args.mlp_weights, expected_len=args.workers, field_name="--mlp-weights")
+    elif args.worker_weights:
+        mlp_weights = parse_positive_ints(args.worker_weights, expected_len=args.workers, field_name="--worker-weights")
+    else:
+        mlp_weights = [1] * args.workers
+    mlp_ranges = ranges_from_counts(allocate_weighted_counts(intermediate_size, mlp_weights))
 
     model_size_bytes = os.path.getsize(model_path)
     save_json(
@@ -193,6 +249,7 @@ def main() -> None:
             "tensor_parallelism_dim": hidden_dim,
             "attention_head_count": num_heads,
             "kv_head_count": num_kv_heads,
+            "transformer_layer_count": num_layers,
             "total_model_bytes": model_size_bytes,
             "tokenizer_file": "tokenizer.json",
             "tokenizer_config_file": "tokenizer_config.json",
@@ -221,10 +278,10 @@ def main() -> None:
 
             for worker_position in range(args.workers):
                 q_start, q_cols, kv_start, kv_cols = attention_shard_geometry(
-                    hidden_dim, num_heads, num_kv_heads, args.workers, worker_position
+                    hidden_dim, num_heads, num_kv_heads, group_ranges, worker_position
                 )
-                mlp_start = partition_start(intermediate_size, worker_position, args.workers)
-                mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
+                mlp_start, mlp_end = mlp_ranges[worker_position]
+                mlp_cols = mlp_end - mlp_start
 
                 tensors: dict[str, np.ndarray] = {
                     "embedding": embedding,
@@ -259,14 +316,19 @@ def main() -> None:
                     tensors[f"layers.{layer_idx}.mlp_norm"] = tensor_from_file(source, names["mlp_norm"])
 
                 shard_path = out_dir / f"shard-{worker_position}-of-{args.workers}.safetensors"
+                tmp_shard_path = out_dir / f".shard-{worker_position}-of-{args.workers}.safetensors.tmp"
+                tmp_shard_path.unlink(missing_ok=True)
                 shard_metadata = {
                     **metadata,
                     "mesh.worker_position": str(worker_position),
                     "mesh.total_workers": str(args.workers),
                     "mesh.column_start": str(q_start),
                     "mesh.column_end": str(q_start + q_cols),
+                    "mesh.mlp_start": str(mlp_start),
+                    "mesh.mlp_end": str(mlp_end),
                 }
-                save_file(tensors, str(shard_path), metadata=shard_metadata)
+                save_file(tensors, str(tmp_shard_path), metadata=shard_metadata)
+                tmp_shard_path.replace(shard_path)
 
                 digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
                 save_json(
@@ -301,10 +363,10 @@ def main() -> None:
 
         for worker_position in range(args.workers):
             q_start, q_cols, kv_start, kv_cols = attention_shard_geometry(
-                hidden_dim, num_heads, num_kv_heads, args.workers, worker_position
+                hidden_dim, num_heads, num_kv_heads, group_ranges, worker_position
             )
-            mlp_start = partition_start(intermediate_size, worker_position, args.workers)
-            mlp_cols = partition_columns(intermediate_size, worker_position, args.workers)
+            mlp_start, mlp_end = mlp_ranges[worker_position]
+            mlp_cols = mlp_end - mlp_start
 
             tensors: dict[str, np.ndarray] = {
                 "embedding": embedding,
@@ -339,14 +401,19 @@ def main() -> None:
                 tensors[f"layers.{layer_idx}.mlp_norm"] = tensor_from_torch(source, names["mlp_norm"])
 
             shard_path = out_dir / f"shard-{worker_position}-of-{args.workers}.safetensors"
+            tmp_shard_path = out_dir / f".shard-{worker_position}-of-{args.workers}.safetensors.tmp"
+            tmp_shard_path.unlink(missing_ok=True)
             shard_metadata = {
                 **metadata,
                 "mesh.worker_position": str(worker_position),
                 "mesh.total_workers": str(args.workers),
                 "mesh.column_start": str(q_start),
                 "mesh.column_end": str(q_start + q_cols),
+                "mesh.mlp_start": str(mlp_start),
+                "mesh.mlp_end": str(mlp_end),
             }
-            save_file(tensors, str(shard_path), metadata=shard_metadata)
+            save_file(tensors, str(tmp_shard_path), metadata=shard_metadata)
+            tmp_shard_path.replace(shard_path)
 
             digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
             save_json(
