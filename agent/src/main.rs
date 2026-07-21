@@ -1079,6 +1079,17 @@ fn direct_candidate_age_seconds(last_updated_ms: u64) -> u64 {
     now_ms.saturating_sub(last_updated_ms) / 1000
 }
 
+fn duration_from_millis_env(name: &str) -> Option<std::time::Duration> {
+    let raw = std::env::var(name).ok()?;
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 => Some(std::time::Duration::from_millis(ms)),
+        _ => {
+            warn!(name, value = %raw, "Ignoring invalid duration environment override");
+            None
+        }
+    }
+}
+
 fn build_worker_position_from_topology(
     topology: &RingTopologyResponse,
     device_id: &Uuid,
@@ -3985,6 +3996,12 @@ async fn cmd_runtime() -> Result<()> {
         info!("Initializing inference coordinator");
 
         let mut inference_runtime_config = InferenceConfig::default();
+        if let Some(timeout) = duration_from_millis_env("MESHNET_ALLREDUCE_TIMEOUT_MS") {
+            inference_runtime_config.allreduce_timeout = timeout;
+        }
+        if let Some(timeout) = duration_from_millis_env("MESHNET_JOB_TIMEOUT_MS") {
+            inference_runtime_config.job_timeout = timeout;
+        }
         inference_runtime_config.recovery_max_attempts_per_job = inference_config_task
             .governance
             .recovery_max_attempts_per_job;

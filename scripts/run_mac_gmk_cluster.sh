@@ -25,6 +25,8 @@ GMK_RUN_ROOT="${MESHNET_GMK_RUN_ROOT:-/home/deepsaint/.meshnet/runs/mac-gmk}"
 KEEP_RUN_ROOT="${MESHNET_KEEP_RUN_ROOT:-0}"
 RUST_LOG_LEVEL="${MESHNET_LAN_RUST_LOG:-info}"
 SKIP_MODEL_SYNC="${MESHNET_SKIP_MODEL_SYNC:-0}"
+ALLREDUCE_TIMEOUT_MS="${MESHNET_ALLREDUCE_TIMEOUT_MS:-120000}"
+JOB_TIMEOUT_MS="${MESHNET_JOB_TIMEOUT_MS:-900000}"
 
 MAC_HOME="$RUN_ROOT/mac-worker"
 CONTROL_HOME="$RUN_ROOT/control-plane"
@@ -399,7 +401,8 @@ def match(pattern, default=None):
 execution_ms = int(match(r"Execution Time:\s+(\d+)ms", "0"))
 ttft_ms = int(match(r"TTFT:\s+(\d+)ms", "0"))
 tokens = int(match(r"Tokens:\s+(\d+)", "0"))
-status = match(r"Status:\s+([a-zA-Z_-]+)", "unknown")
+statuses = re.findall(r"^\s*Status:\s+([a-zA-Z_-]+)", text, re.MULTILINE)
+status = statuses[-1] if statuses else "unknown"
 job_id = match(r"Job ID:\s+([0-9a-f-]{36})", "")
 completion_match = re.search(r"Completion:\n(?P<body>.*?)(?:\n\n\[mesh-mac-gmk\]|\Z)", text, re.S)
 completion = completion_match.group("body").strip() if completion_match else ""
@@ -563,6 +566,8 @@ start_mac_agent() {
             MESHNET_MODEL_STORE="$LOCAL_MODEL_STORE" \
             RUST_LOG="$RUST_LOG_LEVEL" \
             RUST_BACKTRACE=1 \
+            MESHNET_ALLREDUCE_TIMEOUT_MS="$ALLREDUCE_TIMEOUT_MS" \
+            MESHNET_JOB_TIMEOUT_MS="$JOB_TIMEOUT_MS" \
             MESHNET_TENSOR_BIND_ADDR="0.0.0.0:${MAC_TENSOR_PORT}" \
             MESHNET_TENSOR_ADVERTISED_ADDR="${mac_ip}:${MAC_TENSOR_PORT}" \
             "$LOCAL_AGENT_BIN" device runtime --log-level info >"$MAC_LOG" 2>&1
@@ -590,6 +595,8 @@ GMK_MODEL_STORE='$GMK_MODEL_STORE'
 RUST_LOG_LEVEL='$RUST_LOG_LEVEL'
 GMK_TENSOR_PORT='$GMK_TENSOR_PORT'
 GMK_TENSOR_ADVERTISED_ADDR='$GMK_TENSOR_ADVERTISED_ADDR'
+ALLREDUCE_TIMEOUT_MS='$ALLREDUCE_TIMEOUT_MS'
+JOB_TIMEOUT_MS='$JOB_TIMEOUT_MS'
 
 mkdir -p \"\$REMOTE_HOME/.meshnet/logs\"
 launch_log=\"\$REMOTE_HOME/.meshnet/logs/agent-launch.log\"
@@ -619,6 +626,8 @@ nohup env \
 	  RUST_LOG=\"\$RUST_LOG_LEVEL\" \
 	  RUST_BACKTRACE=1 \
 	  ROCM_PATH=/opt/rocm \
+	  MESHNET_ALLREDUCE_TIMEOUT_MS=\"\$ALLREDUCE_TIMEOUT_MS\" \
+	  MESHNET_JOB_TIMEOUT_MS=\"\$JOB_TIMEOUT_MS\" \
 	  MESHNET_TENSOR_BIND_ADDR=\"0.0.0.0:\$GMK_TENSOR_PORT\" \
 	  MESHNET_TENSOR_ADVERTISED_ADDR=\"\$GMK_TENSOR_ADVERTISED_ADDR\" \
 	  \"\$AGENT_BIN\" device runtime --log-level info >>\"\$agent_log\" 2>&1 &
