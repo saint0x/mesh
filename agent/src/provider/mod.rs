@@ -5,12 +5,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionProviderKind {
     Cpu,
     Metal,
     Cuda,
+    Rocm,
 }
 
 impl ExecutionProviderKind {
@@ -19,6 +20,7 @@ impl ExecutionProviderKind {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
             Self::Cuda => "cuda",
+            Self::Rocm => "rocm",
         }
     }
 
@@ -27,6 +29,7 @@ impl ExecutionProviderKind {
             "cpu" => Some(Self::Cpu),
             "metal" => Some(Self::Metal),
             "cuda" => Some(Self::Cuda),
+            "rocm" => Some(Self::Rocm),
             _ => None,
         }
     }
@@ -38,6 +41,7 @@ pub enum ProviderCompatibilityClass {
     CpuPortable,
     MetalFastPath,
     CudaFastPath,
+    RocmFastPath,
     HeterogeneousPortable,
 }
 
@@ -90,11 +94,13 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Cpu => ProviderCompatibilityClass::CpuPortable,
             ExecutionProviderKind::Metal => ProviderCompatibilityClass::MetalFastPath,
             ExecutionProviderKind::Cuda => ProviderCompatibilityClass::CudaFastPath,
+            ExecutionProviderKind::Rocm => ProviderCompatibilityClass::RocmFastPath,
         };
         let optimization_profile = match provider {
             ExecutionProviderKind::Cpu => "cpu_serial",
             ExecutionProviderKind::Metal => "metal_vectorized",
             ExecutionProviderKind::Cuda => "cuda_fused",
+            ExecutionProviderKind::Rocm => "rocm_fused",
         }
         .to_string();
         let supports_decode_microbatch = true;
@@ -106,6 +112,7 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Cpu => MemoryModel::SystemRam,
             ExecutionProviderKind::Metal => MemoryModel::UnifiedMemory,
             ExecutionProviderKind::Cuda => MemoryModel::DiscreteVram,
+            ExecutionProviderKind::Rocm => MemoryModel::DiscreteVram,
         };
         let implementation_maturity = ProviderImplementationMaturity::VerifiedFastPath;
         let verified_runtime = match provider {
@@ -124,6 +131,13 @@ impl BackendContractDescriptor {
                 device_sampling: true,
             },
             ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
+                fast_path_serving: true,
+                decode_microbatch: true,
+                paged_kv: true,
+                checkpoint_handoff: true,
+                device_sampling: true,
+            },
+            ExecutionProviderKind::Rocm => VerifiedRuntimeCapabilities {
                 fast_path_serving: true,
                 decode_microbatch: true,
                 paged_kv: true,
@@ -266,6 +280,10 @@ fn detect_execution_providers_uncached() -> Vec<ExecutionProviderInfo> {
             ExecutionProviderKind::Cuda,
             runtime::probe_provider(ExecutionProviderKind::Cuda),
         ),
+        build_provider_info(
+            ExecutionProviderKind::Rocm,
+            runtime::probe_provider(ExecutionProviderKind::Rocm),
+        ),
     ]
 }
 
@@ -355,4 +373,55 @@ pub fn set_selected_execution_provider(provider: ExecutionProviderKind) -> Resul
 
 pub fn selected_execution_provider() -> Option<ExecutionProviderKind> {
     SELECTED_PROVIDER.get().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_parser_accepts_normalized_rocm_label() {
+        assert_eq!(
+            ExecutionProviderKind::from_str(" ROCM "),
+            Some(ExecutionProviderKind::Rocm)
+        );
+    }
+
+    #[test]
+    fn rocm_contract_is_discrete_fast_path_contract() {
+        let contract = BackendContractDescriptor::for_provider(ExecutionProviderKind::Rocm);
+
+        assert_eq!(contract.provider, ExecutionProviderKind::Rocm);
+        assert_eq!(
+            contract.compatibility_class,
+            ProviderCompatibilityClass::RocmFastPath
+        );
+        assert_eq!(contract.optimization_profile, "rocm_fused");
+        assert_eq!(contract.memory_model, MemoryModel::DiscreteVram);
+        assert!(contract.supports_production_serving());
+    }
+
+    #[test]
+    fn requested_rocm_provider_fails_closed_when_runtime_is_unavailable() {
+        let providers = vec![
+            ExecutionProviderInfo {
+                kind: ExecutionProviderKind::Cpu,
+                available: true,
+                reason: None,
+                contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu),
+            },
+            ExecutionProviderInfo {
+                kind: ExecutionProviderKind::Rocm,
+                available: false,
+                reason: Some("native HIP/ROCm tensor backend is not linked".to_string()),
+                contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Rocm),
+            },
+        ];
+
+        let error = resolve_requested_provider(Some(ExecutionProviderKind::Rocm), &providers)
+            .expect_err("rocm must not silently fallback");
+        assert!(error
+            .to_string()
+            .contains("native HIP/ROCm tensor backend is not linked"));
+    }
 }

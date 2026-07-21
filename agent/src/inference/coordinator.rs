@@ -2180,10 +2180,8 @@ impl InferenceCoordinator {
             )?;
             let (reservation, mut prefill_workspace) =
                 FastPathRuntime::checkout_prefill_workspace(&prefill_plan)?;
-            self.stats.record_prefill_fast_path_plan(
-                &prefill_plan,
-                reservation.reused_existing_arena,
-            );
+            self.stats
+                .record_prefill_fast_path_plan(&prefill_plan, reservation.reused_existing_arena);
             let mut worker_ring = WorkerRing::new(
                 position.position,
                 position.total_workers,
@@ -2785,10 +2783,10 @@ impl InferenceCoordinator {
 mod tests {
     use super::*;
     use crate::executor::ring_allreduce::RingAllReduceMetrics;
-    use crate::inference::runtime::{device_tensor_from_1d, DeviceTensor};
     use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
     use crate::inference::job::InferenceRequest;
     use crate::inference::kv_cache::KVCacheSnapshot;
+    use crate::inference::runtime::{device_tensor_from_1d, DeviceTensor};
     use crate::inference::tensor_ops::{Tensor1D, Tensor2D};
     use crate::network::TensorPlaneConfig;
     use crate::provider::ExecutionProviderKind;
@@ -3591,9 +3589,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("incompatible backend classes"));
+        assert!(error.to_string().contains("incompatible backend classes"));
     }
 
     #[test]

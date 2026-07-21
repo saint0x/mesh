@@ -471,9 +471,8 @@ fn bytes_to_f32_vec(bytes: &[u8], name: &str) -> Result<Vec<f32>> {
         )));
     }
 
-    decode_to_f32_vec(bytes).map_err(|err| {
-        AgentError::Config(format!("Tensor {} float decode failed: {}", name, err))
-    })
+    decode_to_f32_vec(bytes)
+        .map_err(|err| AgentError::Config(format!("Tensor {} float decode failed: {}", name, err)))
 }
 
 fn validate_weight_shapes(

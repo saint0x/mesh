@@ -43,13 +43,8 @@ pub trait ExecutionBackend: Send {
         job_id: Uuid,
     ) -> Result<DeviceTensor>;
 
-    fn sample(
-        &self,
-        logits: &DeviceTensor,
-        temperature: f32,
-        top_p: f32,
-        seed: u64,
-    ) -> Result<u32>;
+    fn sample(&self, logits: &DeviceTensor, temperature: f32, top_p: f32, seed: u64)
+        -> Result<u32>;
 
     fn cache_seq_len(&self) -> usize;
 
@@ -337,10 +332,38 @@ impl CudaExecutionBackend {
     }
 }
 
+pub struct RocmExecutionBackend {
+    core: ProviderRuntimeCore,
+}
+
+impl RocmExecutionBackend {
+    pub fn new(
+        model: Arc<SharedModelResidency>,
+        worker_position: u32,
+        shard_start: usize,
+        shard_end: usize,
+        total_workers: u32,
+        allreduce_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        Ok(Self {
+            core: ProviderRuntimeCore::new_for_provider(
+                ExecutionProviderKind::Rocm,
+                model,
+                worker_position,
+                shard_start,
+                shard_end,
+                total_workers,
+                allreduce_timeout,
+            )?,
+        })
+    }
+}
+
 pub enum ProviderExecutionBackend {
     Cpu(CpuExecutionBackend),
     Metal(MetalExecutionBackend),
     Cuda(CudaExecutionBackend),
+    Rocm(RocmExecutionBackend),
 }
 
 impl ProviderExecutionBackend {
@@ -377,6 +400,14 @@ impl ProviderExecutionBackend {
                 total_workers,
                 allreduce_timeout,
             )?)),
+            ExecutionProviderKind::Rocm => Ok(Self::Rocm(RocmExecutionBackend::new(
+                model,
+                worker_position,
+                shard_start,
+                shard_end,
+                total_workers,
+                allreduce_timeout,
+            )?)),
         }
     }
 
@@ -385,6 +416,7 @@ impl ProviderExecutionBackend {
             Self::Cpu(backend) => &backend.core,
             Self::Metal(backend) => &backend.core,
             Self::Cuda(backend) => &backend.core,
+            Self::Rocm(backend) => &backend.core,
         }
     }
 
@@ -393,6 +425,7 @@ impl ProviderExecutionBackend {
             Self::Cpu(backend) => &mut backend.core,
             Self::Metal(backend) => &mut backend.core,
             Self::Cuda(backend) => &mut backend.core,
+            Self::Rocm(backend) => &mut backend.core,
         }
     }
 
@@ -474,14 +507,16 @@ impl ProviderExecutionBackend {
         .await?;
         let execution_time_ms = step_start.elapsed().as_millis() as u64;
 
-        let sampled_tokens = ProviderRuntimeCore::sample_fast_path_logits_batch(&logits_2d, requests)
-            .map_err(|err| {
-                crate::errors::AgentError::Execution(format!(
-                    "production batched sampling failed for provider {}: {}",
-                    expected_provider.as_str(),
-                    err
-                ))
-            })?;
+        let sampled_tokens = ProviderRuntimeCore::sample_fast_path_logits_batch(
+            &logits_2d, requests,
+        )
+        .map_err(|err| {
+            crate::errors::AgentError::Execution(format!(
+                "production batched sampling failed for provider {}: {}",
+                expected_provider.as_str(),
+                err
+            ))
+        })?;
         Ok(Some(
             requests
                 .iter()
@@ -615,7 +650,13 @@ impl ExecutionBackend for ProviderRuntimeCore {
             FastPathPlanner::prefill_token_ceiling_for_context(&self.fast_path_context())
                 .unwrap_or(tokens.len().max(1));
         self.forward_pass
-            .prefill(tokens, worker_ring, job_id, workspace, prefill_segment_ceiling)
+            .prefill(
+                tokens,
+                worker_ring,
+                job_id,
+                workspace,
+                prefill_segment_ceiling,
+            )
             .await
     }
 
@@ -810,6 +851,14 @@ mod tests {
             .optimization_profile(),
             BackendOptimizationProfile::CudaFused
         );
+        assert_eq!(
+            ProfileBackend {
+                provider: ExecutionProviderKind::Rocm,
+                contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Rocm),
+            }
+            .optimization_profile(),
+            BackendOptimizationProfile::RocmFused
+        );
     }
 
     #[test]
@@ -817,6 +866,7 @@ mod tests {
         let cpu = LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu);
         let metal = LocalExecutorContract::for_provider(ExecutionProviderKind::Metal);
         let cuda = LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda);
+        let rocm = LocalExecutorContract::for_provider(ExecutionProviderKind::Rocm);
 
         assert!(cpu.is_fast_path());
         assert!(cpu.supports_decode_microbatch());
@@ -827,6 +877,9 @@ mod tests {
         assert!(cuda.is_fast_path());
         assert!(cuda.supports_decode_microbatch());
         assert!(cuda.uses_staged_runtime_collectives());
+        assert!(rocm.is_fast_path());
+        assert!(rocm.supports_decode_microbatch());
+        assert!(rocm.uses_staged_runtime_collectives());
     }
 
     #[test]

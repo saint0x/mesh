@@ -3,12 +3,13 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionProviderKind {
     Cpu,
     Metal,
     Cuda,
+    Rocm,
 }
 
 impl ExecutionProviderKind {
@@ -17,14 +18,16 @@ impl ExecutionProviderKind {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
             Self::Cuda => "cuda",
+            Self::Rocm => "rocm",
         }
     }
 
     pub fn from_str(value: &str) -> Option<Self> {
-        match value {
+        match value.trim().to_ascii_lowercase().as_str() {
             "cpu" => Some(Self::Cpu),
             "metal" => Some(Self::Metal),
             "cuda" => Some(Self::Cuda),
+            "rocm" => Some(Self::Rocm),
             _ => None,
         }
     }
@@ -36,6 +39,7 @@ pub enum ProviderCompatibilityClass {
     CpuPortable,
     MetalFastPath,
     CudaFastPath,
+    RocmFastPath,
     HeterogeneousPortable,
 }
 
@@ -88,11 +92,13 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Cpu => ProviderCompatibilityClass::CpuPortable,
             ExecutionProviderKind::Metal => ProviderCompatibilityClass::MetalFastPath,
             ExecutionProviderKind::Cuda => ProviderCompatibilityClass::CudaFastPath,
+            ExecutionProviderKind::Rocm => ProviderCompatibilityClass::RocmFastPath,
         };
         let optimization_profile = match provider {
             ExecutionProviderKind::Cpu => "cpu_serial",
             ExecutionProviderKind::Metal => "metal_vectorized",
             ExecutionProviderKind::Cuda => "cuda_fused",
+            ExecutionProviderKind::Rocm => "rocm_fused",
         }
         .to_string();
         let supports_decode_microbatch = true;
@@ -104,6 +110,7 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Cpu => MemoryModel::SystemRam,
             ExecutionProviderKind::Metal => MemoryModel::UnifiedMemory,
             ExecutionProviderKind::Cuda => MemoryModel::DiscreteVram,
+            ExecutionProviderKind::Rocm => MemoryModel::DiscreteVram,
         };
         let implementation_maturity = ProviderImplementationMaturity::VerifiedFastPath;
         let verified_runtime = match provider {
@@ -122,6 +129,13 @@ impl BackendContractDescriptor {
                 device_sampling: false,
             },
             ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
+                fast_path_serving: true,
+                decode_microbatch: true,
+                paged_kv: true,
+                checkpoint_handoff: true,
+                device_sampling: true,
+            },
+            ExecutionProviderKind::Rocm => VerifiedRuntimeCapabilities {
                 fast_path_serving: true,
                 decode_microbatch: true,
                 paged_kv: true,
@@ -213,4 +227,31 @@ pub struct ExecutionProviderInfo {
     pub available: bool,
     pub reason: Option<String>,
     pub contract: BackendContractDescriptor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_parser_accepts_normalized_rocm_label() {
+        assert_eq!(
+            ExecutionProviderKind::from_str(" ROCM "),
+            Some(ExecutionProviderKind::Rocm)
+        );
+    }
+
+    #[test]
+    fn rocm_contract_is_discrete_fast_path_contract() {
+        let contract = BackendContractDescriptor::for_provider(ExecutionProviderKind::Rocm);
+
+        assert_eq!(contract.provider, ExecutionProviderKind::Rocm);
+        assert_eq!(
+            contract.compatibility_class,
+            ProviderCompatibilityClass::RocmFastPath
+        );
+        assert_eq!(contract.optimization_profile, "rocm_fused");
+        assert_eq!(contract.memory_model, MemoryModel::DiscreteVram);
+        assert!(contract.supports_production_serving());
+    }
 }

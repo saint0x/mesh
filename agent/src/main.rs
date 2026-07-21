@@ -381,7 +381,7 @@ enum DeviceCommands {
         #[arg(short, long = "control-plane", default_value = "http://localhost:8080")]
         control_plane_url: String,
 
-        /// Preferred execution provider to register and run on (`cpu`, `metal`, `cuda`)
+        /// Preferred execution provider to register and run on (`cpu`, `metal`, `cuda`, `rocm`)
         #[arg(long)]
         preferred_provider: Option<String>,
     },
@@ -688,7 +688,7 @@ pub(crate) async fn cmd_init(
     if let Some(provider) = preferred_provider.as_deref() {
         let parsed = agent::ExecutionProviderKind::from_str(provider).ok_or_else(|| {
             anyhow::anyhow!(
-                "Unsupported execution provider '{}'. Expected one of: cpu, metal, cuda",
+                "Unsupported execution provider '{}'. Expected one of: cpu, metal, cuda, rocm",
                 provider
             )
         })?;

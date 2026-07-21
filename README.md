@@ -66,6 +66,7 @@ For constrained networks, Mesh can also use a relay for peer connectivity, but t
   - `cpu`
   - `metal`
   - `cuda`
+  - `rocm`
 - pool creation and LAN peer discovery
 - credit accounting tied to real worker participation
 
@@ -107,13 +108,17 @@ Mesh now exposes one execution architecture with explicit provider selection und
 - `cpu`: baseline runtime for broad compatibility, including Intel Macs and CPU-only Linux machines
 - `metal`: native Apple path for Apple Silicon workers
 - `cuda`: native Linux/NVIDIA path for datacenter and workstation GPUs
+- `rocm`: native Linux/AMD provider contract for HIP/ROCm workers
 
 Provider choice is part of node configuration and capability reporting. Nodes advertise the providers they can actually run, the control plane stores that inventory, and the agent binds the tensor backend to the selected provider at startup. There is no silent provider fallback path.
+
+The ROCm provider is fail-closed by design. Mesh recognizes ROCm as a first-class accelerator contract and will detect host ROCm runtime markers, but live ROCm tensor execution requires a native HIP/ROCm tensor backend to be linked into the agent. Until that backend is present, selecting `rocm` reports the provider as unavailable instead of running the shard on CPU under an AMD label.
 
 Default provider selection is simple:
 
 - prefer `metal` when available
 - otherwise prefer `cuda` when available
+- otherwise prefer `rocm` when available
 - otherwise use `cpu`
 
 To pin a node to a provider, set it in `~/.meshnet/device.toml`:

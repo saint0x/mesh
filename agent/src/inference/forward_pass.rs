@@ -57,9 +57,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::engine::CollectiveResidency;
-use super::kv_cache::{
-    KVCache, KVCacheConfig, KVCacheSnapshot, LiveKVBlockSpan, LiveKVBlockTable,
-};
+use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot, LiveKVBlockSpan, LiveKVBlockTable};
 use super::runtime::{
     apply_rope_device as apply_rope_candle, device_tensor_from_1d as to_candle_1d,
     device_tensor_from_2d as to_candle_2d, host_tensor_2d_from_device as from_candle_2d,
@@ -2038,10 +2036,7 @@ impl ForwardPass {
             Ok(token)
         } else {
             sample_token_device(&logits, temperature, top_p, seed).map_err(|device_err| {
-                AgentError::Execution(format!(
-                    "Device stochastic sampling failed: {}",
-                    device_err
-                ))
+                AgentError::Execution(format!("Device stochastic sampling failed: {}", device_err))
             })
         }
     }
@@ -2077,7 +2072,9 @@ impl ForwardPass {
         } else {
             let mut final_hidden = None;
             let mut workspace = workspace;
-            for (segment_idx, chunk) in retained_tokens.chunks(effective_segment_ceiling).enumerate()
+            for (segment_idx, chunk) in retained_tokens
+                .chunks(effective_segment_ceiling)
+                .enumerate()
             {
                 let absolute_segment_start =
                     start.saturating_add(segment_idx.saturating_mul(effective_segment_ceiling));
@@ -2095,7 +2092,9 @@ impl ForwardPass {
                 final_hidden = Some(hidden);
             }
             final_hidden.ok_or_else(|| {
-                AgentError::Execution("Chunked prefill produced no terminal hidden state".to_string())
+                AgentError::Execution(
+                    "Chunked prefill produced no terminal hidden state".to_string(),
+                )
             })?
         };
         self.last_allreduce_metrics = aggregated_metrics;

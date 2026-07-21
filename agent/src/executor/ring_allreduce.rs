@@ -448,8 +448,9 @@ impl StageSendScratch {
             Self::Vec(_) => true,
         };
         if needs_realloc {
-            let pinned = unsafe { stream.context().alloc_pinned::<f32>(len) }
-                .map_err(|err| AgentError::Execution(format!("CUDA pinned host allocation failed: {err}")))?;
+            let pinned = unsafe { stream.context().alloc_pinned::<f32>(len) }.map_err(|err| {
+                AgentError::Execution(format!("CUDA pinned host allocation failed: {err}"))
+            })?;
             *self = Self::CudaPinned(pinned);
         }
         match self {
@@ -664,12 +665,14 @@ pub enum CollectiveOptimizationProfile {
     CpuLowFanout,
     MetalBalanced,
     CudaHighThroughput,
+    RocmHighThroughput,
 }
 
 impl CollectiveOptimizationProfile {
     fn for_provider(provider: ExecutionProviderKind) -> Self {
         match provider {
             ExecutionProviderKind::Cuda => Self::CudaHighThroughput,
+            ExecutionProviderKind::Rocm => Self::RocmHighThroughput,
             ExecutionProviderKind::Metal => Self::MetalBalanced,
             ExecutionProviderKind::Cpu => Self::CpuLowFanout,
         }
@@ -1074,10 +1077,8 @@ impl<'a> WorkerRing<'a> {
 
         for step in 0..(n - 1) {
             let step_plan = &plan.reduce_scatter_steps[step];
-            let stage_mode = partial_result.stage_send_chunk(
-                step_plan.send_range.clone(),
-                &mut send_stage_scratch,
-            )?;
+            let stage_mode = partial_result
+                .stage_send_chunk(step_plan.send_range.clone(), &mut send_stage_scratch)?;
             if matches!(stage_mode, StageSendChunkMode::HostMaterializedScratch) {
                 host_materialized_this_collective = true;
                 run_metrics.host_materialization_bytes +=
@@ -1116,10 +1117,8 @@ impl<'a> WorkerRing<'a> {
 
         for step in 0..(n - 1) {
             let step_plan = &plan.all_gather_steps[step];
-            let stage_mode = partial_result.stage_send_chunk(
-                step_plan.send_range.clone(),
-                &mut send_stage_scratch,
-            )?;
+            let stage_mode = partial_result
+                .stage_send_chunk(step_plan.send_range.clone(), &mut send_stage_scratch)?;
             if matches!(stage_mode, StageSendChunkMode::HostMaterializedScratch) {
                 host_materialized_this_collective = true;
                 run_metrics.host_materialization_bytes +=
@@ -1187,8 +1186,7 @@ impl<'a> WorkerRing<'a> {
         run_metrics.reduce_scatter_step_time_ms = step_started.elapsed().as_millis() as u64;
         run_metrics.send_wait_time_ms = send_wait_ms;
         run_metrics.receive_wait_time_ms = receive_wait_ms;
-        run_metrics.bytes_sent =
-            (partial_result.data.len() * std::mem::size_of::<f32>()) as u64;
+        run_metrics.bytes_sent = (partial_result.data.len() * std::mem::size_of::<f32>()) as u64;
         run_metrics.bytes_received = recv_msg.payload_bytes().len() as u64;
 
         if recv_msg.element_count() != partial_result.data.len() {
@@ -1237,7 +1235,8 @@ impl<'a> WorkerRing<'a> {
                 partial_result.len()
             )));
         }
-        partial_result.accumulate_range_from_wire_bytes(0..partial_result.len(), recv_msg.payload_bytes());
+        partial_result
+            .accumulate_range_from_wire_bytes(0..partial_result.len(), recv_msg.payload_bytes());
         self.last_run_metrics = run_metrics;
         Ok(partial_result)
     }
@@ -1255,8 +1254,7 @@ impl<'a> WorkerRing<'a> {
         let mut run_metrics = self.pairwise_fast_path_metrics();
         if matches!(stage_mode, StageSendChunkMode::HostMaterializedScratch) {
             run_metrics.host_materialization_count = 1;
-            run_metrics.host_materialization_bytes =
-                (len * std::mem::size_of::<f32>()) as u64;
+            run_metrics.host_materialization_bytes = (len * std::mem::size_of::<f32>()) as u64;
         }
         let step_started = std::time::Instant::now();
         let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -2165,19 +2163,11 @@ mod tests {
         let peer_b = PeerId::random();
 
         let session_a = plane_a
-            .serving_transport_for_neighbors(
-                addr_b,
-                addr_b,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(addr_b, addr_b, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
         let session_b = plane_b
-            .serving_transport_for_neighbors(
-                addr_a,
-                addr_a,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(addr_a, addr_a, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
 
@@ -2249,19 +2239,11 @@ mod tests {
         let peer_b = PeerId::random();
 
         let session_a = plane_a
-            .serving_transport_for_neighbors(
-                addr_b,
-                addr_b,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(addr_b, addr_b, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
         let session_b = plane_b
-            .serving_transport_for_neighbors(
-                addr_a,
-                addr_a,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(addr_a, addr_a, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
 

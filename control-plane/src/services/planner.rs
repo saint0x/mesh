@@ -736,7 +736,7 @@ fn candidate_groups(
     runtime_mode: InferenceRuntimeMode,
 ) -> Vec<Vec<ExecutionGroupMember>> {
     let mut candidates = Vec::new();
-    for island in build_execution_islands(&manifest.model_id, phase, members) {
+    for island in build_execution_islands(manifest, phase, members) {
         for rule in manifest.layout_rules_for_phase(phase) {
             for candidate in candidates_for_rule(manifest, &island.members, runtime_mode, &rule) {
                 push_unique_candidate(&mut candidates, candidate);
@@ -757,7 +757,7 @@ fn candidate_groups(
 }
 
 fn build_execution_islands(
-    model_id: &str,
+    manifest: &ModelManifest,
     phase: ExecutionPhase,
     members: &[ExecutionGroupMember],
 ) -> Vec<ExecutionIsland> {
@@ -785,7 +785,7 @@ fn build_execution_islands(
     for ((compatibility_class, contract_hash), grouped_members) in grouped {
         islands.push(ExecutionIsland {
             island_id: execution_island_id(
-                model_id,
+                &manifest.model_id,
                 phase,
                 compatibility_class,
                 contract_hash.as_str(),
@@ -798,7 +798,50 @@ fn build_execution_islands(
         });
     }
 
+    let heterogeneous_accelerators = members
+        .iter()
+        .filter(|member| is_heterogeneous_accelerator_member(member))
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(grouped_members) = canonical_tensor_parallel_group(
+        &heterogeneous_accelerators,
+        manifest.tensor_parallelism_dim,
+    ) {
+        let unique_accelerator_providers = grouped_members
+            .iter()
+            .map(|member| member.backend_contract.provider)
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_accelerator_providers.len() <= 1 {
+            return islands;
+        }
+        islands.push(ExecutionIsland {
+            island_id: execution_island_id(
+                &manifest.model_id,
+                phase,
+                ProviderCompatibilityClass::HeterogeneousPortable,
+                "portable",
+            ),
+            compatibility_class: ProviderCompatibilityClass::HeterogeneousPortable,
+            backend_contract_hash: None,
+            fast_path_eligible: true,
+            protocol_class: RingProtocolClass::ProviderHeterogeneousPortableRing,
+            members: grouped_members,
+        });
+    }
+
     islands
+}
+
+fn is_heterogeneous_accelerator_member(member: &ExecutionGroupMember) -> bool {
+    member.backend_contract.fast_path_eligible
+        && member.backend_contract.supports_paged_kv
+        && member.backend_contract.supports_decode_microbatch
+        && member.backend_contract.supports_checkpoint_handoff
+        && member.backend_contract.supports_device_sampling
+        && !matches!(
+            member.backend_contract.compatibility_class,
+            ProviderCompatibilityClass::CpuPortable
+        )
 }
 
 fn execution_island_id(
@@ -848,8 +891,31 @@ fn classify_execution_island(
         });
     }
 
+    let unique_accelerator_providers = members
+        .iter()
+        .filter(|member| is_heterogeneous_accelerator_member(member))
+        .map(|member| member.backend_contract.provider)
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_accelerator_providers.len() > 1
+        && members.iter().all(is_heterogeneous_accelerator_member)
+    {
+        return Ok(ExecutionIsland {
+            island_id: execution_island_id(
+                model_id,
+                phase,
+                ProviderCompatibilityClass::HeterogeneousPortable,
+                "portable",
+            ),
+            compatibility_class: ProviderCompatibilityClass::HeterogeneousPortable,
+            backend_contract_hash: None,
+            fast_path_eligible: true,
+            protocol_class: RingProtocolClass::ProviderHeterogeneousPortableRing,
+            members: members.to_vec(),
+        });
+    }
+
     Err(ApiError::Conflict(format!(
-        "production execution island for model {} phase {:?} must be homogeneous fast-path",
+        "production execution island for model {} phase {:?} must be homogeneous fast-path or heterogeneous accelerator portable",
         model_id, phase
     )))
 }
@@ -1690,6 +1756,7 @@ mod tests {
             "cpu" => ExecutionProviderKind::Cpu,
             "metal" => ExecutionProviderKind::Metal,
             "cuda" => ExecutionProviderKind::Cuda,
+            "rocm" => ExecutionProviderKind::Rocm,
             other => panic!("unknown provider {other}"),
         };
         PlannerDeviceMetadata {
@@ -1751,6 +1818,61 @@ mod tests {
             plan.execution_groups[1].kv_transfer_policy,
             KvTransferPolicy::CoLocated
         ));
+    }
+
+    #[test]
+    fn planner_builds_heterogeneous_accelerator_ring_for_metal_rocm_tensor_parallel() {
+        model_assets::testsupport::ensure_test_model("planner-heterogeneous-accelerator", 20);
+        model_assets::clear_model_asset_cache();
+
+        let plan = ExecutionPlanner::plan(
+            &SubmitInferenceRequest {
+                request_id: "planner-request".into(),
+                device_id: "submitter".to_string(),
+                network_id: "net".to_string(),
+                model_id: "planner-heterogeneous-accelerator".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: 32,
+                temperature: 0.7,
+                top_p: 0.9,
+            },
+            &[1, 2, 3],
+            &RingTopology {
+                workers: vec![
+                    worker_with_model_range("planner-heterogeneous-accelerator", "mac", 0, 0, 10),
+                    worker_with_model_range("planner-heterogeneous-accelerator", "gmk", 1, 10, 20),
+                ],
+                ring_stable: true,
+                peer_punch_plans: vec![],
+            },
+            &InferenceSchedulingPolicy::default(),
+            &[planner_metadata(4, "metal"), planner_metadata(16, "rocm")],
+        )
+        .unwrap();
+
+        let decode_group = plan
+            .execution_groups
+            .iter()
+            .find(|group| matches!(group.phase, ExecutionPhase::Decode))
+            .expect("expected decode group");
+        assert_eq!(
+            decode_group.compatibility_class,
+            ProviderCompatibilityClass::HeterogeneousPortable
+        );
+        assert_eq!(
+            decode_group.protocol_class,
+            RingProtocolClass::ProviderHeterogeneousPortableRing
+        );
+        assert!(decode_group.backend_contract_hash.is_none());
+        assert_eq!(
+            decode_group
+                .members
+                .iter()
+                .map(|member| member.backend_contract.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["metal", "rocm"]
+        );
+        assert_eq!(decode_group.total_capacity_units, 20);
     }
 
     #[test]

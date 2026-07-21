@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::IoSlice;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -2178,11 +2178,13 @@ fn preferred_serving_stream_count(
     match profile {
         TensorPlaneProfile::Conservative => match provider {
             ExecutionProviderKind::Cuda => max_streams,
+            ExecutionProviderKind::Rocm => max_streams,
             ExecutionProviderKind::Metal => 2.min(max_streams),
             ExecutionProviderKind::Cpu => 1,
         },
         TensorPlaneProfile::Lan => match provider {
             ExecutionProviderKind::Cuda => max_streams,
+            ExecutionProviderKind::Rocm => max_streams,
             ExecutionProviderKind::Metal => max_streams.min(3).max(2),
             ExecutionProviderKind::Cpu => 1,
         },
@@ -2202,11 +2204,11 @@ fn lane_plan(
     };
     let control_streams = 1;
     let checkpoint_streams = match (profile, provider) {
-        (TensorPlaneProfile::Lan, ExecutionProviderKind::Cuda) => {
-            bulk_streams.min(3).max(1)
-        }
+        (TensorPlaneProfile::Lan, ExecutionProviderKind::Cuda) => bulk_streams.min(3).max(1),
+        (TensorPlaneProfile::Lan, ExecutionProviderKind::Rocm) => bulk_streams.min(3).max(1),
         (TensorPlaneProfile::Lan, ExecutionProviderKind::Metal)
         | (TensorPlaneProfile::Conservative, ExecutionProviderKind::Cuda)
+        | (TensorPlaneProfile::Conservative, ExecutionProviderKind::Rocm)
         | (TensorPlaneProfile::Conservative, ExecutionProviderKind::Metal) => interactive_streams,
         _ => 1,
     };
@@ -2230,7 +2232,12 @@ fn serving_lane_plans(
     max_streams: usize,
 ) -> [ServingLanePlan; 5] {
     [
-        lane_plan(CollectiveLane::ReduceScatter, profile, provider, max_streams),
+        lane_plan(
+            CollectiveLane::ReduceScatter,
+            profile,
+            provider,
+            max_streams,
+        ),
         lane_plan(CollectiveLane::AllGather, profile, provider, max_streams),
         lane_plan(CollectiveLane::Control, profile, provider, max_streams),
         lane_plan(CollectiveLane::BulkTransfer, profile, provider, max_streams),
@@ -2454,7 +2461,8 @@ where
             .min(remaining_payload);
         payload_offset += consumed_payload;
 
-        let consumed_pad = written.saturating_sub(consumed_header + consumed_prefix + consumed_payload);
+        let consumed_pad =
+            written.saturating_sub(consumed_header + consumed_prefix + consumed_payload);
         pad_offset += consumed_pad.min(pad_len.saturating_sub(pad_offset));
     }
     Ok(())
@@ -2796,10 +2804,7 @@ mod tests {
         .unwrap();
 
         plane
-            .prepare_serving_peer_channels(
-                &[plane.local_addr()],
-                ExecutionProviderKind::Cuda,
-            )
+            .prepare_serving_peer_channels(&[plane.local_addr()], ExecutionProviderKind::Cuda)
             .await
             .unwrap();
 
@@ -2848,11 +2853,7 @@ mod tests {
         let target = plane.local_addr();
 
         plane
-            .serving_transport_for_neighbors(
-                target,
-                target,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(target, target, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
 
@@ -2872,11 +2873,7 @@ mod tests {
         let target = plane.local_addr();
 
         plane
-            .serving_transport_for_neighbors(
-                target,
-                target,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(target, target, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
         wait_for_metric(&plane, |snapshot| {
@@ -2885,11 +2882,7 @@ mod tests {
         .await;
 
         plane
-            .serving_transport_for_neighbors(
-                target,
-                target,
-                ExecutionProviderKind::Cpu,
-            )
+            .serving_transport_for_neighbors(target, target, ExecutionProviderKind::Cpu)
             .await
             .unwrap();
 

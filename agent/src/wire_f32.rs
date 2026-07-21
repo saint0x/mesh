@@ -135,7 +135,8 @@ mod tests {
         let src = [5.0f32, 6.0, 7.0];
         let mut scratch = vec![0.0f32; 8];
         let original_capacity = scratch.capacity();
-        let decoded = decode_into_f32_scratch(src.len(), bytes_from_f32(&src), &mut scratch).unwrap();
+        let decoded =
+            decode_into_f32_scratch(src.len(), bytes_from_f32(&src), &mut scratch).unwrap();
         assert_eq!(decoded, src);
         assert_eq!(scratch.capacity(), original_capacity);
     }

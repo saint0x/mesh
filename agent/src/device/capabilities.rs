@@ -7,6 +7,12 @@ use crate::provider::{
     BackendContractDescriptor, ExecutionProviderInfo, ExecutionProviderKind, MemoryModel,
 };
 
+fn parse_first_number(line: &str) -> Option<usize> {
+    line.split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse::<usize>().ok())
+}
+
 /// Device tier classification based on hardware specs.
 ///
 /// Tiers determine credit multipliers for job execution:
@@ -187,6 +193,12 @@ impl DeviceCapabilities {
         {
             return Self::detect_cuda_vram_mb();
         }
+        if providers
+            .iter()
+            .any(|provider| provider.kind == ExecutionProviderKind::Rocm && provider.available)
+        {
+            return Self::detect_rocm_vram_mb();
+        }
         None
     }
 
@@ -202,6 +214,48 @@ impl DeviceCapabilities {
         stdout
             .lines()
             .find_map(|line| line.trim().parse::<usize>().ok())
+    }
+
+    fn detect_rocm_vram_mb() -> Option<usize> {
+        Self::detect_rocm_vram_from_sysfs_mb().or_else(Self::detect_rocm_vram_from_smi_mb)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_rocm_vram_from_sysfs_mb() -> Option<usize> {
+        let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with("card") || name.contains('-') {
+                    return None;
+                }
+                std::fs::read_to_string(entry.path().join("device/mem_info_vram_total")).ok()
+            })
+            .filter_map(|value| value.trim().parse::<usize>().ok())
+            .map(|bytes| bytes / 1_048_576)
+            .max()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_rocm_vram_from_sysfs_mb() -> Option<usize> {
+        None
+    }
+
+    fn detect_rocm_vram_from_smi_mb() -> Option<usize> {
+        let output = Command::new("rocm-smi")
+            .args(["--showmeminfo", "vram"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        stdout
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("total memory"))
+            .filter_map(parse_first_number)
+            .max()
     }
 
     /// Detect operating system.

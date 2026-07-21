@@ -2518,7 +2518,9 @@ fn default_protocol_class(compatibility_class: ProviderCompatibilityClass) -> Ri
             RingProtocolClass::ProviderHeterogeneousPortableRing
         }
         ProviderCompatibilityClass::CpuPortable => RingProtocolClass::UniformModelRing,
-        ProviderCompatibilityClass::MetalFastPath | ProviderCompatibilityClass::CudaFastPath => {
+        ProviderCompatibilityClass::MetalFastPath
+        | ProviderCompatibilityClass::CudaFastPath
+        | ProviderCompatibilityClass::RocmFastPath => {
             RingProtocolClass::ProviderHomogeneousFastRing
         }
     }

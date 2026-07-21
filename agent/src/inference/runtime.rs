@@ -3,9 +3,7 @@ use crate::executor::ring_allreduce::{
     StageSendChunkMode, StageSendScratch, StagedCollectiveBuffer,
 };
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use crate::wire_f32::{
-    accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch,
-};
+use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch};
 #[cfg(target_os = "linux")]
 use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
 #[cfg(target_os = "linux")]
@@ -95,6 +93,7 @@ pub(crate) fn probe_provider(provider: ExecutionProviderKind) -> (bool, Option<S
         ExecutionProviderKind::Cpu => (true, None),
         ExecutionProviderKind::Metal => probe_metal_provider(),
         ExecutionProviderKind::Cuda => probe_cuda_provider(),
+        ExecutionProviderKind::Rocm => probe_rocm_provider(),
     }
 }
 
@@ -142,6 +141,49 @@ fn probe_cuda_provider() -> (bool, Option<String>) {
     }
 }
 
+fn probe_rocm_provider() -> (bool, Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        if !host_has_rocm_runtime() {
+            return (
+                false,
+                Some("rocm runtime probe failed: rocminfo, rocm-smi, and HIP runtime markers were not found".to_string()),
+            );
+        }
+        (
+            false,
+            Some(
+                "rocm runtime detected, but this Mesh build does not link a native HIP/ROCm tensor backend; refusing CPU fallback"
+                    .to_string(),
+            ),
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        (
+            false,
+            Some("rocm provider is only available on Linux builds".to_string()),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_has_rocm_runtime() -> bool {
+    std::process::Command::new("rocminfo")
+        .arg("--help")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        || std::process::Command::new("rocm-smi")
+            .arg("--help")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        || std::path::Path::new("/opt/rocm").exists()
+        || std::path::Path::new("/dev/kfd").exists()
+}
+
 pub(crate) fn execution_device() -> Result<&'static RuntimeDevice> {
     static DEVICE: OnceLock<std::result::Result<RuntimeDevice, String>> = OnceLock::new();
     match DEVICE.get_or_init(|| init_execution_device().map_err(|e| e.to_string())) {
@@ -169,6 +211,10 @@ fn init_execution_device() -> std::result::Result<RuntimeDevice, RuntimeError> {
                 ))
             }
         }
+        ExecutionProviderKind::Rocm => Err(RuntimeError::Msg(
+            "rocm provider requires a native HIP/ROCm tensor backend; this Mesh build refuses CPU fallback"
+                .to_string(),
+        )),
         ExecutionProviderKind::Metal => {
             #[cfg(target_os = "macos")]
             {
@@ -455,8 +501,9 @@ impl DeviceCollectiveBuffer {
         if let Some(storage) = &self.shared_metal {
             let scratch = scratch.ensure_vec(range.len());
             let len = self.len();
-            let staged =
-                unsafe { &slice::from_raw_parts(storage.buffer().contents() as *const f32, len)[range] };
+            let staged = unsafe {
+                &slice::from_raw_parts(storage.buffer().contents() as *const f32, len)[range]
+            };
             scratch.extend_from_slice(staged);
             return Ok(StageSendChunkMode::SharedVisibleScratch);
         }
@@ -549,10 +596,10 @@ impl DeviceCollectiveBuffer {
         payload_bytes: &[u8],
     ) -> Result<DeviceTensor> {
         #[cfg(target_os = "linux")]
-        if let Some(tensor) = self.cuda_upload_tensor_from_wire_bytes(expected_len, payload_bytes)? {
-            record_runtime_collective_host_restore(
-                payload_bytes.len() as u64,
-            );
+        if let Some(tensor) =
+            self.cuda_upload_tensor_from_wire_bytes(expected_len, payload_bytes)?
+        {
+            record_runtime_collective_host_restore(payload_bytes.len() as u64);
             return Ok(tensor);
         }
 
@@ -563,9 +610,7 @@ impl DeviceCollectiveBuffer {
         )?;
         let update = DeviceTensor::from_slice(payload, payload.len(), self.flat.device())
             .map_err(runtime_error)?;
-        record_runtime_collective_host_restore(
-            payload_bytes.len() as u64,
-        );
+        record_runtime_collective_host_restore(payload_bytes.len() as u64);
         Ok(update)
     }
 
@@ -590,7 +635,10 @@ impl DeviceCollectiveBuffer {
             .clone_htod(pinned)
             .map_err(runtime_error)?;
         let tensor = DeviceTensor::from_storage(
-            Storage::Cuda(CudaStorage::wrap_cuda_slice(upload, cuda_storage.device().clone())),
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(
+                upload,
+                cuda_storage.device().clone(),
+            )),
             payload.len(),
             candle_core::op::BackpropOp::none(),
             false,
@@ -614,9 +662,9 @@ impl DeviceCollectiveBuffer {
             })?;
             self.cuda_receive_pinned = Some(pinned);
         }
-        self.cuda_receive_pinned
-            .as_mut()
-            .ok_or_else(|| AgentError::Execution("CUDA pinned receive host buffer missing".to_string()))
+        self.cuda_receive_pinned.as_mut().ok_or_else(|| {
+            AgentError::Execution("CUDA pinned receive host buffer missing".to_string())
+        })
     }
 
     pub(crate) fn into_device_tensor_like(self, template: &DeviceTensor) -> Result<DeviceTensor> {
@@ -667,8 +715,12 @@ fn stage_send_chunk_from_dense_cuda_tensor(
             if start == 0 && total_len == elem_count {
                 let src = cuda_storage.as_cuda_slice::<f32>().map_err(runtime_error)?;
                 let src = src.slice(range.start..range.end);
-                let pinned = scratch.ensure_cuda_pinned(&cuda_storage.device().cuda_stream(), range.len())?;
-                cuda_storage.device().memcpy_dtoh(&src, pinned).map_err(runtime_error)?;
+                let pinned = scratch
+                    .ensure_cuda_pinned(&cuda_storage.device().cuda_stream(), range.len())?;
+                cuda_storage
+                    .device()
+                    .memcpy_dtoh(&src, pinned)
+                    .map_err(runtime_error)?;
                 return Ok(Some(StageSendChunkMode::HostMaterializedScratch));
             }
         }
@@ -799,7 +851,9 @@ mod tests {
         let mut buffer = DeviceCollectiveBuffer::from_device_tensor(&template).unwrap();
         let mut send_scratch = StageSendScratch::default();
 
-        let _ = buffer.stage_send_chunk_impl(0..2, &mut send_scratch).unwrap();
+        let _ = buffer
+            .stage_send_chunk_impl(0..2, &mut send_scratch)
+            .unwrap();
         let first_row = send_scratch.as_slice(2).unwrap().to_vec();
         assert_eq!(first_row, vec![1.0, 2.0]);
 
@@ -809,7 +863,9 @@ mod tests {
             .unwrap();
 
         let replace = wire_bytes(&[7.0f32, 8.0f32]);
-        buffer.copy_range_from_wire_bytes_impl(2..4, &replace).unwrap();
+        buffer
+            .copy_range_from_wire_bytes_impl(2..4, &replace)
+            .unwrap();
 
         let restored =
             host_tensor_2d_from_device(&buffer.into_device_tensor_like(&template).unwrap())
