@@ -10,12 +10,74 @@ from safetensors import safe_open
 from safetensors.numpy import save_file
 
 
-def load_model_metadata(model_dir: Path) -> tuple[dict, int, int, int]:
+def optional_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def first_int(*values, field_name: str) -> int:
+    for value in values:
+        parsed = optional_int(value)
+        if parsed is not None:
+            return parsed
+    raise ValueError(f"unable to resolve required model field {field_name}")
+
+
+def load_shard_metadata(model_dir: Path) -> dict[str, str]:
+    shard_path = model_dir / "shard-0-of-2.safetensors"
+    if not shard_path.exists():
+        return {}
+    with safe_open(str(shard_path), framework="np") as shard:
+        return dict(shard.metadata())
+
+
+def load_model_metadata(model_dir: Path, repo_config: dict | None) -> tuple[dict, int, int, int]:
     model = json.loads((model_dir / "model.json").read_text(encoding="utf-8"))
-    hidden_dim = int(model["tensor_parallelism_dim"])
-    num_heads = int(model["attention_head_count"])
-    num_kv_heads = int(model["kv_head_count"])
+    shard_metadata = load_shard_metadata(model_dir)
+    config = repo_config or {}
+    hidden_dim = first_int(
+        model.get("tensor_parallelism_dim"),
+        config.get("hidden_size"),
+        shard_metadata.get("mesh.hidden_dim"),
+        field_name="tensor_parallelism_dim",
+    )
+    num_heads = first_int(
+        model.get("attention_head_count"),
+        config.get("num_attention_heads"),
+        shard_metadata.get("mesh.num_heads"),
+        field_name="attention_head_count",
+    )
+    num_kv_heads = first_int(
+        model.get("kv_head_count"),
+        config.get("num_key_value_heads"),
+        shard_metadata.get("mesh.num_kv_heads"),
+        num_heads,
+        field_name="kv_head_count",
+    )
+    model["tensor_parallelism_dim"] = hidden_dim
+    model["attention_head_count"] = num_heads
+    model["kv_head_count"] = num_kv_heads
+    layer_count = optional_int(
+        model.get("transformer_layer_count")
+        or config.get("num_hidden_layers")
+        or shard_metadata.get("mesh.num_layers")
+    )
+    if layer_count is not None:
+        model["transformer_layer_count"] = layer_count
+    if optional_int(model.get("total_model_bytes")) is None:
+        model["total_model_bytes"] = sum(path.stat().st_size for path in model_dir.glob("shard-*-of-*.safetensors"))
     return model, hidden_dim, num_heads, num_kv_heads
+
+
+def write_model_manifest(model_dir: Path, model: dict) -> None:
+    (model_dir / "model.json").write_text(
+        json.dumps(model, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def rewrite_manifests(model_dir: Path, model_id: str, shard_ranges: list[tuple[int, int]]) -> None:
@@ -95,8 +157,9 @@ def main() -> None:
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir).expanduser().resolve()
-    model, hidden_dim, num_heads, num_kv_heads = load_model_metadata(model_dir)
     repo_config = load_repo_config(args.repo_id)
+    model, hidden_dim, num_heads, num_kv_heads = load_model_metadata(model_dir, repo_config)
+    write_model_manifest(model_dir, model)
     if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         raise ValueError(
             f"unsupported grouped-query attention geometry: num_heads={num_heads} num_kv_heads={num_kv_heads}"
@@ -104,8 +167,12 @@ def main() -> None:
 
     shard0_path = model_dir / "shard-0-of-2.safetensors"
     shard1_path = model_dir / "shard-1-of-2.safetensors"
+    tmp_shard0_path = model_dir / ".shard-0-of-2.safetensors.tmp"
+    tmp_shard1_path = model_dir / ".shard-1-of-2.safetensors.tmp"
     if not shard0_path.exists() or not shard1_path.exists():
         raise FileNotFoundError("expected existing shard-0-of-2.safetensors and shard-1-of-2.safetensors")
+    tmp_shard0_path.unlink(missing_ok=True)
+    tmp_shard1_path.unlink(missing_ok=True)
 
     head_dim = hidden_dim // num_heads
     q_heads_per_kv_head = num_heads // num_kv_heads
@@ -223,7 +290,7 @@ def main() -> None:
             rewritten_shard1[f"{prefix}.w_down"] = np.ascontiguousarray(shard1.get_tensor(f"{prefix}.w_down"))
         save_file(
             rewritten_shard1,
-            str(shard1_path),
+            str(tmp_shard1_path),
             metadata=build_metadata(
                 shard1_metadata,
                 model["model_id"],
@@ -287,7 +354,7 @@ def main() -> None:
             rewritten_shard0[f"{prefix}.w_down"] = np.ascontiguousarray(shard0.get_tensor(f"{prefix}.w_down"))
         save_file(
             rewritten_shard0,
-            str(shard0_path),
+            str(tmp_shard0_path),
             metadata=build_metadata(
                 shard0_metadata,
                 model["model_id"],
@@ -305,6 +372,8 @@ def main() -> None:
             ),
         )
 
+    tmp_shard0_path.replace(shard0_path)
+    tmp_shard1_path.replace(shard1_path)
     rewrite_manifests(model_dir, model["model_id"], shard_ranges)
 
 

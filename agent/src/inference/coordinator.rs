@@ -507,6 +507,20 @@ impl InferenceCoordinator {
         }
     }
 
+    fn usize_saturating_from_u64(value: u64) -> usize {
+        usize::try_from(value).unwrap_or(usize::MAX)
+    }
+
+    fn apply_position_memory_budget(&mut self, position: &WorkerPosition) {
+        let shard_budget = Self::usize_saturating_from_u64(position.shard_memory_bytes).max(1);
+        self.config.max_total_runtime_bytes = self.config.max_total_runtime_bytes.max(shard_budget);
+        self.config.max_total_kv_cache_bytes = self
+            .config
+            .max_total_kv_cache_bytes
+            .max(shard_budget / 4)
+            .max(1);
+    }
+
     async fn drain_swarm_events(&mut self) -> Result<()> {
         loop {
             match self.swarm_control.event_rx.try_recv() {
@@ -1742,6 +1756,22 @@ impl InferenceCoordinator {
         Ok(model)
     }
 
+    pub async fn warm_model_residency_for_position(
+        &mut self,
+        position: &WorkerPosition,
+    ) -> Result<u64> {
+        let model = self
+            .get_or_load_model_residency(&position.model_id, position)
+            .await?;
+        let resident_bytes = model.resident_bytes();
+        if resident_bytes == 0 {
+            return Err(AgentError::Execution(
+                "assigned shard materialized with zero resident bytes".to_string(),
+            ));
+        }
+        Ok(u64::try_from(resident_bytes).unwrap_or(u64::MAX))
+    }
+
     /// Join the ring topology
     ///
     /// This sets up the worker's position and neighbors for ring all-reduce.
@@ -1755,6 +1785,8 @@ impl InferenceCoordinator {
             shard_range = ?position.shard_column_range,
             "Joining ring topology"
         );
+
+        self.apply_position_memory_budget(&position);
 
         self.swarm_control
             .command_tx
@@ -3883,6 +3915,39 @@ mod tests {
 
         assert!(!coordinator.sessions.contains_key(&session_a));
         assert!(coordinator.sessions.contains_key(&session_b));
+    }
+
+    #[test]
+    fn test_join_ring_applies_production_shard_memory_budget() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_total_kv_cache_bytes: 512 * 1024 * 1024,
+            max_total_runtime_bytes: 2 * 1024 * 1024 * 1024,
+            ..InferenceConfig::default()
+        });
+        let shard_budget = 6 * 1024 * 1024 * 1024_u64;
+        coordinator
+            .join_ring(WorkerPosition {
+                model_id: "test-model".to_string(),
+                position: 0,
+                total_workers: 2,
+                left_neighbor: PeerId::random(),
+                left_neighbor_addrs: vec![],
+                left_neighbor_punch_plan: None,
+                left_neighbor_tensor_addr: "127.0.0.1:5101".parse().unwrap(),
+                right_neighbor: PeerId::random(),
+                right_neighbor_addrs: vec![],
+                right_neighbor_punch_plan: None,
+                right_neighbor_tensor_addr: "127.0.0.1:5102".parse().unwrap(),
+                shard_column_range: (0, 1024),
+                shard_worker_position: 0,
+                shard_total_workers: 2,
+                shard_memory_bytes: shard_budget,
+            })
+            .expect("join ring");
+
+        let budget = coordinator.runtime_memory_budget();
+        assert_eq!(budget.max_total_runtime_bytes, shard_budget as usize);
+        assert_eq!(budget.max_total_kv_cache_bytes, (shard_budget / 4) as usize);
     }
 
     #[test]

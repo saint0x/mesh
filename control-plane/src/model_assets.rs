@@ -87,6 +87,15 @@ pub struct ModelManifest {
     pub execution_layout: ModelExecutionLayout,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ShardArtifactManifest {
+    model_id: String,
+    worker_position: u32,
+    total_workers: u32,
+    column_start: u32,
+    column_end: u32,
+}
+
 fn default_tokenizer_file() -> String {
     "tokenizer.json".to_string()
 }
@@ -503,6 +512,138 @@ fn get_model_assets(model_id: &str) -> Result<CachedModelAssets, ApiError> {
 
 pub fn load_model_manifest(model_id: &str) -> Result<ModelManifest, ApiError> {
     Ok(get_model_assets(model_id)?.manifest)
+}
+
+fn shard_manifest_position_for_total(path: &Path, total_workers: u32) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let suffix = format!("-of-{total_workers}.manifest.json");
+    let position = name.strip_prefix("shard-")?.strip_suffix(&suffix)?;
+    position.parse::<u32>().ok()
+}
+
+pub fn declared_tensor_parallel_shards(
+    model_id: &str,
+    total_workers: u32,
+) -> Result<Option<Vec<(u32, u32)>>, ApiError> {
+    if total_workers == 0 {
+        return Err(ApiError::BadRequest(
+            "total_workers must be greater than zero when resolving shard manifests".to_string(),
+        ));
+    }
+
+    let model_manifest = load_model_manifest(model_id)?;
+    let dir = model_dir(model_id);
+    let mut manifests = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|error| {
+        ApiError::BadRequest(format!(
+            "Failed to read model artifact directory {}: {}",
+            dir.display(),
+            error
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            ApiError::BadRequest(format!(
+                "Failed to inspect model artifact directory {}: {}",
+                dir.display(),
+                error
+            ))
+        })?;
+        let path = entry.path();
+        let Some(position) = shard_manifest_position_for_total(&path, total_workers) else {
+            continue;
+        };
+        manifests.push((position, path));
+    }
+
+    if manifests.is_empty() {
+        return Ok(None);
+    }
+    if manifests.len() != total_workers as usize {
+        return Err(ApiError::Conflict(format!(
+            "Model {} declares {} shard manifests for a {}-worker layout; expected exactly {}",
+            model_id,
+            manifests.len(),
+            total_workers,
+            total_workers
+        )));
+    }
+
+    manifests.sort_by_key(|(position, _)| *position);
+    let mut ranges = vec![(0_u32, 0_u32); total_workers as usize];
+    for (expected_position, (position, path)) in manifests.iter().enumerate() {
+        if *position as usize != expected_position {
+            return Err(ApiError::Conflict(format!(
+                "Model {} is missing shard manifest for worker position {} of {}",
+                model_id, expected_position, total_workers
+            )));
+        }
+        let bytes = fs::read(path).map_err(|error| {
+            ApiError::BadRequest(format!(
+                "Failed to read shard manifest {}: {}",
+                path.display(),
+                error
+            ))
+        })?;
+        let manifest: ShardArtifactManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            ApiError::BadRequest(format!(
+                "Failed to parse shard manifest {}: {}",
+                path.display(),
+                error
+            ))
+        })?;
+        if manifest.model_id != model_id
+            || manifest.worker_position != *position
+            || manifest.total_workers != total_workers
+        {
+            return Err(ApiError::Conflict(format!(
+                "Shard manifest {} does not match model {} worker {}/{}",
+                path.display(),
+                model_id,
+                position,
+                total_workers
+            )));
+        }
+        ranges[*position as usize] = (manifest.column_start, manifest.column_end);
+    }
+
+    validate_declared_shard_ranges(model_id, model_manifest.tensor_parallelism_dim, &ranges)?;
+    Ok(Some(ranges))
+}
+
+fn validate_declared_shard_ranges(
+    model_id: &str,
+    tensor_parallelism_dim: u32,
+    ranges: &[(u32, u32)],
+) -> Result<(), ApiError> {
+    let mut cursor = 0_u32;
+    for (position, (start, end)) in ranges.iter().copied().enumerate() {
+        if start >= end {
+            return Err(ApiError::Conflict(format!(
+                "Model {} shard {} declares empty span {}..{}",
+                model_id, position, start, end
+            )));
+        }
+        if start != cursor {
+            return Err(ApiError::Conflict(format!(
+                "Model {} shard {} starts at {}, expected contiguous cursor {}",
+                model_id, position, start, cursor
+            )));
+        }
+        if end > tensor_parallelism_dim {
+            return Err(ApiError::Conflict(format!(
+                "Model {} shard {} ends at {}, beyond tensor parallel dimension {}",
+                model_id, position, end, tensor_parallelism_dim
+            )));
+        }
+        cursor = end;
+    }
+    if cursor != tensor_parallelism_dim {
+        return Err(ApiError::Conflict(format!(
+            "Model {} shard manifests cover 0..{}, expected 0..{}",
+            model_id, cursor, tensor_parallelism_dim
+        )));
+    }
+    Ok(())
 }
 
 impl ModelManifest {
@@ -1001,6 +1142,31 @@ pub mod testsupport {
 mod tests {
     use super::*;
 
+    fn write_test_shard_manifest(
+        model_dir: &Path,
+        model_id: &str,
+        worker_position: u32,
+        total_workers: u32,
+        column_start: u32,
+        column_end: u32,
+    ) {
+        fs::write(
+            model_dir.join(format!(
+                "shard-{worker_position}-of-{total_workers}.manifest.json"
+            )),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "model_id": model_id,
+                "worker_position": worker_position,
+                "total_workers": total_workers,
+                "column_start": column_start,
+                "column_end": column_end,
+                "expected_sha256": "test"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_tokenize_prompt_applies_chat_template() {
         testsupport::ensure_test_model("chat-template-test", 64);
@@ -1024,5 +1190,49 @@ mod tests {
 
         assert_eq!(ids, expected_ids);
         assert_ne!(ids, raw_ids);
+    }
+
+    #[test]
+    fn declared_tensor_parallel_shards_resolves_exact_manifest_layout() {
+        let model_id = "declared-layout-test";
+        let model_dir = testsupport::ensure_test_model(model_id, 2048);
+        write_test_shard_manifest(&model_dir, model_id, 0, 2, 0, 1024);
+        write_test_shard_manifest(&model_dir, model_id, 1, 2, 1024, 2048);
+        clear_model_asset_cache();
+
+        let ranges = declared_tensor_parallel_shards(model_id, 2)
+            .unwrap()
+            .expect("declared layout");
+
+        assert_eq!(ranges, vec![(0, 1024), (1024, 2048)]);
+    }
+
+    #[test]
+    fn declared_tensor_parallel_shards_rejects_partial_manifest_layout() {
+        let model_id = "partial-layout-test";
+        let model_dir = testsupport::ensure_test_model(model_id, 2048);
+        write_test_shard_manifest(&model_dir, model_id, 0, 2, 0, 1024);
+        clear_model_asset_cache();
+
+        let error = declared_tensor_parallel_shards(model_id, 2).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("declares 1 shard manifests for a 2-worker layout"));
+    }
+
+    #[test]
+    fn declared_tensor_parallel_shards_rejects_non_contiguous_manifest_layout() {
+        let model_id = "gapped-layout-test";
+        let model_dir = testsupport::ensure_test_model(model_id, 2048);
+        write_test_shard_manifest(&model_dir, model_id, 0, 2, 0, 1000);
+        write_test_shard_manifest(&model_dir, model_id, 1, 2, 1024, 2048);
+        clear_model_asset_cache();
+
+        let error = declared_tensor_parallel_shards(model_id, 2).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("starts at 1024, expected contiguous cursor 1000"));
     }
 }

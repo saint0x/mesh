@@ -268,6 +268,34 @@ fn allocate_weighted_group_ranges(
         .collect())
 }
 
+fn resolve_ring_column_ranges(
+    model_id: &str,
+    manifest: &model_assets::ModelManifest,
+    profiles: &[WorkerCapacityProfile],
+    scheduling_policy: &InferenceSchedulingPolicy,
+) -> ApiResult<Vec<(u32, u32)>> {
+    if let Some(declared) =
+        model_assets::declared_tensor_parallel_shards(model_id, profiles.len() as u32)?
+    {
+        return Ok(declared);
+    }
+
+    if let Some(group_width) = model_assets::attention_group_width(manifest)? {
+        allocate_weighted_group_ranges(
+            manifest.tensor_parallelism_dim,
+            group_width,
+            profiles,
+            scheduling_policy,
+        )
+    } else {
+        Ok(allocate_weighted_column_ranges(
+            manifest.tensor_parallelism_dim,
+            profiles,
+            scheduling_policy,
+        ))
+    }
+}
+
 impl RingTopologyManager {
     /// Create a new RingTopologyManager
     pub fn new(db: Arc<Database>) -> Self {
@@ -580,20 +608,8 @@ impl RingTopologyManager {
         let profiles =
             self.load_worker_capacity_profiles(conn, &network_id, &model_id, ring_seq)?;
         let manifest = model_assets::load_model_manifest(&model_id)?;
-        let ranges = if let Some(group_width) = model_assets::attention_group_width(&manifest)? {
-            allocate_weighted_group_ranges(
-                manifest.tensor_parallelism_dim,
-                group_width,
-                &profiles,
-                &scheduling_policy,
-            )?
-        } else {
-            allocate_weighted_column_ranges(
-                manifest.tensor_parallelism_dim,
-                &profiles,
-                &scheduling_policy,
-            )
-        };
+        let ranges =
+            resolve_ring_column_ranges(&model_id, &manifest, &profiles, &scheduling_policy)?;
 
         Ok(profiles
             .into_iter()
@@ -626,20 +642,12 @@ impl RingTopologyManager {
                 stability_multiplier: 1.0,
             })
             .collect::<Vec<_>>();
-        let ranges = if let Some(group_width) = model_assets::attention_group_width(&manifest)? {
-            allocate_weighted_group_ranges(
-                manifest.tensor_parallelism_dim,
-                group_width,
-                &profiles,
-                &InferenceSchedulingPolicy::default(),
-            )?
-        } else {
-            allocate_weighted_column_ranges(
-                manifest.tensor_parallelism_dim,
-                &profiles,
-                &InferenceSchedulingPolicy::default(),
-            )
-        };
+        let ranges = resolve_ring_column_ranges(
+            model_id,
+            &manifest,
+            &profiles,
+            &InferenceSchedulingPolicy::default(),
+        )?;
         let column_range = ranges
             .get(position as usize)
             .copied()

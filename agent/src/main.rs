@@ -191,13 +191,7 @@ async fn validate_worker_position_runtime_readiness(
     config: &DeviceConfig,
     position: &agent::zip::coordinator::WorkerPosition,
 ) -> Result<()> {
-    validate_local_production_provider(config)?;
-    validate_production_artifact_assignment(
-        &position.model_id,
-        position.shard_worker_position,
-        position.shard_total_workers,
-        position.shard_column_range,
-    )?;
+    validate_worker_position_runtime_assignment(config, position)?;
     probe_production_artifact_assignment_materialization(
         &position.model_id,
         position.shard_worker_position,
@@ -208,13 +202,39 @@ async fn validate_worker_position_runtime_readiness(
     Ok(())
 }
 
+fn validate_worker_position_runtime_assignment(
+    config: &DeviceConfig,
+    position: &agent::zip::coordinator::WorkerPosition,
+) -> Result<()> {
+    validate_local_production_provider(config)?;
+    validate_production_artifact_assignment(
+        &position.model_id,
+        position.shard_worker_position,
+        position.shard_total_workers,
+        position.shard_column_range,
+    )?;
+    Ok(())
+}
+
 async fn join_validated_ring_position(
     coordinator: &mut agent::zip::coordinator::InferenceCoordinator,
     config: &DeviceConfig,
     position: agent::zip::coordinator::WorkerPosition,
 ) -> Result<agent::zip::coordinator::WorkerPosition> {
-    validate_worker_position_runtime_readiness(config, &position).await?;
+    validate_worker_position_runtime_assignment(config, &position)?;
     coordinator.join_ring(position.clone())?;
+    let resident_bytes = coordinator
+        .warm_model_residency_for_position(&position)
+        .await
+        .context("warm assigned production shard in inference runtime")?;
+    info!(
+        model_id = %position.model_id,
+        position = position.position,
+        total_workers = position.total_workers,
+        shard_range = ?position.shard_column_range,
+        resident_bytes,
+        "Warmed assigned production shard residency"
+    );
     Ok(position)
 }
 
