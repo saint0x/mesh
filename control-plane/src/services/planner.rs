@@ -834,7 +834,7 @@ fn build_execution_islands(
 
 fn is_heterogeneous_accelerator_member(member: &ExecutionGroupMember) -> bool {
     member.backend_contract.fast_path_eligible
-        && member.backend_contract.supports_paged_kv
+        && member.backend_contract.supports_live_kv
         && member.backend_contract.supports_decode_microbatch
         && member.backend_contract.supports_checkpoint_handoff
         && member.backend_contract.supports_device_sampling
@@ -1821,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_builds_heterogeneous_accelerator_ring_for_metal_rocm_tensor_parallel() {
+    fn planner_builds_heterogeneous_accelerator_ring_for_metal_cuda_tensor_parallel() {
         model_assets::testsupport::ensure_test_model("planner-heterogeneous-accelerator", 20);
         model_assets::clear_model_asset_cache();
 
@@ -1846,7 +1846,7 @@ mod tests {
                 peer_punch_plans: vec![],
             },
             &InferenceSchedulingPolicy::default(),
-            &[planner_metadata(4, "metal"), planner_metadata(16, "rocm")],
+            &[planner_metadata(4, "metal"), planner_metadata(16, "cuda")],
         )
         .unwrap();
 
@@ -1870,7 +1870,7 @@ mod tests {
                 .iter()
                 .map(|member| member.backend_contract.provider.as_str())
                 .collect::<Vec<_>>(),
-            vec!["metal", "rocm"]
+            vec!["metal", "cuda"]
         );
         assert_eq!(decode_group.total_capacity_units, 20);
     }

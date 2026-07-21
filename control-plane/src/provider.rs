@@ -60,11 +60,19 @@ pub enum ProviderImplementationMaturity {
     RuntimeUnavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveKvCacheLayout {
+    HostPaged,
+    DevicePaged,
+    DeviceContiguousWindow,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct VerifiedRuntimeCapabilities {
     pub fast_path_serving: bool,
     pub decode_microbatch: bool,
-    pub paged_kv: bool,
+    pub live_kv: bool,
     pub checkpoint_handoff: bool,
     pub device_sampling: bool,
 }
@@ -75,7 +83,8 @@ pub struct BackendContractDescriptor {
     pub compatibility_class: ProviderCompatibilityClass,
     pub optimization_profile: String,
     pub supports_decode_microbatch: bool,
-    pub supports_paged_kv: bool,
+    pub supports_live_kv: bool,
+    pub kv_cache_layout: LiveKvCacheLayout,
     pub supports_checkpoint_handoff: bool,
     pub supports_device_sampling: bool,
     pub fast_path_eligible: bool,
@@ -119,10 +128,17 @@ impl BackendContractDescriptor {
             },
         }
         .to_string();
-        let supports_decode_microbatch = true;
-        let supports_paged_kv = true;
+        let supports_decode_microbatch = !matches!(provider, ExecutionProviderKind::Rocm);
+        let supports_live_kv = true;
+        let kv_cache_layout = match provider {
+            ExecutionProviderKind::Cpu => LiveKvCacheLayout::HostPaged,
+            ExecutionProviderKind::Metal | ExecutionProviderKind::Cuda => {
+                LiveKvCacheLayout::DevicePaged
+            }
+            ExecutionProviderKind::Rocm => LiveKvCacheLayout::DeviceContiguousWindow,
+        };
         let supports_checkpoint_handoff = true;
-        let supports_device_sampling = !matches!(provider, ExecutionProviderKind::Cpu);
+        let supports_device_sampling = !matches!(provider, ExecutionProviderKind::Rocm);
         let fast_path_eligible = true;
         let memory_model = match provider {
             ExecutionProviderKind::Cpu => MemoryModel::SystemRam,
@@ -138,30 +154,30 @@ impl BackendContractDescriptor {
                 ExecutionProviderKind::Metal => VerifiedRuntimeCapabilities {
                     fast_path_serving: true,
                     decode_microbatch: true,
-                    paged_kv: true,
+                    live_kv: true,
                     checkpoint_handoff: true,
                     device_sampling: true,
                 },
                 ExecutionProviderKind::Cpu => VerifiedRuntimeCapabilities {
                     fast_path_serving: true,
                     decode_microbatch: true,
-                    paged_kv: true,
+                    live_kv: true,
                     checkpoint_handoff: true,
-                    device_sampling: false,
+                    device_sampling: true,
                 },
                 ExecutionProviderKind::Cuda => VerifiedRuntimeCapabilities {
                     fast_path_serving: true,
                     decode_microbatch: true,
-                    paged_kv: true,
+                    live_kv: true,
                     checkpoint_handoff: true,
                     device_sampling: true,
                 },
                 ExecutionProviderKind::Rocm => VerifiedRuntimeCapabilities {
                     fast_path_serving: true,
-                    decode_microbatch: true,
-                    paged_kv: true,
+                    decode_microbatch: false,
+                    live_kv: true,
                     checkpoint_handoff: true,
-                    device_sampling: true,
+                    device_sampling: false,
                 },
             },
         };
@@ -170,7 +186,7 @@ impl BackendContractDescriptor {
                 implementation_maturity,
                 ProviderImplementationMaturity::VerifiedFastPath
             );
-        let supports_paged_kv = supports_paged_kv
+        let supports_live_kv = supports_live_kv
             && matches!(
                 implementation_maturity,
                 ProviderImplementationMaturity::VerifiedFastPath
@@ -195,7 +211,8 @@ impl BackendContractDescriptor {
             compatibility_class,
             optimization_profile,
             supports_decode_microbatch,
-            supports_paged_kv,
+            supports_live_kv,
+            kv_cache_layout,
             supports_checkpoint_handoff,
             supports_device_sampling,
             fast_path_eligible,
@@ -210,11 +227,12 @@ impl BackendContractDescriptor {
 
     pub fn supports_production_serving(&self) -> bool {
         self.fast_path_eligible
-            && self.supports_decode_microbatch
-            && self.supports_paged_kv
+            && self.supports_live_kv
             && self.verified_runtime.fast_path_serving
-            && self.verified_runtime.decode_microbatch
-            && self.verified_runtime.paged_kv
+            && self.verified_runtime.live_kv
+            && (!self.supports_decode_microbatch || self.verified_runtime.decode_microbatch)
+            && (!self.supports_checkpoint_handoff || self.verified_runtime.checkpoint_handoff)
+            && (!self.supports_device_sampling || self.verified_runtime.device_sampling)
     }
 
     pub fn validate_runtime_consistency(&self) -> Result<(), String> {
@@ -230,9 +248,9 @@ impl BackendContractDescriptor {
                 self.provider.as_str()
             ));
         }
-        if self.supports_paged_kv && !self.verified_runtime.paged_kv {
+        if self.supports_live_kv && !self.verified_runtime.live_kv {
             return Err(format!(
-                "provider {} advertises paged KV without runtime verification",
+                "provider {} advertises live KV without runtime verification",
                 self.provider.as_str()
             ));
         }
@@ -257,7 +275,8 @@ impl BackendContractDescriptor {
         self.compatibility_class.hash(&mut hasher);
         self.optimization_profile.hash(&mut hasher);
         self.supports_decode_microbatch.hash(&mut hasher);
-        self.supports_paged_kv.hash(&mut hasher);
+        self.supports_live_kv.hash(&mut hasher);
+        self.kv_cache_layout.hash(&mut hasher);
         self.supports_checkpoint_handoff.hash(&mut hasher);
         self.supports_device_sampling.hash(&mut hasher);
         self.fast_path_eligible.hash(&mut hasher);
@@ -299,6 +318,12 @@ mod tests {
         );
         assert_eq!(contract.optimization_profile, "rocm_fused");
         assert_eq!(contract.memory_model, MemoryModel::DiscreteVram);
+        assert_eq!(
+            contract.kv_cache_layout,
+            LiveKvCacheLayout::DeviceContiguousWindow
+        );
+        assert!(!contract.supports_decode_microbatch);
+        assert!(!contract.supports_device_sampling);
         assert!(contract.supports_production_serving());
     }
 
@@ -312,7 +337,7 @@ mod tests {
         );
         assert!(!contract.fast_path_eligible);
         assert!(!contract.supports_decode_microbatch);
-        assert!(!contract.supports_paged_kv);
+        assert!(!contract.supports_live_kv);
         assert!(!contract.supports_device_sampling);
         assert!(!contract.supports_production_serving());
         contract.validate_runtime_consistency().unwrap();
