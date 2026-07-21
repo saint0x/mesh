@@ -4,9 +4,9 @@ use crate::executor::ring_allreduce::{
 };
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
 use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cuda"))]
 use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cuda"))]
 use candle_core::Storage;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use candle_core::{backend::BackendStorage, MetalStorage, Storage};
@@ -124,12 +124,20 @@ fn probe_metal_provider() -> (bool, Option<String>) {
 }
 
 fn probe_cuda_provider() -> (bool, Option<String>) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     {
         match Device::new_cuda(0) {
             Ok(_) => (true, None),
             Err(err) => (false, Some(format!("cuda runtime probe failed: {}", err))),
         }
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "cuda")))]
+    {
+        (
+            false,
+            Some("cuda provider was not compiled into this Mesh agent; rebuild with `--features cuda` on a CUDA host".to_string()),
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -200,9 +208,16 @@ fn init_execution_device() -> std::result::Result<RuntimeDevice, RuntimeError> {
     match provider {
         ExecutionProviderKind::Cpu => Ok(RuntimeDevice::Cpu),
         ExecutionProviderKind::Cuda => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             {
                 RuntimeDevice::new_cuda(0)
+            }
+            #[cfg(all(target_os = "linux", not(feature = "cuda")))]
+            {
+                Err(RuntimeError::Msg(
+                    "cuda provider was not compiled into this Mesh agent; rebuild with `--features cuda` on a CUDA host"
+                        .to_string(),
+                ))
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -440,7 +455,7 @@ pub(crate) struct DeviceCollectiveBuffer {
     rows: usize,
     cols: usize,
     receive_decode_scratch: Vec<f32>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     cuda_receive_pinned: Option<PinnedHostSlice<f32>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     shared_metal: Option<MetalStorage>,
@@ -471,7 +486,7 @@ impl DeviceCollectiveBuffer {
             rows: dims[0],
             cols: dims[1],
             receive_decode_scratch: Vec::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             cuda_receive_pinned: None,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             shared_metal,
@@ -595,7 +610,7 @@ impl DeviceCollectiveBuffer {
         expected_len: usize,
         payload_bytes: &[u8],
     ) -> Result<DeviceTensor> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "cuda"))]
         if let Some(tensor) =
             self.cuda_upload_tensor_from_wire_bytes(expected_len, payload_bytes)?
         {
@@ -614,7 +629,7 @@ impl DeviceCollectiveBuffer {
         Ok(update)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     fn cuda_upload_tensor_from_wire_bytes(
         &mut self,
         expected_len: usize,
@@ -646,7 +661,7 @@ impl DeviceCollectiveBuffer {
         Ok(Some(tensor))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     fn ensure_cuda_receive_pinned(
         &mut self,
         stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
@@ -701,7 +716,7 @@ impl StagedCollectiveBuffer for DeviceCollectiveBuffer {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cuda"))]
 fn stage_send_chunk_from_dense_cuda_tensor(
     tensor: &DeviceTensor,
     range: Range<usize>,
@@ -728,7 +743,7 @@ fn stage_send_chunk_from_dense_cuda_tensor(
     Ok(None)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", feature = "cuda")))]
 fn stage_send_chunk_from_dense_cuda_tensor(
     _tensor: &DeviceTensor,
     _range: Range<usize>,

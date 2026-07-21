@@ -10,6 +10,10 @@ repository.workspace = true
 name = "agent"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
 [dependencies]
 tokio.workspace = true
 libp2p.workspace = true
@@ -51,10 +55,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Platform-specific dependencies for memory locking
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-candle-core = { version = "0.10.2", features = ["cuda"] }
-candle-nn = { version = "0.10.2", features = ["cuda"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 candle-core = { version = "0.10.2", features = ["metal"] }

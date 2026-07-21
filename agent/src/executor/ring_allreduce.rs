@@ -19,7 +19,7 @@ use crate::network::{
 };
 use crate::provider::ExecutionProviderKind;
 use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cuda"))]
 use candle_core::cuda_backend::cudarc::driver::{CudaStream, PinnedHostSlice};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use candle_core::{backend::BackendStorage, DType, MetalStorage};
@@ -411,7 +411,7 @@ pub enum StageSendChunkMode {
 #[derive(Debug)]
 pub enum StageSendScratch {
     Vec(Vec<f32>),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     CudaPinned(PinnedHostSlice<f32>),
 }
 
@@ -432,12 +432,12 @@ impl StageSendScratch {
                 buffer.reserve(len.saturating_sub(buffer.capacity()));
                 buffer
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::CudaPinned(_) => unreachable!("scratch was normalized to Vec"),
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     pub fn ensure_cuda_pinned(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -462,7 +462,7 @@ impl StageSendScratch {
     pub fn as_slice(&self, len: usize) -> Result<&[f32]> {
         match self {
             Self::Vec(buffer) => Ok(&buffer[..len]),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::CudaPinned(buffer) => {
                 let slice = buffer.as_slice().map_err(|err| {
                     AgentError::Execution(format!(
