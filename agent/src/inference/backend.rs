@@ -422,28 +422,21 @@ impl ProviderExecutionBackend {
 
     pub fn ensure_provider_runtime_available(provider: ExecutionProviderKind) -> Result<()> {
         match provider {
-            ExecutionProviderKind::Cpu
-            | ExecutionProviderKind::Metal
-            | ExecutionProviderKind::Cuda => Ok(()),
-            ExecutionProviderKind::Rocm => {
-                #[cfg(all(target_os = "linux", feature = "rocm"))]
-                {
-                    let (available, reason) = crate::inference::rocm::probe();
-                    if available {
-                        Ok(())
-                    } else {
-                        Err(AgentError::Execution(format!(
-                            "rocm execution backend probe failed: {}",
-                            reason.unwrap_or_else(|| "unknown ROCm runtime error".to_string())
-                        )))
-                    }
-                }
-                #[cfg(not(all(target_os = "linux", feature = "rocm")))]
-                {
-                    Err(AgentError::Execution(
-                        "rocm provider requires a Linux Mesh agent built with `--features rocm`"
-                            .to_string(),
-                    ))
+            ExecutionProviderKind::Cpu => Ok(()),
+            ExecutionProviderKind::Metal
+            | ExecutionProviderKind::Cuda
+            | ExecutionProviderKind::Rocm => {
+                let (available, reason) = crate::inference::runtime::probe_provider(provider);
+                if available {
+                    Ok(())
+                } else {
+                    Err(AgentError::Execution(format!(
+                        "{} execution backend unavailable: {}",
+                        provider.as_str(),
+                        reason.unwrap_or_else(
+                            || "runtime probe failed without a detailed reason".to_string()
+                        )
+                    )))
                 }
             }
         }
@@ -1013,8 +1006,150 @@ mod tests {
                 ExecutionProviderKind::Rocm,
             )
             .expect_err("non-rocm build must reject rocm provider");
-            assert!(error.to_string().contains("--features rocm"));
+            assert!(
+                error.to_string().contains("rocm provider"),
+                "unexpected rocm preflight error: {error}"
+            );
         }
+    }
+
+    #[test]
+    fn cuda_backend_preflight_reflects_build_capability() {
+        #[cfg(all(target_os = "linux", feature = "cuda"))]
+        {
+            ProviderExecutionBackend::ensure_provider_runtime_available(
+                ExecutionProviderKind::Cuda,
+            )
+            .expect("cuda feature build should probe the linked CUDA runtime");
+        }
+        #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+        {
+            let error = ProviderExecutionBackend::ensure_provider_runtime_available(
+                ExecutionProviderKind::Cuda,
+            )
+            .expect_err("non-cuda build must reject cuda provider");
+            assert!(
+                error.to_string().contains("cuda provider"),
+                "unexpected cuda preflight error: {error}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    #[tokio::test]
+    async fn cuda_backend_prefill_decode_and_sample_on_runtime() {
+        use crate::network::{TensorPlane, TensorPlaneConfig};
+        use crate::provider::set_selected_execution_provider;
+        use libp2p::PeerId;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        set_selected_execution_provider(ExecutionProviderKind::Cuda)
+            .expect("cuda provider should be selectable on a CUDA feature build");
+        let weights = tiny_cuda_model_weights();
+        let config = weights.config.clone();
+        let residency = Arc::new(SharedModelResidency::from_host(weights).expect("cuda residency"));
+        let mut backend = ProviderExecutionBackend::new_for_provider(
+            ExecutionProviderKind::Cuda,
+            residency,
+            0,
+            0,
+            config.hidden_dim,
+            1,
+            Duration::from_secs(30),
+        )
+        .expect("cuda backend");
+
+        let mut tensor_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .expect("tensor plane");
+        let peer_id = PeerId::random();
+        let local_addr = tensor_plane.local_addr();
+        let mut worker_ring = WorkerRing::new(
+            0,
+            1,
+            peer_id,
+            peer_id,
+            local_addr,
+            local_addr,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut tensor_plane,
+        );
+
+        let prefill = backend
+            .prefill(&[1, 2, 3], &mut worker_ring, Uuid::new_v4(), None)
+            .await
+            .expect("cuda prefill");
+        assert_eq!(prefill.dims(), &[1, config.vocab_size]);
+        let sampled = backend
+            .sample(&prefill, 0.0, 1.0, 1)
+            .expect("cuda device sampling");
+        assert!(sampled < config.vocab_size as u32);
+        assert_eq!(backend.cache_seq_len(), 3);
+
+        let decode = backend
+            .decode_step(sampled, &mut worker_ring, Uuid::new_v4())
+            .await
+            .expect("cuda decode");
+        assert_eq!(decode.dims(), &[1, config.vocab_size]);
+        assert_eq!(backend.cache_seq_len(), 4);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    fn tiny_cuda_model_weights() -> ModelWeights {
+        use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
+        use crate::inference::tensor_ops::Tensor2D;
+
+        let config = ModelConfig {
+            hidden_dim: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            num_layers: 1,
+            vocab_size: 8,
+            intermediate_size: 4,
+            rms_norm_eps: 1e-5,
+            rope_base: 10000.0,
+        };
+        ModelWeights {
+            model_id: "cuda-forward-test".to_string(),
+            embedding: Tensor2D::new(
+                (0..32).map(|idx| ((idx % 7) as f32 - 3.0) * 0.03).collect(),
+                8,
+                4,
+            )
+            .unwrap(),
+            layers: vec![LayerWeights {
+                layer_idx: 0,
+                w_q: patterned_cuda_matrix(4, 4, 0.02),
+                w_k: patterned_cuda_matrix(4, 2, 0.03),
+                w_v: patterned_cuda_matrix(4, 2, 0.04),
+                w_o: patterned_cuda_matrix(4, 4, 0.02),
+                w_up: patterned_cuda_matrix(4, 4, 0.03),
+                w_gate: patterned_cuda_matrix(4, 4, 0.025),
+                w_down: patterned_cuda_matrix(4, 4, 0.02),
+                attn_norm: Tensor1D::new(vec![1.0; 4]),
+                mlp_norm: Tensor1D::new(vec![1.0; 4]),
+            }],
+            final_norm: Tensor1D::new(vec![1.0; 4]),
+            lm_head: patterned_cuda_matrix(4, 8, 0.015),
+            config,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    fn patterned_cuda_matrix(rows: usize, cols: usize, scale: f32) -> Tensor2D {
+        use crate::inference::tensor_ops::Tensor2D;
+
+        Tensor2D::new(
+            (0..rows * cols)
+                .map(|idx| ((idx % 11) as f32 - 5.0) * scale)
+                .collect(),
+            rows,
+            cols,
+        )
+        .unwrap()
     }
 
     #[test]
