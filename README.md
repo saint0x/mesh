@@ -112,6 +112,8 @@ Mesh now exposes one execution architecture with explicit provider selection und
 
 Provider choice is part of node configuration and capability reporting. Nodes advertise the providers they can actually run, the control plane stores that inventory, and the agent binds the tensor backend to the selected provider at startup. There is no silent provider fallback path.
 
+CUDA is an explicit build feature, not a default Linux dependency. Build NVIDIA workers with `cargo build -p agent --features cuda`; default Linux builds do not require `nvcc` and report CUDA as unavailable unless compiled with that feature.
+
 The ROCm provider is fail-closed by design. Mesh recognizes ROCm as a first-class accelerator contract and will detect host ROCm runtime markers, but live ROCm tensor execution requires a native HIP/ROCm tensor backend to be linked into the agent. Until that backend is present, selecting `rocm` reports the provider as unavailable instead of running the shard on CPU under an AMD label.
 
 Default provider selection is simple:
