@@ -10,7 +10,11 @@ This guide covers the current production runtime bring-up flow.
 - choose the execution provider each worker should use:
   - Apple Silicon Mac: `metal`
   - Linux with NVIDIA GPU: `cuda`
+  - Linux with AMD GPU: `rocm`
   - Intel Mac or CPU-only host: `cpu`
+- build Linux accelerator workers with the matching feature flag:
+  - NVIDIA: `cargo build -p agent --features cuda`
+  - AMD: `ROCM_PATH=/opt/rocm cargo build -p agent --features rocm`
 
 ## Install
 
@@ -67,6 +71,12 @@ mesh device start
 ```
 
 For a mixed LAN test with an Intel Mac, set that second node to `cpu` explicitly. Mesh uses the same execution flow across providers; only the local compute backend changes.
+
+For a VastAI NVIDIA worker, the repo helper can prepare the box once SSH is available:
+
+```bash
+VASTAI_BIN=/tmp/mesh-vastai-venv/bin/vastai scripts/vast_nvidia_bootstrap.sh bootstrap
+```
 
 ### 4. Submit an inference job
 
