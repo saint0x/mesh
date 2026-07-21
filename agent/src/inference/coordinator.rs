@@ -16,7 +16,8 @@ use crate::executor::ring_allreduce::WorkerRing;
 use crate::inference::kv_cache::KVCacheSnapshot;
 use crate::model::registry::ShardRegistry;
 use crate::model::shard::ShardAssignment;
-use crate::network::{MeshSwarm, TensorPlane};
+use crate::network::{MeshSwarm, ServingSessionTransport, TensorPlane};
+use crate::provider::ExecutionProviderKind;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -239,6 +240,9 @@ pub struct InferenceCoordinator {
     /// Dedicated tensor data plane for the hot inference path.
     tensor_plane: TensorPlane,
 
+    /// Reusable serving transport for the active tensor-parallel neighbor topology.
+    serving_transport_cache: Option<CachedServingTransport>,
+
     /// Inference configuration
     config: InferenceConfig,
 
@@ -278,6 +282,13 @@ pub struct InferenceCoordinator {
     /// Governs checkpoint recovery cadence and node-level recovery load.
     #[allow(dead_code)]
     recovery_governor: RecoveryGovernor,
+}
+
+struct CachedServingTransport {
+    left_tensor_addr: SocketAddr,
+    right_tensor_addr: SocketAddr,
+    provider: ExecutionProviderKind,
+    transport: ServingSessionTransport,
 }
 
 struct SwarmControl {
@@ -457,6 +468,7 @@ impl InferenceCoordinator {
         Self {
             swarm_control: Self::spawn_swarm_driver(swarm),
             tensor_plane,
+            serving_transport_cache: None,
             config,
             position: None,
             stats,
@@ -1682,6 +1694,37 @@ impl InferenceCoordinator {
         &mut self.tensor_plane
     }
 
+    async fn serving_transport_for_position(
+        &mut self,
+        position: &WorkerPosition,
+        provider: ExecutionProviderKind,
+    ) -> Result<ServingSessionTransport> {
+        if let Some(cached) = self.serving_transport_cache.as_ref() {
+            if cached.left_tensor_addr == position.left_neighbor_tensor_addr
+                && cached.right_tensor_addr == position.right_neighbor_tensor_addr
+                && cached.provider == provider
+            {
+                return Ok(cached.transport.clone());
+            }
+        }
+
+        let transport = self
+            .tensor_plane
+            .serving_transport_for_neighbors(
+                position.left_neighbor_tensor_addr,
+                position.right_neighbor_tensor_addr,
+                provider,
+            )
+            .await?;
+        self.serving_transport_cache = Some(CachedServingTransport {
+            left_tensor_addr: position.left_neighbor_tensor_addr,
+            right_tensor_addr: position.right_neighbor_tensor_addr,
+            provider,
+            transport: transport.clone(),
+        });
+        Ok(transport)
+    }
+
     fn sync_tensor_plane_metrics(&self) {
         self.stats
             .update_tensor_plane_metrics(self.tensor_plane.metrics_snapshot());
@@ -2271,6 +2314,10 @@ impl InferenceCoordinator {
                 FastPathRuntime::checkout_prefill_workspace(&prefill_plan)?;
             self.stats
                 .record_prefill_fast_path_plan(&prefill_plan, reservation.reused_existing_arena);
+            let provider = session.backend.provider_kind();
+            let serving_transport = self
+                .serving_transport_for_position(position, provider)
+                .await?;
             let mut worker_ring = WorkerRing::new(
                 position.position,
                 position.total_workers,
@@ -2278,9 +2325,9 @@ impl InferenceCoordinator {
                 position.right_neighbor,
                 position.left_neighbor_tensor_addr,
                 position.right_neighbor_tensor_addr,
-                session.backend.provider_kind(),
+                provider,
                 session.backend.executor_contract().clone(),
-                None,
+                Some(serving_transport),
                 self.tensor_plane_mut(),
             );
             info!(
@@ -2407,6 +2454,9 @@ impl InferenceCoordinator {
             .first()
             .map(|(_, session, _)| session.backend.provider_kind())
             .unwrap_or(crate::provider::ExecutionProviderKind::Cpu);
+        let serving_transport = self
+            .serving_transport_for_position(position, provider)
+            .await?;
         let mut worker_ring = WorkerRing::new(
             position.position,
             position.total_workers,
@@ -2423,7 +2473,7 @@ impl InferenceCoordinator {
                         crate::provider::ExecutionProviderKind::Cpu,
                     )
                 }),
-            None,
+            Some(serving_transport),
             self.tensor_plane_mut(),
         );
         worker_ring.prepare_serving_group_channels().await?;
@@ -2541,6 +2591,9 @@ impl InferenceCoordinator {
 
         let provider = session.backend.provider_kind();
         let executor_contract = session.backend.executor_contract().clone();
+        let serving_transport = self
+            .serving_transport_for_position(position, provider)
+            .await?;
         let mut worker_ring = WorkerRing::new(
             position.position,
             position.total_workers,
@@ -2550,7 +2603,7 @@ impl InferenceCoordinator {
             position.right_neighbor_tensor_addr,
             provider,
             executor_contract,
-            None,
+            Some(serving_transport),
             self.tensor_plane_mut(),
         );
         worker_ring.prepare_serving_group_channels().await?;
