@@ -137,6 +137,14 @@ pub enum CollectiveResidency {
     StagedRuntime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheLayout {
+    HostPaged,
+    DevicePaged,
+    DeviceContiguousWindow,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorPhasePlan {
     pub phase: ExecutionPhase,
@@ -148,10 +156,20 @@ pub struct ExecutorPhasePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvRuntimeContract {
-    pub requires_paged_cache: bool,
+    pub layout: KvCacheLayout,
     pub append_only_decode: bool,
     pub supports_prefill: bool,
     pub supports_decode: bool,
+}
+
+impl KvRuntimeContract {
+    pub fn supports_decode_overlap(&self) -> bool {
+        self.append_only_decode
+            && matches!(
+                self.layout,
+                KvCacheLayout::HostPaged | KvCacheLayout::DevicePaged
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,7 +209,7 @@ impl LocalExecutorContract {
                     uses_device_sampling: true,
                 },
                 kv_runtime: KvRuntimeContract {
-                    requires_paged_cache: true,
+                    layout: KvCacheLayout::HostPaged,
                     append_only_decode: true,
                     supports_prefill: true,
                     supports_decode: true,
@@ -225,7 +243,7 @@ impl LocalExecutorContract {
                     uses_device_sampling: true,
                 },
                 kv_runtime: KvRuntimeContract {
-                    requires_paged_cache: true,
+                    layout: KvCacheLayout::DevicePaged,
                     append_only_decode: true,
                     supports_prefill: true,
                     supports_decode: true,
@@ -259,7 +277,7 @@ impl LocalExecutorContract {
                     uses_device_sampling: true,
                 },
                 kv_runtime: KvRuntimeContract {
-                    requires_paged_cache: true,
+                    layout: KvCacheLayout::DevicePaged,
                     append_only_decode: true,
                     supports_prefill: true,
                     supports_decode: true,
@@ -273,9 +291,7 @@ impl LocalExecutorContract {
                 fused_stages: vec![
                     FusedKernelStage::NormQkv,
                     FusedKernelStage::RopeKvWrite,
-                    FusedKernelStage::PagedAttention,
                     FusedKernelStage::ResidualMlp,
-                    FusedKernelStage::DeviceSampling,
                 ],
                 collective_residency: CollectiveResidency::StagedRuntime,
                 prefill: ExecutorPhasePlan {
@@ -283,17 +299,17 @@ impl LocalExecutorContract {
                     class: LocalExecutorClass::FastPath,
                     supports_microbatch: false,
                     requires_static_workspace: true,
-                    uses_device_sampling: true,
+                    uses_device_sampling: false,
                 },
                 decode: ExecutorPhasePlan {
                     phase: ExecutionPhase::Decode,
                     class: LocalExecutorClass::FastPath,
-                    supports_microbatch: true,
+                    supports_microbatch: false,
                     requires_static_workspace: true,
-                    uses_device_sampling: true,
+                    uses_device_sampling: false,
                 },
                 kv_runtime: KvRuntimeContract {
-                    requires_paged_cache: true,
+                    layout: KvCacheLayout::DeviceContiguousWindow,
                     append_only_decode: true,
                     supports_prefill: true,
                     supports_decode: true,

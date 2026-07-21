@@ -478,15 +478,6 @@ impl ProviderExecutionBackend {
             return Ok(Some(Vec::new()));
         };
         let provider = first_request.backend.provider_kind();
-        #[cfg(all(target_os = "linux", feature = "rocm"))]
-        if provider == ExecutionProviderKind::Rocm {
-            return RocmExecutionBackend::decode_step_batch_fast_path(
-                requests,
-                worker_ring,
-                workspace,
-            )
-            .await;
-        }
         Self::decode_step_batch_fast_path_with_provider(provider, requests, worker_ring, workspace)
             .await
     }
@@ -1001,7 +992,7 @@ mod tests {
         assert!(cuda.supports_decode_microbatch());
         assert!(cuda.uses_staged_runtime_collectives());
         assert!(rocm.is_fast_path());
-        assert!(rocm.supports_decode_microbatch());
+        assert!(!rocm.supports_decode_microbatch());
         assert!(rocm.uses_staged_runtime_collectives());
         assert!(rocm.kv_runtime.supports_prefill);
         assert!(rocm.kv_runtime.supports_decode);

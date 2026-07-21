@@ -1350,8 +1350,7 @@ impl<'a> WorkerRing<'a> {
 
     pub fn collective_overlap_plan(&self, lane: CollectiveLane) -> CollectiveOverlapPlan {
         let decode_fast_path = self.executor_contract.supports_decode_microbatch()
-            && self.executor_contract.kv_runtime.append_only_decode
-            && self.executor_contract.kv_runtime.requires_paged_cache;
+            && self.executor_contract.kv_runtime.supports_decode_overlap();
         match lane {
             CollectiveLane::ReduceScatter | CollectiveLane::AllGather => CollectiveOverlapPlan {
                 lane,

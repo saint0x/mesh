@@ -173,14 +173,6 @@ impl RocmExecutionBackend {
             executor_contract,
         })
     }
-
-    pub(crate) async fn decode_step_batch_fast_path(
-        _requests: &mut [crate::inference::backend::DecodeMicrobatchRequest<'_>],
-        _worker_ring: &mut WorkerRing<'_>,
-        _workspace: &mut crate::inference::fast_path::DecodeWorkspaceLease,
-    ) -> Result<Option<Vec<crate::inference::backend::DecodeMicrobatchOutput>>> {
-        Ok(None)
-    }
 }
 
 #[async_trait]
