@@ -3,15 +3,17 @@ use crate::executor::ring_allreduce::{
     StageSendChunkMode, StageSendScratch, StagedCollectiveBuffer,
 };
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+use crate::wire_f32::copy_into_f32_slice;
 use crate::wire_f32::decode_into_f32_scratch;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice};
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
-#[cfg(all(target_os = "linux", feature = "cuda"))]
-use candle_core::Storage;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use candle_core::{backend::BackendStorage, MetalStorage, Storage};
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+use candle_core::{backend::BackendStorage, Storage};
 use candle_core::{DType, Device, Tensor as CandleTensor, D};
 use candle_nn::ops as candle_ops;
 use std::collections::HashMap;
@@ -618,26 +620,26 @@ impl DeviceCollectiveBuffer {
         expected_len: usize,
         payload_bytes: &[u8],
     ) -> Result<Option<DeviceTensor>> {
-        let (storage, _) = self.flat.storage_and_layout();
-        let Storage::Cuda(cuda_storage) = &*storage else {
-            return Ok(None);
+        let cuda_device = {
+            let (storage, _) = self.flat.storage_and_layout();
+            let Storage::Cuda(cuda_storage) = &*storage else {
+                return Ok(None);
+            };
+            cuda_storage.device().clone()
         };
-        let pinned =
-            self.ensure_cuda_receive_pinned(&cuda_storage.device().cuda_stream(), expected_len)?;
-        copy_wire_f32_bytes_into_slice(
-            &mut pinned.as_mut_slice().map_err(runtime_error)?[..expected_len],
+        let pinned = self.ensure_cuda_receive_pinned(&cuda_device.cuda_stream(), expected_len)?;
+        copy_into_f32_slice(
+            &mut pinned.as_mut_slice().map_err(|err| {
+                AgentError::Execution(format!("CUDA pinned receive host slice unavailable: {err}"))
+            })?[..expected_len],
             payload_bytes,
         );
-        let upload = cuda_storage
-            .device()
-            .clone_htod(pinned)
-            .map_err(runtime_error)?;
+        let upload = cuda_device.clone_htod(pinned).map_err(|err| {
+            AgentError::Execution(format!("CUDA host-to-device upload failed: {err}"))
+        })?;
         let tensor = DeviceTensor::from_storage(
-            Storage::Cuda(CudaStorage::wrap_cuda_slice(
-                upload,
-                cuda_storage.device().clone(),
-            )),
-            payload.len(),
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(upload, cuda_device)),
+            expected_len,
             candle_core::op::BackpropOp::none(),
             false,
         );
@@ -718,7 +720,9 @@ fn stage_send_chunk_from_dense_cuda_tensor(
                 cuda_storage
                     .device()
                     .memcpy_dtoh(&src, pinned)
-                    .map_err(runtime_error)?;
+                    .map_err(|err| {
+                        AgentError::Execution(format!("CUDA device-to-host staging failed: {err}"))
+                    })?;
                 return Ok(Some(StageSendChunkMode::HostMaterializedScratch));
             }
         }

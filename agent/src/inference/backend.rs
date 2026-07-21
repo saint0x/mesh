@@ -834,8 +834,12 @@ impl ExecutionBackend for ProviderRuntimeCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
     use crate::inference::runtime::device_tensor_from_1d;
     use crate::inference::tensor_ops::Tensor1D;
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    use crate::inference::tensor_ops::Tensor2D;
 
     struct ProfileBackend {
         provider: ExecutionProviderKind,
@@ -1099,9 +1103,6 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "cuda"))]
     fn tiny_cuda_model_weights() -> ModelWeights {
-        use crate::inference::forward_pass::{LayerWeights, ModelConfig, ModelWeights};
-        use crate::inference::tensor_ops::Tensor2D;
-
         let config = ModelConfig {
             hidden_dim: 4,
             num_heads: 2,
@@ -1140,8 +1141,6 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "cuda"))]
     fn patterned_cuda_matrix(rows: usize, cols: usize, scale: f32) -> Tensor2D {
-        use crate::inference::tensor_ops::Tensor2D;
-
         Tensor2D::new(
             (0..rows * cols)
                 .map(|idx| ((idx % 11) as f32 - 5.0) * scale)
