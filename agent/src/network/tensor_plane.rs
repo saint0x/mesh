@@ -29,6 +29,8 @@ pub const DEFAULT_MAX_INBOUND_MESSAGES: usize = 64;
 pub const DEFAULT_MAX_INBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_OUTBOUND_STREAMS_PER_PEER: usize = 3;
+const SERVING_CONNECT_ATTEMPTS: usize = 8;
+const SERVING_CONNECT_RETRY_BASE_DELAY: Duration = Duration::from_millis(125);
 static NEXT_TENSOR_PLANE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -426,6 +428,8 @@ struct BoundServingLane {
     target: SocketAddr,
     plan: ServingLanePlan,
     streams: Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>>,
+    bound_at: Instant,
+    successful_send_count: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -865,6 +869,8 @@ async fn bind_serving_lane(
         target,
         plan,
         streams: Arc::new(Mutex::new(streams)),
+        bound_at: Instant::now(),
+        successful_send_count: Arc::new(AtomicU64::new(0)),
     })
 }
 
@@ -957,15 +963,17 @@ impl TensorPlane {
                 match listener.accept().await {
                     Ok((mut stream, remote_addr)) => {
                         let state = Arc::clone(&accept_state);
+                        info!(
+                            tensor_plane_instance = state.instance_id,
+                            tensor_plane_state = format_args!("{:p}", Arc::as_ptr(&state)),
+                            remote_addr = %remote_addr,
+                            "Accepted serving dataplane connection"
+                        );
                         tokio::spawn(async move {
                             loop {
-                                match tokio::time::timeout(
-                                    state.io_timeout,
-                                    read_serving_frame(&mut stream, state.max_message_bytes),
-                                )
-                                .await
+                                match read_serving_frame(&mut stream, state.max_message_bytes).await
                                 {
-                                    Ok(Ok(frame)) => {
+                                    Ok(frame) => {
                                         let queued_bytes = frame.header.size_bytes().max(1);
                                         let queued_bytes_u32: u32 = match queued_bytes.try_into() {
                                             Ok(value) => value,
@@ -1076,7 +1084,7 @@ impl TensorPlane {
                                         );
                                         state.inbound.notify.notify_waiters();
                                     }
-                                    Ok(Err(error)) => {
+                                    Err(error) => {
                                         if !matches!(
                                             error.kind(),
                                             std::io::ErrorKind::UnexpectedEof
@@ -1094,17 +1102,6 @@ impl TensorPlane {
                                             );
                                         }
                                         return;
-                                    }
-                                    Err(_) => {
-                                        state
-                                            .metrics
-                                            .receive_timeout_count
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        debug!(
-                                            remote_addr = %remote_addr,
-                                            "serving dataplane connection was idle past the receive timeout; keeping channel open"
-                                        );
-                                        continue;
                                     }
                                 }
                             }
@@ -1526,6 +1523,48 @@ fn sanitized_config(config: TensorPlaneConfig) -> TensorPlaneConfig {
     }
 }
 
+async fn refresh_idle_first_send_lane(
+    state: &Arc<TensorPlaneState>,
+    lane: &BoundServingLane,
+) -> Result<()> {
+    if lane.successful_send_count.load(Ordering::Relaxed) > 0 {
+        return Ok(());
+    }
+    if lane.bound_at.elapsed() < state.io_timeout {
+        return Ok(());
+    }
+
+    evict_connection(state, lane.target, lane.plan.lane).await;
+    let mut refreshed_streams = Vec::with_capacity(lane.plan.desired_stream_count.max(1));
+    for stream_id in 0..lane.plan.desired_stream_count.max(1) as u32 {
+        refreshed_streams.push(
+            ensure_connection_pool(
+                state,
+                lane.target,
+                lane.plan.lane,
+                lane.plan.desired_stream_count,
+                stream_id,
+                true,
+            )
+            .await?,
+        );
+    }
+    {
+        let mut streams = lane.streams.lock().await;
+        *streams = refreshed_streams;
+    }
+    info!(
+        tensor_plane_instance = state.instance_id,
+        tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
+        target = %lane.target,
+        lane = ?lane.plan.lane,
+        idle_ms = lane.bound_at.elapsed().as_millis() as u64,
+        stream_count = lane.plan.desired_stream_count,
+        "Refreshed idle serving lane before first send"
+    );
+    Ok(())
+}
+
 async fn send_serving_frame_bytes_on_bound_lane(
     state: &Arc<TensorPlaneState>,
     lane: &BoundServingLane,
@@ -1585,6 +1624,7 @@ async fn send_serving_frame_bytes_on_bound_lane(
 
     let class_permit =
         acquire_lane_budget(state, lane.target, lane.plan.traffic_class, message_bytes).await?;
+    refresh_idle_first_send_lane(state, lane).await?;
     let selected_stream_index = if lane.plan.desired_stream_count <= 1 {
         0
     } else {
@@ -1601,12 +1641,22 @@ async fn send_serving_frame_bytes_on_bound_lane(
 
     match send_result {
         Ok(()) => {
+            log_serving_send_result(
+                state,
+                lane,
+                header,
+                selected_stream_index,
+                message_bytes,
+                send_started.elapsed(),
+                Ok(()),
+            );
             state
                 .metrics
                 .bytes_sent
                 .fetch_add(message_bytes as u64, Ordering::Relaxed);
             record_phase_bytes(&state.metrics, header.lane, message_bytes as u64, true);
             state.metrics.send_count.fetch_add(1, Ordering::Relaxed);
+            lane.successful_send_count.fetch_add(1, Ordering::Relaxed);
             state
                 .metrics
                 .send_latency_ms
@@ -1617,6 +1667,15 @@ async fn send_serving_frame_bytes_on_bound_lane(
             Ok(())
         }
         Err(error) => {
+            log_serving_send_result(
+                state,
+                lane,
+                header,
+                selected_stream_index,
+                message_bytes,
+                send_started.elapsed(),
+                Err(&error),
+            );
             drop(class_permit);
             drop(outbound_permit);
             Err(error)
@@ -1683,6 +1742,7 @@ async fn send_serving_frame_raw_payload_on_bound_lane(
 
     let class_permit =
         acquire_lane_budget(state, lane.target, lane.plan.traffic_class, message_bytes).await?;
+    refresh_idle_first_send_lane(state, lane).await?;
     let selected_stream_index = if lane.plan.desired_stream_count <= 1 {
         0
     } else {
@@ -1699,12 +1759,22 @@ async fn send_serving_frame_raw_payload_on_bound_lane(
 
     match send_result {
         Ok(()) => {
+            log_serving_send_result(
+                state,
+                lane,
+                header,
+                selected_stream_index,
+                message_bytes,
+                send_started.elapsed(),
+                Ok(()),
+            );
             state
                 .metrics
                 .bytes_sent
                 .fetch_add(message_bytes as u64, Ordering::Relaxed);
             record_phase_bytes(&state.metrics, header.lane, message_bytes as u64, true);
             state.metrics.send_count.fetch_add(1, Ordering::Relaxed);
+            lane.successful_send_count.fetch_add(1, Ordering::Relaxed);
             state
                 .metrics
                 .send_latency_ms
@@ -1715,6 +1785,15 @@ async fn send_serving_frame_raw_payload_on_bound_lane(
             Ok(())
         }
         Err(error) => {
+            log_serving_send_result(
+                state,
+                lane,
+                header,
+                selected_stream_index,
+                message_bytes,
+                send_started.elapsed(),
+                Err(&error),
+            );
             drop(class_permit);
             drop(outbound_permit);
             Err(error)
@@ -2104,28 +2183,49 @@ async fn connect_stream(
     state: &Arc<TensorPlaneState>,
     target: SocketAddr,
 ) -> Result<Arc<Mutex<TcpStream>>> {
-    let stream = tokio::time::timeout(state.connect_timeout, TcpStream::connect(target))
-        .await
-        .map_err(|_| {
-            state
-                .metrics
-                .send_timeout_count
-                .fetch_add(1, Ordering::Relaxed);
-            AgentError::Network(format!(
-                "Timed out connecting to serving dataplane peer {}",
-                target
-            ))
-        })?
-        .map_err(|e| {
-            AgentError::Network(format!(
-                "Failed to connect to serving dataplane peer {}: {}",
-                target, e
-            ))
-        })?;
-    stream.set_nodelay(true).map_err(|e| {
-        AgentError::Network(format!("Failed to set TCP_NODELAY on {}: {}", target, e))
-    })?;
-    Ok(Arc::new(Mutex::new(stream)))
+    let mut last_error = None;
+    for attempt in 1..=SERVING_CONNECT_ATTEMPTS {
+        match tokio::time::timeout(state.connect_timeout, TcpStream::connect(target)).await {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true).map_err(|e| {
+                    AgentError::Network(format!("Failed to set TCP_NODELAY on {}: {}", target, e))
+                })?;
+                info!(
+                    tensor_plane_instance = state.instance_id,
+                    tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
+                    target = %target,
+                    attempt,
+                    "Connected serving dataplane stream"
+                );
+                return Ok(Arc::new(Mutex::new(stream)));
+            }
+            Ok(Err(error)) => {
+                last_error = Some(error.to_string());
+            }
+            Err(_) => {
+                state
+                    .metrics
+                    .send_timeout_count
+                    .fetch_add(1, Ordering::Relaxed);
+                last_error = Some(format!(
+                    "timed out after {}ms",
+                    state.connect_timeout.as_millis()
+                ));
+            }
+        }
+
+        if attempt < SERVING_CONNECT_ATTEMPTS {
+            let delay = SERVING_CONNECT_RETRY_BASE_DELAY.saturating_mul(attempt.min(6) as u32);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    Err(AgentError::Network(format!(
+        "Failed to connect to serving dataplane peer {} after {} attempts: {}",
+        target,
+        SERVING_CONNECT_ATTEMPTS,
+        last_error.unwrap_or_else(|| "unknown connect error".to_string())
+    )))
 }
 
 async fn evict_connection(state: &Arc<TensorPlaneState>, target: SocketAddr, lane: CollectiveLane) {
@@ -2342,6 +2442,61 @@ fn record_traffic_class_send(metrics: &TensorPlaneMetrics, traffic_class: Tensor
             .fetch_add(1, Ordering::Relaxed),
         TensorTrafficClass::Bulk => metrics.bulk_send_count.fetch_add(1, Ordering::Relaxed),
     };
+}
+
+fn log_serving_send_result(
+    state: &Arc<TensorPlaneState>,
+    lane: &BoundServingLane,
+    header: ServingFrameHeader,
+    selected_stream_index: usize,
+    message_bytes: usize,
+    elapsed: Duration,
+    result: std::result::Result<(), &AgentError>,
+) {
+    if !matches!(
+        header.lane,
+        CollectiveLane::ReduceScatter | CollectiveLane::AllGather
+    ) {
+        return;
+    }
+
+    match result {
+        Ok(()) => info!(
+            tensor_plane_instance = state.instance_id,
+            tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
+            target = %lane.target,
+            collective_id = %header.collective_id,
+            collective_seq = header.collective_seq,
+            sender_position = header.sender_position,
+            lane = ?header.lane,
+            layer_idx = header.layer_idx,
+            step = header.step,
+            slot = header.slot,
+            stream_id = header.stream_id,
+            selected_stream_index,
+            message_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Sent serving collective frame"
+        ),
+        Err(error) => warn!(
+            tensor_plane_instance = state.instance_id,
+            tensor_plane_state = format_args!("{:p}", Arc::as_ptr(state)),
+            target = %lane.target,
+            collective_id = %header.collective_id,
+            collective_seq = header.collective_seq,
+            sender_position = header.sender_position,
+            lane = ?header.lane,
+            layer_idx = header.layer_idx,
+            step = header.step,
+            slot = header.slot,
+            stream_id = header.stream_id,
+            selected_stream_index,
+            message_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            error = %error,
+            "Failed to send serving collective frame"
+        ),
+    }
 }
 
 #[cfg(test)]

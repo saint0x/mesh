@@ -33,8 +33,8 @@ pub use crate::inference::{
     KvTransferPolicy, LayerKVCache, LayerWeights, LiveKVBlockSpan, LiveKVBlockTable, LiveKVLayout,
     LiveKVResidency, LiveKVSequenceMetadata, LiveKVWindow, LocalExecutorClass,
     LocalExecutorContract, MetalExecutionBackend, ModelWeights, PrefillBucketStrategy,
-    ProviderExecutionBackend, RuntimeMemoryBudget, SegmentExecutionResult, SessionAssignment,
-    SessionEvictionReason, SessionEvictionState, SessionPauseReason, SessionPauseState,
-    SessionRuntimeStatus, ShardLoader, Tensor1D, Tensor2D, TransportCapabilityTier,
-    WorkspaceRequirements,
+    ProviderExecutionBackend, RingProtocolClass, RuntimeMemoryBudget, SegmentExecutionResult,
+    SessionAssignment, SessionEvictionReason, SessionEvictionState, SessionPauseReason,
+    SessionPauseState, SessionRuntimeStatus, ShardLoader, Tensor1D, Tensor2D,
+    TransportCapabilityTier, WorkspaceRequirements,
 };

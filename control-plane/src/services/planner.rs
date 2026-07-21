@@ -800,7 +800,7 @@ fn build_execution_islands(
 
     let heterogeneous_accelerators = members
         .iter()
-        .filter(|member| is_heterogeneous_accelerator_member(member))
+        .filter(|member| is_heterogeneous_accelerator_member(phase, member))
         .cloned()
         .collect::<Vec<_>>();
     if let Some(grouped_members) = canonical_tensor_parallel_group(
@@ -832,12 +832,22 @@ fn build_execution_islands(
     islands
 }
 
-fn is_heterogeneous_accelerator_member(member: &ExecutionGroupMember) -> bool {
+fn is_heterogeneous_accelerator_member(
+    phase: ExecutionPhase,
+    member: &ExecutionGroupMember,
+) -> bool {
+    let decode_capable = match phase {
+        ExecutionPhase::Prefill => true,
+        ExecutionPhase::Decode => {
+            member.backend_contract.supports_device_sampling
+                && member.backend_contract.verified_runtime.device_sampling
+        }
+    };
+
     member.backend_contract.fast_path_eligible
         && member.backend_contract.supports_live_kv
-        && member.backend_contract.supports_decode_microbatch
         && member.backend_contract.supports_checkpoint_handoff
-        && member.backend_contract.supports_device_sampling
+        && decode_capable
         && !matches!(
             member.backend_contract.compatibility_class,
             ProviderCompatibilityClass::CpuPortable
@@ -893,11 +903,13 @@ fn classify_execution_island(
 
     let unique_accelerator_providers = members
         .iter()
-        .filter(|member| is_heterogeneous_accelerator_member(member))
+        .filter(|member| is_heterogeneous_accelerator_member(phase, member))
         .map(|member| member.backend_contract.provider)
         .collect::<std::collections::BTreeSet<_>>();
     if unique_accelerator_providers.len() > 1
-        && members.iter().all(is_heterogeneous_accelerator_member)
+        && members
+            .iter()
+            .all(|member| is_heterogeneous_accelerator_member(phase, member))
     {
         return Ok(ExecutionIsland {
             island_id: execution_island_id(

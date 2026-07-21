@@ -140,7 +140,7 @@ impl BackendContractDescriptor {
             ExecutionProviderKind::Rocm => LiveKvCacheLayout::DeviceContiguousWindow,
         };
         let supports_checkpoint_handoff = true;
-        let supports_device_sampling = !matches!(provider, ExecutionProviderKind::Rocm);
+        let supports_device_sampling = true;
         let fast_path_eligible = true;
         let memory_model = match provider {
             ExecutionProviderKind::Cpu => MemoryModel::SystemRam,
@@ -179,7 +179,7 @@ impl BackendContractDescriptor {
                     decode_microbatch: false,
                     live_kv: true,
                     checkpoint_handoff: true,
-                    device_sampling: false,
+                    device_sampling: true,
                 },
             },
         };
@@ -473,7 +473,7 @@ mod tests {
             LiveKvCacheLayout::DeviceContiguousWindow
         );
         assert!(!contract.supports_decode_microbatch);
-        assert!(!contract.supports_device_sampling);
+        assert!(contract.supports_device_sampling);
         assert!(contract.supports_production_serving());
     }
 

@@ -42,6 +42,20 @@ pub enum TransportCapabilityTier {
     DirectPreferred,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RingProtocolClass {
+    UniformModelRing,
+    ProviderHomogeneousFastRing,
+    ProviderHeterogeneousPortableRing,
+}
+
+impl Default for RingProtocolClass {
+    fn default() -> Self {
+        Self::UniformModelRing
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAssignment {
     pub session_id: Uuid,

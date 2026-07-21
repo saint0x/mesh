@@ -68,9 +68,9 @@ pub use engine::{
     BackendInstanceSpec, BackendOptimizationProfile, CollectiveResidency, DecodeBatchPlan,
     DecodeBatchPolicy, DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase,
     ExecutorPhasePlan, FusedKernelStage, HostKernel, InferenceRuntimeMode, KvRuntimeContract,
-    KvTransferPolicy, LocalExecutorClass, LocalExecutorContract, RuntimeMemoryBudget,
-    SessionAssignment, SessionEvictionReason, SessionEvictionState, SessionPauseReason,
-    SessionPauseState, SessionRuntimeStatus, TransportCapabilityTier,
+    KvTransferPolicy, LocalExecutorClass, LocalExecutorContract, RingProtocolClass,
+    RuntimeMemoryBudget, SessionAssignment, SessionEvictionReason, SessionEvictionState,
+    SessionPauseReason, SessionPauseState, SessionRuntimeStatus, TransportCapabilityTier,
 };
 #[allow(unused_imports)]
 pub use fast_path::{

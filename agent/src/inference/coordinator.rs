@@ -34,9 +34,9 @@ use super::backend::{
 };
 use super::engine::{
     DecodeBatchPlan, DecodeBatchPolicy, DecodeBatchSlot, DecodeTask, EngineSessionState,
-    ExecutionPhase, InferenceRuntimeMode, RuntimeMemoryBudget, SessionEvictionReason,
-    SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
-    TransportCapabilityTier,
+    ExecutionPhase, InferenceRuntimeMode, RingProtocolClass, RuntimeMemoryBudget,
+    SessionEvictionReason, SessionEvictionState, SessionPauseReason, SessionPauseState,
+    SessionRuntimeStatus, TransportCapabilityTier,
 };
 use super::fast_path::{FastPathPlanner, FastPathRuntime};
 use super::forward_pass::SharedModelResidency;
@@ -1189,13 +1189,17 @@ impl InferenceCoordinator {
             self.remove_decode_task(task.session_id);
         }
 
+        let protocol_class = self.validate_decode_batch_protocol(&slots)?;
+
         for slot in &slots {
             if let Some(session) = self.sessions.get_mut(&slot.session_id) {
                 session.queued_for_decode = false;
             }
         }
 
-        let fast_path = if slots.is_empty() {
+        let fast_path = if slots.is_empty()
+            || protocol_class == RingProtocolClass::ProviderHeterogeneousPortableRing
+        {
             None
         } else {
             let sessions = slots
@@ -1404,6 +1408,8 @@ impl InferenceCoordinator {
             total_kv_tokens = total_kv_tokens.saturating_add(kv_tokens);
         }
 
+        let protocol_class = self.validate_decode_batch_protocol(&slots)?;
+
         for slot in &slots {
             self.remove_decode_task(slot.session_id);
         }
@@ -1413,7 +1419,9 @@ impl InferenceCoordinator {
             }
         }
 
-        let fast_path = if slots.is_empty() {
+        let fast_path = if slots.is_empty()
+            || protocol_class == RingProtocolClass::ProviderHeterogeneousPortableRing
+        {
             None
         } else {
             let sessions = slots
@@ -1507,6 +1515,55 @@ impl InferenceCoordinator {
             .values()
             .filter(|session| session.job.has_decode_context() && !session.job.is_complete())
             .count()
+    }
+
+    fn decode_batch_protocol_class(&self, slots: &[DecodeBatchSlot]) -> Result<RingProtocolClass> {
+        let mut protocol_class = None;
+        for slot in slots {
+            let session = self.sessions.get(&slot.session_id).ok_or_else(|| {
+                AgentError::Execution(format!(
+                    "decode session {} disappeared before protocol validation",
+                    slot.session_id
+                ))
+            })?;
+            match protocol_class {
+                Some(expected) if expected != session.job.request.protocol_class => {
+                    return Err(AgentError::Execution(format!(
+                        "decode batch mixes protocol classes {:?} and {:?}",
+                        expected, session.job.request.protocol_class
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    protocol_class = Some(session.job.request.protocol_class);
+                }
+            }
+        }
+
+        Ok(protocol_class.unwrap_or_default())
+    }
+
+    fn validate_decode_batch_protocol(
+        &self,
+        slots: &[DecodeBatchSlot],
+    ) -> Result<RingProtocolClass> {
+        let protocol_class = self.decode_batch_protocol_class(slots)?;
+        if protocol_class == RingProtocolClass::ProviderHeterogeneousPortableRing && slots.len() > 1
+        {
+            return Err(AgentError::Execution(format!(
+                "heterogeneous portable ring decode executes one model-parallel session per scheduler step; received {} sessions",
+                slots.len()
+            )));
+        }
+
+        Ok(protocol_class)
+    }
+
+    fn decode_batch_uses_portable_ring_protocol(&self, slots: &[DecodeBatchSlot]) -> Result<bool> {
+        Ok(matches!(
+            self.decode_batch_protocol_class(slots)?,
+            RingProtocolClass::ProviderHeterogeneousPortableRing
+        ))
     }
 
     fn decode_batch_policy_for_targets(&self, targets: DecodeBatchTargets) -> DecodeBatchPolicy {
@@ -2280,6 +2337,12 @@ impl InferenceCoordinator {
             return Ok(Vec::new());
         }
 
+        if self.decode_batch_uses_portable_ring_protocol(&batch.slots)? {
+            return self
+                .execute_portable_ring_decode_batch(batch, position)
+                .await;
+        }
+
         let fast_path = batch.fast_path.clone().ok_or_else(|| {
             AgentError::Execution(
                 "decode microbatch execution requires a production fast-path plan".to_string(),
@@ -2413,6 +2476,93 @@ impl InferenceCoordinator {
         }
 
         Ok(outcomes)
+    }
+
+    async fn execute_portable_ring_decode_batch(
+        &mut self,
+        batch: DecodeBatchPlan,
+        position: &WorkerPosition,
+    ) -> Result<Vec<DecodeStepOutcome>> {
+        if batch.slots.len() != 1 {
+            return Err(AgentError::Execution(format!(
+                "heterogeneous portable ring decode executes one model-parallel session per scheduler step; received {} sessions",
+                batch.slots.len()
+            )));
+        }
+
+        let slot = batch.slots.into_iter().next().ok_or_else(|| {
+            AgentError::Execution("portable ring decode received an empty batch".to_string())
+        })?;
+        let mut session = self.sessions.remove(&slot.session_id).ok_or_else(|| {
+            AgentError::Execution(format!(
+                "Decode session {} vanished after portable ring admission",
+                slot.session_id
+            ))
+        })?;
+        let decode_token = session.job.last_generated_token().ok_or_else(|| {
+            AgentError::Execution(format!(
+                "Decode session {} entered the portable ring without a sampled token",
+                slot.session_id
+            ))
+        })?;
+        session.engine_state.assignment.phase = ExecutionPhase::Decode;
+
+        let provider = session.backend.provider_kind();
+        let executor_contract = session.backend.executor_contract().clone();
+        let mut worker_ring = WorkerRing::new(
+            position.position,
+            position.total_workers,
+            position.left_neighbor,
+            position.right_neighbor,
+            position.left_neighbor_tensor_addr,
+            position.right_neighbor_tensor_addr,
+            provider,
+            executor_contract,
+            None,
+            self.tensor_plane_mut(),
+        );
+        worker_ring.prepare_serving_group_channels().await?;
+
+        let step_start = Instant::now();
+        let logits = session
+            .backend
+            .decode_step(decode_token, &mut worker_ring, session.job.request.job_id)
+            .await?;
+        let execution_time_ms = step_start.elapsed().as_millis() as u64;
+        let seed = session.job.request.job_id.as_u128() as u64
+            ^ session.backend.sequence_position() as u64;
+        let sampled_token = session.backend.sample(
+            &logits,
+            session.job.request.config.temperature,
+            session.job.request.config.top_p,
+            seed,
+        )?;
+
+        session.job.add_token(sampled_token);
+        session.job.current_layer = self.config.total_layers;
+        session.decode_steps_served = session.decode_steps_served.saturating_add(1);
+
+        let outcome = DecodeStepOutcome {
+            session_id: slot.session_id,
+            completion_tokens: session.job.current_token_idx,
+            execution_time_ms,
+            kv_cache_seq_len: session.backend.cache_seq_len() as u32,
+            should_checkpoint: self.config.checkpointing_enabled && session.job.should_checkpoint(),
+            completed: session.job.is_complete(),
+            time_to_first_token_ms: session
+                .job
+                .time_to_first_token()
+                .map(|ttft| ttft.as_millis() as u64),
+        };
+
+        let should_requeue = !outcome.completed;
+        self.sessions.insert(slot.session_id, session);
+        self.record_generation_metrics(outcome.session_id, outcome.execution_time_ms);
+        if should_requeue {
+            self.enqueue_decode_task(slot.session_id)?;
+        }
+
+        Ok(vec![outcome])
     }
 
     async fn run_scheduler_owned_decode_worker<F, Fut>(
@@ -3207,6 +3357,94 @@ mod tests {
         assert_eq!(batch.deferred_for_capacity, 0);
         assert_eq!(batch.deferred_for_kv_budget, 0);
         assert!(batch.fast_path.is_some());
+    }
+
+    #[test]
+    fn test_portable_ring_decode_batch_skips_uniform_fast_path_plan() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_id = Uuid::new_v4();
+        insert_decode_session_with_profile(
+            &mut coordinator,
+            session_id,
+            12,
+            12 * 1024,
+            12,
+            22,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Rocm,
+        );
+        coordinator
+            .sessions
+            .get_mut(&session_id)
+            .expect("portable session")
+            .job
+            .request
+            .protocol_class = RingProtocolClass::ProviderHeterogeneousPortableRing;
+
+        coordinator.enqueue_decode_task(session_id).unwrap();
+
+        let batch = coordinator
+            .build_next_decode_batch(
+                session_id,
+                DecodeBatchTargets {
+                    session_ids: vec![session_id],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(batch.slots.len(), 1);
+        assert_eq!(batch.slots[0].session_id, session_id);
+        assert!(batch.fast_path.is_none());
+    }
+
+    #[test]
+    fn test_portable_ring_decode_batch_rejects_local_session_pooling() {
+        let mut coordinator = test_coordinator(InferenceConfig {
+            max_decode_batch_size: 4,
+            max_decode_batch_kv_tokens: 1024,
+            ..InferenceConfig::default()
+        });
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        for session_id in [session_a, session_b] {
+            insert_decode_session_with_profile(
+                &mut coordinator,
+                session_id,
+                12,
+                12 * 1024,
+                12,
+                22,
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Rocm,
+            );
+            coordinator
+                .sessions
+                .get_mut(&session_id)
+                .expect("portable session")
+                .job
+                .request
+                .protocol_class = RingProtocolClass::ProviderHeterogeneousPortableRing;
+            coordinator.enqueue_decode_task(session_id).unwrap();
+        }
+
+        let error = coordinator
+            .build_next_decode_batch(
+                session_a,
+                DecodeBatchTargets {
+                    session_ids: vec![session_a, session_b],
+                    ..DecodeBatchTargets::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("heterogeneous portable ring decode executes one model-parallel session"));
+        assert_eq!(coordinator.decode_queue.len(), 2);
     }
 
     #[test]

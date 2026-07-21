@@ -45,9 +45,9 @@ use agent::{
         ExecutionGroupMember, ExecutionPhase as ApiExecutionPhase, InferenceExecutionLease,
         InferenceJobStatusResponse, InferenceSchedulerQueueState, PeerPunchPlan,
         PendingKvTransferStatus, ProgressEventKind, ReleaseDecodeLeaseRequest,
-        RenewDecodeLeaseRequest, ReportInferenceAssignmentProgressRequest, RingTopologyResponse,
-        ServingSessionMetadata, UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode,
-        WorkerInfo,
+        RenewDecodeLeaseRequest, ReportInferenceAssignmentProgressRequest, RingProtocolClass,
+        RingTopologyResponse, ServingSessionMetadata,
+        UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode, WorkerInfo,
     },
     build_direct_peer_candidates_from_records, format_bytes, init_production_logging,
     init_simple_logging, load_direct_candidate_seed_records, load_observed_reachability_addrs,
@@ -1203,17 +1203,29 @@ fn validate_execution_group_contract(
         );
     }
 
-    let required_hash = group
-        .backend_contract_hash
-        .as_deref()
-        .context("fast-path execution group missing backend contract hash")?;
-    if required_hash != local_contract.contract_hash {
-        anyhow::bail!(
-            "fast-path group {} requires contract {}, local contract is {}",
-            group.execution_island_id,
-            required_hash,
-            local_contract.contract_hash
-        );
+    match group.protocol_class {
+        RingProtocolClass::ProviderHomogeneousFastRing | RingProtocolClass::UniformModelRing => {
+            let required_hash = group
+                .backend_contract_hash
+                .as_deref()
+                .context("fast-path execution group missing backend contract hash")?;
+            if required_hash != local_contract.contract_hash {
+                anyhow::bail!(
+                    "fast-path group {} requires contract {}, local contract is {}",
+                    group.execution_island_id,
+                    required_hash,
+                    local_contract.contract_hash
+                );
+            }
+        }
+        RingProtocolClass::ProviderHeterogeneousPortableRing => {
+            if group.backend_contract_hash.is_some() {
+                anyhow::bail!(
+                    "heterogeneous portable group {} must use per-member backend contracts, not a shared group contract hash",
+                    group.execution_island_id
+                );
+            }
+        }
     }
 
     Ok(())
@@ -1589,6 +1601,15 @@ fn build_runtime_inference_request(
             }
             agent::api::types::InferenceRuntimeMode::ResilientEdge => {
                 agent::zip::InferenceRuntimeMode::ResilientEdge
+            }
+        },
+        protocol_class: match active_group(assignment)?.protocol_class {
+            RingProtocolClass::UniformModelRing => agent::zip::RingProtocolClass::UniformModelRing,
+            RingProtocolClass::ProviderHomogeneousFastRing => {
+                agent::zip::RingProtocolClass::ProviderHomogeneousFastRing
+            }
+            RingProtocolClass::ProviderHeterogeneousPortableRing => {
+                agent::zip::RingProtocolClass::ProviderHeterogeneousPortableRing
             }
         },
         executor_id: device_id.to_string(),

@@ -500,10 +500,12 @@ impl DeviceCollectiveBuffer {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(storage) = &self.shared_metal {
             let scratch = scratch.ensure_vec(range.len());
-            let len = self.len();
-            let staged = unsafe {
-                &slice::from_raw_parts(storage.buffer().contents() as *const f32, len)[range]
-            };
+            let staged = metal_host_f32_slice(storage, self.len()).ok_or_else(|| {
+                AgentError::Execution(
+                    "Metal collective storage is not host-visible for send staging".to_string(),
+                )
+            })?;
+            let staged = &staged[range];
             scratch.extend_from_slice(staged);
             return Ok(StageSendChunkMode::SharedVisibleScratch);
         }
@@ -545,10 +547,13 @@ impl DeviceCollectiveBuffer {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(storage) = &self.shared_metal {
-            let len = self.len();
-            let dst = unsafe {
-                &mut slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)[range]
-            };
+            let dst = metal_host_f32_slice_mut(storage, self.len()).ok_or_else(|| {
+                AgentError::Execution(
+                    "Metal collective storage is not host-visible for receive accumulation"
+                        .to_string(),
+                )
+            })?;
+            let dst = &mut dst[range];
             accumulate_into_f32_slice(dst, payload_bytes);
             return Ok(());
         }
@@ -577,10 +582,12 @@ impl DeviceCollectiveBuffer {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(storage) = &self.shared_metal {
-            let len = self.len();
-            let dst = unsafe {
-                &mut slice::from_raw_parts_mut(storage.buffer().contents() as *mut f32, len)[range]
-            };
+            let dst = metal_host_f32_slice_mut(storage, self.len()).ok_or_else(|| {
+                AgentError::Execution(
+                    "Metal collective storage is not host-visible for receive copy".to_string(),
+                )
+            })?;
+            let dst = &mut dst[range];
             copy_into_f32_slice(dst, payload_bytes);
             return Ok(());
         }
@@ -746,12 +753,42 @@ fn shared_metal_collective_storage(tensor: &DeviceTensor) -> Option<MetalStorage
     if let Storage::Metal(metal_storage) = &*storage {
         if let Some((start, end)) = layout.contiguous_offsets() {
             let total_len = end.saturating_sub(start);
-            if start == 0 && total_len == elem_count && metal_storage.dtype() == DType::F32 {
+            if start == 0
+                && total_len == elem_count
+                && metal_storage.dtype() == DType::F32
+                && metal_host_f32_slice(metal_storage, elem_count).is_some()
+            {
                 return Some(metal_storage.clone());
             }
         }
     }
     None
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_host_f32_slice(storage: &MetalStorage, len: usize) -> Option<&[f32]> {
+    let required_bytes = len.checked_mul(std::mem::size_of::<f32>())?;
+    if storage.buffer().length() < required_bytes {
+        return None;
+    }
+    let ptr = storage.buffer().contents() as *const f32;
+    if ptr.is_null() || (ptr as usize) % std::mem::align_of::<f32>() != 0 {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_host_f32_slice_mut(storage: &MetalStorage, len: usize) -> Option<&mut [f32]> {
+    let required_bytes = len.checked_mul(std::mem::size_of::<f32>())?;
+    if storage.buffer().length() < required_bytes {
+        return None;
+    }
+    let ptr = storage.buffer().contents() as *mut f32;
+    if ptr.is_null() || (ptr as usize) % std::mem::align_of::<f32>() != 0 {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts_mut(ptr, len) })
 }
 
 pub(crate) fn rms_norm_device(

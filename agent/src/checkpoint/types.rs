@@ -415,6 +415,7 @@ impl CheckpointRecoveryPoint {
             phase: checkpoint.request.phase,
             decode_batch_targets: DecodeBatchTargets::default(),
             runtime_mode: InferenceRuntimeMode::default(),
+            protocol_class: crate::zip::RingProtocolClass::default(),
             executor_id: checkpoint.request.executor_id.clone(),
             created_at: checkpoint.metadata.created_at,
         };

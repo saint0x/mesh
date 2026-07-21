@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::engine::{ExecutionPhase, InferenceRuntimeMode};
+use super::engine::{ExecutionPhase, InferenceRuntimeMode, RingProtocolClass};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DecodeBatchTargets {
@@ -86,6 +86,10 @@ pub struct InferenceRequest {
     #[serde(default)]
     pub runtime_mode: InferenceRuntimeMode,
 
+    /// Model-parallel execution protocol chosen by the control-plane planner.
+    #[serde(default)]
+    pub protocol_class: RingProtocolClass,
+
     /// Executor ID (for credit tracking)
     pub executor_id: String,
 
@@ -111,6 +115,7 @@ impl InferenceRequest {
             phase: ExecutionPhase::Prefill,
             decode_batch_targets: DecodeBatchTargets::default(),
             runtime_mode: InferenceRuntimeMode::default(),
+            protocol_class: RingProtocolClass::default(),
             executor_id,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
