@@ -3,7 +3,9 @@ use crate::executor::ring_allreduce::{
     StageSendChunkMode, StageSendScratch, StagedCollectiveBuffer,
 };
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
-use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice, decode_into_f32_scratch};
+use crate::wire_f32::decode_into_f32_scratch;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::wire_f32::{accumulate_into_f32_slice, copy_into_f32_slice};
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 use candle_core::cuda_backend::{cudarc::driver::PinnedHostSlice, CudaStorage};
 #[cfg(all(target_os = "linux", feature = "cuda"))]
@@ -14,6 +16,7 @@ use candle_core::{DType, Device, Tensor as CandleTensor, D};
 use candle_nn::ops as candle_ops;
 use std::collections::HashMap;
 use std::ops::Range;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;

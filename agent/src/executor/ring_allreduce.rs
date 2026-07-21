@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::ops::Range;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
@@ -240,6 +241,7 @@ impl CollectiveMatrix {
     }
 
     pub fn into_host_vec(self) -> Vec<f32> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let len = self.rows.saturating_mul(self.cols);
         match self.backing {
             CollectiveMatrixBacking::Host(data) => data,
@@ -264,6 +266,7 @@ impl CollectiveMatrix {
     }
 
     pub fn host_slice_mut(&mut self) -> &mut [f32] {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let len = self.rows.saturating_mul(self.cols);
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => data.as_mut_slice(),
