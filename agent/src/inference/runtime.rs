@@ -153,20 +153,16 @@ fn probe_cuda_provider() -> (bool, Option<String>) {
 }
 
 fn probe_rocm_provider() -> (bool, Option<String>) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
     {
-        if !host_has_rocm_runtime() {
-            return (
-                false,
-                Some("rocm runtime probe failed: rocminfo, rocm-smi, and HIP runtime markers were not found".to_string()),
-            );
-        }
+        crate::inference::rocm::probe()
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "rocm")))]
+    {
         (
             false,
-            Some(
-                "rocm runtime detected, but this Mesh build does not link a native HIP/ROCm tensor backend; refusing CPU fallback"
-                    .to_string(),
-            ),
+            Some("rocm provider was not compiled into this Mesh agent; rebuild with `--features rocm` on a ROCm host".to_string()),
         )
     }
 
@@ -177,22 +173,6 @@ fn probe_rocm_provider() -> (bool, Option<String>) {
             Some("rocm provider is only available on Linux builds".to_string()),
         )
     }
-}
-
-#[cfg(target_os = "linux")]
-fn host_has_rocm_runtime() -> bool {
-    std::process::Command::new("rocminfo")
-        .arg("--help")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-        || std::process::Command::new("rocm-smi")
-            .arg("--help")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        || std::path::Path::new("/opt/rocm").exists()
-        || std::path::Path::new("/dev/kfd").exists()
 }
 
 pub(crate) fn execution_device() -> Result<&'static RuntimeDevice> {
@@ -230,7 +210,7 @@ fn init_execution_device() -> std::result::Result<RuntimeDevice, RuntimeError> {
             }
         }
         ExecutionProviderKind::Rocm => Err(RuntimeError::Msg(
-            "rocm provider requires a native HIP/ROCm tensor backend; this Mesh build refuses CPU fallback"
+            "rocm provider uses the native HIP/ROCm execution path, not Candle runtime devices"
                 .to_string(),
         )),
         ExecutionProviderKind::Metal => {

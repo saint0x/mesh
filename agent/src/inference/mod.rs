@@ -52,11 +52,11 @@ pub mod fast_path;
 pub mod forward_pass;
 pub mod job;
 pub mod kv_cache;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+pub(crate) mod rocm;
 pub mod runtime;
 pub mod stats;
 pub mod tensor_ops;
-#[cfg(all(target_os = "linux", feature = "rocm"))]
-pub(crate) mod rocm;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
 pub use backend::{

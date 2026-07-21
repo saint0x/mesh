@@ -180,6 +180,27 @@ __global__ void copy_rows_kernel(const float* input, float* out,
   }
 }
 
+__global__ void copy_rows_range_kernel(const float* input, float* out,
+                                       std::size_t row_count,
+                                       std::size_t cols,
+                                       std::size_t src_row_start,
+                                       std::size_t dst_row_start) {
+  const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t len = row_count * cols;
+  if (idx < len) {
+    const std::size_t row = idx / cols;
+    const std::size_t col = idx - row * cols;
+    out[(dst_row_start + row) * cols + col] =
+        input[(src_row_start + row) * cols + col];
+  }
+}
+
+__global__ void add_range_kernel(float* dst, const float* update,
+                                 std::size_t offset, std::size_t len) {
+  const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < len) dst[offset + idx] += update[idx];
+}
+
 __global__ void attention_kernel(const float* q, const float* k_cache,
                                  const float* v_cache,
                                  const uint32_t* local_kv_indices,
@@ -257,39 +278,6 @@ __global__ void attention_kernel(const float* q, const float* k_cache,
   }
 }
 
-__global__ void argmax_rows_kernel(const float* logits, uint32_t* out,
-                                   std::size_t rows, std::size_t cols) {
-  const std::size_t row = blockIdx.x;
-  if (row >= rows) return;
-
-  extern __shared__ unsigned char raw[];
-  float* values = reinterpret_cast<float*>(raw);
-  uint32_t* indices = reinterpret_cast<uint32_t*>(values + blockDim.x);
-
-  float best = -INFINITY;
-  uint32_t best_idx = 0;
-  for (std::size_t col = threadIdx.x; col < cols; col += blockDim.x) {
-    const float value = logits[row * cols + col];
-    if (value > best) {
-      best = value;
-      best_idx = static_cast<uint32_t>(col);
-    }
-  }
-  values[threadIdx.x] = best;
-  indices[threadIdx.x] = best_idx;
-  __syncthreads();
-
-  for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride && values[threadIdx.x + stride] > values[threadIdx.x]) {
-      values[threadIdx.x] = values[threadIdx.x + stride];
-      indices[threadIdx.x] = indices[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-
-  if (threadIdx.x == 0) out[row] = indices[0];
-}
-
 }  // namespace
 
 extern "C" const char* meshnet_rocm_last_error() { return g_last_error; }
@@ -339,15 +327,6 @@ extern "C" int meshnet_rocm_upload_u32(uint32_t* dst, const uint32_t* src,
   return check_hip("hipMemcpyH2D",
                    hipMemcpy(dst, src, len * sizeof(uint32_t),
                              hipMemcpyHostToDevice))
-             ? 0
-             : 1;
-}
-
-extern "C" int meshnet_rocm_download_u32(uint32_t* dst, const uint32_t* src,
-                                         std::size_t len) {
-  return check_hip("hipMemcpyD2H",
-                   hipMemcpy(dst, src, len * sizeof(uint32_t),
-                             hipMemcpyDeviceToHost))
              ? 0
              : 1;
 }
@@ -444,6 +423,23 @@ extern "C" int meshnet_rocm_copy_rows(const float* input, float* out,
   return launch_ok("copy_rows_kernel") ? 0 : 1;
 }
 
+extern "C" int meshnet_rocm_copy_rows_range(const float* input, float* out,
+                                            std::size_t row_count,
+                                            std::size_t cols,
+                                            std::size_t src_row_start,
+                                            std::size_t dst_row_start) {
+  const std::size_t len = row_count * cols;
+  copy_rows_range_kernel<<<blocks_for(len), 256>>>(
+      input, out, row_count, cols, src_row_start, dst_row_start);
+  return launch_ok("copy_rows_range_kernel") ? 0 : 1;
+}
+
+extern "C" int meshnet_rocm_add_range(float* dst, const float* update,
+                                      std::size_t offset, std::size_t len) {
+  add_range_kernel<<<blocks_for(len), 256>>>(dst, update, offset, len);
+  return launch_ok("add_range_kernel") ? 0 : 1;
+}
+
 extern "C" int meshnet_rocm_attention(const float* q, const float* k_cache,
                                       const float* v_cache,
                                       const uint32_t* local_kv_indices,
@@ -461,12 +457,4 @@ extern "C" int meshnet_rocm_attention(const float* q, const float* k_cache,
       q, k_cache, v_cache, local_kv_indices, out, q_rows, q_cols, kv_cols,
       cache_prefix_len, cache_seq_len, head_dim);
   return launch_ok("attention_kernel") ? 0 : 1;
-}
-
-extern "C" int meshnet_rocm_argmax_rows(const float* logits, uint32_t* out,
-                                        std::size_t rows, std::size_t cols) {
-  const unsigned threads = 256;
-  const std::size_t shared = threads * (sizeof(float) + sizeof(uint32_t));
-  argmax_rows_kernel<<<rows, threads, shared>>>(logits, out, rows, cols);
-  return launch_ok("argmax_rows_kernel") ? 0 : 1;
 }

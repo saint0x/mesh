@@ -61,7 +61,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=meshnet_rocm_kernels");
-    println!("cargo:rustc-link-search=native={}", rocm_path.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        rocm_path.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=dylib=amdhip64");
     println!("cargo:rustc-link-lib=dylib=hipblas");
     println!(

@@ -856,7 +856,7 @@ impl FastPathPlanner {
             BackendOptimizationProfile::CpuSerial => GraphCaptureStrategy::LayoutValidated,
             BackendOptimizationProfile::MetalVectorized => GraphCaptureStrategy::LayoutValidated,
             BackendOptimizationProfile::CudaFused => GraphCaptureStrategy::ReplayPreferred,
-            BackendOptimizationProfile::RocmUnavailable => GraphCaptureStrategy::LayoutValidated,
+            BackendOptimizationProfile::RocmFused => GraphCaptureStrategy::ReplayPreferred,
         }
     }
 
@@ -898,13 +898,13 @@ impl FastPathPlanner {
             BackendOptimizationProfile::CpuSerial => 16,
             BackendOptimizationProfile::MetalVectorized => 64,
             BackendOptimizationProfile::CudaFused => 96,
-            BackendOptimizationProfile::RocmUnavailable => 1,
+            BackendOptimizationProfile::RocmFused => 96,
         };
         let per_batch_bytes = match bucket.optimization_profile {
             BackendOptimizationProfile::CpuSerial => 4 * 1_024,
             BackendOptimizationProfile::MetalVectorized => 16 * 1_024,
             BackendOptimizationProfile::CudaFused => 32 * 1_024,
-            BackendOptimizationProfile::RocmUnavailable => 0,
+            BackendOptimizationProfile::RocmFused => 32 * 1_024,
         };
 
         WorkspaceRequirements {

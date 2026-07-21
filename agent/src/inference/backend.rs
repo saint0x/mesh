@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+use super::rocm::forward::RocmExecutionBackend;
 use super::runtime::{runtime_error, sample_tokens_device_with_seeds, DeviceTensor};
 
 #[async_trait]
@@ -336,6 +338,8 @@ pub enum ProviderExecutionBackend {
     Cpu(CpuExecutionBackend),
     Metal(MetalExecutionBackend),
     Cuda(CudaExecutionBackend),
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    Rocm(RocmExecutionBackend),
 }
 
 impl ProviderExecutionBackend {
@@ -393,17 +397,55 @@ impl ProviderExecutionBackend {
                 total_workers,
                 allreduce_timeout,
             )?)),
-            ExecutionProviderKind::Rocm => unreachable!("rocm provider was rejected by preflight"),
+            ExecutionProviderKind::Rocm => {
+                #[cfg(all(target_os = "linux", feature = "rocm"))]
+                {
+                    Ok(Self::Rocm(RocmExecutionBackend::new(
+                        model,
+                        worker_position,
+                        shard_start,
+                        shard_end,
+                        total_workers,
+                        allreduce_timeout,
+                    )?))
+                }
+                #[cfg(not(all(target_os = "linux", feature = "rocm")))]
+                {
+                    Err(AgentError::Execution(
+                        "rocm provider requires a Linux Mesh agent built with `--features rocm`"
+                            .to_string(),
+                    ))
+                }
+            }
         }
     }
 
     pub fn ensure_provider_runtime_available(provider: ExecutionProviderKind) -> Result<()> {
         match provider {
-            ExecutionProviderKind::Cpu | ExecutionProviderKind::Metal | ExecutionProviderKind::Cuda => Ok(()),
-            ExecutionProviderKind::Rocm => Err(AgentError::Execution(
-                "rocm execution backend is unavailable because this Mesh agent does not link a native HIP/ROCm tensor runtime"
-                    .to_string(),
-            )),
+            ExecutionProviderKind::Cpu
+            | ExecutionProviderKind::Metal
+            | ExecutionProviderKind::Cuda => Ok(()),
+            ExecutionProviderKind::Rocm => {
+                #[cfg(all(target_os = "linux", feature = "rocm"))]
+                {
+                    let (available, reason) = crate::inference::rocm::probe();
+                    if available {
+                        Ok(())
+                    } else {
+                        Err(AgentError::Execution(format!(
+                            "rocm execution backend probe failed: {}",
+                            reason.unwrap_or_else(|| "unknown ROCm runtime error".to_string())
+                        )))
+                    }
+                }
+                #[cfg(not(all(target_os = "linux", feature = "rocm")))]
+                {
+                    Err(AgentError::Execution(
+                        "rocm provider requires a Linux Mesh agent built with `--features rocm`"
+                            .to_string(),
+                    ))
+                }
+            }
         }
     }
 
@@ -412,6 +454,8 @@ impl ProviderExecutionBackend {
             Self::Cpu(backend) => &backend.core,
             Self::Metal(backend) => &backend.core,
             Self::Cuda(backend) => &backend.core,
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(_) => unreachable!("rocm backend does not use the Candle provider core"),
         }
     }
 
@@ -420,6 +464,8 @@ impl ProviderExecutionBackend {
             Self::Cpu(backend) => &mut backend.core,
             Self::Metal(backend) => &mut backend.core,
             Self::Cuda(backend) => &mut backend.core,
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(_) => unreachable!("rocm backend does not use the Candle provider core"),
         }
     }
 
@@ -432,6 +478,15 @@ impl ProviderExecutionBackend {
             return Ok(Some(Vec::new()));
         };
         let provider = first_request.backend.provider_kind();
+        #[cfg(all(target_os = "linux", feature = "rocm"))]
+        if provider == ExecutionProviderKind::Rocm {
+            return RocmExecutionBackend::decode_step_batch_fast_path(
+                requests,
+                worker_ring,
+                workspace,
+            )
+            .await;
+        }
         Self::decode_step_batch_fast_path_with_provider(provider, requests, worker_ring, workspace)
             .await
     }
@@ -534,15 +589,27 @@ impl ExecutionBackend for ProviderExecutionBackend {
     }
 
     fn provider_kind(&self) -> ExecutionProviderKind {
-        self.core().provider_kind()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().provider_kind(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.provider_kind(),
+        }
     }
 
     fn optimization_profile(&self) -> BackendOptimizationProfile {
-        self.core().optimization_profile()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().optimization_profile(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.optimization_profile(),
+        }
     }
 
     fn executor_contract(&self) -> &LocalExecutorContract {
-        self.core().executor_contract()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().executor_contract(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.executor_contract(),
+        }
     }
 
     async fn prefill(
@@ -552,9 +619,19 @@ impl ExecutionBackend for ProviderExecutionBackend {
         job_id: Uuid,
         workspace: Option<&mut PrefillWorkspaceLease>,
     ) -> Result<DeviceTensor> {
-        self.core_mut()
-            .prefill(tokens, worker_ring, job_id, workspace)
-            .await
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => {
+                self.core_mut()
+                    .prefill(tokens, worker_ring, job_id, workspace)
+                    .await
+            }
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => {
+                backend
+                    .prefill(tokens, worker_ring, job_id, workspace)
+                    .await
+            }
+        }
     }
 
     async fn decode_step(
@@ -563,9 +640,15 @@ impl ExecutionBackend for ProviderExecutionBackend {
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
     ) -> Result<DeviceTensor> {
-        self.core_mut()
-            .decode_step(token, worker_ring, job_id)
-            .await
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => {
+                self.core_mut()
+                    .decode_step(token, worker_ring, job_id)
+                    .await
+            }
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.decode_step(token, worker_ring, job_id).await,
+        }
     }
 
     fn sample(
@@ -575,43 +658,89 @@ impl ExecutionBackend for ProviderExecutionBackend {
         top_p: f32,
         seed: u64,
     ) -> Result<u32> {
-        self.core().sample(logits, temperature, top_p, seed)
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => {
+                self.core().sample(logits, temperature, top_p, seed)
+            }
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.sample(logits, temperature, top_p, seed),
+        }
     }
 
     fn cache_seq_len(&self) -> usize {
-        self.core().cache_seq_len()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().cache_seq_len(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.cache_seq_len(),
+        }
     }
 
     fn live_kv_cache_bytes(&self) -> usize {
-        self.core().live_kv_cache_bytes()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().live_kv_cache_bytes(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.live_kv_cache_bytes(),
+        }
     }
 
     fn logical_kv_tokens(&self) -> usize {
-        self.core().logical_kv_tokens()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().logical_kv_tokens(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.logical_kv_tokens(),
+        }
     }
 
     fn sequence_position(&self) -> usize {
-        self.core().sequence_position()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().sequence_position(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.sequence_position(),
+        }
     }
 
     fn last_allreduce_metrics(&self) -> RingAllReduceMetrics {
-        self.core().last_allreduce_metrics()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().last_allreduce_metrics(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.last_allreduce_metrics(),
+        }
     }
 
     fn export_kv_cache(&self, max_cached_tokens: Option<usize>) -> Result<Option<KVCacheSnapshot>> {
-        self.core().export_kv_cache(max_cached_tokens)
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => {
+                self.core().export_kv_cache(max_cached_tokens)
+            }
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.export_kv_cache(max_cached_tokens),
+        }
     }
 
     fn import_kv_cache(&mut self, snapshot: &KVCacheSnapshot) -> Result<()> {
-        self.core_mut().import_kv_cache(snapshot)
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => {
+                self.core_mut().import_kv_cache(snapshot)
+            }
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.import_kv_cache(snapshot),
+        }
     }
 
     fn clear(&mut self) {
-        self.core_mut().clear();
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core_mut().clear(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.clear(),
+        }
     }
 
     fn fast_path_context(&self) -> FastPathBackendContext {
-        self.core().fast_path_context()
+        match self {
+            Self::Cpu(_) | Self::Metal(_) | Self::Cuda(_) => self.core().fast_path_context(),
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            Self::Rocm(backend) => backend.fast_path_context(),
+        }
     }
 }
 
@@ -851,7 +980,7 @@ mod tests {
                 contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Rocm),
             }
             .optimization_profile(),
-            BackendOptimizationProfile::RocmUnavailable
+            BackendOptimizationProfile::RocmFused
         );
     }
 
@@ -871,19 +1000,30 @@ mod tests {
         assert!(cuda.is_fast_path());
         assert!(cuda.supports_decode_microbatch());
         assert!(cuda.uses_staged_runtime_collectives());
-        assert!(!rocm.is_fast_path());
-        assert!(!rocm.supports_decode_microbatch());
-        assert!(!rocm.kv_runtime.supports_prefill);
-        assert!(!rocm.kv_runtime.supports_decode);
+        assert!(rocm.is_fast_path());
+        assert!(rocm.supports_decode_microbatch());
+        assert!(rocm.uses_staged_runtime_collectives());
+        assert!(rocm.kv_runtime.supports_prefill);
+        assert!(rocm.kv_runtime.supports_decode);
     }
 
     #[test]
-    fn rocm_backend_construction_fails_until_native_runtime_exists() {
-        let error = ProviderExecutionBackend::ensure_provider_runtime_available(
-            ExecutionProviderKind::Rocm,
-        )
-        .expect_err("rocm backend must fail closed");
-        assert!(error.to_string().contains("native HIP/ROCm tensor runtime"));
+    fn rocm_backend_preflight_reflects_build_capability() {
+        #[cfg(all(target_os = "linux", feature = "rocm"))]
+        {
+            ProviderExecutionBackend::ensure_provider_runtime_available(
+                ExecutionProviderKind::Rocm,
+            )
+            .expect("rocm feature build should probe the linked HIP runtime");
+        }
+        #[cfg(not(all(target_os = "linux", feature = "rocm")))]
+        {
+            let error = ProviderExecutionBackend::ensure_provider_runtime_available(
+                ExecutionProviderKind::Rocm,
+            )
+            .expect_err("non-rocm build must reject rocm provider");
+            assert!(error.to_string().contains("--features rocm"));
+        }
     }
 
     #[test]

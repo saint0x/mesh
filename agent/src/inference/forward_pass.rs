@@ -47,6 +47,7 @@
 
 use crate::errors::{AgentError, Result};
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
+use crate::provider::{selected_execution_provider, ExecutionProviderKind};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -1690,7 +1691,9 @@ fn gate_up_partials_from_combined(
 pub struct SharedModelResidency {
     model_id: String,
     config: ModelConfig,
-    device_weights: Arc<DeviceModelWeights>,
+    device_weights: Option<Arc<DeviceModelWeights>>,
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    rocm_weights: Option<Arc<super::rocm::forward::RocmModelWeights>>,
     resident_bytes: usize,
 }
 
@@ -1698,12 +1701,37 @@ impl SharedModelResidency {
     pub fn from_host(weights: ModelWeights) -> Result<Self> {
         let model_id = weights.model_id.clone();
         let config = weights.config.clone();
-        let device_weights = Arc::new(DeviceModelWeights::from_host(&weights)?);
-        let resident_bytes = device_weights.memory_usage_bytes();
+        let provider = selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu);
+        #[cfg(all(target_os = "linux", feature = "rocm"))]
+        if provider == ExecutionProviderKind::Rocm {
+            let rocm_weights =
+                Arc::new(super::rocm::forward::RocmModelWeights::from_host(&weights)?);
+            let resident_bytes = rocm_weights.memory_usage_bytes();
+            return Ok(Self {
+                model_id,
+                config,
+                device_weights: None,
+                rocm_weights: Some(rocm_weights),
+                resident_bytes,
+            });
+        }
+        if provider == ExecutionProviderKind::Rocm {
+            return Err(AgentError::Execution(
+                "rocm provider requires a Linux Mesh agent built with `--features rocm`"
+                    .to_string(),
+            ));
+        }
+        let device_weights = Some(Arc::new(DeviceModelWeights::from_host(&weights)?));
+        let resident_bytes = device_weights
+            .as_ref()
+            .map(|weights| weights.memory_usage_bytes())
+            .unwrap_or_default();
         Ok(Self {
             model_id,
             config,
             device_weights,
+            #[cfg(all(target_os = "linux", feature = "rocm"))]
+            rocm_weights: None,
             resident_bytes,
         })
     }
@@ -1718,6 +1746,23 @@ impl SharedModelResidency {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    fn candle_weights(&self) -> Result<Arc<DeviceModelWeights>> {
+        self.device_weights.as_ref().cloned().ok_or_else(|| {
+            AgentError::Execution(
+                "requested Candle weights from a non-Candle model residency".to_string(),
+            )
+        })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub(crate) fn rocm_weights(&self) -> Result<Arc<super::rocm::forward::RocmModelWeights>> {
+        self.rocm_weights.as_ref().cloned().ok_or_else(|| {
+            AgentError::Execution(
+                "requested ROCm weights from a non-ROCm model residency".to_string(),
+            )
+        })
     }
 }
 
@@ -1761,6 +1806,7 @@ impl ForwardPass {
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
         let config = residency.config().clone();
+        let device_weights = residency.candle_weights()?;
         let kv_config = KVCacheConfig {
             num_layers: config.num_layers,
             num_heads: config.num_kv_heads,
@@ -1774,12 +1820,12 @@ impl ForwardPass {
         let local_kv_head_indices = CandleTensor::from_vec(
             local_kv_head_indices_host,
             attention_layout.local_q_heads,
-            residency.device_weights.embedding.device(),
+            device_weights.embedding.device(),
         )
         .map_err(device_error)?;
 
         Ok(Self {
-            device_weights: Arc::clone(&residency.device_weights),
+            device_weights,
             config,
             allreduce_timeout,
             attention_layout,

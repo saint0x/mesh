@@ -16,7 +16,6 @@ extern "C" {
     fn meshnet_rocm_upload_f32(dst: *mut f32, src: *const f32, len: usize) -> c_int;
     fn meshnet_rocm_download_f32(dst: *mut f32, src: *const f32, len: usize) -> c_int;
     fn meshnet_rocm_upload_u32(dst: *mut u32, src: *const u32, len: usize) -> c_int;
-    fn meshnet_rocm_download_u32(dst: *mut u32, src: *const u32, len: usize) -> c_int;
     fn meshnet_rocm_fill(out: *mut f32, value: f32, len: usize) -> c_int;
     fn meshnet_rocm_add(lhs: *const f32, rhs: *const f32, out: *mut f32, len: usize) -> c_int;
     fn meshnet_rocm_mul(lhs: *const f32, rhs: *const f32, out: *mut f32, len: usize) -> c_int;
@@ -68,6 +67,20 @@ extern "C" {
         cols: usize,
         dst_row_start: usize,
     ) -> c_int;
+    fn meshnet_rocm_copy_rows_range(
+        input: *const f32,
+        out: *mut f32,
+        row_count: usize,
+        cols: usize,
+        src_row_start: usize,
+        dst_row_start: usize,
+    ) -> c_int;
+    fn meshnet_rocm_add_range(
+        dst: *mut f32,
+        update: *const f32,
+        offset: usize,
+        len: usize,
+    ) -> c_int;
     fn meshnet_rocm_attention(
         q: *const f32,
         k_cache: *const f32,
@@ -81,21 +94,20 @@ extern "C" {
         cache_seq_len: usize,
         head_dim: usize,
     ) -> c_int;
-    fn meshnet_rocm_argmax_rows(
-        logits: *const f32,
-        out: *mut u32,
-        rows: usize,
-        cols: usize,
-    ) -> c_int;
 }
 
 pub(crate) fn probe() -> (bool, Option<String>) {
     match device_count() {
         Ok(count) if count > 0 => (true, None),
-        Ok(_) => (false, Some("rocm runtime reported zero HIP devices".to_string())),
+        Ok(_) => (
+            false,
+            Some("rocm runtime reported zero HIP devices".to_string()),
+        ),
         Err(err) => (false, Some(err.to_string())),
     }
 }
+
+pub(crate) mod forward;
 
 fn device_count() -> Result<i32> {
     let mut count = 0;
@@ -196,8 +208,61 @@ impl RocmTensor {
         Ok(data)
     }
 
+    pub(crate) fn download_range(&self, range: std::ops::Range<usize>) -> Result<Vec<f32>> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(AgentError::Execution(format!(
+                "ROCm download range {}..{} out of {} elements",
+                range.start,
+                range.end,
+                self.len()
+            )));
+        }
+        let mut data = vec![0.0; range.len()];
+        call(|| unsafe {
+            meshnet_rocm_download_f32(
+                data.as_mut_ptr(),
+                self.ptr.as_ptr().add(range.start),
+                data.len(),
+            )
+        })?;
+        Ok(data)
+    }
+
+    pub(crate) fn upload_range(&self, range_start: usize, values: &[f32]) -> Result<()> {
+        if range_start.saturating_add(values.len()) > self.len() {
+            return Err(AgentError::Execution(format!(
+                "ROCm upload range {}..{} out of {} elements",
+                range_start,
+                range_start.saturating_add(values.len()),
+                self.len()
+            )));
+        }
+        call(|| unsafe {
+            meshnet_rocm_upload_f32(
+                self.ptr.as_ptr().add(range_start),
+                values.as_ptr(),
+                values.len(),
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn to_2d(&self) -> Result<Tensor2D> {
         Tensor2D::new(self.to_vec()?, self.rows, self.cols)
+    }
+
+    pub(crate) fn to_2d_prefix_rows(&self, rows: usize) -> Result<Tensor2D> {
+        if rows > self.rows {
+            return Err(AgentError::Execution(format!(
+                "ROCm prefix rows {} exceed tensor rows {}",
+                rows, self.rows
+            )));
+        }
+        Tensor2D::new(
+            self.download_range(0..rows.saturating_mul(self.cols))?,
+            rows,
+            self.cols,
+        )
     }
 
     pub(crate) fn matmul(&self, rhs: &Self) -> Result<Self> {
@@ -225,7 +290,12 @@ impl RocmTensor {
         self.same_shape(rhs, "add")?;
         let out = Self::uninitialized(self.rows, self.cols)?;
         call(|| unsafe {
-            meshnet_rocm_add(self.ptr.as_ptr(), rhs.ptr.as_ptr(), out.ptr.as_ptr(), self.len())
+            meshnet_rocm_add(
+                self.ptr.as_ptr(),
+                rhs.ptr.as_ptr(),
+                out.ptr.as_ptr(),
+                self.len(),
+            )
         })?;
         Ok(out)
     }
@@ -234,7 +304,12 @@ impl RocmTensor {
         self.same_shape(rhs, "mul")?;
         let out = Self::uninitialized(self.rows, self.cols)?;
         call(|| unsafe {
-            meshnet_rocm_mul(self.ptr.as_ptr(), rhs.ptr.as_ptr(), out.ptr.as_ptr(), self.len())
+            meshnet_rocm_mul(
+                self.ptr.as_ptr(),
+                rhs.ptr.as_ptr(),
+                out.ptr.as_ptr(),
+                self.len(),
+            )
         })?;
         Ok(out)
     }
@@ -353,6 +428,80 @@ impl RocmTensor {
         })
     }
 
+    pub(crate) fn copy_rows_range_to(
+        &self,
+        dst: &Self,
+        src_row_start: usize,
+        row_count: usize,
+        dst_row_start: usize,
+    ) -> Result<()> {
+        if self.cols != dst.cols
+            || src_row_start.saturating_add(row_count) > self.rows
+            || dst_row_start.saturating_add(row_count) > dst.rows
+        {
+            return Err(AgentError::Execution(format!(
+                "ROCm row range copy shape mismatch: src {}x{} rows {}..{}, dst {}x{} rows {}..{}",
+                self.rows,
+                self.cols,
+                src_row_start,
+                src_row_start.saturating_add(row_count),
+                dst.rows,
+                dst.cols,
+                dst_row_start,
+                dst_row_start.saturating_add(row_count)
+            )));
+        }
+        call(|| unsafe {
+            meshnet_rocm_copy_rows_range(
+                self.ptr.as_ptr(),
+                dst.ptr.as_ptr(),
+                row_count,
+                self.cols,
+                src_row_start,
+                dst_row_start,
+            )
+        })
+    }
+
+    pub(crate) fn copy_rows(&self, row_start: usize, row_count: usize) -> Result<Self> {
+        if row_start.saturating_add(row_count) > self.rows {
+            return Err(AgentError::Execution(format!(
+                "ROCm row slice {}..{} out of {} rows",
+                row_start,
+                row_start.saturating_add(row_count),
+                self.rows
+            )));
+        }
+        let out = Self::uninitialized(row_count, self.cols)?;
+        self.copy_rows_range_to(&out, row_start, row_count, 0)?;
+        Ok(out)
+    }
+
+    pub(crate) fn add_range_from(&self, range_start: usize, update: &Self) -> Result<()> {
+        if update.rows != 1 {
+            return Err(AgentError::Execution(format!(
+                "ROCm range update expects a flat 1-row tensor, got {}x{}",
+                update.rows, update.cols
+            )));
+        }
+        if range_start.saturating_add(update.len()) > self.len() {
+            return Err(AgentError::Execution(format!(
+                "ROCm add range {}..{} out of {} elements",
+                range_start,
+                range_start.saturating_add(update.len()),
+                self.len()
+            )));
+        }
+        call(|| unsafe {
+            meshnet_rocm_add_range(
+                self.ptr.as_ptr(),
+                update.ptr.as_ptr(),
+                range_start,
+                update.len(),
+            )
+        })
+    }
+
     pub(crate) fn attention(
         q: &Self,
         k_cache: &Self,
@@ -386,14 +535,6 @@ impl RocmTensor {
         Ok(out)
     }
 
-    pub(crate) fn argmax_rows(&self) -> Result<Vec<u32>> {
-        let out = RocmU32Buffer::uninitialized(self.rows)?;
-        call(|| unsafe {
-            meshnet_rocm_argmax_rows(self.ptr.as_ptr(), out.ptr.as_ptr(), self.rows, self.cols)
-        })?;
-        out.to_vec()
-    }
-
     fn same_shape(&self, rhs: &Self, op: &str) -> Result<()> {
         if self.rows == rhs.rows && self.cols == rhs.cols {
             return Ok(());
@@ -414,7 +555,6 @@ impl Drop for RocmTensor {
 #[derive(Debug)]
 pub(crate) struct RocmU32Buffer {
     ptr: NonNull<u32>,
-    len: usize,
     _marker: PhantomData<u32>,
 }
 
@@ -424,7 +564,9 @@ unsafe impl Sync for RocmU32Buffer {}
 impl RocmU32Buffer {
     pub(crate) fn from_slice(values: &[u32]) -> Result<Self> {
         let out = Self::uninitialized(values.len())?;
-        call(|| unsafe { meshnet_rocm_upload_u32(out.ptr.as_ptr(), values.as_ptr(), values.len()) })?;
+        call(|| unsafe {
+            meshnet_rocm_upload_u32(out.ptr.as_ptr(), values.as_ptr(), values.len())
+        })?;
         Ok(out)
     }
 
@@ -436,15 +578,8 @@ impl RocmU32Buffer {
         })?;
         Ok(Self {
             ptr,
-            len,
             _marker: PhantomData,
         })
-    }
-
-    pub(crate) fn to_vec(&self) -> Result<Vec<u32>> {
-        let mut data = vec![0u32; self.len];
-        call(|| unsafe { meshnet_rocm_download_u32(data.as_mut_ptr(), self.ptr.as_ptr(), self.len) })?;
-        Ok(data)
     }
 }
 
