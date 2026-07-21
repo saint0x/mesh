@@ -55,6 +55,8 @@ pub mod kv_cache;
 pub mod runtime;
 pub mod stats;
 pub mod tensor_ops;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+pub(crate) mod rocm;
 
 pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
 pub use backend::{
