@@ -1428,6 +1428,54 @@ async fn retry_control_plane_write(
     }
 }
 
+async fn report_assignment_failure(
+    registration_client: &RegistrationClient,
+    assignment: &InferenceExecutionLease,
+    job_id: Uuid,
+    device_id: Uuid,
+    control_plane_segment_id: &str,
+    error: impl Into<String>,
+) {
+    let error = error.into();
+    let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
+        device_id: device_id.to_string(),
+        segment_id: control_plane_segment_id.to_string(),
+        success: false,
+        completion: None,
+        completion_tokens: None,
+        execution_time_ms: 0,
+        time_to_first_token_ms: None,
+        kv_cache_seq_len: None,
+        error: Some(error.clone()),
+    };
+    if let Err(report_error) = retry_control_plane_write(
+        "report_inference_result",
+        job_id,
+        Some(control_plane_segment_id),
+        || {
+            let registration_client = registration_client.clone();
+            let request = failure_request.clone();
+            Box::pin(async move {
+                registration_client
+                    .report_inference_result(job_id, request)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        },
+    )
+    .await
+    {
+        error!(
+            job_id = %job_id,
+            lease_id = %assignment.lease_id,
+            segment_id = %control_plane_segment_id,
+            assignment_error = %error,
+            report_error = %report_error,
+            "Failed to report terminal assignment failure"
+        );
+    }
+}
+
 async fn release_decode_setup_failure(
     registration_client: &RegistrationClient,
     assignment: &InferenceExecutionLease,
@@ -2801,45 +2849,29 @@ async fn handle_assignment_execution_outcome(
             if matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode)
                 && matches!(lease_role, DecodeLeaseRole::Owner)
             {
-                info!(
+                error!(
                     job_id = %job_id,
                     segment_id = %control_plane_segment_id,
                     error = %error,
-                    "Decode segment failed; releasing lease for retry instead of reporting terminal failure"
+                    "Decode segment failed; reporting terminal assignment failure"
                 );
-                release_decode_lease_if_needed(
+                report_assignment_failure(
                     registration_client,
                     assignment,
-                    "segment_execution_failed",
-                    Some(error.to_string()),
+                    job_id,
+                    device_id,
+                    control_plane_segment_id,
+                    error.to_string(),
                 )
                 .await;
             } else if !matches!(assignment.active_segment.phase, ApiExecutionPhase::Decode) {
-                let failure_request = agent::api::types::ReportInferenceAssignmentRequest {
-                    device_id: device_id.to_string(),
-                    segment_id: control_plane_segment_id.to_string(),
-                    success: false,
-                    completion: None,
-                    completion_tokens: None,
-                    execution_time_ms: 0,
-                    time_to_first_token_ms: None,
-                    kv_cache_seq_len: None,
-                    error: Some(error.to_string()),
-                };
-                let _ = retry_control_plane_write(
-                    "report_inference_result",
+                report_assignment_failure(
+                    registration_client,
+                    assignment,
                     job_id,
-                    Some(control_plane_segment_id),
-                    || {
-                        let registration_client = registration_client.clone();
-                        let request = failure_request.clone();
-                        Box::pin(async move {
-                            registration_client
-                                .report_inference_result(job_id, request)
-                                .await
-                                .map_err(|error| error.to_string())
-                        })
-                    },
+                    device_id,
+                    control_plane_segment_id,
+                    error.to_string(),
                 )
                 .await;
             }
