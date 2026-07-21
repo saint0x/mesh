@@ -32,6 +32,9 @@ LOG_DIR="$RUN_ROOT/logs"
 CONTROL_LOG="$LOG_DIR/control-plane.log"
 MAC_LOG="$LOG_DIR/mac-agent.log"
 JOB_LOG="$LOG_DIR/job.log"
+BENCH_DIR="$RUN_ROOT/bench"
+BENCH_JSONL="$BENCH_DIR/results.jsonl"
+BENCH_MD="$BENCH_DIR/BENCH.md"
 
 CONTROL_PID=""
 MAC_AGENT_PID=""
@@ -45,6 +48,7 @@ usage: $(basename "$0") [command]
 
 Commands:
   run          Build, sync artifacts, start Mac+GMK Mesh, run one smoke inference.
+  bench        Build, sync artifacts, start Mac+GMK Mesh, run the production prompt bench.
   sync-model   Copy $MODEL_ID artifacts from Mac to GMK.
   stop         Stop processes from the current run root on Mac and GMK.
 
@@ -374,6 +378,170 @@ seed_gmk_credits() {
         }" >/dev/null
 }
 
+parse_job_log() {
+    local label="$1"
+    local prompt="$2"
+    local max_tokens="$3"
+    local log_path="$4"
+    python3 - "$label" "$prompt" "$max_tokens" "$log_path" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+label, prompt, max_tokens, log_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), Path(sys.argv[4])
+text = log_path.read_text(encoding="utf-8", errors="replace")
+
+def match(pattern, default=None):
+    found = re.search(pattern, text, re.MULTILINE)
+    return found.group(1).strip() if found else default
+
+execution_ms = int(match(r"Execution Time:\s+(\d+)ms", "0"))
+ttft_ms = int(match(r"TTFT:\s+(\d+)ms", "0"))
+tokens = int(match(r"Tokens:\s+(\d+)", "0"))
+status = match(r"Status:\s+([a-zA-Z_-]+)", "unknown")
+job_id = match(r"Job ID:\s+([0-9a-f-]{36})", "")
+completion_match = re.search(r"Completion:\n(?P<body>.*?)(?:\n\n\[mesh-mac-gmk\]|\Z)", text, re.S)
+completion = completion_match.group("body").strip() if completion_match else ""
+assignments = []
+for line in text.splitlines():
+    if not line.strip().startswith("pos="):
+        continue
+    assignments.append(line.strip())
+
+payload = {
+    "label": label,
+    "job_id": job_id,
+    "model_id": match(r"Model ID:\s+(.+)", ""),
+    "status": status,
+    "tokens": tokens,
+    "max_tokens": max_tokens,
+    "execution_ms": execution_ms,
+    "ttft_ms": ttft_ms,
+    "tokens_per_second": round(tokens / (execution_ms / 1000.0), 4) if execution_ms else 0.0,
+    "prompt": prompt,
+    "completion": completion,
+    "assignments": assignments,
+}
+print(json.dumps(payload, sort_keys=True))
+PY
+}
+
+write_bench_markdown() {
+    python3 - "$BENCH_JSONL" "$BENCH_MD" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+jsonl_path, md_path = Path(sys.argv[1]), Path(sys.argv[2])
+rows = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+lines = [
+    "# Mac + GMK Mesh Bench",
+    "",
+    "| Label | Status | Tokens | TTFT ms | Wall ms | Tok/s |",
+    "|---|---:|---:|---:|---:|---:|",
+]
+for row in rows:
+    lines.append(
+        f"| {row['label']} | {row['status']} | {row['tokens']} | {row['ttft_ms']} | {row['execution_ms']} | {row['tokens_per_second']:.4f} |"
+    )
+
+lines.extend(["", "## Qualitative Outputs", ""])
+for row in rows:
+    completion = row["completion"].replace("\n", "\n    ")
+    prompt = row["prompt"].replace("\n", "\n    ")
+    lines.extend(
+        [
+            f"### {row['label']}",
+            "",
+            f"Prompt: {prompt}",
+            "",
+            f"Completion:",
+            "",
+            f"    {completion}",
+            "",
+            "Assignments:",
+            "",
+        ]
+    )
+    for assignment in row["assignments"]:
+        lines.append(f"- `{assignment}`")
+    lines.append("")
+
+md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+print(md_path)
+PY
+}
+
+run_single_job() {
+    local label="$1"
+    local prompt="$2"
+    local max_tokens="$3"
+    local log_path="$4"
+    env HOME="$MAC_HOME" MESHNET_HOME="$MAC_HOME" MESHNET_MODEL_STORE="$LOCAL_MODEL_STORE" \
+        "$LOCAL_AGENT_BIN" job run \
+        --model-id "$MODEL_ID" \
+        --prompt "$prompt" \
+        --max-tokens "$max_tokens" \
+        --temperature 0.0 \
+        --top-p 1.0 >"$log_path" 2>&1
+    grep -q "Status:          completed" "$log_path"
+}
+
+run_smoke_job() {
+    log "topology stable; running smoke inference"
+    run_single_job \
+        "smoke" \
+        "Say hello from the Mac and GMK mesh in five words." \
+        16 \
+        "$JOB_LOG" || {
+        cat "$JOB_LOG" >&2 || true
+        die "smoke inference did not complete"
+    }
+
+    log "smoke inference completed"
+    cat "$JOB_LOG"
+}
+
+run_bench_jobs() {
+    mkdir -p "$BENCH_DIR"
+    : >"$BENCH_JSONL"
+
+    local labels=(
+        "latency-short"
+        "reasoning-medium"
+        "code-systems"
+        "creative-recall"
+        "long-context-style"
+    )
+    local max_tokens=(32 96 128 96 160)
+    local prompts=(
+        "Answer in two sentences: what is heterogeneous tensor-parallel inference and why does sharding by real device capacity matter?"
+        "Explain how the universe came into being. Keep it grounded, structured, and clear enough for an engineer who wants the real conceptual map."
+        "Write a compact Rust function that validates non-overlapping shard ranges covering 0..hidden_dim exactly. Include edge cases in prose after the code."
+        "Invent a vivid but technically plausible metaphor for a Mac Metal worker and an AMD ROCm worker sharing one transformer layer over a LAN."
+        "You are evaluating a distributed inference engine. Discuss TTFT, decode throughput, shard residency, network synchronization, and why a slower small shard can still help or hurt end-to-end latency."
+    )
+
+    for idx in "${!labels[@]}"; do
+        local label="${labels[$idx]}"
+        local prompt="${prompts[$idx]}"
+        local max_token="${max_tokens[$idx]}"
+        local log_path="$BENCH_DIR/${label}.log"
+        log "bench job label=$label max_tokens=$max_token"
+        if ! run_single_job "$label" "$prompt" "$max_token" "$log_path"; then
+            cat "$log_path" >&2 || true
+            die "bench inference failed for $label"
+        fi
+        parse_job_log "$label" "$prompt" "$max_token" "$log_path" >>"$BENCH_JSONL"
+    done
+
+    write_bench_markdown >/dev/null
+    log "bench completed: $BENCH_MD"
+    cat "$BENCH_MD"
+}
+
 start_control_plane() {
     mkdir -p "$CONTROL_HOME" "$LOG_DIR"
     (
@@ -620,28 +788,20 @@ env HOME='$remote_home' MESHNET_HOME='$remote_home' MESHNET_MODEL_STORE='$GMK_MO
     }
     sleep 3
 
-    log "topology stable; running smoke inference"
-    env HOME="$MAC_HOME" MESHNET_HOME="$MAC_HOME" MESHNET_MODEL_STORE="$LOCAL_MODEL_STORE" \
-        "$LOCAL_AGENT_BIN" job run \
-        --model-id "$MODEL_ID" \
-        --prompt "Say hello from the Mac and GMK mesh in five words." \
-        --max-tokens 16 \
-        --temperature 0.0 \
-        --top-p 1.0 >"$JOB_LOG" 2>&1
-
-    if ! grep -q "Status:          completed" "$JOB_LOG"; then
-        cat "$JOB_LOG" >&2 || true
-        die "smoke inference did not complete"
+    if [[ "${MESHNET_BENCH_MODE:-0}" == "1" ]]; then
+        run_bench_jobs
+    else
+        run_smoke_job
     fi
-
-    log "smoke inference completed"
-    cat "$JOB_LOG"
     log "logs: $LOG_DIR"
 }
 
 case "${1:-run}" in
     run)
         run_cluster
+        ;;
+    bench)
+        MESHNET_BENCH_MODE=1 run_cluster
         ;;
     sync-model)
         sync_model
